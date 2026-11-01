@@ -6,7 +6,7 @@ type MaybePromise<T> = T | Promise<T>
 type Timeframe = '5m' | '15m' | '1H'
 type Instrument = { instId: string; listTime?: number | string; [key: string]: unknown }
 export type MarketHistoryOptions = {
-  store: Pick<MarketStore, 'candles' | 'coverage' | 'inspectCandles' | 'statistics'> & Partial<Pick<MarketStore, 'candleRevision' | 'candleChangesSince'>>
+  store: Pick<MarketStore, 'candles' | 'coverage' | 'inspectCandles' | 'missingCompletePriceRanges' | 'statisticsCoverage'> & Partial<Pick<MarketStore, 'candleRevision' | 'candleChangesSince'>>
   metadata: AuditMetadata
   get(path: string, parameters: Record<string, string | number>, signal: AbortSignal, priority: StorePriority, options?: { getPriority?: () => StorePriority }): Promise<unknown[][]>
   /** Reuse a just-closed candle from the acknowledged stream before REST acquisition. */

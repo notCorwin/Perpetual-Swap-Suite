@@ -528,7 +528,7 @@ export class MarketStore {
     // Inspection also owns its identity for the entire cache fence.
     try {
       if (command === 'candles' || command === 'missingCompletePriceRanges') query = validateQuery(query)
-      else if (command === 'inspect') query = { ...query }
+      else if (command === 'inspect' || command === 'statisticsCoverage') query = { ...query }
     } catch (error) { return Promise.reject(error) }
     return this.operation(async () => {
       const valid = command === 'candles' || command === 'missingCompletePriceRanges' ? query : validateQuery(query)
@@ -585,6 +585,7 @@ export class MarketStore {
   appendStatistics(input, priority = 'background') { return this.operation(() => this.writer.request('appendStatistics', [input], priority)) }
   candles(query, priority = 'background') { return this.read('candles', query, priority) }
   statistics(query, priority = 'background') { return this.read('statistics', query, priority) }
+  statisticsCoverage(query, priority = 'background') { return this.read('statisticsCoverage', query, priority) }
   coverage(instrument, timeframe, priority = 'background') { return this.read('coverage', { instrument, timeframe }, priority) }
   candleWatermark(instrument, timeframe, priority = 'background') { return this.read('watermark', { instrument, timeframe }, priority, false) }
   priceWatermark(instrument, timeframe, priority = 'background') { return this.read('watermark', { instrument, timeframe }, priority, true) }

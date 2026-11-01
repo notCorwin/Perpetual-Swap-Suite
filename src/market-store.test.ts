@@ -141,6 +141,66 @@ test('native coverage reports exact gaps and independently expires explicit abse
   } finally { await f.close() }
 })
 
+test('compact statistics coverage retains source gaps, leases, and price-dependent taker validity', async () => {
+  const f = await fixture(), expiresAt = Date.now() + 60_000
+  try {
+    await f.store.appendCandles([candle(1), candle(2)])
+    await f.store.appendStatistics({ ...query, source: 'oi', from: base, through: base, values: [[base, 42]] })
+    await f.store.appendStatistics({ ...query, source: 'oi', from: base + step, through: base + 2 * step, values: [], expiresAt })
+    await f.store.appendStatistics({ ...query, source: 'oi', from: base + 4 * step, through: base + 4 * step, values: [], expiresAt: null })
+    const oi = await f.store.statisticsCoverage({ ...query, through: base + 4 * step, source: 'oi' })
+    assert.deepEqual(oi, { gaps: [{ from: base + 3 * step, through: base + 3 * step }], expiries: [
+      { from: base + step, through: base + 2 * step, expiresAt }, { from: base + 4 * step, through: base + 4 * step, expiresAt: 0 },
+    ] })
+
+    await f.store.appendStatistics({ ...query, source: 'taker', from: base, through: base, values: [[base, 1, 2]] })
+    await f.store.appendStatistics({ ...query, source: 'taker', from: base + step, through: base + step, values: [[base + step, 0, 0]], expiresAt })
+    await f.store.appendStatistics({ ...query, source: 'taker', from: base + 2 * step, through: base + 2 * step,
+      values: [[base + 2 * step, 0.4, 0.6]], priceVolume: 1 })
+    await f.store.appendCandles([{ ...candle(2), volume: 2 }])
+    const taker = await f.store.statisticsCoverage({ ...query, through: base + 3 * step, source: 'taker' })
+    assert.deepEqual(taker, { gaps: [{ from: base + 2 * step, through: base + 3 * step }],
+      expiries: [{ from: base + step, through: base + step, expiresAt }] })
+  } finally { await f.close() }
+})
+
+test('compact statistics coverage preserves malformed legacy observations for validation', async () => {
+  const f = await fixture(), expiresAt = Date.now() + 60_000, end = base + 4 * step
+  try {
+    await f.store.appendCandles([candle(2), candle(3)])
+    for (const source of ['oi', 'taker'] as const) {
+      const values = Array.from({ length: 5 }, (_, i) => source === 'oi' ? [base + i * step, 1] : [base + i * step, 1, 1])
+      await f.store.appendStatistics({ ...query, through: end, source, values })
+    }
+    const database = new DatabaseSync(f.store.path)
+    try {
+      const series = database.prepare('SELECT id FROM series WHERE instrument=? AND timeframe=?').get(query.instrument, query.timeframe) as { id: number }
+      const update = database.prepare('UPDATE statistics SET value1=?, value2=?, expires_at=?, observed_volume=? WHERE series_id=? AND source=? AND timestamp=?')
+      update.run(-1, null, expiresAt, null, series.id, 1, base)
+      update.run('bad', null, expiresAt, null, series.id, 1, base + step)
+      update.run(Infinity, null, expiresAt, null, series.id, 1, base + 2 * step)
+      update.run(null, null, expiresAt, null, series.id, 1, base + 3 * step)
+      database.prepare(`INSERT INTO statistics(series_id,source,timestamp,value1,value2,expires_at,written_at,origin,import_version,absence_attempts,observed_volume)
+        VALUES(?,1,?,NULL,NULL,?,0,1,0,1,NULL)`).run(series.id, base + 3 * step + 1, expiresAt)
+      update.run(1, null, expiresAt, null, series.id, 2, base)
+      update.run(-1, 1, expiresAt, null, series.id, 2, base + step)
+      update.run(0, 0, expiresAt, null, series.id, 2, base + 2 * step)
+      update.run(1, 1, expiresAt, 99, series.id, 2, base + 3 * step)
+    } finally { database.close() }
+    assert.deepEqual(await f.store.statisticsCoverage({ ...query, through: end, source: 'oi' }), { gaps: [], expiries: [
+      { from: base, through: base + 2 * step, expiresAt: 0 },
+      { from: base + 3 * step, through: base + 3 * step, expiresAt },
+      { from: base + 3 * step + 1, through: base + 3 * step + 1, expiresAt },
+    ] })
+    assert.deepEqual(await f.store.statisticsCoverage({ ...query, through: end, source: 'taker' }), {
+      gaps: [{ from: base + 3 * step, through: base + 3 * step }], expiries: [
+        { from: base, through: base, expiresAt }, { from: base + step, through: base + step, expiresAt: 0 },
+        { from: base + 2 * step, through: base + 2 * step, expiresAt },
+      ],
+    })
+  } finally { await f.close() }
+})
+
 test('coverage follows continuous series bounds through gaps, replacement and imported facts', async () => {
   const f = await fixture(), range = { ...query, through: base + 4 * step }
   try {

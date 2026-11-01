@@ -9,7 +9,7 @@ test('maintenance is bounded while continuity and interactive work retain indepe
   let release!: () => void
   const gate = new Promise<void>(resolve => { release = resolve })
   const sync = new HistorySync({
-    store: { async missingCandleRanges(query) { return covered.has(`${query.source}:${query.instrument}`) ? [] : [{ from: query.from, through: query.through }] } },
+    store: { async missingCandleRanges(query) { return { gaps: covered.has(`${query.source}:${query.instrument}`) ? [] : [{ from: query.from, through: query.through }], leases: [] } } },
     write(records, task) { for (const row of records) covered.add(`${task.source}:${row.instrument}`) },
     maxConcurrentTasks: 3, maxConcurrentPerSource: { candles: 2, oi: 1 },
     sources: Object.fromEntries(['candles', 'oi'].map(source => [source, { async fetchGap(query: { instrument: string; timeframe: '5m' | '15m' | '1H'; from: number }) {

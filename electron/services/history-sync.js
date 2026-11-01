@@ -338,13 +338,13 @@ export class HistorySync {
           delete request.materialize
           const result = await this.store.missingCandleRanges(request, requestPriority, { materialize: portion.materialize })
           signal?.throwIfAborted()
-          if (!Array.isArray(result)) throw new TypeError('store.missingCandleRanges must return an array.')
-          const checked = result.map(value => range(value, step))
+          if (!Array.isArray(result?.gaps)) throw new TypeError('store.missingCandleRanges must return gaps.')
+          const checked = result.gaps.map(value => range(value, step))
           if (checked.some(value => value.from < portion.from || value.through > portion.through)) throw new TypeError('Store gaps must be inside the requested range.')
           gaps = merged([...subtract(gaps, [portion], step), ...checked], step)
           unmaterialized = merged([...subtract(unmaterialized, [portion], step), ...(portion.materialize ? [] : checked)], step)
-          const observed = this.store.coverageLeases?.(request) ?? []
-          if (!Array.isArray(observed)) throw new TypeError('store.coverageLeases must return an array.')
+          const observed = result.leases
+          if (!Array.isArray(observed)) throw new TypeError('store.missingCandleRanges must return leases.')
           for (const lease of observed) {
             range(lease, step); integer(lease.expiresAt, 'expiresAt')
             if (lease.from < portion.from || lease.through > portion.through) throw new TypeError('Coverage leases must be inside the verified range.')

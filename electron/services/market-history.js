@@ -2,28 +2,12 @@ import { HistorySync } from './history-sync.js'
 import { DataAudit } from './data-audit.js'
 import { CANDLE_INTERVALS, validateCandle } from './market-store.js'
 import { completePriceCandle as pricePresent } from './market-records.js'
-import { statisticsMask, STATISTICS_OI as OI, STATISTICS_TAKER as TAKER, validTakerVolumes } from './statistics-state.js'
+import { STATISTICS_OI as OI, STATISTICS_TAKER as TAKER } from './statistics-state.js'
 
 const keyOf = (instrument, timeframe) => `${instrument}:${timeframe}`
 const rangeKey = value => `${keyOf(value.instrument, value.timeframe)}:${value.from}:${value.through}`
 const numeric = value => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value)) ? Number(value) : null
 const nonnegative = value => typeof value === 'number' && Number.isFinite(value) && value >= 0
-const expiryField = source => source === OI ? 'statisticsOIExpiresAt' : 'statisticsTakerExpiresAt'
-const sourcePresent = (row, source, now) => {
-  if (!(statisticsMask(row) & source)) return false
-  const valid = source === OI ? nonnegative(row.oi) : validTakerVolumes(row)
-  return valid || Number(row[expiryField(source)]) > now
-}
-const missing = (rows, from, through, interval, present) => {
-  const stamps = new Set(rows.filter(present).map(row => row.timestamp)), result = []
-  let first = null
-  for (let stamp = from; stamp <= through; stamp += interval) {
-    if (!stamps.has(stamp)) first ??= stamp
-    else if (first !== null) { result.push({ from: first, through: stamp - interval }); first = null }
-  }
-  if (first !== null) result.push({ from: first, through })
-  return result
-}
 const mergedRanges = (ranges, interval) => {
   const result = []
   for (const value of [...ranges].sort((a, b) => a.from - b.from)) {
@@ -59,7 +43,6 @@ export class MarketHistory {
     this.latestTasks = new Map()
     this.seeds = new Map()
     this.repairs = new Map()
-    this.coverageLeaseReads = new Map()
     const statistics = source => ({
       inspect: query => this.inspectSource(query),
       fetchGap: query => this.fetchStatistics(query, source),
@@ -78,7 +61,6 @@ export class MarketHistory {
               ? store.statisticsCoverageChangesSince(query.instrument, query.timeframe, query.source, revision)
               : store.candleChangesSince(query.instrument, query.timeframe, revision) } : {}),
         } : {}),
-        coverageLeases: query => this.coverageLeaseReads.get(`${rangeKey(query)}:${query.source}`) ?? [],
       },
       sources: {
         candles: { inspect: query => this.inspectSource(query), fetchGap: query => this.fetchPrices(query) },
@@ -133,41 +115,34 @@ export class MarketHistory {
   }
 
   async missingSource(query, priority, { materialize = true } = {}) {
-    let rows = [], gaps = []
+    let gaps = [], coverage
     if (query.source === 'candles') gaps = await this.store.missingCompletePriceRanges(query, priority)
-    else rows = await this.store.statistics(query, priority)
+    else coverage = await this.store.statisticsCoverage(query, priority)
     if (materialize && query.source === 'candles' && query.timeframe !== '5m' && this.derivePrices) {
       if (gaps.length) {
         for (const gap of gaps) await this.derivePrices({ instrument: query.instrument, timeframe: query.timeframe, ...gap }, priority)
         gaps = await this.store.missingCompletePriceRanges(query, priority)
       }
     }
-    const bit = query.source === 'oi' ? OI : TAKER
     const observations = this.seeds.get(keyOf(query.instrument, query.timeframe)), observedAt = this.now()
     const leases = []
-    if (query.source !== 'candles') for (const row of rows) {
-      const numericObservation = bit === OI ? nonnegative(row.oi) : validTakerVolumes(row)
-      const expiresAt = Number(row[expiryField(bit)])
-      if (!(statisticsMask(row) & bit) || numericObservation || expiresAt <= observedAt || !Number.isSafeInteger(expiresAt)) continue
-      const previous = leases.at(-1)
-      if (previous?.expiresAt === expiresAt && row.timestamp === previous.through + query.intervalMS) previous.through = row.timestamp
-      else leases.push({ from: row.timestamp, through: row.timestamp, expiresAt })
+    if (coverage) {
+      gaps.push(...coverage.gaps)
+      for (const entry of coverage.expiries) {
+        if (!(entry.expiresAt > observedAt)) {
+          if ((entry.from - query.from) % query.intervalMS === 0) gaps.push({ from: entry.from, through: entry.through })
+        } else if (Number.isSafeInteger(entry.expiresAt)) leases.push(entry)
+      }
     }
-    const leaseKey = `${rangeKey(query)}:${query.source}`
-    // Only the caller's immediately following coverageLeases lookup needs
-    // these ranges. Retain bounded query metadata, never source candle rows.
-    this.coverageLeaseReads.delete(leaseKey)
-    this.coverageLeaseReads.set(leaseKey, leases)
-    while (this.coverageLeaseReads.size > 512) this.coverageLeaseReads.delete(this.coverageLeaseReads.keys().next().value)
     if (query.source === 'candles') {
       for (const timestamp of observations?.keys() ?? []) if (Number.isSafeInteger(timestamp) && timestamp >= query.from && timestamp <= query.through
         && (timestamp - query.from) % query.intervalMS === 0) gaps.push({ from: timestamp, through: timestamp })
-    } else gaps = missing(rows, query.from, query.through, query.intervalMS, row => sourcePresent(row, bit, observedAt))
+    }
     if (query.source === 'candles') for (const repair of this.repairs.values()) {
       if (repair.instrument !== query.instrument || repair.timeframe !== query.timeframe) continue
       for (const bounds of repair.remaining) if (bounds.from <= query.through && bounds.through >= query.from) gaps.push({ from: Math.max(bounds.from, query.from), through: Math.min(bounds.through, query.through) })
     }
-    return mergedRanges(gaps, query.intervalMS)
+    return { gaps: mergedRanges(gaps, query.intervalMS), leases }
   }
 
   parsed(instId, timeframe, values) {

@@ -390,6 +390,43 @@ const statisticRows = query => {
   return [...result.values()]
 }
 
+// Return coverage facts from one SQLite read. Classify absence leases only
+// after the worker response, including its queueing and transfer time.
+function statisticsCoverage(query) {
+  const valid = validateQuery(query), source = query.source, step = CANDLE_INTERVALS[valid.timeframe]
+  if (!['oi', 'taker'].includes(source) || valid.from % step || valid.through % step) throw new TypeError('Invalid statistics coverage range.')
+  const bit = source === 'oi' ? 1 : 2, rows = statisticRows(query), gaps = [], expiries = []
+  const nonnegative = value => typeof value === 'number' && Number.isFinite(value) && value >= 0
+  let next = valid.from
+  const addGap = (from, through) => {
+    if (from > through) return
+    const previous = gaps.at(-1)
+    if (previous && previous.through + step === from) previous.through = through
+    else gaps.push({ from, through })
+  }
+  const addExpiry = row => {
+    const expiresAt = Number(source === 'oi' ? row.statisticsOIExpiresAt : row.statisticsTakerExpiresAt), timestamp = row.timestamp
+    const previous = expiries.at(-1)
+    if (previous && Object.is(previous.expiresAt, expiresAt) && previous.through + step === timestamp) previous.through = timestamp
+    else expiries.push({ from: timestamp, through: timestamp, expiresAt })
+  }
+  for (const row of rows) {
+    const timestamp = row.timestamp, mask = statisticsMask(row)
+    const numeric = source === 'oi' ? nonnegative(row.oi) : validTakerVolumes(row)
+    if ((timestamp - valid.from) % step !== 0) {
+      // Preserve the existing validation of non-grid leased legacy data.
+      if ((mask & bit) && !numeric) addExpiry(row)
+      continue
+    }
+    addGap(next, timestamp - step)
+    next = timestamp + step
+    if (!(mask & bit)) addGap(timestamp, timestamp)
+    else if (!numeric) addExpiry(row)
+  }
+  addGap(next, valid.through)
+  return { gaps, expiries }
+}
+
 function missingRanges(query, source = 'candles', verify = false) {
   if (!['candles', 'oi', 'taker'].includes(source)) throw new TypeError('Invalid history source.')
   const valid = validateQuery(query), step = CANDLE_INTERVALS[valid.timeframe], series = identity(valid)
@@ -440,6 +477,7 @@ const commands = {
   validateCandles: rows => { if (!Array.isArray(rows)) throw new TypeError('Candles must be an array.'); rows.forEach(validateCandle); return { result: undefined } },
   append: (rows, options) => append(rows, options), appendStatistics, aggregateCandles,
   candles: query => ({ result: candleRows(query) }), statistics: query => ({ result: statisticRows(query) }),
+  statisticsCoverage: query => ({ result: statisticsCoverage(query) }),
   missingRanges: (query, source) => ({ result: missingRanges(query, source) }),
   missingCompletePriceRanges: query => ({ result: missingCompletePriceRanges(query) }),
   coverage: query => { validateQuery(query); const value = identity(query); return { result: { count: value?.candle_count ?? 0, first: value?.first_ts ?? null, last: value?.last_ts ?? null } } },

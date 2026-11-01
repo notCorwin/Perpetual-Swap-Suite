@@ -79,6 +79,8 @@ export class MarketStore {
   appendCandles(candles: CandleRecord[], priority?: StorePriority): Promise<number>
   appendStatistics(page: StatisticsPage, priority?: StorePriority): Promise<number>
   statistics(query: CandleQuery & { source?: 'oi' | 'taker' }, priority?: StorePriority): Promise<StatisticsRecord[]>
+  /** One snapshot of time-independent gaps and absence expiries. */
+  statisticsCoverage(query: CandleQuery & CandleRange & { source: 'oi' | 'taker' }, priority?: StorePriority): Promise<{ gaps: CandleRange[]; expiries: Array<CandleRange & { expiresAt: number }> }>
   statisticsMissingRanges(query: CandleQuery & CandleRange & { source: 'oi' | 'taker' }, priority?: StorePriority): Promise<CandleRange[]>
   /** Replace the inclusive grid range, including malformed records within each covered bar. */
   replaceCandles(query: CandleQuery & CandleRange, candles: CandleRecord[], priority?: StorePriority): Promise<number>

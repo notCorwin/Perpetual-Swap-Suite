@@ -76,13 +76,12 @@ export type HistorySource = {
 }
 export type HistorySyncOptions = {
   store: {
-    missingCandleRanges(query: HistoryRange & { instrument: string; timeframe: HistoryTimeframe; source: string; intervalMS: number }, priority?: HistoryPriority): Promise<HistoryRange[]>
+    /** Gaps and direct absence leases come from the same storage snapshot. */
+    missingCandleRanges(query: HistoryRange & { instrument: string; timeframe: HistoryTimeframe; source: string; intervalMS: number }, priority?: HistoryPriority): Promise<{ gaps: HistoryRange[]; leases: HistoryCoverageLease[] }>
     /** Process-local mutation revision. Without one, completed enqueues revalidate storage. */
     coverageVersion?(query: HistoryRange & { instrument: string; timeframe: HistoryTimeframe; source: string }): MaybePromise<number>
     /** Null ranges mean the journal no longer covers the requested revision. */
     coverageChanges?(query: HistoryRange & { instrument: string; timeframe: HistoryTimeframe; source: string }, revision: number): MaybePromise<{ revision: number; ranges: HistoryRange[] | null }>
-    /** Direct empty-observation leases from the immediately preceding coverage read. Numeric observations have no lease. */
-    coverageLeases?(query: HistoryRange & { instrument: string; timeframe: HistoryTimeframe; source: string }): HistoryCoverageLease[]
     appendCandles?(records: CandleRecord[], priority?: HistoryPriority): Promise<number>
   }
   sources: Record<string, HistorySource>

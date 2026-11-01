@@ -33,7 +33,7 @@ class MemoryStore {
       else if (first !== null) { result.push({ from: first, through: timestamp - request.intervalMS }); first = null }
     }
     if (first !== null) result.push({ from: first, through: request.through })
-    return result
+    return { gaps: result, leases: [] }
   }
 }
 const fixture = (options: Partial<HistorySyncOptions> = {}) => {
@@ -368,7 +368,7 @@ test('unknown identity invalidates reads already awaiting their first version', 
   let versions = 0
   const store = {
     async coverageVersion() { if (++versions === 1) { entered.resolve(); await gate.promise }; return 0 },
-    async missingCandleRanges(request: HistoryRange) { reads.push({ from: request.from, through: request.through }); return [] },
+    async missingCandleRanges(request: HistoryRange) { reads.push({ from: request.from, through: request.through }); return { gaps: [], leases: [] } },
   }
   const sync = new HistorySync({ store, write: async () => {}, sources: { candles: { fetchGap: () => [] } } }) as any
   t.after(() => { gate.resolve(); return sync.close() })
@@ -413,7 +413,7 @@ test('coverage invalidation journals are globally bounded and retired after read
       const portions = reads.get(request.instrument) ?? []
       portions.push({ from: request.from, through: request.through }); reads.set(request.instrument, portions)
       if (portions.length === 1) { if (reads.size === 129) entered.resolve(); await gate.promise }
-      return []
+      return { gaps: [], leases: [] }
     },
   }
   const sync = new HistorySync({ store, write: async () => {}, sources: { candles: { fetchGap: () => [] } } }) as any
@@ -484,7 +484,7 @@ test('an exhausted checkpoint retains but rechecks a newer shared coverage snaps
     coverageVersion: () => 0,
     async missingCandleRanges() {
       if (++reads === 1) { entered.resolve(); await gate.promise }
-      return []
+      return { gaps: [], leases: [] }
     },
   }
   const sync = new HistorySync({ store, write: async () => {}, sources: { candles: { fetchGap: () => [] } } }) as any
@@ -509,7 +509,7 @@ test('an exhausted checkpoint marks its unchanged shared snapshot dirty for vers
     coverageChanges: () => ({ revision: version, ranges: [{ from: base, through: base }, { from: base + 2 * step, through: base + 2 * step }] }),
     async missingCandleRanges() {
       if (++reads === 2) { entered.resolve(); await gate.promise }
-      return []
+      return { gaps: [], leases: [] }
     },
   }
   const sync = new HistorySync({ store, write: async () => {}, sources: { candles: { fetchGap: () => [] } } }) as any
@@ -535,7 +535,7 @@ test('unknown checkpoint evidence dirties all of a larger shared snapshot', asyn
     coverageChanges: () => ({ revision: version, ranges: null }),
     async missingCandleRanges() {
       if (++reads === 2) { entered.resolve(); await gate.promise }
-      return []
+      return { gaps: [], leases: [] }
     },
   }
   const sync = new HistorySync({ store, write: async () => {}, sources: { candles: { fetchGap: () => [] } } }) as any
@@ -558,7 +558,7 @@ for (const mode of ['version-after', 'version-before', 'epoch-after'] as const) 
     coverageChanges: () => ({ revision: version, ranges: [{ from: base, through: base }] }),
     async missingCandleRanges() {
       if (++reads === 1) { entered.resolve(); await gate.promise }
-      return []
+      return { gaps: [], leases: [] }
     },
   }
   const sync = new HistorySync({ store, write: async () => {}, sources: { candles: { fetchGap: () => [] } } }) as any
@@ -784,7 +784,7 @@ test('overlapping held and interactive windows retain the bounded coverage read 
   const spans: number[] = []
   const store = { async missingCandleRanges(request: HistoryRange & { intervalMS: number }) {
     spans.push((request.through - request.from) / request.intervalMS + 1)
-    return []
+    return { gaps: [], leases: [] }
   } }
   const sync = new HistorySync({ store, sources: { candles: { fetchGap: () => { throw new Error('All slots are local.') } } }, write: async () => {} })
   t.after(() => sync.close())
@@ -861,8 +861,7 @@ test('held reuse excludes shared and repeated downloads while counting later loc
 
 test('held coverage counts neither empty leases nor explicit unavailable slots as local numeric reuse', async t => {
   const store = {
-    async missingCandleRanges() { return [{ from: base + 2 * step, through: base + 2 * step }] },
-    coverageLeases() { return [{ from: base + step, through: base + step, expiresAt: base + 60_000 }] },
+    async missingCandleRanges() { return { gaps: [{ from: base + 2 * step, through: base + 2 * step }], leases: [{ from: base + step, through: base + step, expiresAt: base + 60_000 }] } },
   }
   const sync = new HistorySync({ store, now: () => base, sources: { oi: {
     inspect: () => ({ unavailable: [{ from: base + 2 * step, through: base + 2 * step, reason: 'Not offered.' }] }),
@@ -880,8 +879,7 @@ test('held coverage counts neither empty leases nor explicit unavailable slots a
 test('an unavailable gap next to an empty lease remains distinct through hold and release', async t => {
   let calls = 0
   const store = {
-    async missingCandleRanges() { return [{ from: base, through: base }] },
-    coverageLeases() { return [{ from: base + step, through: base + step, expiresAt: base + 60_000 }] },
+    async missingCandleRanges() { return { gaps: [{ from: base, through: base }], leases: [{ from: base + step, through: base + step, expiresAt: base + 60_000 }] } },
   }
   const sync = new HistorySync({ store, now: () => base, sources: { oi: {
     inspect: () => ({ unavailable: [{ from: base, through: base, reason: 'Not offered.' }] }),
@@ -895,6 +893,80 @@ test('an unavailable gap next to an empty lease remains distinct through hold an
   assert.deepEqual([result.status, result.coveredRecords, result.emptyRecords, result.unavailableRecords, result.localRecords], ['unavailable', 0, 1, 1, 0])
   assert.deepEqual(result.remaining, [{ from: base, through: base }])
   assert.equal(calls, 0)
+})
+
+test('concurrent reads of one range keep each snapshot paired with its own lease', async t => {
+  const entered = deferred(), gate = deferred(), firstExpiry = base + 60_000, secondExpiry = base + 120_000
+  let reads = 0
+  const store = {
+    async missingCandleRanges() {
+      const expiresAt = ++reads === 1 ? firstExpiry : secondExpiry
+      const snapshot = { gaps: [], leases: [{ from: base, through: base, expiresAt }] }
+      if (reads === 1) { entered.resolve(); await gate.promise }
+      return snapshot
+    },
+  }
+  const sync = new HistorySync({ store, now: () => base, sources: { oi: { fetchGap: () => [] } }, write: async () => {} }) as any
+  t.after(() => { gate.resolve(); return sync.close() })
+  const request = { ...query, source: 'oi', through: base }
+  const first = sync.missing(request, 'background', undefined, { returnCoverage: true })
+  await entered.promise
+  const second = await sync.missing(request, 'foreground', undefined, { returnCoverage: true })
+  gate.resolve()
+  const earlier = await first
+  assert.deepEqual(earlier.coverage.leases, [{ from: base, through: base, expiresAt: firstExpiry }])
+  assert.deepEqual(second.coverage.leases, [{ from: base, through: base, expiresAt: secondExpiry }])
+})
+
+test('a committed source change during a lease read forces a fresh paired snapshot', async t => {
+  const entered = deferred(), gate = deferred(), expired = base + 60_000
+  let reads = 0, version = 0, numeric = false
+  const store = {
+    coverageVersion: () => version,
+    coverageChanges: () => ({ revision: version, ranges: [{ from: base, through: base }] }),
+    async missingCandleRanges() {
+      const snapshot = { gaps: [], leases: numeric ? [] : [{ from: base, through: base, expiresAt: expired }] }
+      if (++reads === 1) { entered.resolve(); await gate.promise }
+      return snapshot
+    },
+  }
+  const sync = new HistorySync({ store, now: () => base, sources: { oi: { fetchGap: () => [] } }, write: async () => {} }) as any
+  t.after(() => { gate.resolve(); return sync.close() })
+  const request = { ...query, source: 'oi', through: base }
+  const pending = sync.missing(request, 'background', undefined, { returnCoverage: true })
+  await entered.promise
+  numeric = true; version++; sync.invalidate(request); gate.resolve()
+  const result = await pending
+  assert.ok(reads >= 2)
+  assert.deepEqual(result.coverage.leases, [])
+  assert.deepEqual(result.ranges, [])
+})
+
+test('an empty observation that expires while held is fetched after release', async t => {
+  let clock = base, numeric = false, version = 0, calls = 0
+  const expiresAt = base + 1_000
+  const store = {
+    coverageVersion: () => version,
+    coverageChanges: () => ({ revision: version, ranges: [{ from: base, through: base }] }),
+    async missingCandleRanges() {
+      return { gaps: !numeric && clock >= expiresAt ? [{ from: base, through: base }] : [],
+        leases: !numeric && clock < expiresAt ? [{ from: base, through: base, expiresAt }] : [] }
+    },
+  }
+  const sync = new HistorySync({ store, now: () => clock, sources: { oi: { fetchGap: request => {
+    calls++; return [{ instrument: request.instrument, timeframe: request.timeframe, timestamp: base, oi: 5 }]
+  } } }, write: async () => { numeric = true; version++ } })
+  t.after(() => sync.close())
+  const held = await sync.enqueue({ ...query, source: 'oi', through: base }, { hold: true })
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  assert.equal(sync.getTask(held.id)?.emptyRecords, 1)
+  clock = expiresAt
+  assert.equal(sync.release(held.id), true)
+  const completed = await sync.waitFor(held.id)
+  assert.equal(completed.status, 'completed')
+  assert.equal(completed.coveredRecords, 1)
+  assert.equal(completed.emptyRecords, 0)
+  assert.equal(calls, 1)
 })
 
 test('release rechecks source availability rather than retaining an obsolete held boundary', async t => {
@@ -1538,11 +1610,10 @@ test('durable progress separates numeric history, leased emptiness, and overlapp
   const last = base + 9 * step, expiresAt = Date.now() + 60_000
   await store.appendCandles(rows({ ...query, through: base + 2 * step } as HistorySourceQuery))
   const { sync } = fixture({ store: {
-    missingCandleRanges: request => store.missingCandleRanges(request),
-    coverageVersion: () => store.version,
-    coverageLeases: request => request.from <= base + 2 * step && request.through >= base + step
+    missingCandleRanges: async request => ({ ...(await store.missingCandleRanges(request)), leases: request.from <= base + 2 * step && request.through >= base + step
       ? [{ from: Math.max(request.from, base + step), through: Math.min(request.through, base + 2 * step), expiresAt },
-        { from: Math.max(request.from, base + step), through: Math.min(request.through, base + 2 * step), expiresAt }] : [],
+        { from: Math.max(request.from, base + step), through: Math.min(request.through, base + 2 * step), expiresAt }] : [] }),
+    coverageVersion: () => store.version,
   }, sources: { candles: {
     inspect: () => ({ unavailable: [{ from: base + step, through: base + 5 * step, reason: 'Explicit bounded source evidence.' },
       { from: base + 4 * step, through: base + 5 * step, reason: 'Overlapping bounded evidence.' }] }),
@@ -1564,10 +1635,14 @@ test('completed finite consumers never restart at lease expiry and explicit requ
   const sync = new HistorySync({ now: () => clock,
     sources: { oi: { fetchGap: request => { calls.push(request); return [{ instrument: request.instrument, timeframe: request.timeframe, timestamp: last, oi: null }] } } },
     store: {
-      async missingCandleRanges(request) { reads.push({ from: request.from, through: request.through }); return request.from <= last && request.through >= last && expiresAt <= clock ? [{ from: last, through: last }] : [] },
+      async missingCandleRanges(request) {
+        reads.push({ from: request.from, through: request.through })
+        const contains = request.from <= last && request.through >= last
+        return { gaps: contains && expiresAt <= clock ? [{ from: last, through: last }] : [],
+          leases: contains && expiresAt > clock ? [{ from: last, through: last, expiresAt }] : [] }
+      },
       coverageVersion: () => revision,
       coverageChanges: () => ({ revision, ranges: [{ from: last, through: last }] }),
-      coverageLeases: request => request.from <= last && request.through >= last && expiresAt > clock ? [{ from: last, through: last, expiresAt }] : [],
     },
     write() { expiresAt = clock + 10; revision++ },
   })

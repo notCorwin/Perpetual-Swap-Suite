@@ -71,8 +71,43 @@ test('durable-only parent inspection still excludes live seeds and outstanding r
   ;(history as any).derivePrices = () => { derives++; throw new Error('Progress inspection cannot derive.') }
   const gaps = await (history as any).missingSource({ instrument: instId, timeframe: '15m', source: 'candles', from: base,
     through: base + 2 * interval, intervalMS: interval }, 'background', { materialize: false })
-  assert.deepEqual(gaps, [{ from: base, through: base + interval }])
+  assert.deepEqual(gaps, { gaps: [{ from: base, through: base + interval }], leases: [] })
   assert.equal(derives, 0)
+})
+
+test('statistics coverage classifies leases after the asynchronous read, including clock changes', async t => {
+  let clock = base + day
+  const { history, store } = await fixture(t, { now: () => clock })
+  const expiresAt = clock + 100, query = { instrument: instId, timeframe: '5m', source: 'oi' as const, from: base, through: base, intervalMS: step }
+  await store.appendStatistics({ ...query, values: [], observedAt: clock, expiresAt })
+  const read = store.statisticsCoverage.bind(store)
+  let afterRead = clock
+  ;(store as any).statisticsCoverage = async (value: any, priority: any) => {
+    const result = await read(value, priority)
+    clock = afterRead
+    return result
+  }
+  for (const [before, after, expected] of [
+    [expiresAt - 10, expiresAt, { gaps: [{ from: base, through: base }], leases: [] }],
+    [expiresAt + 10, expiresAt - 1, { gaps: [], leases: [{ from: base, through: base, expiresAt }] }],
+  ] as const) {
+    clock = before; afterRead = after
+    assert.deepEqual(await (history as any).missingSource(query, 'background'), expected)
+  }
+})
+
+test('a cached absence expires and is fetched again without renewing an old lease', async t => {
+  let clock = base + day
+  const { history, store, calls } = await fixture(t, { now: () => clock })
+  const expiresAt = clock + 100
+  await store.appendStatistics({ instrument: instId, timeframe: '5m', source: 'oi', from: base, through: base,
+    values: [], observedAt: clock, expiresAt })
+  const first = await (history as any).request(instId, '5m', 'oi', base, base, 'background')
+  assert.equal(first.emptyRecords, 1); assert.equal(calls.length, 0)
+  clock = expiresAt
+  const second = await (history as any).request(instId, '5m', 'oi', base, base, 'background')
+  assert.equal(second.coveredRecords, 1); assert.equal(calls.length, 1)
+  assert.equal((await store.statistics({ instrument: instId, timeframe: '5m', source: 'oi', from: base, through: base }))[0].oi, 50)
 })
 
 test('a price commit racing the compact coverage read is rechecked before fetching', async t => {
@@ -124,9 +159,9 @@ test('a real SQLite write survives cancellation when later coverage never stabil
 
 test('OI mutation racing a local coverage read is rechecked before any network request', async t => {
   const { history, store, calls } = await fixture(t)
-  const entered = deferred(), gate = deferred(), read = store.statistics.bind(store)
+  const entered = deferred(), gate = deferred(), read = store.statisticsCoverage.bind(store)
   let reads = 0
-  ;(store as any).statistics = async (query: any, priority: any) => {
+  ;(store as any).statisticsCoverage = async (query: any, priority: any) => {
     const snapshot = await read(query, priority)
     if (++reads === 1) { entered.resolve(); await gate.promise }
     return snapshot
@@ -147,9 +182,9 @@ test('concurrent Taker writes do not restart an unrelated OI coverage read', asy
   const { history, store, calls } = await fixture(t)
   const bounds = { instrument: instId, timeframe: '5m' as const, from: base, through: base }
   await store.appendStatistics({ ...bounds, source: 'oi', values: [[base, 50]] })
-  const entered = deferred(), gate = deferred(), read = store.statistics.bind(store)
+  const entered = deferred(), gate = deferred(), read = store.statisticsCoverage.bind(store)
   let reads = 0
-  ;(store as any).statistics = async (query: any, priority: any) => {
+  ;(store as any).statisticsCoverage = async (query: any, priority: any) => {
     const snapshot = await read(query, priority)
     if (++reads === 1) { entered.resolve(); await gate.promise }
     return snapshot
@@ -171,8 +206,8 @@ test('price insertion and deletion recheck Taker coverage without rechecking OI'
   await store.appendStatistics({ ...bounds, source: 'oi', values: [[base, 50], [base + step, 60]] })
   await store.appendStatistics({ ...bounds, through: base, source: 'taker', values: [[base, 0, 0]] })
   await store.appendStatistics({ ...bounds, from: base + step, source: 'taker', values: [[base + step, 4, 6]], priceVolume: 10 })
-  const read = store.statistics.bind(store), reads = { oi: 0, taker: 0 }
-  ;(store as any).statistics = (query: any, priority: any) => { if (query.source in reads) reads[query.source as 'oi' | 'taker']++; return read(query, priority) }
+  const read = store.statisticsCoverage.bind(store), reads = { oi: 0, taker: 0 }
+  ;(store as any).statisticsCoverage = (query: any, priority: any) => { if (query.source in reads) reads[query.source as 'oi' | 'taker']++; return read(query, priority) }
   const request = async (source: 'oi' | 'taker') => {
     const task = await history.sync.enqueue({ ...bounds, source, priority: 'background' })
     return history.sync.waitFor(task.id)

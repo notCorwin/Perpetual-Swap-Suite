@@ -42,23 +42,16 @@ class SourceStore {
   }
   coverageVersion() { return this.revision }
   async missingCandleRanges(query: HistoryRange & { instrument: string; timeframe: string; source: string; intervalMS: number }) {
-    const gaps: HistoryRange[] = []
+    const gaps: HistoryRange[] = [], leases: { from: number; through: number; expiresAt: number }[] = []
     let from: number | null = null
     for (let timestamp = query.from; timestamp <= query.through; timestamp += query.intervalMS) {
       const value = this.values.get(this.key({ ...query, timestamp }))
       if (!value || !numeric(value.record, query.source) && value.expiresAt <= this.now()) from ??= timestamp
       else if (from !== null) { gaps.push({ from, through: timestamp - query.intervalMS }); from = null }
+      if (value && !numeric(value.record, query.source) && value.expiresAt > this.now()) leases.push({ from: timestamp, through: timestamp, expiresAt: value.expiresAt })
     }
     if (from !== null) gaps.push({ from, through: query.through })
-    return gaps
-  }
-  coverageLeases(query: HistoryRange & { instrument: string; timeframe: HistoryTimeframe; source: string }) {
-    const result = []
-    for (let timestamp = query.from; timestamp <= query.through; timestamp += intervals[query.timeframe]) {
-      const value = this.values.get(this.key({ ...query, timestamp }))
-      if (value && !numeric(value.record, query.source) && value.expiresAt > this.now()) result.push({ from: timestamp, through: timestamp, expiresAt: value.expiresAt })
-    }
-    return result
+    return { gaps, leases }
   }
 }
 const fixture = (t: TestContext, options: { now?: () => number; metadata?: MemoryMetadata; fetchGap?: HistorySource['fetchGap']; inspect?: HistorySource['inspect']; pageSize?: number; chunkSlots?: number; concurrency?: number } = {}) => {
