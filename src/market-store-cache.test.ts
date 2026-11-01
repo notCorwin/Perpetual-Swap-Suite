@@ -83,6 +83,119 @@ test('candle queries own normalized parameters and return independent rows on mi
   } finally { await f.close() }
 })
 
+test('complete price gaps reuse only an exact full candle snapshot and never expose cached rows', async () => {
+  const f = await fixture()
+  try {
+    await f.store.appendCandles([candle(0), { ...candle(2), baseVolume: null }, candle(4)])
+    const original = await f.store.candles(query), before = requests(f.store)
+    original[0].baseVolume = null
+    const gaps = await f.store.missingCompletePriceRanges(query)
+    assert.deepEqual(gaps, [{ from: base + step, through: base + 3 * step }])
+    assert.equal(requests(f.store), before, 'The retained full candle query serves coverage without a reader request.')
+    gaps[0].from = 0
+    assert.deepEqual(await f.store.missingCompletePriceRanges(query), [{ from: base + step, through: base + 3 * step }])
+    assert.equal((await f.store.candles(query))[0].baseVolume, 1)
+    await f.store.missingCompletePriceRanges({ ...query, through: base + 3 * step })
+    assert.equal(requests(f.store), before + 1, 'A different range uses the authoritative SQL query.')
+    const limited = { ...query, instrument: 'LIMIT-USDT-SWAP', limit: 1 }
+    await f.store.candles(limited)
+    const beforeLimited = requests(f.store)
+    assert.deepEqual(await f.store.missingCompletePriceRanges(limited), [{ from: limited.from, through: limited.through }])
+    assert.equal(requests(f.store), beforeLimited + 1, 'A limited candle result cannot prove the full range.')
+  } finally { await f.close() }
+})
+
+test('a committed writer still in transit prevents reuse of an old retained coverage snapshot', async () => {
+  const f = await fixture(), transport = controlledTransport(f.store)
+  try {
+    await f.store.appendCandles([candle(0)])
+    await f.store.candles(query)
+    const hold = transport.hold(job => job.command === 'append')
+    const writing = f.store.appendCandles([{ ...candle(0), baseVolume: null }]); await hold.reached
+    const before = requests(f.store)
+    assert.deepEqual(await f.store.missingCompletePriceRanges(query), [{ from: base, through: query.through }])
+    assert.equal(requests(f.store), before + 1, 'An active writer forces SQL even before its revision notification.')
+    hold.release(); await writing
+  } finally { transport.restore(); await f.close() }
+})
+
+test('cached gap computation ignores off-grid records and does not enumerate an unbounded empty range', async () => {
+  const f = await fixture()
+  try {
+    await f.store.appendCandles([candle(0), candle(2)])
+    const database = new DatabaseSync(f.store.path)
+    try {
+      database.prepare(`INSERT INTO candles(series_id,timestamp,open,high,low,close,volume,base_volume,quote_volume,written_at,origin,import_version)
+        SELECT series_id,?,open,high,low,close,volume,base_volume,quote_volume,written_at,origin,import_version FROM candles WHERE timestamp=?`).run(base + step + 0.5, base)
+    } finally { database.close() }
+    const range = { ...query, through: base + 2 * step }
+    await f.store.candles(range)
+    const before = requests(f.store)
+    assert.deepEqual(await f.store.missingCompletePriceRanges(range), [{ from: base + step, through: base + step }])
+    const empty = { ...query, instrument: 'EMPTY-USDT-SWAP', from: 0, through: Number.MAX_SAFE_INTEGER }
+    await f.store.candles(empty)
+    const afterEmpty = requests(f.store)
+    assert.deepEqual(await f.store.missingCompletePriceRanges(empty), [{ from: 0, through: Math.floor(Number.MAX_SAFE_INTEGER / step) * step }])
+    assert.equal(requests(f.store), afterEmpty)
+    assert.equal(afterEmpty, before + 1)
+  } finally { await f.close() }
+})
+
+test('complete price gaps share an eligible in-flight candle read without blocking foreground behind background', async () => {
+  const f = await fixture(), transport = controlledTransport(f.store)
+  try {
+    await f.store.appendCandles([candle(0)])
+    const readHold = transport.hold(job => job.command === 'candles' && job.priority === 'foreground')
+    const reading = f.store.candles(query, 'foreground'); await readHold.reached
+    const before = requests(f.store), shared = f.store.missingCompletePriceRanges(query, 'background')
+    await turn(); assert.equal(requests(f.store), before)
+    readHold.release(); await reading
+    assert.deepEqual(await shared, [{ from: base + step, through: query.through }])
+    const other = { ...query, instrument: 'OTHER-USDT-SWAP' }
+    const backgroundHold = transport.hold(job => job.command === 'candles' && job.args[0].instrument === other.instrument)
+    const background = f.store.candles(other, 'background'); await backgroundHold.reached
+    const beforeForeground = requests(f.store)
+    assert.deepEqual(await f.store.missingCompletePriceRanges(other, 'foreground'), [{ from: other.from, through: other.through }])
+    assert.equal(requests(f.store), beforeForeground + 1, 'A foreground request cannot join a background read.')
+    backgroundHold.release(); await background
+  } finally { transport.restore(); await f.close() }
+})
+
+test('a writer invalidates an in-flight shared candle snapshot before it can prove coverage', async () => {
+  const f = await fixture(), transport = controlledTransport(f.store)
+  try {
+    await f.store.appendCandles([candle(0)])
+    const hold = transport.hold(job => job.command === 'candles'), old = f.store.candles(query)
+    await hold.reached
+    const pending = f.store.missingCompletePriceRanges(query)
+    await turn()
+    await f.store.appendCandles([{ ...candle(0), baseVolume: null }])
+    const before = requests(f.store)
+    hold.release(); assert.equal((await old)[0].baseVolume, 1)
+    assert.deepEqual(await pending, [{ from: base, through: query.through }])
+    assert.equal(requests(f.store), before + 1, 'A stale in-flight snapshot falls back to SQL.')
+  } finally { transport.restore(); await f.close() }
+})
+
+test('an inspection retires an in-flight shared snapshot even when the business revision is unchanged', async () => {
+  const f = await fixture(), transport = controlledTransport(f.store)
+  try {
+    await f.store.appendCandles([candle(0)])
+    const hold = transport.hold(job => job.command === 'candles'), old = f.store.candles(query)
+    await hold.reached
+    const pending = f.store.missingCompletePriceRanges(query), revision = f.store.candleRevision(query.instrument, query.timeframe)
+    await turn()
+    const database = new DatabaseSync(f.store.path)
+    try { database.prepare('UPDATE candles SET base_volume=NULL WHERE timestamp=?').run(base) } finally { database.close() }
+    assert.ok((await f.store.inspectCandles(query)).issues.some(issue => issue.reason === 'missing-base-volume'))
+    assert.equal(f.store.candleRevision(query.instrument, query.timeframe), revision)
+    const before = requests(f.store)
+    hold.release(); assert.equal((await old)[0].baseVolume, 1)
+    assert.deepEqual(await pending, [{ from: base, through: query.through }])
+    assert.equal(requests(f.store), before + 1)
+  } finally { transport.restore(); await f.close() }
+})
+
 test('all-source revisions invalidate related writes while unrelated commits preserve reuse', async () => {
   const f = await fixture()
   try {

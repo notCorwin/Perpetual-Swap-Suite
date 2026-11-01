@@ -2,7 +2,7 @@ import { createOperationWorker, createOperationProcess, createWorkerRequest } fr
 import { mkdir, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { CANDLE_INTERVALS, validateQuery } from './market-records.js'
+import { CANDLE_INTERVALS, completePriceCandle, validateQuery } from './market-records.js'
 import { measureOperation } from './operations.js'
 export { CANDLE_INTERVALS, validateCandle } from './market-records.js'
 
@@ -104,6 +104,45 @@ class CandleReadCache {
   snapshot() {
     return { entries: this.#entries.size, estimatedBytes: this.#entryBytes,
       pending: this.#pending.size, pendingKeyBytes: this.#pendingBytes }
+  }
+
+  async completePriceGaps(query, priority) {
+    const { store } = this, series = keyOf(query.instrument, query.timeframe)
+    if (!this.eligible(series)) return null
+    // Only an unlimited ascending query proves the complete requested range.
+    const key = JSON.stringify([query.instrument, query.timeframe, query.from, query.through, undefined, 'asc'])
+    const revision = store.candleRevision(query.instrument, query.timeframe), writerSequence = store.writer.nextID
+    const valid = () => this.eligible(series) && store.writer.nextID === writerSequence
+      && store.candleRevision(query.instrument, query.timeframe) === revision
+    let entry = this.#entries.get(key)
+    let rows, pending
+    if (entry && entry.revision === revision) {
+      this.#entries.delete(key); this.#entries.set(key, entry)
+      rows = entry.rows
+    } else {
+      if (entry) { this.#deleteEntry(key); entry = null }
+      const rank = priorityRank(priority)
+      for (let candidate = rank; candidate < PRIORITY_BUCKET_COUNT; candidate += 1) {
+        const value = this.#pending.get(`${candidate}:${key}`)
+        if (value && value.revision === revision && value.writerSequence === writerSequence) { pending = value; break }
+      }
+      if (!pending) return null
+      rows = await pending.task
+      if (pending.retired || !valid()) return null
+    }
+    const step = CANDLE_INTERVALS[query.timeframe], through = Math.floor(query.through / step) * step
+    let next = Math.ceil(query.from / step) * step
+    const gaps = []
+    for (const row of rows) {
+      const timestamp = row.timestamp
+      if (!Number.isSafeInteger(timestamp) || timestamp % step || timestamp < next || timestamp > through || !completePriceCandle(row)) continue
+      if (timestamp > next) gaps.push({ from: next, through: timestamp - step })
+      if (timestamp === through) { next = null; break }
+      next = timestamp + step
+    }
+    if (next !== null && next <= through) gaps.push({ from: next, through })
+    if (!valid() || pending?.retired || entry && this.#entries.get(key) !== entry) return null
+    return gaps
   }
 
   async read(query, priority) {
@@ -488,11 +527,11 @@ export class MarketStore {
     // Snapshot the candle query before any asynchronous import or caller edit.
     // Inspection also owns its identity for the entire cache fence.
     try {
-      if (command === 'candles') query = validateQuery(query)
+      if (command === 'candles' || command === 'missingCompletePriceRanges') query = validateQuery(query)
       else if (command === 'inspect') query = { ...query }
     } catch (error) { return Promise.reject(error) }
     return this.operation(async () => {
-      const valid = command === 'candles' ? query : validateQuery(query)
+      const valid = command === 'candles' || command === 'missingCompletePriceRanges' ? query : validateQuery(query)
       const inspection = command === 'inspect' ? keyOf(valid.instrument, valid.timeframe) : null
       if (inspection !== null) this.candleReads.beginInspection(inspection)
       try {
@@ -500,6 +539,10 @@ export class MarketStore {
         // a current tail must never make the viewport wait for the full archive.
         if (!['coverage', 'watermark', 'checkpointRead'].includes(command)) await this.imported(valid, priority, command === 'inspect')
         if (command === 'candles') return await this.candleReads.read(query, priority)
+        if (command === 'missingCompletePriceRanges') {
+          const gaps = await this.candleReads.completePriceGaps(valid, priority)
+          if (gaps !== null) return gaps
+        }
         return await this.readers.request(command, [query, ...args], priority)
       } finally {
         if (inspection !== null) this.candleReads.endInspection(inspection)
@@ -549,6 +592,11 @@ export class MarketStore {
     const timeframe = query.timeframe ?? '5m'
     if (query.intervalMS !== undefined && query.intervalMS !== CANDLE_INTERVALS[timeframe]) return Promise.reject(new TypeError('Candle interval must match timeframe.'))
     return this.read('missingRanges', { ...query, timeframe }, priority, 'candles')
+  }
+  missingCompletePriceRanges(query, priority = 'background') {
+    const timeframe = query.timeframe ?? '5m'
+    if (query.intervalMS !== undefined && query.intervalMS !== CANDLE_INTERVALS[timeframe]) return Promise.reject(new TypeError('Candle interval must match timeframe.'))
+    return this.read('missingCompletePriceRanges', { ...query, timeframe }, priority)
   }
   statisticsMissingRanges(query, priority = 'background') { return this.read('missingRanges', query, priority, query.source) }
   inspectCandles(query, priority = 'background') { return this.read('inspect', query, priority) }

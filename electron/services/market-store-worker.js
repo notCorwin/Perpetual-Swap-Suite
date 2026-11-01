@@ -417,11 +417,31 @@ function missingRanges(query, source = 'candles', verify = false) {
   return values
 }
 
+function missingCompletePriceRanges(query) {
+  const valid = validateQuery(query), step = CANDLE_INTERVALS[valid.timeframe], series = identity(valid)
+  const from = Math.ceil(valid.from / step) * step, through = Math.floor(valid.through / step) * step
+  if (from > through) return []
+  if (!series) return [{ from, through }]
+  // The sentinel closes the last gap in the same SQLite snapshot as every
+  // other gap. Old files can contain non-grid rows or missing volume units.
+  return all(`WITH present(timestamp) AS (
+      SELECT timestamp FROM candles WHERE series_id=? AND timestamp>=? AND timestamp<=?
+        AND typeof(timestamp)='integer' AND timestamp%?=0
+        AND typeof(base_volume) IN ('integer','real') AND base_volume>=0 AND base_volume<=1.7976931348623157e308
+        AND typeof(quote_volume) IN ('integer','real') AND quote_volume>=0 AND quote_volume<=1.7976931348623157e308
+      UNION ALL SELECT ?+?
+    ), spans AS (
+      SELECT timestamp,LAG(timestamp,1,?) OVER(ORDER BY timestamp) AS previous FROM present
+    ) SELECT previous+? AS "from",timestamp-? AS through FROM spans WHERE timestamp-previous>? ORDER BY "from"`,
+  series.id, from, through, step, through, step, from - step, step, step, step)
+}
+
 const commands = {
   validateCandles: rows => { if (!Array.isArray(rows)) throw new TypeError('Candles must be an array.'); rows.forEach(validateCandle); return { result: undefined } },
   append: (rows, options) => append(rows, options), appendStatistics, aggregateCandles,
   candles: query => ({ result: candleRows(query) }), statistics: query => ({ result: statisticRows(query) }),
   missingRanges: (query, source) => ({ result: missingRanges(query, source) }),
+  missingCompletePriceRanges: query => ({ result: missingCompletePriceRanges(query) }),
   coverage: query => { validateQuery(query); const value = identity(query); return { result: { count: value?.candle_count ?? 0, first: value?.first_ts ?? null, last: value?.last_ts ?? null } } },
   watermark: (query, priceOnly) => { validateQuery(query); const value = identity(query); return { result: `sqlite:${value?.id ?? 0}:${priceOnly ? value?.price_revision ?? 0 : value?.revision ?? 0}` } },
   checkpointRead: query => {

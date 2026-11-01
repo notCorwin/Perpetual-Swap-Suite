@@ -75,6 +75,27 @@ test('durable-only parent inspection still excludes live seeds and outstanding r
   assert.equal(derives, 0)
 })
 
+test('a price commit racing the compact coverage read is rechecked before fetching', async t => {
+  const { history, store, calls } = await fixture(t)
+  const entered = deferred(), gate = deferred(), read = store.missingCompletePriceRanges.bind(store)
+  let reads = 0
+  ;(store as any).missingCompletePriceRanges = async (query: any, priority: any) => {
+    const snapshot = await read(query, priority)
+    if (++reads === 1) { entered.resolve(); await gate.promise }
+    return snapshot
+  }
+  t.after(() => gate.resolve())
+  const task = await history.sync.enqueue({ instrument: instId, timeframe: '5m', source: 'candles', from: base, through: base, priority: 'background' })
+  await entered.promise
+  await store.appendCandles([row(base)])
+  gate.resolve()
+  const completed = await history.sync.waitFor(task.id)
+  assert.equal(completed.status, 'completed')
+  assert.equal(completed.coveredRecords, 1)
+  assert.ok(reads >= 2)
+  assert.equal(calls.length, 0)
+})
+
 test('OI mutation racing a local coverage read is rechecked before any network request', async t => {
   const { history, store, calls } = await fixture(t)
   const entered = deferred(), gate = deferred(), read = store.statistics.bind(store)

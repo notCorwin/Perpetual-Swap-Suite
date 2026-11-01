@@ -5,6 +5,8 @@ const intervals = { '5m': 300_000, '15m': 900_000, '1H': 3_600_000 }
 const terminal = new Set(['paused', 'cancelled', 'completed', 'unavailable'])
 const priorities = { interactive: 4, foreground: 4, prepared: 4, repair: 4, continuity: 3, statistics: 3, prefetch: 1, chartWarm: 1, background: 0 }
 const MAX_SHARED_COVERAGE_SLOTS = 2400
+const MAX_COVERAGE_INVALIDATIONS = 256
+const MAX_ACTIVE_COVERAGE_JOURNALS = 128
 const clone = value => structuredClone(value)
 const integer = (value, name, minimum = 0) => {
   if (!Number.isSafeInteger(value) || value < minimum) throw new TypeError(`${name} must be a safe integer of at least ${minimum}.`)
@@ -30,6 +32,8 @@ const priority = value => {
 const seriesKey = value => JSON.stringify([value.instrument, value.timeframe, value.source])
 const intersects = (a, b) => a.from <= b.through && a.through >= b.from
 const clipped = (values, bounds) => values.filter(value => intersects(value, bounds)).map(value => ({ ...value, from: Math.max(value.from, bounds.from), through: Math.min(value.through, bounds.through) }))
+const validRanges = (values, step) => Array.isArray(values) && values.every(value => Number.isSafeInteger(value?.from) && value.from >= 0
+  && Number.isSafeInteger(value?.through) && value.from <= value.through && value.from % step === 0 && value.through % step === 0)
 const merged = (values, step) => {
   const result = []
   for (const value of [...values].sort((a, b) => a.from - b.from)) {
@@ -73,7 +77,7 @@ export class HistorySync {
     this.maxRetainedTerminalTasks = integer(options.maxRetainedTerminalTasks ?? 512, 'maxRetainedTerminalTasks', 1)
     if (this.minRequestIntervalMS > 2147483647 || this.maxRetryDelayMS > 2147483647) throw new TypeError('History delays cannot exceed 2147483647 milliseconds.')
     this.tasks = new Map(); this.groups = new Map(); this.waiters = new Map(); this.controls = new Map(); this.holds = new Set(); this.rechecks = new Set(); this.isolated = new Set(); this.heldDownloads = new Map(); this.heldCoverage = new Map(); this.idleWaiters = []
-    this.active = new Map(); this.coverageChecks = new Map(); this.coverageEpochs = new Map()
+    this.active = new Map(); this.coverageChecks = new Map(); this.coverageEpochs = new Map(); this.coverageInvalidations = new Map(); this.coverageReaders = new Map()
     this.closed = false; this.started = null; this.closing = null; this.timer = null; this.draining = false
     this.requestTail = Promise.resolve(); this.lastRequestAt = null
     this.turn = 0; this.urgentTurns = 0; this.fatalError = null; this.instrumentEpochs = new Map()
@@ -232,17 +236,45 @@ export class HistorySync {
       priority: getPriority(), getPriority, cursor: null, signal: entry.controller.signal }
   }
   invalidate(query) {
+    if (!query || typeof query.instrument !== 'string' || !query.instrument.trim() || !Object.hasOwn(intervals, query.timeframe)
+      || typeof query.source !== 'string' || !this.sources.has(query.source)) {
+      // An unknown identity cannot safely be assigned to just one series.
+      // A read may already be awaiting its version before its group exists.
+      for (const key of new Set([...this.groups.keys(), ...this.coverageReaders.keys()])) {
+        const [instrument, timeframe, source] = JSON.parse(key)
+        this.invalidate({ instrument, timeframe, source, from: NaN, through: NaN })
+      }
+      return
+    }
+    const step = intervals[query.timeframe], valid = Number.isSafeInteger(query.from) && query.from >= 0
+      && Number.isSafeInteger(query.through) && query.from <= query.through && query.from % step === 0 && query.through % step === 0
+    const affected = valid ? { from: query.from, through: query.through } : { from: 0, through: Math.floor(Number.MAX_SAFE_INTEGER / step) * step }
     const key = seriesKey(query), cached = this.coverageChecks.get(key)
     const active = this.groups.get(key)?.active
-    if (active?.inspectionBounds?.some(bounds => intersects(bounds, query))) active.inspectionInvalidated = true
-    this.coverageEpochs.set(key, (this.coverageEpochs.get(key) ?? 0) + 1)
-    if (cached) cached.dirty = merged([...cached.dirty, ...clipped([query], cached)], intervals[query.timeframe])
+    if (active?.inspectionBounds?.some(bounds => intersects(bounds, affected))) active.inspectionInvalidated = true
+    if (this.coverageReaders.has(key)) {
+      const previousEpoch = this.coverageEpochs.get(key) ?? 0
+      const epoch = previousEpoch >= Number.MAX_SAFE_INTEGER ? 0 : previousEpoch + 1
+      this.coverageEpochs.set(key, epoch)
+      let journal = this.coverageInvalidations.get(key)
+      if (epoch === 0 && journal) journal.length = 0
+      if (!journal && this.coverageInvalidations.size < MAX_ACTIVE_COVERAGE_JOURNALS) {
+        journal = []; this.coverageInvalidations.set(key, journal)
+      }
+      if (journal) {
+        journal.push({ epoch, range: valid ? affected : null })
+        if (journal.length > MAX_COVERAGE_INVALIDATIONS) journal.shift()
+      }
+    }
+    if (cached) cached.dirty = merged([...cached.dirty, ...clipped([affected], cached)], step)
     let wake = false
     for (const id of this.groups.get(key)?.tasks ?? []) {
       const task = this.tasks.get(id), held = this.heldCoverage.get(id)
-      if (!task || terminal.has(task.status) || !held || !intersects(task, query)) continue
-      held.dirty = merged([...held.dirty, ...clipped([query], held)], intervals[query.timeframe])
-      if (this.holds.has(id)) {
+      if (!task || terminal.has(task.status) || !held || !intersects(held, affected)) continue
+      // A shared snapshot can cover more than this consumer. Keep the entire
+      // snapshot valid for any overlapping consumer that reuses it later.
+      held.dirty = merged([...held.dirty, ...clipped([affected], held)], step)
+      if (this.holds.has(id) && intersects(task, affected)) {
         // A source boundary may have changed during the hold. A local
         // refresh needs current inspection rather than old shared evidence.
         task.unavailableRanges = []
@@ -254,52 +286,79 @@ export class HistorySync {
   }
 
   async missing(query, requestPriority, pinned, { materializeRanges = [query] } = {}) {
-    const key = seriesKey(query), step = intervals[query.timeframe], previous = pinned ?? this.coverageChecks.get(key)
-    const epoch = this.coverageEpochs.get(key) ?? 0, version = await this.store.coverageVersion?.(query)
-    // A series has one coverage cache shared by every active consumer.
-    // Only consumers intersecting this read can extend its shared window.
-    // A held archive range and an unrelated old/new interactive range must
-    // never expand a bounded request into years of intervening rows.
-    const retained = [...this.group(query).tasks].map(id => this.tasks.get(id)).filter(task => task && intersects(task, query) && (!terminal.has(task.status) || this.controls.has(task.id)))
-    const shared = { from: Math.min(query.from, ...retained.map(task => task.from)), through: Math.max(query.through, ...retained.map(task => task.through)) }
-    const maxSlots = Math.max(MAX_SHARED_COVERAGE_SLOTS, (query.through - query.from) / step + 1)
-    const bounds = slots([shared], step) <= maxSlots ? shared : { from: query.from, through: query.through }
-    let gaps = clipped(previous?.remaining ?? [], bounds), leases = clipped(previous?.leases ?? [], bounds)
-    // Gaps observed for progress alone have not been checked for derivable
-    // prices. A later foreground request or release must materialize them.
-    let unmaterialized = clipped(previous?.unmaterialized ?? [], bounds)
-    const materializedBounds = merged(materializeRanges.flatMap(value => clipped([value], bounds)), step)
-    let refresh = previous ? [...subtract([bounds], [previous], step), ...clipped(previous.dirty, bounds), ...leases.filter(lease => lease.expiresAt <= this.now())] : [bounds]
-    refresh.push(...materializedBounds.flatMap(value => clipped(unmaterialized, value)))
-    if (previous && (version === undefined || previous.version !== version)) {
-      const changed = version === undefined ? null : await this.store.coverageChanges?.(query, previous.version)
-      refresh.push(...clipped(changed?.ranges ?? [bounds], bounds))
-    }
-    const requested = merged(refresh, step)
-    const portions = [...materializedBounds.flatMap(value => clipped(requested, value)).map(value => ({ ...value, materialize: true })),
-      ...subtract(requested, materializedBounds, step).map(value => ({ ...value, materialize: false }))]
-    for (const portion of portions) {
-      const request = { ...descriptor(query), ...portion, intervalMS: step }
-      delete request.materialize
-      const result = await this.store.missingCandleRanges(request, requestPriority, { materialize: portion.materialize })
-      if (!Array.isArray(result)) throw new TypeError('store.missingCandleRanges must return an array.')
-      const checked = result.map(value => range(value, step))
-      if (checked.some(value => value.from < portion.from || value.through > portion.through)) throw new TypeError('Store gaps must be inside the requested range.')
-      gaps = merged([...subtract(gaps, [portion], step), ...checked], step)
-      unmaterialized = merged([...subtract(unmaterialized, [portion], step), ...(portion.materialize ? [] : checked)], step)
-      const observed = this.store.coverageLeases?.(request) ?? []
-      if (!Array.isArray(observed)) throw new TypeError('store.coverageLeases must return an array.')
-      for (const lease of observed) {
-        range(lease, step); integer(lease.expiresAt, 'expiresAt')
-        if (lease.from < portion.from || lease.through > portion.through) throw new TypeError('Coverage leases must be inside the verified range.')
+    const key = seriesKey(query), step = intervals[query.timeframe]
+    let previous = pinned ?? this.coverageChecks.get(key)
+    this.coverageReaders.set(key, (this.coverageReaders.get(key) ?? 0) + 1)
+    try {
+      while (true) {
+        const epoch = this.coverageEpochs.get(key) ?? 0, version = await this.store.coverageVersion?.(query)
+        // A series has one coverage cache shared by every active consumer.
+        // Only consumers intersecting this read can extend its shared window.
+        // A held archive range and an unrelated old/new interactive range must
+        // never expand a bounded request into years of intervening rows.
+        const retained = [...this.group(query).tasks].map(id => this.tasks.get(id)).filter(task => task && intersects(task, query) && (!terminal.has(task.status) || this.controls.has(task.id)))
+        const shared = { from: Math.min(query.from, ...retained.map(task => task.from)), through: Math.max(query.through, ...retained.map(task => task.through)) }
+        const maxSlots = Math.max(MAX_SHARED_COVERAGE_SLOTS, (query.through - query.from) / step + 1)
+        const bounds = slots([shared], step) <= maxSlots ? shared : { from: query.from, through: query.through }
+        let gaps = clipped(previous?.remaining ?? [], bounds), leases = clipped(previous?.leases ?? [], bounds)
+        // Gaps observed for progress alone have not been checked for derivable
+        // prices. A later foreground request or release must materialize them.
+        let unmaterialized = clipped(previous?.unmaterialized ?? [], bounds)
+        const materializedBounds = merged(materializeRanges.flatMap(value => clipped([value], bounds)), step)
+        let refresh = previous ? [...subtract([bounds], [previous], step), ...clipped(previous.dirty, bounds), ...leases.filter(lease => lease.expiresAt <= this.now())] : [bounds]
+        refresh.push(...materializedBounds.flatMap(value => clipped(unmaterialized, value)))
+        if (previous && (version === undefined || previous.version !== version)) {
+          const changed = version === undefined ? null : await this.store.coverageChanges?.(query, previous.version)
+          refresh.push(...clipped(changed && changed.revision === version && validRanges(changed.ranges, step) ? changed.ranges : [bounds], bounds))
+        }
+        const requested = merged(refresh, step)
+        const portions = [...materializedBounds.flatMap(value => clipped(requested, value)).map(value => ({ ...value, materialize: true })),
+          ...subtract(requested, materializedBounds, step).map(value => ({ ...value, materialize: false }))]
+        for (const portion of portions) {
+          const request = { ...descriptor(query), ...portion, intervalMS: step }
+          delete request.materialize
+          const result = await this.store.missingCandleRanges(request, requestPriority, { materialize: portion.materialize })
+          if (!Array.isArray(result)) throw new TypeError('store.missingCandleRanges must return an array.')
+          const checked = result.map(value => range(value, step))
+          if (checked.some(value => value.from < portion.from || value.through > portion.through)) throw new TypeError('Store gaps must be inside the requested range.')
+          gaps = merged([...subtract(gaps, [portion], step), ...checked], step)
+          unmaterialized = merged([...subtract(unmaterialized, [portion], step), ...(portion.materialize ? [] : checked)], step)
+          const observed = this.store.coverageLeases?.(request) ?? []
+          if (!Array.isArray(observed)) throw new TypeError('store.coverageLeases must return an array.')
+          for (const lease of observed) {
+            range(lease, step); integer(lease.expiresAt, 'expiresAt')
+            if (lease.from < portion.from || lease.through > portion.through) throw new TypeError('Coverage leases must be inside the verified range.')
+          }
+          leases = [...subtract(leases, [portion], step), ...observed]
+        }
+        const cached = { ...bounds, version, remaining: gaps, leases, unmaterialized, dirty: [] }
+        const afterVersion = await this.store.coverageVersion?.(query), afterEpoch = this.coverageEpochs.get(key) ?? 0
+        let dirty = []
+        if (epoch !== afterEpoch) {
+          const journal = this.coverageInvalidations.get(key), changes = Array.isArray(journal) && journal.every(change => change && Number.isSafeInteger(change.epoch))
+            ? journal.filter(change => change.epoch > epoch && change.epoch <= afterEpoch) : []
+          if (!changes.length || changes[0].epoch !== epoch + 1 || changes.at(-1).epoch !== afterEpoch
+            || changes.some((change, index) => change.epoch !== epoch + index + 1 || !validRanges([change.range], step))) dirty = [bounds]
+          else dirty.push(...changes.map(change => change.range))
+        }
+        if (version !== afterVersion) {
+          const changed = Number.isSafeInteger(version) && Number.isSafeInteger(afterVersion) && afterVersion > version
+            ? await this.store.coverageChanges?.(query, version) : null
+          const validChanges = changed && changed.revision === afterVersion && validRanges(changed.ranges, step)
+          if (!validChanges || afterVersion !== await this.store.coverageVersion?.(query)) dirty = [bounds]
+          else dirty.push(...changed.ranges)
+        }
+        if (afterEpoch !== (this.coverageEpochs.get(key) ?? 0)) dirty = [bounds]
+        cached.dirty = merged(clipped(dirty, bounds), step)
+        this.coverageChecks.set(key, cached)
+        if (cached.dirty.length) { previous = cached; continue }
+        return clipped(gaps, query)
       }
-      leases = [...subtract(leases, [portion], step), ...observed]
+    } finally {
+      const readers = this.coverageReaders.get(key) - 1
+      if (readers) this.coverageReaders.set(key, readers)
+      else { this.coverageReaders.delete(key); this.coverageEpochs.delete(key); this.coverageInvalidations.delete(key) }
     }
-    const cached = { ...bounds, version, remaining: gaps, leases, unmaterialized, dirty: [] }
-    if (epoch !== (this.coverageEpochs.get(key) ?? 0) || version !== await this.store.coverageVersion?.(query)) cached.dirty = [bounds]
-    this.coverageChecks.set(key, cached)
-    if (cached.dirty.length) return this.missing(query, requestPriority, cached, { materializeRanges })
-    return clipped(gaps, query)
   }
 
   unavailable(query, inspection) {

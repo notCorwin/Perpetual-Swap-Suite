@@ -30,6 +30,54 @@ test('confirmed facts use worker-owned SQLite and indexed bounded native ranges'
   } finally { await f.close() }
 })
 
+test('complete price gaps match the public price predicate even for incomplete legacy rows', async () => {
+  const f = await fixture(), range = { ...query, through: base + 8 * step }
+  try {
+    assert.deepEqual(await f.store.missingCompletePriceRanges(range), [{ from: base, through: range.through }])
+    await f.store.appendCandles(Array.from({ length: 9 }, (_, index) => candle(index)))
+    const database = new DatabaseSync(f.store.path)
+    try {
+      const update = database.prepare('UPDATE candles SET base_volume=?, quote_volume=? WHERE timestamp=?')
+      update.run(null, 1, base)
+      update.run(1, null, base + step)
+      update.run(0, 0, base + 2 * step)
+      update.run(Number.MAX_VALUE, Number.MAX_VALUE, base + 3 * step)
+      update.run(Infinity, 1, base + 4 * step)
+      update.run('not-a-number', 1, base + 5 * step)
+      update.run(-1, 1, base + 6 * step)
+    } finally { database.close() }
+    const rows = await f.store.candles(range), expected: { from: number; through: number }[] = []
+    for (const row of rows) if (!(row.confirmed && [row.baseVolume, row.quoteVolume].every(value => typeof value === 'number' && Number.isFinite(value) && value >= 0))) {
+      const last = expected.at(-1)
+      if (last && last.through + step === row.timestamp) last.through = row.timestamp
+      else expected.push({ from: row.timestamp, through: row.timestamp })
+    }
+    assert.deepEqual(expected, [{ from: base, through: base + step }, { from: base + 4 * step, through: base + 6 * step }])
+    assert.deepEqual(await f.store.missingCompletePriceRanges(range), expected)
+    assert.deepEqual(await f.store.missingCandleRanges(range), [], 'The existing row-presence query retains its distinct contract.')
+    await assert.rejects(f.store.missingCompletePriceRanges({ ...range, intervalMS: step * 3 }), /interval must match/)
+  } finally { await f.close() }
+})
+
+test('complete price gaps ignore off-grid legacy rows and retain inclusive grid boundaries', async () => {
+  const f = await fixture(), range = { ...query, through: base + 4 * step }
+  try {
+    await f.store.appendCandles([candle(0), candle(2), candle(4)])
+    const database = new DatabaseSync(f.store.path)
+    try {
+      const insert = database.prepare(`INSERT INTO candles(series_id,timestamp,open,high,low,close,volume,base_volume,quote_volume,written_at,origin,import_version)
+        SELECT series_id,?,open,high,low,close,volume,base_volume,quote_volume,written_at,origin,import_version FROM candles WHERE timestamp=?`)
+      insert.run(base + step + 1, base)
+      insert.run(base + 3 * step + 0.5, base)
+    } finally { database.close() }
+    const expected = [{ from: base + step, through: base + step }, { from: base + 3 * step, through: base + 3 * step }]
+    assert.deepEqual(await f.store.missingCompletePriceRanges(range), expected)
+    assert.deepEqual(await f.store.missingCompletePriceRanges({ ...range, from: base + 1, through: base + 4 * step - 1 }), expected)
+    assert.deepEqual(await f.store.missingCompletePriceRanges({ ...range, from: base + 1, through: base + step - 1 }), [])
+    assert.deepEqual(await f.store.missingCompletePriceRanges({ ...range, from: base + 4 * step, through: base + 4 * step }), [])
+  } finally { await f.close() }
+})
+
 test('coverage remains exact across mixed-series batches, repairs, and protected imports', async () => {
   const f = await fixture(), eth = 'ETH-USDT-SWAP'
   const ethCandle = (index: number) => ({ ...candle(index), instrument: eth })

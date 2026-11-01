@@ -192,6 +192,48 @@ test('dirty coverage for one held window does not alter another held window', as
   await Promise.all([sync.cancel(first.id), sync.cancel(second.id)])
 })
 
+test('a held shared snapshot remembers changes outside its own demand without waking', async t => {
+  const store = new MemoryStore(), original = store.missingCandleRanges.bind(store), reads: HistoryRange[] = []
+  const append = store.appendSource.bind(store), changes: { revision: number; from: number; through: number }[] = []
+  store.appendSource = async (records, source) => {
+    const result = await append(records, source)
+    if (records.length) changes.push({ revision: store.version, from: Math.min(...records.map(row => row.timestamp)), through: Math.max(...records.map(row => row.timestamp)) })
+    return result
+  }
+  ;(store as any).coverageChanges = (_query: unknown, revision: number) => ({ revision: store.version,
+    ranges: changes.filter(value => value.revision > revision).map(({ from, through }) => ({ from, through })) })
+  store.missingCandleRanges = async request => { reads.push({ from: request.from, through: request.through }); return original(request) }
+  const { sync, requests } = fixture({ store }); t.after(() => sync.close())
+  await store.appendCandles(rows({ ...query, priority: 'background', getPriority: () => 'background', cursor: null, signal: new AbortController().signal }))
+  const [first, second] = await Promise.all([
+    sync.enqueue({ ...query, through: base + step, priority: 'background' }, { hold: true }),
+    sync.enqueue({ ...query, from: base + step, priority: 'background' }, { hold: true }),
+  ])
+  await waitFor(() => sync.getTask(first.id)?.status === 'waiting' && sync.getTask(second.id)?.status === 'waiting')
+  const snapshot = (sync as any).heldCoverage.get(first.id)
+  assert.deepEqual([snapshot.from, snapshot.through], [base, base + 2 * step])
+  await sync.cancel(second.id)
+  const countBefore = reads.length
+  // A seed or repair changes slot 2 without a durable store revision. The
+  // first hold doesn't need it, but its larger shared snapshot still does.
+  store.values.delete(store.key({ ...query, timestamp: base + 2 * step }))
+  sync.invalidate({ ...query, from: base + 2 * step, through: base + 2 * step })
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(sync.getTask(first.id)?.status, 'waiting')
+  assert.equal(reads.length, countBefore, 'An out-of-demand mutation does not wake the hold.')
+  const snapshotDirty = (sync as any).heldCoverage.get(first.id).dirty
+  store.values.delete(store.key({ ...query, timestamp: base }))
+  sync.invalidate({ ...query, from: base, through: base })
+  const interactive = await sync.enqueue({ ...query, priority: 'interactive' })
+  const result = await sync.waitFor(interactive.id)
+  assert.equal(result.status, 'completed')
+  assert.equal(result.coveredRecords, 3)
+  assert.deepEqual(requests.map(request => [request.from, request.through]).sort((a, b) => a[0] - b[0]), [[base, base], [base + 2 * step, base + 2 * step]])
+  assert.ok(store.values.has(store.key({ ...query, timestamp: base + 2 * step })))
+  assert.deepEqual(snapshotDirty, [{ from: base + 2 * step, through: base + 2 * step }])
+  await sync.cancel(first.id)
+})
+
 test('a price mutation during a held coverage read cannot be lost', async t => {
   const store = new MemoryStore(), read = store.missingCandleRanges.bind(store), entered = deferred(), gate = deferred()
   let reads = 0
@@ -211,6 +253,228 @@ test('a price mutation during a held coverage read cannot be lost', async t => {
   assert.ok(reads >= 2)
   assert.equal(requests.length, 0)
   await sync.cancel(held.id)
+})
+
+test('overlapping invalidations during a large read recheck only their verified slots', async t => {
+  const store = new MemoryStore(), original = store.missingCandleRanges.bind(store), entered = deferred(), gate = deferred()
+  const reads: HistoryRange[] = [], changes: { revision: number; from: number; through: number }[] = []
+  store.missingCandleRanges = async request => {
+    reads.push({ from: request.from, through: request.through })
+    const snapshot = await original(request)
+    if (reads.length === 1) { entered.resolve(); await gate.promise }
+    return snapshot
+  }
+  ;(store as any).coverageChanges = (_query: unknown, revision: number) => ({ revision: store.version,
+    ranges: changes.filter(value => value.revision > revision).map(({ from, through }) => ({ from, through })) })
+  const { sync, requests } = fixture({ store }); t.after(() => { gate.resolve(); return sync.close() })
+  const bounds = { ...query, through: base + 2399 * step }
+  const held = await sync.enqueue(bounds, { hold: true }); await entered.promise
+  const updated = [37, 42].map(index => rows({ ...query, from: base + index * step, through: base + index * step,
+    priority: 'background', getPriority: () => 'background', cursor: null, signal: new AbortController().signal })[0])
+  // Model a seed/repair invalidation and an independent durable write. Their
+  // evidence must be unioned even though neither journal contains both slots.
+  store.values.set(store.key(updated[0]), updated[0])
+  await store.appendCandles([updated[1]])
+  changes.push({ revision: store.version, from: updated[1].timestamp, through: updated[1].timestamp })
+  sync.invalidate({ ...query, from: updated[0].timestamp, through: updated[0].timestamp })
+  gate.resolve()
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  assert.equal(sync.getTask(held.id)?.coveredRecords, 2)
+  assert.deepEqual(reads, [{ from: bounds.from, through: bounds.through }, ...updated.map(row => ({ from: row.timestamp, through: row.timestamp }))])
+  assert.equal(requests.length, 0)
+  await sync.cancel(held.id)
+})
+
+test('explicit invalidation tracks seed or repair changes even without a store revision', async t => {
+  const store = new MemoryStore(), original = store.missingCandleRanges.bind(store), entered = deferred(), gate = deferred()
+  const reads: HistoryRange[] = []
+  store.missingCandleRanges = async request => {
+    reads.push({ from: request.from, through: request.through })
+    const snapshot = await original(request)
+    if (reads.length === 1) { entered.resolve(); await gate.promise }
+    return snapshot
+  }
+  const { sync } = fixture({ store }); t.after(() => { gate.resolve(); return sync.close() })
+  const held = await sync.enqueue(query, { hold: true }); await entered.promise
+  const row = rows({ ...query, from: base + step, through: base + step, priority: 'background', getPriority: () => 'background', cursor: null, signal: new AbortController().signal })[0]
+  store.values.set(store.key(row), row)
+  sync.invalidate({ ...query, from: row.timestamp, through: row.timestamp }); gate.resolve()
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  assert.equal(sync.getTask(held.id)?.coveredRecords, 1)
+  assert.deepEqual(reads, [{ from: base, through: base + 2 * step }, { from: base + step, through: base + step }])
+  await sync.cancel(held.id)
+})
+
+for (const mode of ['truncated', 'unaligned', 'unknown-source', 'unknown-version'] as const) test(`${mode} invalidation during coverage read falls back to a full recheck`, async t => {
+  const store = new MemoryStore(), original = store.missingCandleRanges.bind(store), entered = deferred(), gate = deferred()
+  const reads: HistoryRange[] = []
+  store.missingCandleRanges = async request => {
+    reads.push({ from: request.from, through: request.through })
+    const snapshot = await original(request)
+    if (reads.length === 1) { entered.resolve(); await gate.promise }
+    return snapshot
+  }
+  if (mode === 'unknown-version') (store as any).coverageChanges = () => ({ revision: store.version, ranges: null })
+  const { sync } = fixture({ store }); t.after(() => { gate.resolve(); return sync.close() })
+  const held = await sync.enqueue(query, { hold: true }); await entered.promise
+  const row = rows({ ...query, from: base + step, through: base + step, priority: 'background', getPriority: () => 'background', cursor: null, signal: new AbortController().signal })[0]
+  if (mode === 'unknown-version') await store.appendCandles([row])
+  else store.values.set(store.key(row), row)
+  if (mode === 'truncated') for (let index = 0; index < 257; index++) sync.invalidate({ ...query, from: base + step, through: base + step })
+  if (mode === 'unaligned') sync.invalidate({ ...query, from: base + 1, through: base + step })
+  if (mode === 'unknown-source') sync.invalidate({ ...query, source: 'unknown' })
+  gate.resolve()
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  assert.equal(sync.getTask(held.id)?.coveredRecords, 1)
+  assert.deepEqual(reads, [{ from: base, through: base + 2 * step }, { from: base, through: base + 2 * step }])
+  await sync.cancel(held.id)
+})
+
+test('unrelated invalidations during a coverage read do not cause a reread', async t => {
+  const store = new MemoryStore(), original = store.missingCandleRanges.bind(store), entered = deferred(), gate = deferred()
+  let reads = 0
+  store.missingCandleRanges = async request => {
+    const snapshot = await original(request)
+    if (++reads === 1) { entered.resolve(); await gate.promise }
+    return snapshot
+  }
+  const { sync } = fixture({ store }); t.after(() => { gate.resolve(); return sync.close() })
+  const held = await sync.enqueue(query, { hold: true }); await entered.promise
+  sync.invalidate({ ...query, from: base + 10 * step, through: base + 10 * step }); gate.resolve()
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  assert.equal(reads, 1)
+  await sync.cancel(held.id)
+})
+
+test('a different valid source does not invalidate this source coverage', async t => {
+  const store = new MemoryStore(), original = store.missingCandleRanges.bind(store), entered = deferred(), gate = deferred()
+  let reads = 0
+  store.missingCandleRanges = async request => {
+    const snapshot = await original(request)
+    if (++reads === 1) { entered.resolve(); await gate.promise }
+    return snapshot
+  }
+  const { sync } = fixture({ store, sources: { candles: { fetchGap: () => [] }, oi: { fetchGap: () => [] } } })
+  t.after(() => { gate.resolve(); return sync.close() })
+  const held = await sync.enqueue(query, { hold: true }); await entered.promise
+  sync.invalidate({ ...query, source: 'oi' }); gate.resolve()
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  assert.equal(reads, 1)
+  await sync.cancel(held.id)
+})
+
+test('unknown identity invalidates reads already awaiting their first version', async t => {
+  const entered = deferred(), gate = deferred(), reads: HistoryRange[] = []
+  let versions = 0
+  const store = {
+    async coverageVersion() { if (++versions === 1) { entered.resolve(); await gate.promise }; return 0 },
+    async missingCandleRanges(request: HistoryRange) { reads.push({ from: request.from, through: request.through }); return [] },
+  }
+  const sync = new HistorySync({ store, write: async () => {}, sources: { candles: { fetchGap: () => [] } } }) as any
+  t.after(() => { gate.resolve(); return sync.close() })
+  const pending = sync.missing(query, 'background'); await entered.promise
+  assert.equal(sync.groups.size, 0, 'The source group has not yet been created.')
+  sync.invalidate({ ...query, source: 'unknown' }); gate.resolve()
+  await pending
+  assert.deepEqual(reads, [{ from: base, through: base + 2 * step }, { from: base, through: base + 2 * step }])
+  assert.equal(sync.coverageInvalidations.size, 0)
+})
+
+test('a second change while awaiting version evidence forces a safe recheck', async t => {
+  const store = new MemoryStore(), original = store.missingCandleRanges.bind(store)
+  const entered = deferred(), firstGate = deferred(), evidenceEntered = deferred(), evidenceGate = deferred(), reads: HistoryRange[] = []
+  store.missingCandleRanges = async request => {
+    reads.push({ from: request.from, through: request.through })
+    const snapshot = await original(request)
+    if (reads.length === 1) { entered.resolve(); await firstGate.promise }
+    return snapshot
+  }
+  ;(store as any).coverageChanges = async (_query: unknown, revision: number) => {
+    if (revision === 0 && store.version === 1) { evidenceEntered.resolve(); await evidenceGate.promise; return { revision: 1, ranges: [{ from: base, through: base }] } }
+    return { revision: store.version, ranges: [{ from: base, through: base + step }] }
+  }
+  const { sync } = fixture({ store }); t.after(() => { firstGate.resolve(); evidenceGate.resolve(); return sync.close() })
+  const held = await sync.enqueue(query, { hold: true }); await entered.promise
+  const values = rows({ ...query, from: base, through: base + step, priority: 'background', getPriority: () => 'background', cursor: null, signal: new AbortController().signal })
+  await store.appendCandles([values[0]]); firstGate.resolve(); await evidenceEntered.promise
+  await store.appendCandles([values[1]])
+  sync.invalidate({ ...query, from: values[1].timestamp, through: values[1].timestamp }); evidenceGate.resolve()
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  assert.equal(sync.getTask(held.id)?.coveredRecords, 2)
+  assert.deepEqual(reads[1], { from: base, through: base + 2 * step })
+  await sync.cancel(held.id)
+})
+
+test('coverage invalidation journals are globally bounded and retired after reads settle', async t => {
+  const entered = deferred(), gate = deferred(), reads = new Map<string, HistoryRange[]>()
+  const store = {
+    coverageVersion: () => 0,
+    async missingCandleRanges(request: HistoryRange & { instrument: string }) {
+      const portions = reads.get(request.instrument) ?? []
+      portions.push({ from: request.from, through: request.through }); reads.set(request.instrument, portions)
+      if (portions.length === 1) { if (reads.size === 129) entered.resolve(); await gate.promise }
+      return []
+    },
+  }
+  const sync = new HistorySync({ store, write: async () => {}, sources: { candles: { fetchGap: () => [] } } }) as any
+  t.after(() => { gate.resolve(); return sync.close() })
+  const inputs = Array.from({ length: 129 }, (_, index) => ({ ...query, instrument: `S${index}` }))
+  const tasks = inputs.map(input => sync.missing(input, 'background'))
+  await entered.promise
+  for (const input of inputs) sync.invalidate({ ...input, from: base + step, through: base + step })
+  assert.equal(sync.coverageInvalidations.size, 128)
+  gate.resolve(); await Promise.all(tasks)
+  assert.deepEqual(reads.get('S0')?.[1], { from: base + step, through: base + step })
+  assert.deepEqual(reads.get('S128')?.[1], { from: base, through: base + 2 * step }, 'Missing journal evidence forces full coverage.')
+  assert.equal(sync.coverageReaders.size, 0)
+  assert.equal(sync.coverageEpochs.size, 0)
+  assert.equal(sync.coverageInvalidations.size, 0)
+})
+
+test('sustained invalidation retries stay within one reader and a bounded journal', async t => {
+  const store = new MemoryStore(), original = store.missingCandleRanges.bind(store)
+  const key = JSON.stringify([query.instrument, query.timeframe, query.source]), limit = 2500
+  const { sync } = fixture({ store }), internal = sync as any
+  t.after(() => sync.close())
+  let reads = 0, maxReaders = 0, maxJournal = 0
+  store.missingCandleRanges = async request => {
+    const snapshot = await original(request)
+    reads++
+    if (reads <= limit) {
+      if (reads === limit) {
+        const value = rows({ ...query, from: base + step, through: base + step, priority: 'background', getPriority: () => 'background', cursor: null, signal: new AbortController().signal })[0]
+        store.values.set(store.key(value), value)
+      }
+      sync.invalidate({ ...query, from: base + step, through: base + step })
+      maxReaders = Math.max(maxReaders, internal.coverageReaders.get(key) ?? 0)
+      maxJournal = Math.max(maxJournal, internal.coverageInvalidations.get(key)?.length ?? 0)
+    }
+    return snapshot
+  }
+  assert.deepEqual(await internal.missing(query, 'background'), [{ from: base, through: base }, { from: base + 2 * step, through: base + 2 * step }])
+  assert.equal(reads, limit + 1)
+  assert.equal(maxReaders, 1)
+  assert.ok(maxJournal <= 256)
+  assert.equal(internal.coverageReaders.size, 0)
+  assert.equal(internal.coverageEpochs.size, 0)
+  assert.equal(internal.coverageInvalidations.size, 0)
+})
+
+test('a failed iterative coverage recheck releases its reader and journal', async t => {
+  const store = new MemoryStore(), original = store.missingCandleRanges.bind(store), { sync } = fixture({ store }), internal = sync as any
+  t.after(() => sync.close())
+  let reads = 0
+  store.missingCandleRanges = async request => {
+    if (++reads === 30) throw new Error('Injected local read failure.')
+    const snapshot = await original(request)
+    if (reads < 30) sync.invalidate({ ...query, from: base + step, through: base + step })
+    return snapshot
+  }
+  await assert.rejects(internal.missing(query, 'background'), /Injected local read failure/)
+  assert.equal(internal.coverageReaders.size, 0)
+  assert.equal(internal.coverageEpochs.size, 0)
+  assert.equal(internal.coverageInvalidations.size, 0)
+  assert.deepEqual(await internal.missing(query, 'background'), [{ from: base, through: base + 2 * step }])
 })
 
 test('releasing during suspended inspection cannot complete from stale local coverage', async t => {

@@ -133,12 +133,13 @@ export class MarketHistory {
   }
 
   async missingSource(query, priority, { materialize = true } = {}) {
-    let rows = query.source === 'candles' ? await this.store.candles(query, priority) : await this.store.statistics(query, priority)
+    let rows = [], gaps = []
+    if (query.source === 'candles') gaps = await this.store.missingCompletePriceRanges(query, priority)
+    else rows = await this.store.statistics(query, priority)
     if (materialize && query.source === 'candles' && query.timeframe !== '5m' && this.derivePrices) {
-      const gaps = missing(rows, query.from, query.through, query.intervalMS, pricePresent)
       if (gaps.length) {
         for (const gap of gaps) await this.derivePrices({ instrument: query.instrument, timeframe: query.timeframe, ...gap }, priority)
-        rows = await this.store.candles(query, priority)
+        gaps = await this.store.missingCompletePriceRanges(query, priority)
       }
     }
     const bit = query.source === 'oi' ? OI : TAKER
@@ -158,8 +159,10 @@ export class MarketHistory {
     this.coverageLeaseReads.delete(leaseKey)
     this.coverageLeaseReads.set(leaseKey, leases)
     while (this.coverageLeaseReads.size > 512) this.coverageLeaseReads.delete(this.coverageLeaseReads.keys().next().value)
-    const gaps = missing(rows, query.from, query.through, query.intervalMS,
-      query.source === 'candles' ? row => pricePresent(row) && !observations?.has(row.timestamp) : row => sourcePresent(row, bit, observedAt))
+    if (query.source === 'candles') {
+      for (const timestamp of observations?.keys() ?? []) if (Number.isSafeInteger(timestamp) && timestamp >= query.from && timestamp <= query.through
+        && (timestamp - query.from) % query.intervalMS === 0) gaps.push({ from: timestamp, through: timestamp })
+    } else gaps = missing(rows, query.from, query.through, query.intervalMS, row => sourcePresent(row, bit, observedAt))
     if (query.source === 'candles') for (const repair of this.repairs.values()) {
       if (repair.instrument !== query.instrument || repair.timeframe !== query.timeframe) continue
       for (const bounds of repair.remaining) if (bounds.from <= query.through && bounds.through >= query.from) gaps.push({ from: Math.max(bounds.from, query.from), through: Math.min(bounds.through, query.through) })

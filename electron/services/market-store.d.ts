@@ -102,5 +102,7 @@ export class MarketStore {
   migrationStatus(): Promise<{ complete: boolean; completedPartitions: number; failedPartitions: number; importedRows: number; issues: Array<{ path: string; instrument: string; timeframe: string; from: number; through: number; reason: string; detail: string }>; error: string }>
   coverage(instrument: string, timeframe: string, priority?: StorePriority): Promise<{ count: number; first: number | null; last: number | null }>
   missingCandleRanges(query: { instrument: string; timeframe?: string; from: number; through: number; intervalMS?: number }, priority?: StorePriority): Promise<Array<{ from: number; through: number }>>
+  /** Price gaps include rows whose base or quote volume is missing or invalid. */
+  missingCompletePriceRanges(query: { instrument: string; timeframe?: string; from: number; through: number; intervalMS?: number }, priority?: StorePriority): Promise<CandleRange[]>
   close(): Promise<void>
 }
