@@ -303,7 +303,7 @@ export class MarketStore {
 
   constructor(root, path, writer, readers) {
     this.root = root; this.path = path; this.closed = false; this.closeTask = null
-    this.revisions = new Map(); this.priceRevisions = new Map(); this.mutations = new Map(); this.operations = new Set()
+    this.revisions = new Map(); this.priceRevisions = new Map(); this.statisticsRevisions = new Map(); this.mutations = new Map(); this.operations = new Set()
     this.listeners = new Set(); this.migration = null; this.migrationPending = new Map(); this.migrationWrites = new Set(); this.nextMigrationID = 0
     this.writeMetrics = { partitions: 0, rowsSubmitted: 0, bytesRead: 0, bytesWritten: 0, durationMS: 0 }
     this.writer = new DatabaseWorkers([writer], (mutations, duration) => this.committed(mutations, duration))
@@ -325,9 +325,27 @@ export class MarketStore {
     for (const change of changes) {
       const key = keyOf(change.instrument, change.timeframe), revision = (this.revisions.get(key) ?? 0) + 1
       this.revisions.set(key, revision)
-      if (change.priceFrom !== null) this.priceRevisions.set(key, (this.priceRevisions.get(key) ?? 0) + 1)
+      const validRange = name => change[`${name}From`] === null && change[`${name}Through`] === null
+        || Number.isSafeInteger(change[`${name}From`]) && Number.isSafeInteger(change[`${name}Through`])
+          && change[`${name}From`] >= change.from && change[`${name}From`] <= change[`${name}Through`] && change[`${name}Through`] <= change.through
+      const priceKnown = validRange('price'), priceChanged = !priceKnown || change.priceFrom !== null
+      if (priceChanged) this.priceRevisions.set(key, (this.priceRevisions.get(key) ?? 0) + 1)
+      const known = ['price', 'oi', 'taker'].every(validRange)
+      const coverage = {}
+      for (const source of ['oi', 'taker']) {
+        const ranges = !known ? null : [
+          ...(change[`${source}From`] === null ? [] : [{ from: change[`${source}From`], through: change[`${source}Through`] }]),
+          ...(source === 'taker' && change.priceFrom !== null ? [{ from: change.priceFrom, through: change.priceThrough }] : []),
+        ]
+        if (!ranges || ranges.length) {
+          const sourceKey = `${key}:${source}`, sourceRevision = (this.statisticsRevisions.get(sourceKey) ?? 0) + 1
+          this.statisticsRevisions.set(sourceKey, sourceRevision)
+          coverage[source] = { revision: sourceRevision, ranges }
+        }
+      }
       const journal = this.mutations.get(key) ?? []
-      journal.push({ revision, range: { from: change.from, through: change.through } })
+      journal.push({ revision, range: { from: change.from, through: change.through },
+        ...(priceChanged ? { priceRevision: this.priceRevisions.get(key), priceRange: priceKnown ? { from: change.priceFrom, through: change.priceThrough } : null } : {}), ...coverage })
       if (journal.length > 256) journal.shift()
       this.mutations.set(key, journal)
       for (const listener of this.listeners) { try { listener({ ...change, revision }) } catch { /* Observers cannot interrupt a durable commit. */ } }
@@ -337,6 +355,24 @@ export class MarketStore {
   subscribe(listener) { this.listeners.add(listener); return () => this.listeners.delete(listener) }
   candleRevision(instrument, timeframe) { return this.revisions.get(keyOf(instrument, timeframe)) ?? 0 }
   candlePriceRevision(instrument, timeframe) { return this.priceRevisions.get(keyOf(instrument, timeframe)) ?? 0 }
+  statisticsCoverageRevision(instrument, timeframe, source) {
+    if (!['oi', 'taker'].includes(source)) throw new TypeError('Invalid statistics source.')
+    return this.statisticsRevisions.get(`${keyOf(instrument, timeframe)}:${source}`) ?? 0
+  }
+  statisticsCoverageChangesSince(instrument, timeframe, source, previousRevision) {
+    const revision = this.statisticsCoverageRevision(instrument, timeframe, source)
+    if (previousRevision === revision) return { revision, ranges: [] }
+    const changes = (this.mutations.get(keyOf(instrument, timeframe)) ?? []).map(change => change[source]).filter(Boolean)
+    if (!Number.isSafeInteger(previousRevision) || previousRevision < 0 || previousRevision > revision || !changes.length || previousRevision < changes[0].revision - 1) return { revision, ranges: null }
+    if (changes.some(change => change.revision > previousRevision && !change.ranges)) return { revision, ranges: null }
+    const ranges = []
+    for (const value of changes.filter(change => change.revision > previousRevision).flatMap(change => change.ranges).sort((a, b) => a.from - b.from)) {
+      const previous = ranges.at(-1)
+      if (previous && value.from <= previous.through) previous.through = Math.max(previous.through, value.through)
+      else ranges.push({ ...value })
+    }
+    return { revision, ranges }
+  }
   candleChangesSince(instrument, timeframe, previousRevision) {
     const revision = this.candleRevision(instrument, timeframe)
     if (previousRevision === revision) return { revision, ranges: [] }
@@ -344,6 +380,20 @@ export class MarketStore {
     if (!Number.isSafeInteger(previousRevision) || previousRevision < 0 || previousRevision > revision || !changes.length || previousRevision < changes[0].revision - 1) return { revision, ranges: null }
     const ranges = []
     for (const value of changes.filter(change => change.revision > previousRevision).map(change => change.range).sort((a, b) => a.from - b.from)) {
+      const previous = ranges.at(-1)
+      if (previous && value.from <= previous.through) previous.through = Math.max(previous.through, value.through)
+      else ranges.push({ ...value })
+    }
+    return { revision, ranges }
+  }
+  candlePriceChangesSince(instrument, timeframe, previousRevision) {
+    const revision = this.candlePriceRevision(instrument, timeframe)
+    if (previousRevision === revision) return { revision, ranges: [] }
+    const changes = (this.mutations.get(keyOf(instrument, timeframe)) ?? []).filter(change => change.priceRevision !== undefined)
+    if (!Number.isSafeInteger(previousRevision) || previousRevision < 0 || previousRevision > revision || !changes.length || previousRevision < changes[0].priceRevision - 1) return { revision, ranges: null }
+    if (changes.some(change => change.priceRevision > previousRevision && !change.priceRange)) return { revision, ranges: null }
+    const ranges = []
+    for (const value of changes.filter(change => change.priceRevision > previousRevision).map(change => change.priceRange).sort((a, b) => a.from - b.from)) {
       const previous = ranges.at(-1)
       if (previous && value.from <= previous.through) previous.through = Math.max(previous.through, value.through)
       else ranges.push({ ...value })

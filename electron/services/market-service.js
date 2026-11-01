@@ -273,6 +273,7 @@ export class MarketService {
       if (!change.imported || this.closing) return
       this.markChartDataChanged(change.instrument)
       if (change.priceFrom !== null) {
+        this.history?.sync.invalidate({ instrument: change.instrument, timeframe: change.timeframe, source: 'candles', from: change.priceFrom, through: change.priceThrough })
         this.preparedCharts.invalidate(change.instrument, change.timeframe)
         this.invalidateLiquidityHistory(change.instrument, null, change.timeframe)
         this.scheduleQualification(change.instrument, change.timeframe)

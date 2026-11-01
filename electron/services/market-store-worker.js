@@ -73,11 +73,16 @@ const priceFields = ['open', 'high', 'low', 'close', 'volume', 'baseVolume', 'qu
 const DERIVED_CANDLE_ORIGIN = 2
 const toPrice = row => row && ({ timestamp: row.timestamp, open: row.open, high: row.high, low: row.low, close: row.close,
   volume: row.volume, baseVolume: row.base_volume, quoteVolume: row.quote_volume })
-const mutate = (changes, series, timestamp, price = false) => {
+const mutate = (changes, series, timestamp, price = false, statistic = null) => {
   let change = changes.get(series.id)
-  if (!change) { change = { instrument: series.instrument, timeframe: series.timeframe, from: timestamp, through: timestamp, priceFrom: null, priceThrough: null }; changes.set(series.id, change) }
+  if (!change) { change = { instrument: series.instrument, timeframe: series.timeframe, from: timestamp, through: timestamp, priceFrom: null, priceThrough: null,
+    oiFrom: null, oiThrough: null, takerFrom: null, takerThrough: null }; changes.set(series.id, change) }
   change.from = Math.min(change.from, timestamp); change.through = Math.max(change.through, timestamp)
   if (price) { change.priceFrom = Math.min(change.priceFrom ?? timestamp, timestamp); change.priceThrough = Math.max(change.priceThrough ?? timestamp, timestamp) }
+  if (statistic) {
+    const from = `${statistic}From`, through = `${statistic}Through`
+    change[from] = Math.min(change[from] ?? timestamp, timestamp); change[through] = Math.max(change[through] ?? timestamp, timestamp)
+  }
 }
 const transaction = operation => {
   database.exec('BEGIN IMMEDIATE')
@@ -135,7 +140,7 @@ function writeStatistic(series, source, timestamp, first, second, expiresAt, cha
     expires_at=excluded.expires_at,written_at=excluded.written_at,origin=excluded.origin,import_version=excluded.import_version,
     absence_attempts=excluded.absence_attempts,observed_volume=excluded.observed_volume`,
   series.id, source, timestamp, first, second, expiresAt, observedAt, importing ? 0 : 1, importVersion, absenceAttempts, observedVolume)
-  mutate(changes, series, timestamp)
+  mutate(changes, series, timestamp, false, source === 1 ? 'oi' : 'taker')
   return true
 }
 
@@ -244,7 +249,8 @@ function aggregateCandles(input) {
         .map(row => [row.timestamp, row]))
       : new Map()
     const changes = new Map()
-    let changed = 0, invalidated = 0
+    let changed = 0, invalidated = 0, added = 0, firstAdded = null, lastAdded = null
+    let deletedFirst = false, deletedLast = false
 
     for (let timestamp = query.from; timestamp <= query.through; timestamp += targetStep) {
       const aggregate = aggregates.get(timestamp), previous = existing.get(timestamp)
@@ -261,20 +267,30 @@ function aggregateCandles(input) {
           written_at=excluded.written_at,origin=excluded.origin,import_version=excluded.import_version`,
         series.id, timestamp, aggregate.open, aggregate.high, aggregate.low, aggregate.close, aggregate.volume, aggregate.baseVolume,
         aggregate.quoteVolume, Date.now(), DERIVED_CANDLE_ORIGIN, 0)
-        if (!previous) run('UPDATE series SET candle_count=candle_count+1, first_ts=MIN(COALESCE(first_ts,?),?), last_ts=MAX(COALESCE(last_ts,?),?) WHERE id=?',
-          timestamp, timestamp, timestamp, timestamp, series.id)
+        if (!previous) {
+          added += 1
+          firstAdded = Math.min(firstAdded ?? timestamp, timestamp)
+          lastAdded = Math.max(lastAdded ?? timestamp, timestamp)
+        }
         mutate(changes, series, timestamp, true)
         changed += 1
       } else if (invalidateIncomplete && previous?.origin === DERIVED_CANDLE_ORIGIN) {
         run('DELETE FROM candles WHERE series_id=? AND timestamp=?', series.id, timestamp)
-        run(`UPDATE series SET candle_count=MAX(candle_count-1,0),
-          first_ts=CASE WHEN first_ts=? THEN (SELECT MIN(timestamp) FROM candles WHERE series_id=?) ELSE first_ts END,
-          last_ts=CASE WHEN last_ts=? THEN (SELECT MAX(timestamp) FROM candles WHERE series_id=?) ELSE last_ts END
-          WHERE id=?`, timestamp, series.id, timestamp, series.id, series.id)
+        deletedFirst ||= timestamp === series.first_ts
+        deletedLast ||= timestamp === series.last_ts
         mutate(changes, series, timestamp, true)
         changed += 1
         invalidated += 1
       }
+    }
+    if (added || invalidated) {
+      // Check removed endpoints after all inserts and deletes, so a mixed batch
+      // observes the final transaction state. Both lookups use the series key.
+      const first = deletedFirst ? get('SELECT timestamp FROM candles WHERE series_id=? ORDER BY timestamp LIMIT 1', series.id)?.timestamp ?? null
+        : firstAdded === null ? series.first_ts : Math.min(series.first_ts ?? firstAdded, firstAdded)
+      const last = deletedLast ? get('SELECT timestamp FROM candles WHERE series_id=? ORDER BY timestamp DESC LIMIT 1', series.id)?.timestamp ?? null
+        : lastAdded === null ? series.last_ts : Math.max(series.last_ts ?? lastAdded, lastAdded)
+      run('UPDATE series SET candle_count=candle_count+?, first_ts=?, last_ts=? WHERE id=?', added - invalidated, first, last, series.id)
     }
     return { result: { changed, complete: aggregates.size, invalidated }, mutations: finishMutations(changes) }
   })

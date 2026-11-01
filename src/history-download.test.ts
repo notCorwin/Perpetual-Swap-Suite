@@ -74,6 +74,24 @@ const fixture = (t: TestContext, options: { now?: () => number; metadata?: Memor
 }
 const finished = async (download: HistoryDownload) => { await waitFor(() => download.snapshot().phase !== 'running'); return download.snapshot() }
 
+test('progress notifications coalesce expensive report updates while snapshots remain current', async t => {
+  const gate = deferred(), f = fixture(t, { fetchGap: async request => { await gate.promise; return records(request) } })
+  t.after(() => gate.resolve())
+  f.download.start([instrument])
+  await waitFor(() => f.calls.length > 0)
+  const active = [...(f.download as any).active.values()][0] as { task: any }
+  const download = f.download as any, update = download.update.bind(download)
+  let updates = 0
+  download.update = () => { updates++; return update() }
+  for (let count = 1; count <= 20; count++) download.observe({ ...active.task, coveredRecords: count })
+  assert.equal(updates, 0, 'Observer notifications should share the existing publication window.')
+  assert.ok(f.download.snapshot().progress.available >= 20, 'An explicit snapshot reads the latest observation immediately.')
+  assert.equal(updates, 1)
+  await waitFor(() => (f.metadata.report?.progress.available ?? 0) >= 20)
+  gate.resolve()
+  assert.equal((await finished(f.download)).phase, 'completed')
+})
+
 test('a manual download freezes listing-aligned completed ranges for every native source and ignores duplicate starts', async t => {
   let clock = base + 3 * hour + 123_000
   const gate = deferred()

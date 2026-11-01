@@ -52,6 +52,546 @@ test('validates source identities, ranges, priorities and scheduling limits', as
   await assert.rejects(sync.enqueue({ ...query, priority: 'urgent' as 'foreground' }), /priority/)
 })
 
+test('held consumers report local coverage without fetching and recheck after release', async t => {
+  const { sync, store, requests } = fixture(); t.after(() => sync.close())
+  const read = store.missingCandleRanges.bind(store)
+  let reads = 0
+  store.missingCandleRanges = async request => { reads++; return read(request) }
+  await store.appendCandles(rows({ ...query, priority: 'background', getPriority: () => 'background', cursor: null, signal: new AbortController().signal }).slice(0, 2))
+  const held = await sync.enqueue({ ...query, priority: 'background' }, { hold: true })
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  assert.equal(sync.getTask(held.id)?.coveredRecords, 2)
+  assert.equal(sync.getTask(held.id)?.localRecords, 2)
+  assert.equal(requests.length, 0)
+  const heldReads = reads
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(requests.length, 0, 'A held consumer does not repeatedly admit source work.')
+  assert.equal(reads, heldReads, 'A held consumer does not repeatedly scan local history.')
+  store.values.delete(store.key({ ...query, timestamp: base })); store.version++
+  assert.equal(sync.release(held.id), true)
+  const complete = await sync.waitFor(held.id)
+  assert.equal(complete.status, 'completed')
+  assert.equal(complete.coveredRecords, 3)
+  assert.equal(complete.localRecords, 1, 'A deleted local slot downloaded again is not counted as reuse.')
+  assert.deepEqual(requests.map(value => [value.from, value.through]), [[base + 2 * step, base + 2 * step], [base, base]])
+})
+
+test('held progress refreshes coalesced dirty ranges without source requests or full-window rescans', async t => {
+  const store = new MemoryStore(), append = store.appendSource.bind(store), read = store.missingCandleRanges.bind(store)
+  const changes: { revision: number; from: number; through: number }[] = [], reads: HistoryRange[] = []
+  store.appendSource = async (records, source) => {
+    const result = await append(records, source)
+    if (records.length) changes.push({ revision: store.version, from: Math.min(...records.map(value => value.timestamp)), through: Math.max(...records.map(value => value.timestamp)) })
+    return result
+  }
+  store.missingCandleRanges = async request => { reads.push({ from: request.from, through: request.through }); return read(request) }
+  ;(store as any).coverageChanges = (_query: unknown, revision: number) => ({ revision: store.version,
+    ranges: changes.filter(value => value.revision > revision).map(({ from, through }) => ({ from, through })) })
+  let inspections = 0, requests = 0
+  const { sync } = fixture({ store, sources: { candles: { inspect: () => { inspections++; return {} }, fetchGap: () => { requests++; return [] } } } })
+  t.after(() => sync.close())
+  const held = await sync.enqueue({ ...query, through: base + 99 * step, priority: 'background' }, { hold: true })
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  for (let batch = 0; batch < 2; batch++) {
+    const first = batch * 3, values = rows({ ...query, from: base + first * step, through: base + (first + 2) * step,
+      priority: 'background', getPriority: () => 'background', cursor: null, signal: new AbortController().signal })
+    await store.appendCandles(values)
+    for (const value of values) sync.invalidate({ ...query, from: value.timestamp, through: value.timestamp })
+    await waitFor(() => sync.getTask(held.id)?.status === 'waiting' && sync.getTask(held.id)?.coveredRecords === first + 3)
+  }
+  assert.deepEqual(reads.map(value => (value.through - value.from) / step + 1), [100, 3, 3])
+  assert.equal(inspections, 3, 'Each burst coalesces into one local recheck.')
+  assert.equal(requests, 0)
+  assert.equal(sync.getTask(held.id)?.localRecords, 6)
+  await sync.cancel(held.id)
+})
+
+test('a second invalidation in the same shared run refreshes a previously rechecked hold', async t => {
+  const gate = deferred(), entered = deferred(), store = new MemoryStore()
+  let calls = 0
+  const { sync } = fixture({ store, sources: { candles: { fetchGap: async request => {
+    calls++; entered.resolve(); await gate.promise; return rows(request)
+  } } } })
+  t.after(() => { gate.resolve(); return sync.close() })
+  const held = await sync.enqueue({ ...query, priority: 'background' }, { hold: true })
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  const interactive = await sync.enqueue({ ...query, priority: 'interactive' })
+  // Both the interactive task and this recheck must enter the same run.
+  sync.invalidate(query)
+  await entered.promise
+  assert.equal(sync.getTask(held.id)?.status, 'waiting')
+  gate.resolve()
+  assert.equal((await sync.waitFor(interactive.id)).status, 'completed')
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting' && sync.getTask(held.id)?.coveredRecords === 3)
+  assert.equal(sync.getTask(held.id)?.localRecords, 0)
+  assert.equal(calls, 1)
+  await sync.cancel(held.id)
+})
+
+test('a foreground upgrade materializes only its part of a larger progress-only gap', async t => {
+  const store = new MemoryStore(), read = store.missingCandleRanges.bind(store)
+  const reads: { from: number; through: number; materialize: boolean }[] = []
+  let derivable = false, requests = 0
+  ;(store as any).missingCandleRanges = async (request: HistoryRange, _priority: unknown, options: { materialize: boolean }) => {
+    reads.push({ from: request.from, through: request.through, materialize: options.materialize })
+    if (derivable && options.materialize) {
+      derivable = false
+      await store.appendCandles(rows({ ...query, ...request, priority: 'interactive', getPriority: () => 'interactive', cursor: null, signal: new AbortController().signal }))
+    }
+    return read(request as any)
+  }
+  const { sync } = fixture({ store, sources: { candles: { fetchGap: () => { requests++; throw new Error('A derivable parent needs no source request.') } } } }); t.after(() => sync.close())
+  const bounds = { ...query, through: base + 2399 * step }
+  const held = await sync.enqueue({ ...bounds, priority: 'background' }, { hold: true })
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  const before = reads.length
+  derivable = true
+  sync.invalidate(bounds)
+  await waitFor(() => reads.length > before && sync.getTask(held.id)?.status === 'waiting')
+  assert.deepEqual(reads.at(-1), { from: base, through: base + 2399 * step, materialize: false })
+  const interactive = await sync.enqueue({ ...query, through: base, priority: 'interactive' })
+  assert.equal((await sync.waitFor(interactive.id)).status, 'completed')
+  assert.deepEqual(reads[before + 1], { from: base, through: base, materialize: true })
+  assert.ok(reads.slice(before + 1).filter(value => value.materialize).every(value => value.from === base && value.through === base))
+  assert.equal(requests, 0)
+  await sync.cancel(held.id)
+})
+
+test('a newly held consumer receives full initial materialization even beside a dirty existing hold', async t => {
+  const store = new MemoryStore(), read = store.missingCandleRanges.bind(store)
+  const modes: boolean[] = []
+  ;(store as any).missingCandleRanges = async (request: HistoryRange, _priority: unknown, options: { materialize: boolean }) => {
+    modes.push(options.materialize)
+    return read(request as any)
+  }
+  const { sync } = fixture({ store }); t.after(() => sync.close())
+  const first = await sync.enqueue({ ...query, priority: 'background' }, { hold: true })
+  await waitFor(() => sync.getTask(first.id)?.status === 'waiting')
+  const before = modes.length
+  sync.invalidate(query)
+  const second = await sync.enqueue({ ...query, priority: 'background' }, { hold: true })
+  await waitFor(() => sync.getTask(first.id)?.status === 'waiting' && sync.getTask(second.id)?.status === 'waiting')
+  assert.deepEqual(modes.slice(before), [true])
+  await Promise.all([sync.cancel(first.id), sync.cancel(second.id)])
+})
+
+test('dirty coverage for one held window does not alter another held window', async t => {
+  const store = new MemoryStore(), read = store.missingCandleRanges.bind(store), reads: HistoryRange[] = []
+  store.missingCandleRanges = async request => { reads.push({ from: request.from, through: request.through }); return read(request) }
+  const { sync } = fixture({ store }); t.after(() => sync.close())
+  const first = await sync.enqueue({ ...query, priority: 'background' }, { hold: true })
+  const second = await sync.enqueue({ ...query, from: base + 10 * step, through: base + 12 * step, priority: 'background' }, { hold: true })
+  await waitFor(() => sync.getTask(first.id)?.status === 'waiting' && sync.getTask(second.id)?.status === 'waiting')
+  const before = reads.length
+  await store.appendCandles(rows({ ...query, from: base, through: base, priority: 'background', getPriority: () => 'background', cursor: null, signal: new AbortController().signal }))
+  sync.invalidate({ ...query, from: base, through: base })
+  await waitFor(() => sync.getTask(first.id)?.status === 'waiting' && sync.getTask(first.id)?.coveredRecords === 1)
+  assert.equal(sync.getTask(second.id)?.status, 'waiting')
+  assert.equal(sync.getTask(second.id)?.coveredRecords, 0)
+  assert.ok(reads.slice(before).every(value => value.through < base + 10 * step))
+  await Promise.all([sync.cancel(first.id), sync.cancel(second.id)])
+})
+
+test('a price mutation during a held coverage read cannot be lost', async t => {
+  const store = new MemoryStore(), read = store.missingCandleRanges.bind(store), entered = deferred(), gate = deferred()
+  let reads = 0
+  store.missingCandleRanges = async request => {
+    const snapshot = await read(request)
+    if (++reads === 1) { entered.resolve(); await gate.promise }
+    return snapshot
+  }
+  const { sync, requests } = fixture({ store }); t.after(() => { gate.resolve(); return sync.close() })
+  const held = await sync.enqueue({ ...query, priority: 'background' }, { hold: true })
+  await entered.promise
+  await store.appendCandles(rows({ ...query, from: base, through: base, priority: 'background', getPriority: () => 'background', cursor: null, signal: new AbortController().signal }))
+  sync.invalidate({ ...query, from: base, through: base }); gate.resolve()
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  assert.equal(sync.getTask(held.id)?.coveredRecords, 1)
+  assert.equal(sync.getTask(held.id)?.localRecords, 1)
+  assert.ok(reads >= 2)
+  assert.equal(requests.length, 0)
+  await sync.cancel(held.id)
+})
+
+test('releasing during suspended inspection cannot complete from stale local coverage', async t => {
+  const entered = deferred(), gate = deferred(), store = new MemoryStore(), requests: HistorySourceQuery[] = []
+  let inspections = 0
+  const { sync } = fixture({ store, sources: { candles: {
+    inspect: async () => { if (++inspections === 1) { entered.resolve(); await gate.promise }; return {} },
+    fetchGap: request => { requests.push(request); return rows(request) },
+  } } }); t.after(() => { gate.resolve(); return sync.close() })
+  await store.appendCandles(rows({ ...query, priority: 'background', getPriority: () => 'background', cursor: null, signal: new AbortController().signal }))
+  const held = await sync.enqueue({ ...query, priority: 'background' }, { hold: true })
+  await entered.promise
+  store.values.delete(store.key({ ...query, timestamp: base })); store.version++
+  assert.equal(sync.release(held.id), true)
+  gate.resolve()
+  const complete = await sync.waitFor(held.id)
+  assert.equal(complete.status, 'completed')
+  assert.equal(complete.coveredRecords, 3)
+  assert.deepEqual(requests.map(value => [value.from, value.through]), [[base, base]])
+  assert.ok(inspections >= 2, 'Release must force fresh local inspection before completion.')
+})
+
+test('unrelated writes to the same series do not repeatedly restart an inspected range', async t => {
+  const entered = deferred(), gate = deferred(), store = new MemoryStore()
+  let inspections = 0
+  const { sync } = fixture({ store, sources: { candles: {
+    inspect: async () => { inspections++; entered.resolve(); await gate.promise; return {} },
+    fetchGap: request => rows(request),
+  } } }); t.after(() => { gate.resolve(); return sync.close() })
+  await store.appendCandles(rows({ ...query, priority: 'background', getPriority: () => 'background', cursor: null, signal: new AbortController().signal }))
+  const held = await sync.enqueue({ ...query, priority: 'background' }, { hold: true })
+  await entered.promise
+  for (let index = 0; index < 100; index++) sync.invalidate({ ...query, from: base + 100 * step, through: base + 100 * step })
+  gate.resolve()
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  assert.equal(inspections, 1, 'Unrelated invalidations cannot starve an already inspected range.')
+  await sync.cancel(held.id)
+})
+
+test('a disjoint interactive inspection cannot complete a released hold from stale shared coverage', async t => {
+  const entered = deferred(), gate = deferred(), store = new MemoryStore(), requests: HistorySourceQuery[] = []
+  const later = base + 100 * step
+  const { sync } = fixture({ store, sources: { candles: {
+    inspect: async request => { if (request.from === base) { entered.resolve(); await gate.promise }; return {} },
+    fetchGap: request => { requests.push(request); return rows(request) },
+  } } }); t.after(() => { gate.resolve(); return sync.close() })
+  const template = rows({ ...query, priority: 'background', getPriority: () => 'background', cursor: null, signal: new AbortController().signal })
+  await store.appendCandles([template[0], { ...template[0], timestamp: later }])
+  const held = await sync.enqueue({ ...query, from: later, through: later, priority: 'background' }, { hold: true })
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  const interactive = await sync.enqueue({ ...query, from: base, through: base, priority: 'interactive' })
+  await entered.promise
+  store.values.delete(store.key({ ...query, timestamp: later })); store.version++
+  assert.equal(sync.release(held.id), true)
+  gate.resolve()
+  assert.equal((await sync.waitFor(interactive.id)).status, 'completed')
+  const completed = await sync.waitFor(held.id)
+  assert.equal(completed.status, 'completed')
+  assert.equal(completed.localRecords, 0)
+  assert.deepEqual(requests.map(value => [value.from, value.through]), [[later, later]])
+})
+
+test('a distant interactive consumer cannot expand a held archive read across the intervening history', async t => {
+  const store = new MemoryStore(), original = store.missingCandleRanges.bind(store), spans: number[] = []
+  store.missingCandleRanges = async request => {
+    const span = (request.through - request.from) / request.intervalMS + 1
+    spans.push(span)
+    assert.ok(span <= 3, `Unexpected unbounded coverage read of ${span} slots.`)
+    return original(request)
+  }
+  const { sync } = fixture({ store }); t.after(() => sync.close())
+  const distant = base + 365 * 24 * 12 * step
+  const held = await sync.enqueue({ ...query, from: distant, through: distant + 2 * step, priority: 'background' }, { hold: true })
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  const interactive = await sync.enqueue({ ...query, priority: 'interactive' })
+  assert.equal((await sync.waitFor(interactive.id)).status, 'completed')
+  assert.ok(spans.length >= 2)
+  assert.equal((await sync.cancel(held.id)).status, 'cancelled')
+})
+
+test('overlapping held and interactive windows retain the bounded coverage read size', async t => {
+  const spans: number[] = []
+  const store = { async missingCandleRanges(request: HistoryRange & { intervalMS: number }) {
+    spans.push((request.through - request.from) / request.intervalMS + 1)
+    return []
+  } }
+  const sync = new HistorySync({ store, sources: { candles: { fetchGap: () => { throw new Error('All slots are local.') } } }, write: async () => {} })
+  t.after(() => sync.close())
+  const held = await sync.enqueue({ ...query, from: base + 2399 * step, through: base + 4798 * step, priority: 'background' }, { hold: true })
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  const interactive = await sync.enqueue({ ...query, from: base, through: base + 2399 * step, priority: 'interactive' })
+  assert.equal((await sync.waitFor(interactive.id)).status, 'completed')
+  assert.ok(spans.every(value => value <= 2400), `Coverage reads were not bounded: ${spans}`)
+  await sync.cancel(held.id)
+})
+
+test('disjoint ready consumers each complete using their own bounded coverage snapshot', async t => {
+  const { sync, requests } = fixture(); t.after(() => sync.close())
+  const later = base + 365 * 24 * 12 * step
+  const [first, second] = await Promise.all([
+    sync.enqueue({ ...query, priority: 'foreground' }),
+    sync.enqueue({ ...query, from: later, through: later + 2 * step, priority: 'foreground' }),
+  ])
+  const results = await Promise.all([sync.waitFor(first.id), sync.waitFor(second.id)])
+  assert.ok(results.every(value => value.status === 'completed' && value.coveredRecords === 3))
+  assert.equal(requests.length, 2)
+  assert.ok(requests.every(value => value.through - value.from <= 2 * step))
+})
+
+test('an interactive consumer bypasses a hold and its failure does not fail the held consumer', async t => {
+  let failed = true, calls = 0
+  const { sync } = fixture({ maxAttempts: 1, sources: { candles: { fetchGap: request => {
+    calls++
+    if (failed) throw new Error('Interactive source unavailable.')
+    return rows(request)
+  } } } }); t.after(() => sync.close())
+  const held = await sync.enqueue({ ...query, priority: 'background' }, { hold: true })
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  const interactive = await sync.enqueue({ ...query, priority: 'interactive' })
+  assert.equal((await sync.waitFor(interactive.id)).status, 'paused')
+  assert.equal(sync.getTask(held.id)?.status, 'waiting')
+  assert.equal(sync.getTask(held.id)?.attempts, 0)
+  failed = false
+  assert.equal(sync.release(held.id), true)
+  assert.equal((await sync.waitFor(held.id)).status, 'completed')
+  assert.equal(calls, 2)
+})
+
+test('a held consumer can be cancelled independently without occupying source capacity', async t => {
+  const { sync, requests } = fixture(); t.after(() => sync.close())
+  const held = await sync.enqueue({ ...query, priority: 'background' }, { hold: true })
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  assert.equal((await sync.cancel(held.id)).status, 'cancelled')
+  assert.equal(sync.release(held.id), false)
+  const normal = await sync.enqueue({ ...query, priority: 'foreground' })
+  assert.equal((await sync.waitFor(normal.id)).status, 'completed')
+  assert.equal(requests.length, 1)
+})
+
+test('held reuse excludes shared and repeated downloads while counting later local materialization', async t => {
+  const { sync, store, requests } = fixture(); t.after(() => sync.close())
+  const held = await sync.enqueue({ ...query, priority: 'background' }, { hold: true })
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  for (let iteration = 0; iteration < 2; iteration++) {
+    if (iteration) { store.values.delete(store.key({ ...query, timestamp: base })); store.version++; sync.invalidate({ ...query, from: base, through: base }) }
+    const interactive = await sync.enqueue({ ...query, from: base, through: base, priority: 'interactive' })
+    assert.equal((await sync.waitFor(interactive.id)).status, 'completed')
+  }
+  const materialized = rows({ ...query, priority: 'background', getPriority: () => 'background', cursor: null, signal: new AbortController().signal }).slice(1)
+  await store.appendCandles(materialized)
+  sync.invalidate({ ...query, from: base + step, through: base + 2 * step })
+  assert.equal(sync.release(held.id), true)
+  const complete = await sync.waitFor(held.id)
+  assert.equal(complete.status, 'completed')
+  assert.equal(complete.coveredRecords, 3)
+  assert.equal(complete.localRecords, 2, 'Only the locally materialized slots count as reused.')
+  assert.equal(requests.length, 2, 'Repeated downloads of the same slot are recorded once for reuse accounting.')
+})
+
+test('held coverage counts neither empty leases nor explicit unavailable slots as local numeric reuse', async t => {
+  const store = {
+    async missingCandleRanges() { return [{ from: base + 2 * step, through: base + 2 * step }] },
+    coverageLeases() { return [{ from: base + step, through: base + step, expiresAt: base + 60_000 }] },
+  }
+  const sync = new HistorySync({ store, now: () => base, sources: { oi: {
+    inspect: () => ({ unavailable: [{ from: base + 2 * step, through: base + 2 * step, reason: 'Not offered.' }] }),
+    fetchGap: () => { throw new Error('Known coverage cannot require a source fetch.') },
+  } }, write: async () => {} }); t.after(() => sync.close())
+  const held = await sync.enqueue({ ...query, source: 'oi', priority: 'background' }, { hold: true })
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  assert.deepEqual([sync.getTask(held.id)?.coveredRecords, sync.getTask(held.id)?.emptyRecords,
+    sync.getTask(held.id)?.unavailableRecords, sync.getTask(held.id)?.localRecords], [1, 1, 1, 1])
+  sync.release(held.id)
+  const complete = await sync.waitFor(held.id)
+  assert.deepEqual([complete.status, complete.coveredRecords, complete.emptyRecords, complete.unavailableRecords, complete.localRecords], ['unavailable', 1, 1, 1, 1])
+})
+
+test('an unavailable gap next to an empty lease remains distinct through hold and release', async t => {
+  let calls = 0
+  const store = {
+    async missingCandleRanges() { return [{ from: base, through: base }] },
+    coverageLeases() { return [{ from: base + step, through: base + step, expiresAt: base + 60_000 }] },
+  }
+  const sync = new HistorySync({ store, now: () => base, sources: { oi: {
+    inspect: () => ({ unavailable: [{ from: base, through: base, reason: 'Not offered.' }] }),
+    fetchGap: () => { calls++; return [] },
+  } }, write: async () => {} }); t.after(() => sync.close())
+  const held = await sync.enqueue({ ...query, through: base + step, source: 'oi', priority: 'background' }, { hold: true })
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  assert.deepEqual(sync.getTask(held.id)?.remaining, [{ from: base, through: base }])
+  assert.equal(sync.release(held.id), true)
+  const result = await sync.waitFor(held.id)
+  assert.deepEqual([result.status, result.coveredRecords, result.emptyRecords, result.unavailableRecords, result.localRecords], ['unavailable', 0, 1, 1, 0])
+  assert.deepEqual(result.remaining, [{ from: base, through: base }])
+  assert.equal(calls, 0)
+})
+
+test('release rechecks source availability rather than retaining an obsolete held boundary', async t => {
+  let unavailable = true, calls = 0
+  const { sync } = fixture({ sources: { candles: {
+    inspect: () => unavailable ? { unavailable: [{ ...query, reason: 'Before current listing.' }] } : {},
+    fetchGap: request => { calls++; return rows(request) },
+  } } }); t.after(() => sync.close())
+  const held = await sync.enqueue({ ...query, priority: 'background' }, { hold: true })
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  assert.equal(sync.getTask(held.id)?.unavailableRecords, 3)
+  unavailable = false
+  sync.release(held.id)
+  const completed = await sync.waitFor(held.id)
+  assert.equal(completed.status, 'completed')
+  assert.equal(completed.coveredRecords, 3)
+  assert.equal(completed.unavailableRecords, 0)
+  assert.equal(calls, 1)
+})
+
+test('a held dirty-range refresh rechecks changed source availability without fetching', async t => {
+  let unavailable = true, calls = 0, inspections = 0
+  const { sync } = fixture({ sources: { candles: {
+    inspect: () => { inspections++; return unavailable ? { unavailable: [{ ...query, reason: 'Previous boundary.' }] } : {} },
+    fetchGap: () => { calls++; return [] },
+  } } }); t.after(() => sync.close())
+  const held = await sync.enqueue({ ...query, priority: 'background' }, { hold: true })
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  assert.equal(sync.getTask(held.id)?.unavailableRecords, 3)
+  unavailable = false
+  for (let index = 0; index < 3; index++) sync.invalidate({ ...query, from: base + index * step, through: base + index * step })
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting' && sync.getTask(held.id)?.unavailableRecords === 0)
+  assert.equal(inspections, 2, 'The invalidation burst is checked once.')
+  assert.equal(calls, 0)
+  await sync.cancel(held.id)
+})
+
+test('a released hold does not inherit another consumer’s obsolete in-flight unavailable proof', async t => {
+  const entered = deferred(), gate = deferred(), store = new MemoryStore()
+  let unavailable = true, calls = 0
+  const { sync } = fixture({ store, sources: { candles: {
+    inspect: () => unavailable ? { unavailable: [{ from: base, through: base, reason: 'Previously unavailable.' }] } : {},
+    fetchGap: async request => {
+      if (++calls === 1) { entered.resolve(); await gate.promise }
+      return rows(request)
+    },
+  } } }); t.after(() => { gate.resolve(); return sync.close() })
+  const held = await sync.enqueue({ ...query, priority: 'background' }, { hold: true })
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  const interactive = await sync.enqueue({ ...query, priority: 'interactive' })
+  await entered.promise
+  unavailable = false
+  assert.equal(sync.release(held.id), true)
+  gate.resolve()
+  await sync.waitFor(interactive.id)
+  const completed = await sync.waitFor(held.id)
+  assert.equal(completed.status, 'completed')
+  assert.equal(completed.coveredRecords, 3)
+  assert.equal(completed.unavailableRecords, 0)
+  assert.equal(calls, 2, 'The newly available slot is acquired after the old shared page.')
+})
+
+test('an empty recheck is not mistaken for progress because of an obsolete shared unavailable proof', async t => {
+  const entered = deferred(), gate = deferred(), store = new MemoryStore()
+  let unavailable = true, calls = 0
+  const { sync } = fixture({ store, maxAttempts: 1, sources: { candles: {
+    inspect: () => unavailable ? { unavailable: [{ from: base, through: base, reason: 'Previously unavailable.' }] } : {},
+    fetchGap: async request => {
+      if (++calls === 1) { entered.resolve(); await gate.promise; return rows(request) }
+      return []
+    },
+  } } }); t.after(() => { gate.resolve(); return sync.close() })
+  const held = await sync.enqueue({ ...query, priority: 'background' }, { hold: true })
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  const interactive = await sync.enqueue({ ...query, priority: 'interactive' })
+  await entered.promise
+  unavailable = false; sync.release(held.id); gate.resolve()
+  await sync.waitFor(interactive.id)
+  const paused = await sync.waitFor(held.id)
+  assert.equal(paused.status, 'paused')
+  assert.match(paused.lastError!, /no persisted coverage progress/)
+  assert.equal(calls, 2)
+})
+
+test('a released multi-page hold keeps its proof isolated until completion', async t => {
+  const entered = deferred(), gate = deferred(), store = new MemoryStore()
+  let unavailable = true, calls = 0
+  const extended = { ...query, through: base + 3 * step }
+  const { sync } = fixture({ store, sources: { candles: {
+    pageSize: 1,
+    inspect: () => unavailable ? { unavailable: [{ from: base, through: base, reason: 'Previously unavailable.' }] } : {},
+    fetchGap: async request => { if (++calls === 1) { entered.resolve(); await gate.promise }; return rows(request) },
+  } } }); t.after(() => { gate.resolve(); return sync.close() })
+  const held = await sync.enqueue({ ...extended, priority: 'background' }, { hold: true })
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  const interactive = await sync.enqueue({ ...extended, priority: 'interactive' })
+  await entered.promise
+  unavailable = false; sync.release(held.id); gate.resolve()
+  const [previous, completed] = await Promise.all([sync.waitFor(interactive.id), sync.waitFor(held.id)])
+  assert.equal(previous.status, 'unavailable', 'The other consumer retains its prior explicit source evidence.')
+  assert.equal(completed.status, 'completed')
+  assert.equal(completed.coveredRecords, 4)
+  assert.equal(completed.unavailableRecords, 0)
+  assert.equal(calls, 4, 'The released hold must acquire the formerly unavailable slot on a later page.')
+})
+
+for (const stage of ['fetch', 'write'] as const) test(`a held consumer joining an in-flight ${stage} does not count its shared download as reuse`, async t => {
+  const entered = deferred(), gate = deferred(), store = new MemoryStore()
+  const { sync } = fixture({ store, sources: { candles: { fetchGap: async request => {
+    if (stage === 'fetch') { entered.resolve(); await gate.promise }
+    return rows(request)
+  } } }, write: async (values, task) => {
+    if (stage === 'write') { entered.resolve(); await gate.promise }
+    await store.appendSource(values, task.source)
+  } }); t.after(() => { gate.resolve(); return sync.close() })
+  const interactive = await sync.enqueue({ ...query, priority: 'interactive' })
+  await entered.promise
+  const held = await sync.enqueue({ ...query, priority: 'background' }, { hold: true })
+  gate.resolve()
+  assert.equal((await sync.waitFor(interactive.id)).status, 'completed')
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  assert.equal(sync.release(held.id), true)
+  const complete = await sync.waitFor(held.id)
+  assert.equal(complete.coveredRecords, 3)
+  assert.equal(complete.localRecords, 0, 'The same shared source download is not reclassified as local data.')
+})
+
+for (const stage of ['fetch', 'write'] as const) test(`held progress refresh survives a shared ${stage} in flight`, async t => {
+  const entered = deferred(), gate = deferred(), store = new MemoryStore()
+  const { sync } = fixture({ store, sources: { candles: { fetchGap: async request => {
+    if (stage === 'fetch') { entered.resolve(); await gate.promise }
+    return rows(request)
+  } } }, write: async (values, task) => {
+    if (stage === 'write') { entered.resolve(); await gate.promise }
+    await store.appendSource(values, task.source)
+  } }); t.after(() => { gate.resolve(); return sync.close() })
+  const held = await sync.enqueue({ ...query, priority: 'background' }, { hold: true })
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  const interactive = await sync.enqueue({ ...query, from: base, through: base, priority: 'interactive' })
+  await entered.promise
+  const local = rows({ ...query, from: base + step, through: base + step, priority: 'background', getPriority: () => 'background', cursor: null, signal: new AbortController().signal })
+  await store.appendCandles(local); sync.invalidate({ ...query, from: base + step, through: base + step })
+  gate.resolve(); await sync.waitFor(interactive.id)
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting' && sync.getTask(held.id)?.coveredRecords === 2)
+  assert.equal(sync.getTask(held.id)?.localRecords, 1)
+  await sync.cancel(held.id)
+})
+
+test('cancelling a held consumer during a shared admitted write keeps downloaded slots out of reuse', async t => {
+  const entered = deferred(), gate = deferred(), store = new MemoryStore()
+  const { sync } = fixture({ store, write: async (values, task) => {
+    entered.resolve(); await gate.promise; await store.appendSource(values, task.source)
+  } }); t.after(() => { gate.resolve(); return sync.close() })
+  const held = await sync.enqueue({ ...query, priority: 'background' }, { hold: true })
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  const interactive = await sync.enqueue({ ...query, priority: 'interactive' })
+  await entered.promise
+  const stopped = sync.cancel(held.id)
+  gate.resolve()
+  const cancelled = await stopped
+  assert.equal(cancelled.status, 'cancelled')
+  assert.equal(cancelled.coveredRecords, 3)
+  assert.equal(cancelled.localRecords, 0)
+  assert.equal((await sync.waitFor(interactive.id)).status, 'completed')
+})
+
+test('closing during an accepted shared write preserves the cancelled hold checkpoint', async t => {
+  const entered = deferred(), gate = deferred(), store = new MemoryStore()
+  const { sync } = fixture({ store, write: async (values, task) => {
+    entered.resolve(); await gate.promise; await store.appendSource(values, task.source)
+  } }); t.after(() => { gate.resolve(); return sync.close() })
+  const held = await sync.enqueue({ ...query, priority: 'background' }, { hold: true })
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  await sync.enqueue({ ...query, priority: 'interactive' })
+  await entered.promise
+  const stopped = sync.cancel(held.id)
+  await waitFor(() => sync.getTask(held.id)?.status === 'cancelled')
+  const closing = sync.close()
+  gate.resolve()
+  const cancelled = await stopped
+  await closing
+  assert.equal(cancelled.status, 'cancelled')
+  assert.equal(cancelled.coveredRecords, 3)
+  assert.equal(cancelled.localRecords, 0)
+})
+
 test('overlapping and adjacent consumers share one canonical API page without persisted execution rows', async t => {
   const { sync, requests } = fixture(); t.after(() => sync.close())
   const consumers = await Promise.all([

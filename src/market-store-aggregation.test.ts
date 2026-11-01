@@ -22,7 +22,7 @@ const parent = (timeframe: '15m' | '1H', timestamp = base, patch: Record<string,
 })
 const fixture = async () => {
   const root = await mkdtemp(join(tmpdir(), 'perp-aggregate-')), store = await MarketStore.open(root)
-  return { store, close: async () => { await store.close(); await rm(root, { recursive: true, force: true }) } }
+  return { root, store, close: async () => { await store.close(); await rm(root, { recursive: true, force: true }) } }
 }
 const near = (actual: number, expected: number) => assert.ok(Math.abs(actual - expected) <= Math.max(1, Math.abs(expected)) * Number.EPSILON * 8,
   `expected ${actual} to be within floating point rounding of ${expected}`)
@@ -142,6 +142,56 @@ test('invalidation removes only incomplete derived prices and leaves independent
       { changed: 1, complete: 1, invalidated: 0 })
     assert.equal((await f.store.candles({ instrument, timeframe: '15m', from: base, through: base }))[0].close, 116)
   } finally { await f.close() }
+})
+
+test('aggregate batches maintain exact coverage through mixed boundary deletions and additions', async () => {
+  const f = await fixture(), range = { instrument, timeframe: '15m' as const, from: base, through: base + 5 * quarterHour }
+  const database = new DatabaseSync(join(f.root, 'market.sqlite'))
+  try {
+    database.exec(`CREATE TABLE aggregate_metadata_updates(n INTEGER NOT NULL);
+      CREATE TRIGGER count_aggregate_metadata AFTER UPDATE OF candle_count ON series
+      WHEN NEW.instrument='${instrument}' AND NEW.timeframe='15m'
+      BEGIN INSERT INTO aggregate_metadata_updates VALUES(1); END;`)
+    const updates = () => Number(database.prepare('SELECT COUNT(*) AS count FROM aggregate_metadata_updates').get()!.count)
+    await f.store.appendCandles(Array.from({ length: 12 }, (_, index) => child(index)))
+    await f.store.aggregateCandles(range)
+    assert.deepEqual(await f.store.coverage(instrument, '15m'), { count: 4, first: base, last: base + 3 * quarterHour })
+    assert.equal(updates(), 1, 'All inserts update series metadata once.')
+    await f.store.aggregateCandles(range)
+    assert.equal(updates(), 1, 'An unchanged aggregate does not update metadata.')
+
+    await f.store.appendCandles(Array.from({ length: 6 }, (_, index) => child(index + 12)))
+    for (const index of [0, 9]) await f.store.replaceCandles({ instrument, timeframe: '5m', from: base + index * childStep, through: base + index * childStep }, [])
+    const result = await f.store.aggregateCandles({ ...range, invalidateIncomplete: true })
+    assert.deepEqual(result, { changed: 4, complete: 4, invalidated: 2 })
+    assert.deepEqual(await f.store.coverage(instrument, '15m'), { count: 4, first: base + quarterHour, last: base + 5 * quarterHour })
+    assert.equal(updates(), 2, 'Mixed additions and boundary removals share one metadata update.')
+    assert.deepEqual(await f.store.missingCandleRanges({ ...range, intervalMS: quarterHour }), [
+      { from: base, through: base }, { from: base + 3 * quarterHour, through: base + 3 * quarterHour },
+    ])
+
+    await f.store.replaceCandles({ instrument, timeframe: '5m', from: base, through: base + 17 * childStep }, [])
+    await f.store.aggregateCandles({ ...range, invalidateIncomplete: true })
+    assert.deepEqual(await f.store.coverage(instrument, '15m'), { count: 0, first: null, last: null })
+    assert.equal(updates(), 3, 'Removing every parent still performs one metadata update.')
+  } finally { database.close(); await f.close() }
+})
+
+test('a failed aggregate rolls back parent rows, coverage metadata and revisions', async () => {
+  const f = await fixture(), database = new DatabaseSync(join(f.root, 'market.sqlite'))
+  try {
+    await f.store.appendCandles(Array.from({ length: 6 }, (_, index) => child(index)))
+    await f.store.appendCandles([parent('15m', base + 2 * quarterHour)])
+    const before = await f.store.coverage(instrument, '15m'), revision = f.store.candleRevision(instrument, '15m')
+    database.exec(`CREATE TRIGGER reject_aggregate_insert BEFORE INSERT ON candles
+      WHEN NEW.timestamp=${base + quarterHour} AND NEW.series_id=(SELECT id FROM series WHERE instrument='${instrument}' AND timeframe='15m')
+      BEGIN SELECT RAISE(ABORT, 'injected aggregate failure'); END;`)
+    const range = { instrument, timeframe: '15m' as const, from: base, through: base + 2 * quarterHour }
+    await assert.rejects(f.store.aggregateCandles(range), /injected aggregate failure/)
+    assert.deepEqual(await f.store.coverage(instrument, '15m'), before)
+    assert.equal(f.store.candleRevision(instrument, '15m'), revision)
+    assert.deepEqual((await f.store.candles(range)).map(row => row.timestamp), [base + 2 * quarterHour])
+  } finally { database.close(); await f.close() }
 })
 
 test('aggregation requires complete parent bucket boundaries', async () => {

@@ -115,13 +115,30 @@ test('a scheduling failure cleans up its partially installed witness and retains
 })
 
 test('event-loop evidence distinguishes idle polling from low-CPU synchronous waiting', async () => {
-  const witness = startNodeDriverLoopWitness({ capacity: 64 })
+  let previous, idleObserved, afterWaitObserved, afterWait = false
+  const idleSample = new Promise(resolve => { idleObserved = resolve })
+  const postWaitSample = new Promise(resolve => { afterWaitObserved = resolve })
+  // Observe the same cumulative counters captured by the witness. Waiting for
+  // an actual idle interval avoids assuming that a busy host will schedule a
+  // particular timer within a fixed 60 ms wall-clock window.
+  const witness = startNodeDriverLoopWitness({ capacity: 256, runtime: { readEventLoop: () => {
+    const value = performance.eventLoopUtilization()
+    if (previous && value.idle - previous.idle > value.active - previous.active) idleObserved()
+    if (afterWait) afterWaitObserved()
+    previous = value
+    return value
+  } } })
+  let timeout
   try {
-    await new Promise(resolve => setTimeout(resolve, 60))
+    const bounded = promise => Promise.race([promise, new Promise((_, reject) => {
+      timeout = setTimeout(() => reject(new Error('The witness did not capture the expected event-loop interval.')), 3_000)
+    })]).finally(() => clearTimeout(timeout))
+    await bounded(idleSample)
     const startedAt = performance.timeOrigin + performance.now()
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 80)
     const endedAt = performance.timeOrigin + performance.now()
-    await new Promise(resolve => setTimeout(resolve, 60))
+    afterWait = true
+    await bounded(postWaitSample)
     const report = witness.stop()
     assert.equal(report.complete, true)
     assert.equal(report.eventLoopEvidence.state, 'observed')

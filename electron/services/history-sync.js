@@ -4,6 +4,7 @@ import { beginOperation } from './operations.js'
 const intervals = { '5m': 300_000, '15m': 900_000, '1H': 3_600_000 }
 const terminal = new Set(['paused', 'cancelled', 'completed', 'unavailable'])
 const priorities = { interactive: 4, foreground: 4, prepared: 4, repair: 4, continuity: 3, statistics: 3, prefetch: 1, chartWarm: 1, background: 0 }
+const MAX_SHARED_COVERAGE_SLOTS = 2400
 const clone = value => structuredClone(value)
 const integer = (value, name, minimum = 0) => {
   if (!Number.isSafeInteger(value) || value < minimum) throw new TypeError(`${name} must be a safe integer of at least ${minimum}.`)
@@ -71,7 +72,7 @@ export class HistorySync {
     this.maxAttempts = integer(options.maxAttempts ?? 5, 'maxAttempts', 1)
     this.maxRetainedTerminalTasks = integer(options.maxRetainedTerminalTasks ?? 512, 'maxRetainedTerminalTasks', 1)
     if (this.minRequestIntervalMS > 2147483647 || this.maxRetryDelayMS > 2147483647) throw new TypeError('History delays cannot exceed 2147483647 milliseconds.')
-    this.tasks = new Map(); this.groups = new Map(); this.waiters = new Map(); this.controls = new Map(); this.idleWaiters = []
+    this.tasks = new Map(); this.groups = new Map(); this.waiters = new Map(); this.controls = new Map(); this.holds = new Set(); this.rechecks = new Set(); this.isolated = new Set(); this.heldDownloads = new Map(); this.heldCoverage = new Map(); this.idleWaiters = []
     this.active = new Map(); this.coverageChecks = new Map(); this.coverageEpochs = new Map()
     this.closed = false; this.started = null; this.closing = null; this.timer = null; this.draining = false
     this.requestTail = Promise.resolve(); this.lastRequestAt = null
@@ -90,7 +91,7 @@ export class HistorySync {
     return this.groups.get(key)
   }
 
-  async enqueue(input) {
+  async enqueue(input, { hold = false } = {}) {
     const epoch = this.instrumentEpochs.get(input?.instrument) ?? 0
     await this.start(); this.assertOpen()
     if (epoch !== (this.instrumentEpochs.get(input?.instrument) ?? 0)) throw new DOMException('The instrument history demand was retired.', 'AbortError')
@@ -101,6 +102,8 @@ export class HistorySync {
     const task = { schemaVersion: 1, id, ...identity, ...bounds, purpose: 'requested', priority: priority(input.priority ?? 'background'),
       status: 'queued', createdAt: timestamp, updatedAt: timestamp, nextAttemptAt: null, attempts: 0, cursor: null, cursorRange: null,
       unavailableRanges: [], remaining: [bounds], writtenRecords: 0, coveredRecords: 0, emptyRecords: 0, unavailableRecords: 0, localRecords: 0, inspected: false, lastError: null }
+    if (typeof hold !== 'boolean') throw new TypeError('History hold must be boolean.')
+    if (hold) { this.holds.add(id); this.heldDownloads.set(id, []) }
     this.tasks.set(id, task); this.group(task).tasks.add(id)
     const active = this.group(task).active
     const cached = this.coverageChecks.get(seriesKey(task))
@@ -118,7 +121,7 @@ export class HistorySync {
     const tasks = [...this.tasks.values()].filter(task => removed.has(task.instrument))
     await Promise.all(tasks.filter(task => !terminal.has(task.status) || this.controls.has(task.id)).map(task => this.cancel(task.id)))
     for (const task of tasks) {
-      this.tasks.delete(task.id); this.group(task).tasks.delete(task.id)
+      this.holds.delete(task.id); this.rechecks.delete(task.id); this.isolated.delete(task.id); this.heldDownloads.delete(task.id); this.heldCoverage.delete(task.id); this.tasks.delete(task.id); this.group(task).tasks.delete(task.id)
     }
     for (const group of this.groups.values()) if (removed.has(group.instrument)) {
       group.active?.controller.abort(); this.coverageChecks.delete(group.key)
@@ -129,6 +132,19 @@ export class HistorySync {
 
   getTask(id) { const task = this.tasks.get(text(id, 'task ID')); return task ? clone(task) : null }
   listTasks() { return [...this.tasks.values()].map(clone) }
+  release(id) {
+    const task = this.requireTask(id)
+    if (!this.holds.delete(id) || terminal.has(task.status)) return false
+    // Child commits may have changed or removed parent rows after the initial
+    // local inspection. Re-read before allowing acquisition or completion.
+    task.unavailableRanges = []
+    this.rechecks.add(id)
+    this.isolated.add(id)
+    this.invalidate(task)
+    if (task.status === 'waiting') task.status = 'queued'
+    this.notify(task); this.kick()
+    return true
+  }
   promote(query, requestPriority) {
     this.assertOpen()
     const identity = descriptor(query), bounds = range(query, intervals[identity.timeframe]), promoted = priority(requestPriority)
@@ -162,10 +178,10 @@ export class HistorySync {
       const result = await pending
       if (result.status === status) return result
     }
-    const task = this.requireTask(id); task.status = status; task.nextAttemptAt = null
+    const task = this.requireTask(id); task.status = status; task.nextAttemptAt = null; this.holds.delete(id)
     const group = this.group(task), entry = group.active
     // Cancelling one consumer never cancels another consumer's shared page.
-    if (entry && !this.demands(group).some(value => !entry.bounds || intersects(value, entry.bounds))) entry.controller.abort()
+    if (entry && !this.demands(group).some(value => !this.holds.has(value.id) && (!entry.bounds || intersects(value, entry.bounds)))) entry.controller.abort()
     if (!entry?.writing || !intersects(task, entry.bounds)) {
       this.notify(task); this.settle(task); this.prune(); this.kick()
       return clone(task)
@@ -176,7 +192,8 @@ export class HistorySync {
       try {
         await entry.writePromise.catch(() => undefined)
         await this.missing(task, task.priority)
-        this.measure(task, this.coverageChecks.get(group.key), [...task.unavailableRanges, ...entry.unavailable])
+        this.measure(task, this.coverageChecks.get(group.key), this.rechecks.has(task.id) ? [] : this.isolated.has(task.id)
+          ? [...task.unavailableRanges, ...(entry.freshUnavailable ?? [])] : [...task.unavailableRanges, ...entry.unavailable])
       } finally {
         this.controls.delete(id)
         this.notify(task); this.settle(task); this.prune(); this.kick(); this.settleIdle()
@@ -205,7 +222,7 @@ export class HistorySync {
   }
   async whenIdle() { await this.start(); this.assertOpen(); if (this.isIdle()) return; return new Promise((resolve, reject) => this.idleWaiters.push({ resolve, reject })) }
   demands(group) { return [...group.tasks].map(id => this.tasks.get(id)).filter(task => task && !terminal.has(task.status)) }
-  ready(group) { return this.demands(group).filter(task => task.status !== 'retry' || task.nextAttemptAt <= this.now()) }
+  ready(group) { return this.demands(group).filter(task => task.status !== 'waiting' && (task.status !== 'retry' || task.nextAttemptAt <= this.now())) }
   sourceQuery(entry, bounds) {
     // Keep this callback intact through adapters: MarketService.get accepts it
     // in its fifth argument, { getPriority }, and reevaluates queued admission.
@@ -216,29 +233,60 @@ export class HistorySync {
   }
   invalidate(query) {
     const key = seriesKey(query), cached = this.coverageChecks.get(key)
+    const active = this.groups.get(key)?.active
+    if (active?.inspectionBounds?.some(bounds => intersects(bounds, query))) active.inspectionInvalidated = true
     this.coverageEpochs.set(key, (this.coverageEpochs.get(key) ?? 0) + 1)
     if (cached) cached.dirty = merged([...cached.dirty, ...clipped([query], cached)], intervals[query.timeframe])
+    let wake = false
+    for (const id of this.groups.get(key)?.tasks ?? []) {
+      const task = this.tasks.get(id), held = this.heldCoverage.get(id)
+      if (!task || terminal.has(task.status) || !held || !intersects(task, query)) continue
+      held.dirty = merged([...held.dirty, ...clipped([query], held)], intervals[query.timeframe])
+      if (this.holds.has(id)) {
+        // A source boundary may have changed during the hold. A local
+        // refresh needs current inspection rather than old shared evidence.
+        task.unavailableRanges = []
+        this.rechecks.add(id); this.isolated.add(id)
+        if (task.status === 'waiting') { task.status = 'queued'; wake = true }
+      }
+    }
+    if (wake) this.kick()
   }
 
-  async missing(query, requestPriority) {
-    const key = seriesKey(query), step = intervals[query.timeframe], previous = this.coverageChecks.get(key)
+  async missing(query, requestPriority, pinned, { materializeRanges = [query] } = {}) {
+    const key = seriesKey(query), step = intervals[query.timeframe], previous = pinned ?? this.coverageChecks.get(key)
     const epoch = this.coverageEpochs.get(key) ?? 0, version = await this.store.coverageVersion?.(query)
     // A series has one coverage cache shared by every active consumer.
-    const retained = [...this.group(query).tasks].map(id => this.tasks.get(id)).filter(task => task && (!terminal.has(task.status) || this.controls.has(task.id)))
-    const bounds = { from: Math.min(query.from, ...retained.map(task => task.from)), through: Math.max(query.through, ...retained.map(task => task.through)) }
+    // Only consumers intersecting this read can extend its shared window.
+    // A held archive range and an unrelated old/new interactive range must
+    // never expand a bounded request into years of intervening rows.
+    const retained = [...this.group(query).tasks].map(id => this.tasks.get(id)).filter(task => task && intersects(task, query) && (!terminal.has(task.status) || this.controls.has(task.id)))
+    const shared = { from: Math.min(query.from, ...retained.map(task => task.from)), through: Math.max(query.through, ...retained.map(task => task.through)) }
+    const maxSlots = Math.max(MAX_SHARED_COVERAGE_SLOTS, (query.through - query.from) / step + 1)
+    const bounds = slots([shared], step) <= maxSlots ? shared : { from: query.from, through: query.through }
     let gaps = clipped(previous?.remaining ?? [], bounds), leases = clipped(previous?.leases ?? [], bounds)
+    // Gaps observed for progress alone have not been checked for derivable
+    // prices. A later foreground request or release must materialize them.
+    let unmaterialized = clipped(previous?.unmaterialized ?? [], bounds)
+    const materializedBounds = merged(materializeRanges.flatMap(value => clipped([value], bounds)), step)
     let refresh = previous ? [...subtract([bounds], [previous], step), ...clipped(previous.dirty, bounds), ...leases.filter(lease => lease.expiresAt <= this.now())] : [bounds]
+    refresh.push(...materializedBounds.flatMap(value => clipped(unmaterialized, value)))
     if (previous && (version === undefined || previous.version !== version)) {
       const changed = version === undefined ? null : await this.store.coverageChanges?.(query, previous.version)
       refresh.push(...clipped(changed?.ranges ?? [bounds], bounds))
     }
-    for (const portion of merged(refresh, step)) {
+    const requested = merged(refresh, step)
+    const portions = [...materializedBounds.flatMap(value => clipped(requested, value)).map(value => ({ ...value, materialize: true })),
+      ...subtract(requested, materializedBounds, step).map(value => ({ ...value, materialize: false }))]
+    for (const portion of portions) {
       const request = { ...descriptor(query), ...portion, intervalMS: step }
-      const result = await this.store.missingCandleRanges(request, requestPriority)
+      delete request.materialize
+      const result = await this.store.missingCandleRanges(request, requestPriority, { materialize: portion.materialize })
       if (!Array.isArray(result)) throw new TypeError('store.missingCandleRanges must return an array.')
       const checked = result.map(value => range(value, step))
       if (checked.some(value => value.from < portion.from || value.through > portion.through)) throw new TypeError('Store gaps must be inside the requested range.')
       gaps = merged([...subtract(gaps, [portion], step), ...checked], step)
+      unmaterialized = merged([...subtract(unmaterialized, [portion], step), ...(portion.materialize ? [] : checked)], step)
       const observed = this.store.coverageLeases?.(request) ?? []
       if (!Array.isArray(observed)) throw new TypeError('store.coverageLeases must return an array.')
       for (const lease of observed) {
@@ -247,10 +295,10 @@ export class HistorySync {
       }
       leases = [...subtract(leases, [portion], step), ...observed]
     }
-    const cached = { ...bounds, version, remaining: gaps, leases, dirty: [] }
+    const cached = { ...bounds, version, remaining: gaps, leases, unmaterialized, dirty: [] }
     if (epoch !== (this.coverageEpochs.get(key) ?? 0) || version !== await this.store.coverageVersion?.(query)) cached.dirty = [bounds]
     this.coverageChecks.set(key, cached)
-    if (cached.dirty.length) return this.missing(query, requestPriority)
+    if (cached.dirty.length) return this.missing(query, requestPriority, cached, { materializeRanges })
     return clipped(gaps, query)
   }
 
@@ -337,29 +385,63 @@ export class HistorySync {
   async run(entry) {
     const { group, controller } = entry, { signal } = controller, step = intervals[group.timeframe]
     const initial = this.ready(group)
+    const sourceEligible = new Set(initial.filter(task => !this.holds.has(task.id)).map(task => task.id))
     const bounds = merged(initial, step), source = this.sources.get(group.source)
     try {
-      let gaps = [], unavailable = initial.flatMap(task => task.unavailableRanges)
+      let gaps = [], unavailable = initial.flatMap(task => task.unavailableRanges), freshUnavailable = []
+      const observedCoverage = []
+      entry.inspectionBounds = [...bounds]
       for (const portion of bounds) {
         const query = this.sourceQuery(entry, portion)
-        const raw = await this.missing(query, query.priority)
+        const pinned = initial.map(task => this.heldCoverage.get(task.id)).find(value => value && value.from <= portion.from && value.through >= portion.through)
+        // An already-inspected hold only reports durable local progress.
+        // Its initial inspection and release still materialize all derivable
+        // prices before the consumer can complete or fetch from the source.
+        const materializeRanges = initial.filter(task => !this.holds.has(task.id) || !this.heldCoverage.has(task.id))
+        const raw = await this.missing(query, query.priority, pinned, { materializeRanges })
+        // missing() also reads retained consumers' ranges to share coverage.
+        // Any of those ranges may be assessed after inspection, even when
+        // they do not intersect the currently selected consumer's bounds.
+        const cached = this.coverageChecks.get(group.key)
+        if (cached) {
+          entry.inspectionBounds.push({ from: cached.from, through: cached.through })
+          observedCoverage.push(cached)
+        }
         signal.throwIfAborted()
         const excluded = source.inspect ? this.unavailable(query, await source.inspect(query)) : []
-        unavailable.push(...excluded); gaps.push(...subtract(raw, unavailable, step))
+        // A hold can be released, or a mutation can invalidate this range,
+        // while source inspection is suspended. Never complete a consumer
+        // from the coverage snapshot that preceded that change.
+        if (entry.inspectionInvalidated) return
+        unavailable.push(...excluded); freshUnavailable.push(...excluded); gaps.push(...subtract(raw, freshUnavailable, step))
       }
-      this.assess(group, unavailable)
+      // A foreground consumer may arrive while a progress-only read is in
+      // flight. It must upgrade those gaps before this run can fetch them.
+      if (this.ready(group).some(task => !this.holds.has(task.id) && !sourceEligible.has(task.id)
+        && observedCoverage.some(cached => cached.unmaterialized.some(portion => intersects(task, portion))))) return
+      entry.inspectionBounds = null
+      for (const task of initial) this.rechecks.delete(task.id)
+      this.assess(group, unavailable, observedCoverage, freshUnavailable)
       const ready = this.ready(group).sort((a, b) => priorities[b.priority] - priorities[a.priority] || a.createdAt - b.createdAt)
-      const available = ready.filter(task => clipped(gaps, task).length)
+      const needed = task => clipped(subtract(gaps, task.unavailableRanges, step), task)
+      const available = ready.filter(task => needed(task).length)
       const selected = group.urgentPages >= 8 ? available.find(task => priorities[task.priority] < priorities.continuity) ?? available[0] : available[0]
       if (!selected) return
       group.urgentPages = priorities[selected.priority] >= priorities.continuity ? group.urgentPages + 1 : 0
-      const wanted = clipped(gaps, selected).at(-1), connected = gaps.find(value => intersects(value, wanted))
+      // A ready interactive consumer may share a group with a held archive.
+      // Extend a page only through ranges owned by consumers actually ready
+      // for source access; a held gap alone cannot authorize prefetch.
+      const admitted = merged(ready.flatMap(needed), step)
+      const wanted = needed(selected).at(-1), connected = admitted.find(value => intersects(value, wanted))
       const size = integer(source.pageSize ?? (group.source === 'candles' ? 300 : 100), 'source.pageSize', 1)
       const from = Math.max(connected.from, wanted.through - (size - 1) * step)
       const page = { from, through: Math.min(connected.through, from + (size - 1) * step) }
       entry.bounds = page
       const participants = this.demands(group).filter(task => intersects(task, page))
-      for (const task of participants) { task.status = 'running'; task.nextAttemptAt = null; this.notify(task) }
+      for (const task of participants) {
+        task.status = this.holds.has(task.id) ? this.rechecks.has(task.id) ? 'queued' : 'waiting' : 'running'
+        task.nextAttemptAt = null; this.notify(task)
+      }
       const query = this.sourceQuery(entry, page)
       const response = await this.callSource(() => source.fetchGap(query), query)
       signal.throwIfAborted()
@@ -373,18 +455,31 @@ export class HistorySync {
       })
       const before = slots(clipped(gaps, page), step)
       entry.unavailable = unavailable
+      entry.freshUnavailable = freshUnavailable
       const commit = async () => {
         if (records.length) {
           // Once a write is admitted, cancellation cannot abandon its durable facts.
           await this.write(records, { ...clone(selected), ...page, priority: query.getPriority() })
+          // A hold can arrive after this page started or be cancelled while
+          // its admitted durable write drains. Both still own this checkpoint.
+          const holders = [...group.tasks].map(id => this.tasks.get(id)).filter(task => task && this.heldDownloads.has(task.id)
+            && (!terminal.has(task.status) || this.controls.has(task.id)))
+          for (const task of holders) {
+            const fetched = records.filter(row => row.timestamp >= task.from && row.timestamp <= task.through)
+              .map(row => ({ from: row.timestamp, through: row.timestamp }))
+            this.heldDownloads.set(task.id, merged([...this.heldDownloads.get(task.id), ...fetched], step))
+          }
           this.invalidate({ ...query, from: Math.min(...records.map(row => row.timestamp)), through: Math.max(...records.map(row => row.timestamp)) })
           for (const task of participants) task.writtenRecords += records.filter(row => row.timestamp >= task.from && row.timestamp <= task.through).length
         }
         const after = await this.missing(query, selected.priority)
-        if (result.unavailable) unavailable.push(...this.unavailable(query, result))
-        for (const task of participants) if (!terminal.has(task.status)) task.status = 'queued'
-        this.assess(group, unavailable)
-        if (slots(subtract(after, unavailable, step), step) >= before && this.demands(group).some(task => intersects(task, page))) throw new Error('The history source made no persisted coverage progress.')
+        if (result.unavailable) {
+          const observed = this.unavailable(query, result)
+          unavailable.push(...observed); freshUnavailable.push(...observed)
+        }
+        for (const task of participants) if (!terminal.has(task.status)) task.status = this.holds.has(task.id) && !this.rechecks.has(task.id) ? 'waiting' : 'queued'
+        this.assess(group, unavailable, undefined, freshUnavailable)
+        if (slots(subtract(after, selected.unavailableRanges, step), step) >= before && this.demands(group).some(task => intersects(task, page))) throw new Error('The history source made no persisted coverage progress.')
         for (const task of participants) if (!terminal.has(task.status)) { task.attempts = 0; task.lastError = null }
       }
       if (records.length) {
@@ -398,9 +493,10 @@ export class HistorySync {
         for (const task of this.demands(group)) if (task.status === 'running') task.status = 'queued'
         return
       }
-      for (const task of this.demands(group).filter(task => !entry.bounds || intersects(task, entry.bounds))) {
+      for (const task of this.demands(group).filter(task => (!entry.bounds || !this.holds.has(task.id)) && (!entry.bounds || intersects(task, entry.bounds)))) {
         task.attempts++; task.lastError = error instanceof Error ? error.message : String(error)
         task.status = task.attempts >= this.maxAttempts ? 'paused' : 'retry'
+        if (task.status === 'paused') this.holds.delete(task.id)
         const now = this.now(), retryAt = Number.isSafeInteger(error?.retryAt) ? error.retryAt : 0
         const retryAfter = Number.isFinite(error?.retryAfter) && error.retryAfter >= 0 ? Math.min(Number.MAX_SAFE_INTEGER, Math.ceil(now + error.retryAfter)) : 0
         task.nextAttemptAt = task.status === 'retry' ? Math.max(retryAt, retryAfter,
@@ -411,15 +507,21 @@ export class HistorySync {
     }
   }
 
-  assess(group, unavailable) {
-    const cached = this.coverageChecks.get(group.key)
-    if (!cached) return
+  assess(group, unavailable, coverage = [this.coverageChecks.get(group.key)], freshUnavailable = unavailable) {
     for (const task of this.demands(group)) {
+      // A released hold cannot use an in-flight page's older source proof.
+      if (this.rechecks.has(task.id)) continue
       // A newly admitted consumer outside this coverage read remains queued.
-      if (task.from < cached.from || task.through > cached.through) continue
-      this.measure(task, cached, unavailable)
+      const cached = coverage.find(value => value && task.from >= value.from && task.through <= value.through)
+      if (!cached) continue
+      const proof = this.isolated.has(task.id) ? [...task.unavailableRanges, ...freshUnavailable] : unavailable
+      this.measure(task, cached, proof)
+      // Coverage ranges are replaced via clipped/merged/subtract, never
+      // mutated. Holds share them and retain only an independent dirty list.
+      if (this.heldDownloads.has(task.id)) this.heldCoverage.set(task.id, { ...cached, dirty: cached.dirty.map(value => ({ ...value })) })
       const step = intervals[task.timeframe]
-      if (!subtract(task.remaining, task.unavailableRanges, step).length) {
+      if (this.holds.has(task.id)) task.status = 'waiting'
+      else if (!subtract(task.remaining, task.unavailableRanges, step).length) {
         task.status = task.remaining.length ? 'unavailable' : 'completed'; task.nextAttemptAt = null; task.attempts = 0; task.lastError = null
       }
       this.notify(task); this.settle(task)
@@ -435,7 +537,10 @@ export class HistorySync {
     task.coveredRecords = slots([task], step) - slots(task.remaining, step) - slots(coveredLeases, step)
     task.emptyRecords = slots(subtract(coveredLeases, task.unavailableRanges, step), step)
     task.unavailableRecords = slots(merged(unavailableMissing, step), step)
-    if (!task.inspected) task.localRecords = task.coveredRecords
+    if (this.heldDownloads.has(task.id)) {
+      const numeric = subtract([task], merged([...task.remaining, ...coveredLeases], step), step)
+      task.localRecords = slots(subtract(numeric, this.heldDownloads.get(task.id), step), step)
+    } else if (!task.inspected) task.localRecords = task.coveredRecords
     task.inspected = true
   }
   notify(task) { task.updatedAt = this.now(); try { Promise.resolve(this.onProgress?.(clone(task))).catch(() => undefined) } catch { /* Detached observer. */ } }
@@ -452,7 +557,7 @@ export class HistorySync {
   }
   prune() {
     const finished = [...this.tasks.values()].filter(task => terminal.has(task.status) && !this.waiters.has(task.id) && !this.controls.has(task.id))
-    for (const task of finished.slice(0, Math.max(0, finished.length - this.maxRetainedTerminalTasks))) { this.tasks.delete(task.id); this.group(task).tasks.delete(task.id) }
+    for (const task of finished.slice(0, Math.max(0, finished.length - this.maxRetainedTerminalTasks))) { this.holds.delete(task.id); this.rechecks.delete(task.id); this.isolated.delete(task.id); this.heldDownloads.delete(task.id); this.heldCoverage.delete(task.id); this.tasks.delete(task.id); this.group(task).tasks.delete(task.id) }
   }
   isIdle() { return !this.active.size && !this.controls.size && ![...this.tasks.values()].some(task => !terminal.has(task.status)) }
   settleIdle() { if (this.isIdle()) for (const waiter of this.idleWaiters.splice(0)) waiter.resolve() }
@@ -464,7 +569,12 @@ export class HistorySync {
     const error = new Error('HistorySync is closed.')
     for (const values of this.waiters.values()) for (const waiter of values) waiter.reject(error)
     this.waiters.clear(); for (const waiter of this.idleWaiters.splice(0)) waiter.reject(error)
-    this.closing = (async () => { await this.started?.catch(() => undefined); await Promise.all([...this.active.values()].map(entry => entry.promise)); await Promise.allSettled([...this.controls.values()]) })()
+    this.closing = (async () => {
+      await this.started?.catch(() => undefined)
+      await Promise.all([...this.active.values()].map(entry => entry.promise))
+      await Promise.allSettled([...this.controls.values()])
+      this.holds.clear(); this.rechecks.clear(); this.isolated.clear(); this.heldDownloads.clear(); this.heldCoverage.clear()
+    })()
     return this.closing
   }
 }

@@ -89,7 +89,10 @@ export class MarketStore {
   getDiagnostics(): { workerThreadIds: { writer: number; readers: number[] }; reads: Record<string, number>; writes: Record<string, number>; candleCache: { entries: number; estimatedBytes: number; pending: number; pendingKeyBytes: number }; migrationComplete: boolean; migrationProcessId: number | null }
   candleRevision(instrument: string, timeframe: string): number
   candlePriceRevision(instrument: string, timeframe: string): number
+  statisticsCoverageRevision(instrument: string, timeframe: string, source: 'oi' | 'taker'): number
+  statisticsCoverageChangesSince(instrument: string, timeframe: string, source: 'oi' | 'taker', revision: number): { revision: number; ranges: CandleRange[] | null }
   candleChangesSince(instrument: string, timeframe: string, revision: number): { revision: number; ranges: CandleRange[] | null }
+  candlePriceChangesSince(instrument: string, timeframe: string, revision: number): { revision: number; ranges: CandleRange[] | null }
   candles(query: CandleQuery, priority?: StorePriority): Promise<CandleRecord[]>
   candleWatermark(instrument: string, timeframe: string, priority?: StorePriority): Promise<string>
   priceWatermark(instrument: string, timeframe: string, priority?: StorePriority): Promise<string>

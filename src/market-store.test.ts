@@ -215,6 +215,70 @@ test('durable versions survive restart and same-batch revisions are deterministi
   } finally { await restarted?.close(); await f.close() }
 })
 
+test('price coverage versions ignore statistic writes and retain bounded changed ranges', async () => {
+  const f = await fixture()
+  try {
+    await f.store.appendCandles([candle(0), candle(1)])
+    const priceRevision = f.store.candlePriceRevision(query.instrument, query.timeframe)
+    await f.store.appendStatistics({ ...query, source: 'oi', values: [[base, 100]], expiresAt: Date.now() + 60_000 })
+    assert.equal(f.store.candlePriceRevision(query.instrument, query.timeframe), priceRevision)
+    assert.deepEqual(f.store.candlePriceChangesSince(query.instrument, query.timeframe, priceRevision), { revision: priceRevision, ranges: [] })
+    await f.store.appendCandles([candle(3), candle(4)])
+    await f.store.replaceCandles({ ...query, from: base, through: base }, [])
+    const latest = f.store.candlePriceRevision(query.instrument, query.timeframe)
+    assert.deepEqual(f.store.candlePriceChangesSince(query.instrument, query.timeframe, priceRevision), { revision: latest,
+      ranges: [{ from: base, through: base }, { from: base + 3 * step, through: base + 4 * step }] })
+    for (const invalid of [{}, { priceFrom: base, priceThrough: undefined }, { priceFrom: base - step, priceThrough: base }]) {
+      const before = f.store.candlePriceRevision(query.instrument, query.timeframe)
+      const takerBefore = f.store.statisticsCoverageRevision(query.instrument, query.timeframe, 'taker')
+      ;(f.store as any).committed([{ instrument: query.instrument, timeframe: query.timeframe, from: base, through: base, ...invalid }])
+      assert.deepEqual(f.store.candlePriceChangesSince(query.instrument, query.timeframe, before), { revision: before + 1, ranges: null })
+      assert.deepEqual(f.store.statisticsCoverageChangesSince(query.instrument, query.timeframe, 'taker', takerBefore), { revision: takerBefore + 1, ranges: null })
+    }
+    for (let index = 0; index < 257; index++) (f.store as any).committed([{ instrument: query.instrument, timeframe: query.timeframe,
+      from: base, through: base, priceFrom: base, priceThrough: base }])
+    const truncated = f.store.candlePriceRevision(query.instrument, query.timeframe)
+    assert.deepEqual(f.store.candlePriceChangesSince(query.instrument, query.timeframe, priceRevision), { revision: truncated, ranges: null })
+  } finally { await f.close() }
+})
+
+test('statistics coverage versions isolate sources and retain price-dependent taker invalidation', async () => {
+  const f = await fixture()
+  let restarted: MarketStore | undefined
+  try {
+    const version = (source: 'oi' | 'taker') => f.store.statisticsCoverageRevision(query.instrument, query.timeframe, source)
+    const changes = (source: 'oi' | 'taker', revision: number) => f.store.statisticsCoverageChangesSince(query.instrument, query.timeframe, source, revision)
+    await f.store.appendStatistics({ ...query, through: base, source: 'oi', values: [[base, 100]] })
+    assert.deepEqual([version('oi'), version('taker')], [1, 0])
+    await f.store.appendStatistics({ ...query, from: base + step, through: base + step, source: 'taker', values: [[base + step, 0, 0]] })
+    assert.deepEqual([version('oi'), version('taker')], [1, 1])
+    await f.store.appendCandles([candle(1)])
+    assert.deepEqual([version('oi'), version('taker')], [1, 2], 'Price can invalidate Taker zero or price-bound facts, but not OI.')
+    assert.equal((await f.store.statistics({ ...query, source: 'taker' }))[0].sell, null)
+    assert.deepEqual(changes('oi', 0), { revision: 1, ranges: [{ from: base, through: base }] })
+    assert.deepEqual(changes('taker', 0), { revision: 2, ranges: [{ from: base + step, through: base + step }] })
+    await f.store.appendStatistics({ ...query, from: base + 2 * step, through: base + 2 * step, source: 'oi', values: [], expiresAt: Date.now() + 60_000 })
+    assert.deepEqual([version('oi'), version('taker')], [2, 2], 'An empty OI lease changes only OI coverage.')
+    await (f.store as any).writer.request('append', [[{ ...candle(3), oi: 77, statisticsVersion: 9, writtenAt: 100 }], { importing: true }])
+    assert.deepEqual([version('oi'), version('taker')], [3, 3], 'Import records both its OI and its price effects.')
+    assert.deepEqual(changes('oi', 2), { revision: 3, ranges: [{ from: base + 3 * step, through: base + 3 * step }] })
+    await (f.store as any).writer.request('append', [[{ ...candle(1), oi: 55, statisticsVersion: 9, writtenAt: 101 }], { importing: true }])
+    assert.deepEqual([version('oi'), version('taker')], [4, 3], 'An OI-only import cannot invalidate Taker.')
+    const oiBeforeUnknown = version('oi'), takerBeforeUnknown = version('taker')
+    ;(f.store as any).committed([{ instrument: query.instrument, timeframe: query.timeframe, from: base + 4 * step,
+      through: base + 4 * step, priceFrom: null, priceThrough: null }])
+    assert.equal(changes('oi', oiBeforeUnknown).ranges, null)
+    assert.equal(changes('taker', takerBeforeUnknown).ranges, null)
+    const old = version('oi')
+    for (let index = 0; index < 257; index++) (f.store as any).committed([{ instrument: query.instrument, timeframe: query.timeframe,
+      from: base, through: base, priceFrom: null, priceThrough: null, oiFrom: base, oiThrough: base, takerFrom: null, takerThrough: null }])
+    assert.deepEqual(changes('oi', old), { revision: version('oi'), ranges: null })
+    await f.store.close(); restarted = await MarketStore.open(f.root)
+    assert.equal(restarted.statisticsCoverageRevision(query.instrument, query.timeframe, 'oi'), 0)
+    assert.equal((await restarted.statistics({ ...query, source: 'oi' })).find(value => value.timestamp === base)?.oi, 100)
+  } finally { await restarted?.close(); await f.close() }
+})
+
 test('checkpoint validity follows price corrections while statistics and later appends preserve earlier seeds', async () => {
   const f = await fixture()
   try {

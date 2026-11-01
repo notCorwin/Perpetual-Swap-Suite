@@ -66,10 +66,17 @@ export class MarketHistory {
     })
     this.sync = new HistorySync({
       store: {
-        missingCandleRanges: (query, priority) => this.missingSource(query, priority),
+        missingCandleRanges: (query, priority, options) => this.missingSource(query, priority, options),
         ...(typeof store.candleRevision === 'function' ? {
-          coverageVersion: query => store.candleRevision(query.instrument, query.timeframe),
-          ...(typeof store.candleChangesSince === 'function' ? { coverageChanges: (query, revision) => store.candleChangesSince(query.instrument, query.timeframe, revision) } : {}),
+          coverageVersion: query => query.source === 'candles' && typeof store.candlePriceRevision === 'function' && typeof store.candlePriceChangesSince === 'function'
+            ? store.candlePriceRevision(query.instrument, query.timeframe)
+            : query.source !== 'candles' && typeof store.statisticsCoverageRevision === 'function' && typeof store.statisticsCoverageChangesSince === 'function'
+              ? store.statisticsCoverageRevision(query.instrument, query.timeframe, query.source) : store.candleRevision(query.instrument, query.timeframe),
+          ...(typeof store.candleChangesSince === 'function' ? { coverageChanges: (query, revision) => query.source === 'candles'
+            && typeof store.candlePriceRevision === 'function' && typeof store.candlePriceChangesSince === 'function' ? store.candlePriceChangesSince(query.instrument, query.timeframe, revision)
+            : query.source !== 'candles' && typeof store.statisticsCoverageRevision === 'function' && typeof store.statisticsCoverageChangesSince === 'function'
+              ? store.statisticsCoverageChangesSince(query.instrument, query.timeframe, query.source, revision)
+              : store.candleChangesSince(query.instrument, query.timeframe, revision) } : {}),
         } : {}),
         coverageLeases: query => this.coverageLeaseReads.get(`${rangeKey(query)}:${query.source}`) ?? [],
       },
@@ -125,9 +132,9 @@ export class MarketHistory {
     }
   }
 
-  async missingSource(query, priority) {
+  async missingSource(query, priority, { materialize = true } = {}) {
     let rows = query.source === 'candles' ? await this.store.candles(query, priority) : await this.store.statistics(query, priority)
-    if (query.source === 'candles' && query.timeframe !== '5m' && this.derivePrices) {
+    if (materialize && query.source === 'candles' && query.timeframe !== '5m' && this.derivePrices) {
       const gaps = missing(rows, query.from, query.through, query.intervalMS, pricePresent)
       if (gaps.length) {
         for (const gap of gaps) await this.derivePrices({ instrument: query.instrument, timeframe: query.timeframe, ...gap }, priority)

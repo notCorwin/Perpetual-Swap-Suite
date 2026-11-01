@@ -2667,7 +2667,7 @@ test('covered focus navigation still publishes a known indicator failure for the
 })
 
 
-test('a failed cached price repair publishes its retry deadline through the encoder, store and controller, then recovers', async context => {
+test('a failed cached price repair publishes its retry deadline through the encoder, store and controller, then recovers', { timeout: 10_000 }, async context => {
   const now = Math.floor(Date.now() / interval) * interval + 1000
   context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
   const canonical = source(400), absent = canonical[380], retryAt = now + 7000
@@ -2688,10 +2688,27 @@ test('a failed cached price repair publishes its retry deadline through the enco
   const encoder = new ChartNotificationEncoder()
   const unsubscribe = pipeline.subscribe((frame: any) => controller.ingestPrepared(encoder.encode(frame)))
   const flush = async () => { for (let count = 0; count < 10; count++) await new Promise<void>(resolve => setImmediate(resolve)) }
+  const retryScheduled = deferred(), scheduleRefresh = pipeline.scheduleRefresh.bind(pipeline)
+  pipeline.scheduleRefresh = () => {
+    scheduleRefresh()
+    if ([...pipeline.repairDeadlines.values()].includes(retryAt)) retryScheduled.resolve()
+  }
+  const waitForView = (predicate: (view: ReturnType<typeof controller.getSnapshot>) => boolean) => new Promise<void>(resolve => {
+    const check = () => { if (predicate(controller.getSnapshot())) { stop(); resolve() } }
+    const stop = controller.subscribe(check)
+    check()
+  })
+  const failedView = waitForView(view => view.presented?.priceState === 'error' && view.presented.priceStatus?.retryAt === retryAt)
   await controller.setUniverse([instId], '15m', instId)
   const close = controller.open(instId, '15m')
   try {
-    await flush()
+    await failedView
+    await pipeline.focus.task
+    await Promise.allSettled([...pipeline.sourceTasks.values()].map((job: any) => job.task))
+    await finishSeed(pipeline)
+    // Source completion schedules the retry from a later setImmediate. Wait
+    // for the actual deadline to be installed before advancing fake time.
+    await retryScheduled.promise
     const failed = controller.getSnapshot(), frame = pipeline.cached(`${instId}:15m`)
     assert.equal(calls, 1); assert.equal(failed.pending, false)
     assert.equal(frame.error, 'Price endpoint offline'); assert.equal(frame.priceStatus.state, 'error'); assert.equal(frame.priceStatus.retryAt, retryAt)
@@ -2701,7 +2718,8 @@ test('a failed cached price repair publishes its retry deadline through the enco
     const cached = await pipeline.local(instId, '15m')
     assert.equal(cached.bars, frame.bars); assert.equal(cached.error, 'Price endpoint offline'); assert.equal(cached.priceStatus.retryAt, retryAt)
     context.mock.timers.tick(6999); await flush(); assert.equal(calls, 1)
-    context.mock.timers.tick(1); await flush()
+    const recoveredView = waitForView(view => view.presented?.bars.length === 96 && view.presented.priceState === 'ready')
+    context.mock.timers.tick(1); await recoveredView
     const recovered = controller.getSnapshot()
     assert.equal(calls, 2); assert.equal(recovered.presented?.bars.length, 96); assert.equal(recovered.presented?.priceState, 'ready')
     assert.equal(recovered.error, ''); assert.equal(recovered.presented?.priceStatus?.error, undefined)

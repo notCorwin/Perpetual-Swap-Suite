@@ -5,7 +5,7 @@ export type HistoryPriority = 'interactive' | 'foreground' | 'prepared' | 'repai
 export type HistoryRange = { from: number; through: number }
 export type HistoryCoverageLease = HistoryRange & { expiresAt: number }
 export type UnavailableHistoryRange = HistoryRange & { reason: string }
-export type HistoryTaskStatus = 'queued' | 'running' | 'retry' | 'paused' | 'cancelled' | 'completed' | 'unavailable'
+export type HistoryTaskStatus = 'queued' | 'running' | 'waiting' | 'retry' | 'paused' | 'cancelled' | 'completed' | 'unavailable'
 export type HistoryTask = HistoryRange & {
   schemaVersion: 1
   id: string
@@ -31,7 +31,7 @@ export type HistoryTask = HistoryRange & {
   emptyRecords: number
   /** Nonnumeric slots covered by explicit source evidence; numeric data takes precedence. */
   unavailableRecords: number
-  /** Numeric coverage observed at the consumer's first durable inspection. */
+  /** Numeric source coverage reused without this held consumer's direct source downloads; ordinary consumers retain their first inspection count. */
   localRecords: number
   inspected: boolean
   lastError: string | null
@@ -109,7 +109,9 @@ export class HistorySync {
   /** Start the process-local scheduler without restoring persisted demand. */
   start(): Promise<this>
   /** Create a finite process-local consumer. Overlapping and adjacent consumers share source coverage and API pages; cancellation removes only that consumer. */
-  enqueue(request: HistoryRequest): Promise<HistoryTask>
+  enqueue(request: HistoryRequest, options?: { hold?: boolean }): Promise<HistoryTask>
+  /** Release a held consumer, invalidate its coverage and recheck before source access or completion. */
+  release(id: string): boolean
   /** Remove delisted instruments' consumers without deleting durable facts. */
   removeTargets(instIds: Iterable<string>): Promise<void>
   /** Read detached snapshots. Terminal handles can expire from bounded result history. */
