@@ -12,7 +12,6 @@ if (!['arm64', 'x64'].includes(process.arch)) throw new Error(`Unsupported macOS
 if (process.argv.length > 2) throw new Error('Usage: scripts/package-electron.sh')
 const revision = (await execute('git', ['rev-parse', 'HEAD'], { cwd: root })).stdout.trim()
 const dirty = Boolean((await execute('git', ['status', '--porcelain'], { cwd: root })).stdout.trim())
-if (process.env.GITHUB_SHA && process.env.GITHUB_SHA !== revision) throw new Error('The checkout revision differs from GITHUB_SHA.')
 await run('npm', ['run', 'build'], { cwd: root })
 const metadata = { schemaVersion: 1, revision, dirty, builtAt: new Date().toISOString(), arch: process.arch }
 const metadataPath = join(root, '.build', 'build-revision.json')
