@@ -477,6 +477,231 @@ test('a failed iterative coverage recheck releases its reader and journal', asyn
   assert.deepEqual(await internal.missing(query, 'background'), [{ from: base, through: base + 2 * step }])
 })
 
+test('an exhausted checkpoint retains but rechecks a newer shared coverage snapshot', async t => {
+  const entered = deferred(), gate = deferred()
+  let reads = 0
+  const store = {
+    coverageVersion: () => 0,
+    async missingCandleRanges() {
+      if (++reads === 1) { entered.resolve(); await gate.promise }
+      return []
+    },
+  }
+  const sync = new HistorySync({ store, write: async () => {}, sources: { candles: { fetchGap: () => [] } } }) as any
+  t.after(() => { gate.resolve(); return sync.close() })
+  const stale = sync.missing(query, 'background', undefined, { maxAttempts: 1, returnCoverage: true })
+  await entered.promise
+  sync.invalidate({ ...query, from: base, through: base })
+  const fresh = await sync.missing(query, 'foreground', undefined, { returnCoverage: true })
+  const key = JSON.stringify([query.instrument, query.timeframe, query.source])
+  assert.equal(sync.coverageChecks.get(key), fresh.coverage)
+  gate.resolve()
+  assert.equal(await stale, null)
+  assert.equal(sync.coverageChecks.get(key), fresh.coverage, 'A different consumer’s snapshot is not evicted.')
+  assert.deepEqual(fresh.coverage.dirty, [{ from: query.from, through: query.through }], 'Its generation is conservatively rechecked.')
+})
+
+test('an exhausted checkpoint marks its unchanged shared snapshot dirty for version-only changes', async t => {
+  const entered = deferred(), gate = deferred()
+  let reads = 0, version = 0
+  const store = {
+    coverageVersion: () => version,
+    coverageChanges: () => ({ revision: version, ranges: [{ from: base, through: base }, { from: base + 2 * step, through: base + 2 * step }] }),
+    async missingCandleRanges() {
+      if (++reads === 2) { entered.resolve(); await gate.promise }
+      return []
+    },
+  }
+  const sync = new HistorySync({ store, write: async () => {}, sources: { candles: { fetchGap: () => [] } } }) as any
+  t.after(() => { gate.resolve(); return sync.close() })
+  const initial = await sync.missing(query, 'background', undefined, { returnCoverage: true })
+  const pinned = { ...initial.coverage, through: base + step, dirty: [{ from: base, through: base }] }
+  const stale = sync.missing({ ...query, through: base + step }, 'background', pinned, { maxAttempts: 1, returnCoverage: true })
+  await entered.promise
+  version++
+  gate.resolve()
+  assert.equal(await stale, null)
+  const key = JSON.stringify([query.instrument, query.timeframe, query.source])
+  assert.equal(sync.coverageChecks.get(key), initial.coverage)
+  assert.deepEqual(initial.coverage.dirty, [{ from: base, through: base + 2 * step }],
+    'The larger shared snapshot must be rechecked before reuse.')
+})
+
+test('unknown checkpoint evidence dirties all of a larger shared snapshot', async t => {
+  const entered = deferred(), gate = deferred()
+  let reads = 0, version = 0
+  const store = {
+    coverageVersion: () => version,
+    coverageChanges: () => ({ revision: version, ranges: null }),
+    async missingCandleRanges() {
+      if (++reads === 2) { entered.resolve(); await gate.promise }
+      return []
+    },
+  }
+  const sync = new HistorySync({ store, write: async () => {}, sources: { candles: { fetchGap: () => [] } } }) as any
+  t.after(() => { gate.resolve(); return sync.close() })
+  const initial = await sync.missing(query, 'background', undefined, { returnCoverage: true })
+  const pinned = { ...initial.coverage, through: base + step, dirty: [{ from: base, through: base }] }
+  const stale = sync.missing({ ...query, through: base + step }, 'background', pinned, { maxAttempts: 1, returnCoverage: true })
+  await entered.promise
+  version++
+  gate.resolve()
+  assert.equal(await stale, null)
+  assert.deepEqual(initial.coverage.dirty, [{ from: base, through: base + 2 * step }])
+})
+
+for (const mode of ['version-after', 'version-before', 'epoch-after'] as const) test(`an exhausted checkpoint rechecks shared data with ${mode} evidence`, async t => {
+  const entered = deferred(), gate = deferred()
+  let reads = 0, version = 0
+  const store = {
+    coverageVersion: () => version,
+    coverageChanges: () => ({ revision: version, ranges: [{ from: base, through: base }] }),
+    async missingCandleRanges() {
+      if (++reads === 1) { entered.resolve(); await gate.promise }
+      return []
+    },
+  }
+  const sync = new HistorySync({ store, write: async () => {}, sources: { candles: { fetchGap: () => [] } } }) as any
+  t.after(() => { gate.resolve(); return sync.close() })
+  const stale = sync.missing(query, 'background', undefined, { maxAttempts: 1, returnCoverage: true })
+  await entered.promise
+  if (mode === 'version-before') version++
+  const shared = await sync.missing(query, 'foreground', undefined, { returnCoverage: true })
+  if (mode === 'version-after') version++
+  if (mode === 'epoch-after') sync.invalidate({ ...query, from: base, through: base })
+  gate.resolve()
+  assert.equal(await stale, null)
+  const key = JSON.stringify([query.instrument, query.timeframe, query.source])
+  assert.equal(sync.coverageChecks.get(key), shared.coverage)
+  assert.deepEqual(shared.coverage.dirty, [{ from: query.from, through: query.through }])
+  const next = await sync.enqueue(query)
+  assert.equal(next.inspected, false, 'A dirty snapshot cannot provide optimistic progress to a new consumer.')
+  await sync.cancel(next.id)
+})
+
+test('a checkpoint dirtied during source inspection cannot complete from its stale snapshot', async t => {
+  const store = new MemoryStore(), inspectEntered = deferred(), inspectGate = deferred(), versionEntered = deferred(), versionGate = deferred()
+  const originalVersion = store.coverageVersion.bind(store)
+  let suspendVersion = false
+  ;(store as any).coverageVersion = async () => {
+    const snapshot = originalVersion()
+    if (suspendVersion) { suspendVersion = false; versionEntered.resolve(); await versionGate.promise }
+    return snapshot
+  }
+  ;(store as any).coverageChanges = () => ({ revision: store.version, ranges: [{ from: base, through: base }] })
+  let inspections = 0
+  const { sync, requests } = fixture({ store, sources: { candles: {
+    inspect: async () => { if (++inspections === 1) { inspectEntered.resolve(); await inspectGate.promise }; return {} },
+    fetchGap: request => { requests.push(request); return rows(request) },
+  } } })
+  t.after(() => { inspectGate.resolve(); versionGate.resolve(); return sync.close() })
+  await store.appendCandles(rows({ ...query, priority: 'background', getPriority: () => 'background', cursor: null, signal: new AbortController().signal }))
+  const task = await sync.enqueue(query); await inspectEntered.promise
+  suspendVersion = true
+  const checkpoint = (sync as any).missing(query, 'background', undefined, { maxAttempts: 1, returnCoverage: true })
+  await versionEntered.promise
+  store.values.delete(store.key({ ...query, timestamp: base })); store.version++
+  versionGate.resolve()
+  assert.equal(await checkpoint, null)
+  inspectGate.resolve()
+  const completed = await sync.waitFor(task.id)
+  assert.equal(completed.status, 'completed')
+  assert.deepEqual(requests.map(request => [request.from, request.through]), [[base, base]])
+  assert.ok(store.values.has(store.key({ ...query, timestamp: base })))
+})
+
+test('a checkpoint dirtied after a write recheck cannot complete from that stale snapshot', async t => {
+  const store = new MemoryStore(), postEntered = deferred(), postGate = deferred(), versionEntered = deferred(), versionGate = deferred()
+  const originalVersion = store.coverageVersion.bind(store)
+  let suspendVersion = false, written = false, postHeld = false
+  ;(store as any).coverageVersion = async () => {
+    const snapshot = originalVersion()
+    if (suspendVersion) { suspendVersion = false; versionEntered.resolve(); await versionGate.promise }
+    return snapshot
+  }
+  ;(store as any).coverageChanges = () => ({ revision: store.version, ranges: [{ from: base, through: base }] })
+  const { sync, requests } = fixture({ store, write: async (values, task) => { await store.appendSource(values, task.source); written = true } })
+  const originalMissing = (sync as any).missing.bind(sync)
+  ;(sync as any).missing = async (...args: any[]) => {
+    const result = await originalMissing(...args)
+    if (written && !postHeld) { postHeld = true; postEntered.resolve(); await postGate.promise }
+    return result
+  }
+  t.after(() => { postGate.resolve(); versionGate.resolve(); return sync.close() })
+  const task = await sync.enqueue(query); await postEntered.promise
+  suspendVersion = true
+  const checkpoint = originalMissing(query, 'background', undefined, { maxAttempts: 1, returnCoverage: true })
+  await versionEntered.promise
+  store.values.delete(store.key({ ...query, timestamp: base })); store.version++
+  versionGate.resolve()
+  assert.equal(await checkpoint, null)
+  postGate.resolve()
+  const completed = await sync.waitFor(task.id)
+  assert.equal(completed.status, 'completed')
+  assert.deepEqual(requests.map(request => [request.from, request.through]), [[base, base + 2 * step], [base, base]])
+  assert.ok(store.values.has(store.key({ ...query, timestamp: base })))
+})
+
+for (const globalCache of ['disjoint', 'absent'] as const) test(`an unknown checkpoint invalidates active inspection with ${globalCache} shared coverage`, async t => {
+  const store = new MemoryStore(), inspectEntered = deferred(), inspectGate = deferred(), versionEntered = deferred(), versionGate = deferred()
+  const originalVersion = store.coverageVersion.bind(store)
+  let suspendVersion = false, inspections = 0
+  ;(store as any).coverageVersion = async () => {
+    const snapshot = originalVersion()
+    if (suspendVersion) { suspendVersion = false; versionEntered.resolve(); await versionGate.promise }
+    return snapshot
+  }
+  ;(store as any).coverageChanges = () => ({ revision: store.version, ranges: [{ from: base, through: base + 10 * step }] })
+  const { sync, requests } = fixture({ store, sources: { candles: {
+    inspect: async () => { if (++inspections === 1) { inspectEntered.resolve(); await inspectGate.promise }; return {} },
+    fetchGap: request => { requests.push(request); return rows(request) },
+  } } })
+  t.after(() => { inspectGate.resolve(); versionGate.resolve(); return sync.close() })
+  const other = { ...query, from: base + 10 * step, through: base + 10 * step }
+  await store.appendCandles(rows({ ...query, priority: 'background', getPriority: () => 'background', cursor: null, signal: new AbortController().signal }))
+  const task = await sync.enqueue(query); await inspectEntered.promise
+  const internal = sync as any, key = JSON.stringify([query.instrument, query.timeframe, query.source])
+  await internal.missing(other, 'background')
+  assert.deepEqual([internal.coverageChecks.get(key).from, internal.coverageChecks.get(key).through], [other.from, other.through])
+  suspendVersion = true
+  const checkpoint = internal.missing(other, 'background', undefined, { maxAttempts: 1, returnCoverage: true })
+  await versionEntered.promise
+  store.values.delete(store.key({ ...query, timestamp: base })); store.version++
+  if (globalCache === 'absent') internal.coverageChecks.delete(key)
+  versionGate.resolve(); assert.equal(await checkpoint, null)
+  inspectGate.resolve()
+  assert.equal((await sync.waitFor(task.id)).status, 'completed')
+  assert.deepEqual(requests.map(request => [request.from, request.through]), [[base, base]])
+  assert.ok(store.values.has(store.key({ ...query, timestamp: base })))
+})
+
+test('an unknown checkpoint rechecks held coverage beyond the shared cache range', async t => {
+  const store = new MemoryStore(), versionEntered = deferred(), versionGate = deferred(), originalVersion = store.coverageVersion.bind(store)
+  let suspendVersion = false
+  ;(store as any).coverageVersion = async () => {
+    const snapshot = originalVersion()
+    if (suspendVersion) { suspendVersion = false; versionEntered.resolve(); await versionGate.promise }
+    return snapshot
+  }
+  ;(store as any).coverageChanges = () => ({ revision: store.version, ranges: [{ from: base, through: base + 10 * step }] })
+  const { sync, requests } = fixture({ store }); t.after(() => { versionGate.resolve(); return sync.close() })
+  await store.appendCandles(rows({ ...query, priority: 'background', getPriority: () => 'background', cursor: null, signal: new AbortController().signal }))
+  const held = await sync.enqueue(query, { hold: true })
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting')
+  assert.equal(sync.getTask(held.id)?.coveredRecords, 3)
+  const other = { ...query, from: base + 10 * step, through: base + 10 * step }, internal = sync as any
+  await internal.missing(other, 'background')
+  suspendVersion = true
+  const checkpoint = internal.missing(other, 'background', undefined, { maxAttempts: 1, returnCoverage: true })
+  await versionEntered.promise
+  store.values.delete(store.key({ ...query, timestamp: base })); store.version++
+  versionGate.resolve(); assert.equal(await checkpoint, null)
+  await waitFor(() => sync.getTask(held.id)?.status === 'waiting' && sync.getTask(held.id)?.coveredRecords === 2)
+  assert.deepEqual(sync.getTask(held.id)?.remaining, [{ from: base, through: base }])
+  assert.equal(requests.length, 0)
+  await sync.cancel(held.id)
+})
+
 test('releasing during suspended inspection cannot complete from stale local coverage', async t => {
   const entered = deferred(), gate = deferred(), store = new MemoryStore(), requests: HistorySourceQuery[] = []
   let inspections = 0
@@ -899,6 +1124,182 @@ test('cancelling one consumer leaves another consumer and the shared fetch activ
   gate.resolve()
   assert.equal((await sync.waitFor(second.id)).status, 'completed')
   assert.equal(store.values.size, 3)
+})
+
+for (const shared of [false, true]) test(`accepted write cancellation stays bounded under permanent invalidation (shared=${shared})`, async t => {
+  const store = new MemoryStore(), original = store.missingCandleRanges.bind(store), entered = deferred(), gate = deferred()
+  let written = false, changing = true, reads = 0, fetches = 0, sourceSignal: AbortSignal | undefined
+  const { sync } = fixture({ store, sources: { candles: { fetchGap: request => { fetches++; sourceSignal = request.signal; return rows(request) } } },
+    write: async (records, task) => { entered.resolve(); await gate.promise; await store.appendSource(records, task.source); written = true } })
+  store.missingCandleRanges = async request => {
+    const snapshot = await original(request)
+    if (written && changing) { reads++; sync.invalidate({ ...query, from: base, through: base }); await new Promise(resolve => setImmediate(resolve)) }
+    return snapshot
+  }
+  t.after(async () => { changing = false; gate.resolve(); await sync.close() })
+  const first = await sync.enqueue(query), second = shared ? await sync.enqueue(query) : null
+  await entered.promise
+  let settled = false
+  const stopped = sync.cancel(first.id).then(result => { settled = true; return result })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(settled, false, 'Cancellation must wait for the admitted write.')
+  if (shared) assert.equal(sourceSignal?.aborted, false, 'Cancelling one consumer cannot abort shared work.')
+  assert.equal(store.values.size, 0)
+  gate.resolve()
+  let timer: ReturnType<typeof setTimeout>
+  const result = await Promise.race([stopped, new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), 1000) })])
+  clearTimeout(timer!)
+  assert.ok(result, 'Cancellation must not wait for permanently changing coverage.')
+  assert.equal(store.values.size, 3, 'The acknowledged write remains durable.')
+  assert.deepEqual([result.status, result.writtenRecords, result.coveredRecords, result.emptyRecords, result.unavailableRecords, result.localRecords],
+    ['cancelled', 3, 0, 0, 0, 0])
+  assert.deepEqual(result.remaining, [{ from: query.from, through: query.through }])
+  assert.ok(reads > 0)
+  changing = false
+  if (second) assert.equal((await sync.waitFor(second.id)).status, 'completed')
+  await sync.whenIdle()
+  assert.equal(fetches, 1)
+  assert.equal((sync as any).coverageReaders.size, 0)
+  assert.equal((sync as any).coverageInvalidations.size, 0)
+})
+
+test('close joins an accepted write but does not wait for permanently changing coverage', async t => {
+  const store = new MemoryStore(), original = store.missingCandleRanges.bind(store), entered = deferred(), gate = deferred()
+  let written = false, changing = true
+  const { sync } = fixture({ store, write: async (records, task) => { entered.resolve(); await gate.promise; await store.appendSource(records, task.source); written = true } })
+  store.missingCandleRanges = async request => {
+    const snapshot = await original(request)
+    if (written && changing) { sync.invalidate({ ...query, from: base, through: base }); await new Promise(resolve => setImmediate(resolve)) }
+    return snapshot
+  }
+  t.after(async () => { changing = false; gate.resolve(); await sync.close() })
+  await sync.enqueue(query); await entered.promise
+  let closed = false
+  const closing = sync.close().then(() => { closed = true })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(closed, false, 'Close must join an admitted write.')
+  gate.resolve()
+  let timer: ReturnType<typeof setTimeout>
+  const complete = await Promise.race([closing.then(() => true), new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), 1000) })])
+  clearTimeout(timer!)
+  assert.equal(complete, true)
+  assert.equal(store.values.size, 3)
+  assert.equal((sync as any).active.size, 0)
+  assert.equal((sync as any).coverageReaders.size, 0)
+})
+
+test('a failed accepted write still settles cancellation without inventing coverage', async t => {
+  const store = new MemoryStore(), entered = deferred(), gate = deferred()
+  const { sync } = fixture({ store, write: async () => { entered.resolve(); await gate.promise; throw new Error('Injected write failure.') } })
+  t.after(() => { gate.resolve(); return sync.close() })
+  const task = await sync.enqueue(query); await entered.promise
+  const stopping = sync.cancel(task.id); gate.resolve()
+  const result = await stopping
+  assert.deepEqual([result.status, result.writtenRecords, result.coveredRecords, result.emptyRecords, result.unavailableRecords], ['cancelled', 0, 0, 0, 0])
+  assert.equal(store.values.size, 0)
+  await sync.whenIdle()
+})
+
+test('a failed post-write checkpoint retains the durable count without claiming coverage', async t => {
+  const store = new MemoryStore(), original = store.missingCandleRanges.bind(store), entered = deferred(), gate = deferred()
+  let written = false
+  const { sync } = fixture({ store, write: async (records, task) => { entered.resolve(); await gate.promise; await store.appendSource(records, task.source); written = true } })
+  store.missingCandleRanges = async request => {
+    if (written) throw new Error('Injected checkpoint failure.')
+    return original(request)
+  }
+  t.after(() => { gate.resolve(); return sync.close() })
+  const task = await sync.enqueue(query); await entered.promise
+  const stopping = sync.cancel(task.id); gate.resolve()
+  await assert.rejects(stopping, /Injected checkpoint failure/)
+  await sync.whenIdle()
+  const result = sync.getTask(task.id)!
+  assert.deepEqual([result.status, result.writtenRecords, result.coveredRecords, result.emptyRecords, result.unavailableRecords], ['cancelled', 3, 0, 0, 0])
+  assert.deepEqual(result.remaining, [{ from: query.from, through: query.through }])
+  assert.equal(store.values.size, 3)
+  assert.equal((sync as any).coverageReaders.size, 0)
+})
+
+for (const action of ['cancel', 'close'] as const) test(`${action} stops a coverage read under continuous invalidation`, async t => {
+  const store = new MemoryStore(), original = store.missingCandleRanges.bind(store), entered = deferred()
+  const { sync } = fixture({ store }), internal = sync as any
+  let reads = 0, changing = true
+  store.missingCandleRanges = async request => {
+    const snapshot = await original(request)
+    reads++; entered.resolve()
+    if (changing) {
+      sync.invalidate({ ...query, from: base, through: base })
+      await new Promise(resolve => setImmediate(resolve))
+    }
+    return snapshot
+  }
+  t.after(async () => { changing = false; await sync.close() })
+  const task = await sync.enqueue(query); await entered.promise
+  const stopping = action === 'cancel' ? sync.cancel(task.id).then(() => sync.whenIdle()) : sync.close()
+  let timer: ReturnType<typeof setTimeout>
+  const stopped = await Promise.race([stopping.then(() => true), new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), 1000) })])
+  clearTimeout(timer!)
+  if (!stopped) changing = false
+  assert.equal(stopped, true, `${action} must not wait for invalidations to stop.`)
+  const stoppedAt = reads
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(reads, stoppedAt)
+  assert.equal(internal.active.size, 0)
+  assert.equal(internal.coverageReaders.size, 0)
+  assert.equal(internal.coverageInvalidations.size, 0)
+})
+
+test('cancelling one shared consumer preserves another through continuously changing coverage', async t => {
+  const store = new MemoryStore(), original = store.missingCandleRanges.bind(store), entered = deferred()
+  const { sync } = fixture({ store })
+  let reads = 0, changing = true
+  store.missingCandleRanges = async request => {
+    const snapshot = await original(request)
+    reads++; entered.resolve()
+    if (changing) {
+      sync.invalidate({ ...query, from: base, through: base })
+      await new Promise(resolve => setImmediate(resolve))
+    }
+    return snapshot
+  }
+  t.after(async () => { changing = false; await sync.close() })
+  const [first, second] = await Promise.all([sync.enqueue(query), sync.enqueue(query)])
+  await entered.promise
+  assert.equal((await sync.cancel(first.id)).status, 'cancelled')
+  await waitFor(() => reads >= 3)
+  changing = false
+  assert.equal((await sync.waitFor(second.id)).status, 'completed')
+  assert.equal(store.values.size, 3)
+  await sync.whenIdle()
+})
+
+test('a cancelled accepted write still retries its durable checkpoint during invalidation', async t => {
+  const store = new MemoryStore(), original = store.missingCandleRanges.bind(store), entered = deferred(), gate = deferred()
+  let written = false, checkpointReads = 0
+  const { sync } = fixture({ store, write: async (records, task) => {
+    entered.resolve(); await gate.promise; await store.appendSource(records, task.source); written = true
+  } })
+  store.missingCandleRanges = async request => {
+    const snapshot = await original(request)
+    if (written && checkpointReads++ < 4) {
+      sync.invalidate({ ...query, from: base, through: base })
+      await new Promise(resolve => setImmediate(resolve))
+    }
+    return snapshot
+  }
+  t.after(() => { gate.resolve(); return sync.close() })
+  const task = await sync.enqueue(query); await entered.promise
+  let stopped = false
+  const cancelled = sync.cancel(task.id).then(value => { stopped = true; return value })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(stopped, false, 'An accepted write still owns its durable completion.')
+  gate.resolve()
+  const result = await cancelled
+  assert.deepEqual([result.status, result.coveredRecords, result.writtenRecords], ['cancelled', 3, 3])
+  assert.equal(store.values.size, 3)
+  assert.ok(checkpointReads >= 5, 'Transient invalidations are rechecked before reporting coverage.')
+  await sync.whenIdle()
+  assert.equal((sync as any).coverageReaders.size, 0)
 })
 
 test('cancellation during an accepted durable write cannot undo facts or revive the consumer', async t => {

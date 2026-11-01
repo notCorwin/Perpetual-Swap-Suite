@@ -96,6 +96,32 @@ test('a price commit racing the compact coverage read is rechecked before fetchi
   assert.equal(calls.length, 0)
 })
 
+test('a real SQLite write survives cancellation when later coverage never stabilizes', async t => {
+  const { history, store } = await fixture(t), sync = history.sync as any
+  const entered = deferred(), gate = deferred(), write = sync.write.bind(sync), read = sync.store.missingCandleRanges.bind(sync.store)
+  let written = false, changing = true
+  sync.write = async (...args: any[]) => { entered.resolve(); await gate.promise; await write(...args); written = true }
+  sync.store.missingCandleRanges = async (request: any, priority: any, options: any) => {
+    const result = await read(request, priority, options)
+    if (written && changing) sync.invalidate({ instrument: instId, timeframe: '5m', source: 'candles', from: base, through: base })
+    return result
+  }
+  try {
+    const task = await sync.enqueue({ instrument: instId, timeframe: '5m', source: 'candles', from: base, through: base, priority: 'background' })
+    await entered.promise
+    const cancelled = sync.cancel(task.id)
+    gate.resolve()
+    let timer: ReturnType<typeof setTimeout>
+    const result = await Promise.race([cancelled, new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), 2000) })])
+    clearTimeout(timer!)
+    assert.ok(result, 'Cancellation cannot wait indefinitely for coverage to stabilize.')
+    assert.deepEqual([result.status, result.writtenRecords, result.coveredRecords, result.emptyRecords, result.unavailableRecords], ['cancelled', 1, 0, 0, 0])
+    assert.deepEqual(result.remaining, [{ from: base, through: base }])
+    assert.equal((await store.candles({ instrument: instId, timeframe: '5m', from: base, through: base })).length, 1)
+    assert.equal(sync.coverageReaders.size, 0)
+  } finally { changing = false; gate.resolve() }
+})
+
 test('OI mutation racing a local coverage read is rechecked before any network request', async t => {
   const { history, store, calls } = await fixture(t)
   const entered = deferred(), gate = deferred(), read = store.statistics.bind(store)

@@ -7,6 +7,7 @@ const priorities = { interactive: 4, foreground: 4, prepared: 4, repair: 4, cont
 const MAX_SHARED_COVERAGE_SLOTS = 2400
 const MAX_COVERAGE_INVALIDATIONS = 256
 const MAX_ACTIVE_COVERAGE_JOURNALS = 128
+const MAX_CHECKPOINT_ATTEMPTS = 32
 const clone = value => structuredClone(value)
 const integer = (value, name, minimum = 0) => {
   if (!Number.isSafeInteger(value) || value < minimum) throw new TypeError(`${name} must be a safe integer of at least ${minimum}.`)
@@ -193,11 +194,23 @@ export class HistorySync {
     // An admitted durable mutation owns its completion even after its last
     // consumer stops. Never wait for a shared page still on the network.
     const stopped = Promise.resolve().then(async () => {
+      const unverified = () => {
+        task.remaining = [{ from: task.from, through: task.through }]
+        task.unavailableRanges = []
+        task.coveredRecords = 0; task.emptyRecords = 0; task.unavailableRecords = 0; task.localRecords = 0; task.inspected = false
+      }
       try {
         await entry.writePromise.catch(() => undefined)
-        await this.missing(task, task.priority)
-        this.measure(task, this.coverageChecks.get(group.key), this.rechecks.has(task.id) ? [] : this.isolated.has(task.id)
+        const checkpoint = await this.missing(task, task.priority, undefined, { maxAttempts: MAX_CHECKPOINT_ATTEMPTS, returnCoverage: true })
+        if (!checkpoint || this.coverageChecks.get(group.key) !== checkpoint.coverage || checkpoint.coverage.dirty.length) {
+          // A changing range cannot be reported as verified. The acknowledged
+          // write count remains durable, and later requests can recheck it.
+          unverified()
+        } else this.measure(task, checkpoint.coverage, this.rechecks.has(task.id) ? [] : this.isolated.has(task.id)
           ? [...task.unavailableRanges, ...(entry.freshUnavailable ?? [])] : [...task.unavailableRanges, ...entry.unavailable])
+      } catch (error) {
+        unverified()
+        throw error
       } finally {
         this.controls.delete(id)
         this.notify(task); this.settle(task); this.prune(); this.kick(); this.settleIdle()
@@ -285,13 +298,17 @@ export class HistorySync {
     if (wake) this.kick()
   }
 
-  async missing(query, requestPriority, pinned, { materializeRanges = [query] } = {}) {
+  async missing(query, requestPriority, pinned, { materializeRanges = [query], signal, maxAttempts = Infinity, returnCoverage = false } = {}) {
     const key = seriesKey(query), step = intervals[query.timeframe]
     let previous = pinned ?? this.coverageChecks.get(key)
     this.coverageReaders.set(key, (this.coverageReaders.get(key) ?? 0) + 1)
     try {
+      let attempts = 0
       while (true) {
+        attempts++
+        signal?.throwIfAborted()
         const epoch = this.coverageEpochs.get(key) ?? 0, version = await this.store.coverageVersion?.(query)
+        signal?.throwIfAborted()
         // A series has one coverage cache shared by every active consumer.
         // Only consumers intersecting this read can extend its shared window.
         // A held archive range and an unrelated old/new interactive range must
@@ -309,15 +326,18 @@ export class HistorySync {
         refresh.push(...materializedBounds.flatMap(value => clipped(unmaterialized, value)))
         if (previous && (version === undefined || previous.version !== version)) {
           const changed = version === undefined ? null : await this.store.coverageChanges?.(query, previous.version)
+          signal?.throwIfAborted()
           refresh.push(...clipped(changed && changed.revision === version && validRanges(changed.ranges, step) ? changed.ranges : [bounds], bounds))
         }
         const requested = merged(refresh, step)
         const portions = [...materializedBounds.flatMap(value => clipped(requested, value)).map(value => ({ ...value, materialize: true })),
           ...subtract(requested, materializedBounds, step).map(value => ({ ...value, materialize: false }))]
         for (const portion of portions) {
+          signal?.throwIfAborted()
           const request = { ...descriptor(query), ...portion, intervalMS: step }
           delete request.materialize
           const result = await this.store.missingCandleRanges(request, requestPriority, { materialize: portion.materialize })
+          signal?.throwIfAborted()
           if (!Array.isArray(result)) throw new TypeError('store.missingCandleRanges must return an array.')
           const checked = result.map(value => range(value, step))
           if (checked.some(value => value.from < portion.from || value.through > portion.through)) throw new TypeError('Store gaps must be inside the requested range.')
@@ -333,6 +353,7 @@ export class HistorySync {
         }
         const cached = { ...bounds, version, remaining: gaps, leases, unmaterialized, dirty: [] }
         const afterVersion = await this.store.coverageVersion?.(query), afterEpoch = this.coverageEpochs.get(key) ?? 0
+        signal?.throwIfAborted()
         let dirty = []
         if (epoch !== afterEpoch) {
           const journal = this.coverageInvalidations.get(key), changes = Array.isArray(journal) && journal.every(change => change && Number.isSafeInteger(change.epoch))
@@ -344,15 +365,23 @@ export class HistorySync {
         if (version !== afterVersion) {
           const changed = Number.isSafeInteger(version) && Number.isSafeInteger(afterVersion) && afterVersion > version
             ? await this.store.coverageChanges?.(query, version) : null
+          signal?.throwIfAborted()
           const validChanges = changed && changed.revision === afterVersion && validRanges(changed.ranges, step)
           if (!validChanges || afterVersion !== await this.store.coverageVersion?.(query)) dirty = [bounds]
           else dirty.push(...changed.ranges)
+          signal?.throwIfAborted()
         }
         if (afterEpoch !== (this.coverageEpochs.get(key) ?? 0)) dirty = [bounds]
         cached.dirty = merged(clipped(dirty, bounds), step)
+        if (cached.dirty.length && attempts >= maxAttempts) {
+          // The changed range is not trustworthy. Retire all shared and held
+          // coverage for this series, including any in-flight inspection.
+          this.invalidate({ ...descriptor(query), from: 0, through: Math.floor(Number.MAX_SAFE_INTEGER / step) * step })
+          return null
+        }
         this.coverageChecks.set(key, cached)
         if (cached.dirty.length) { previous = cached; continue }
-        return clipped(gaps, query)
+        return returnCoverage ? { ranges: clipped(gaps, query), coverage: cached } : clipped(gaps, query)
       }
     } finally {
       const readers = this.coverageReaders.get(key) - 1
@@ -457,7 +486,9 @@ export class HistorySync {
         // Its initial inspection and release still materialize all derivable
         // prices before the consumer can complete or fetch from the source.
         const materializeRanges = initial.filter(task => !this.holds.has(task.id) || !this.heldCoverage.has(task.id))
-        const raw = await this.missing(query, query.priority, pinned, { materializeRanges })
+        // Initial coverage may stop when its source demand is withdrawn.
+        // An accepted write still completes before its bounded checkpoint.
+        const raw = await this.missing(query, query.priority, pinned, { materializeRanges, signal })
         // missing() also reads retained consumers' ranges to share coverage.
         // Any of those ranges may be assessed after inspection, even when
         // they do not intersect the currently selected consumer's bounds.
@@ -471,7 +502,7 @@ export class HistorySync {
         // A hold can be released, or a mutation can invalidate this range,
         // while source inspection is suspended. Never complete a consumer
         // from the coverage snapshot that preceded that change.
-        if (entry.inspectionInvalidated) return
+        if (entry.inspectionInvalidated || observedCoverage.some(value => value.dirty.length)) return
         unavailable.push(...excluded); freshUnavailable.push(...excluded); gaps.push(...subtract(raw, freshUnavailable, step))
       }
       // A foreground consumer may arrive while a progress-only read is in
@@ -515,37 +546,46 @@ export class HistorySync {
       const before = slots(clipped(gaps, page), step)
       entry.unavailable = unavailable
       entry.freshUnavailable = freshUnavailable
-      const commit = async () => {
-        if (records.length) {
-          // Once a write is admitted, cancellation cannot abandon its durable facts.
-          await this.write(records, { ...clone(selected), ...page, priority: query.getPriority() })
-          // A hold can arrive after this page started or be cancelled while
-          // its admitted durable write drains. Both still own this checkpoint.
-          const holders = [...group.tasks].map(id => this.tasks.get(id)).filter(task => task && this.heldDownloads.has(task.id)
-            && (!terminal.has(task.status) || this.controls.has(task.id)))
-          for (const task of holders) {
-            const fetched = records.filter(row => row.timestamp >= task.from && row.timestamp <= task.through)
-              .map(row => ({ from: row.timestamp, through: row.timestamp }))
-            this.heldDownloads.set(task.id, merged([...this.heldDownloads.get(task.id), ...fetched], step))
-          }
-          this.invalidate({ ...query, from: Math.min(...records.map(row => row.timestamp)), through: Math.max(...records.map(row => row.timestamp)) })
-          for (const task of participants) task.writtenRecords += records.filter(row => row.timestamp >= task.from && row.timestamp <= task.through).length
-        }
-        const after = await this.missing(query, selected.priority)
+      const observeUnavailable = () => {
         if (result.unavailable) {
           const observed = this.unavailable(query, result)
           unavailable.push(...observed); freshUnavailable.push(...observed)
         }
+      }
+      const persist = async () => {
+        // The physical write and its facts settle even if all demand stops.
+        await this.write(records, { ...clone(selected), ...page, priority: query.getPriority() })
+        // A hold can arrive after this page started or be cancelled while
+        // its admitted durable write drains. Both still own this checkpoint.
+        const holders = [...group.tasks].map(id => this.tasks.get(id)).filter(task => task && this.heldDownloads.has(task.id)
+          && (!terminal.has(task.status) || this.controls.has(task.id)))
+        for (const task of holders) {
+          const fetched = records.filter(row => row.timestamp >= task.from && row.timestamp <= task.through)
+            .map(row => ({ from: row.timestamp, through: row.timestamp }))
+          this.heldDownloads.set(task.id, merged([...this.heldDownloads.get(task.id), ...fetched], step))
+        }
+        this.invalidate({ ...query, from: Math.min(...records.map(row => row.timestamp)), through: Math.max(...records.map(row => row.timestamp)) })
+        for (const task of participants) task.writtenRecords += records.filter(row => row.timestamp >= task.from && row.timestamp <= task.through).length
+        observeUnavailable()
+      }
+      const assessWrite = async () => {
+        // This source read can stop after its demand is withdrawn. A stopped
+        // consumer separately verifies its accepted write with a bounded read.
+        const checked = await this.missing(query, selected.priority, undefined, { signal, returnCoverage: true })
+        // Another reader may have dirtied or replaced the result while this
+        // continuation was waiting. Requeue instead of using mixed snapshots.
+        if (checked.coverage.dirty.length || this.coverageChecks.get(group.key) !== checked.coverage) return
+        const after = checked.ranges
         for (const task of participants) if (!terminal.has(task.status)) task.status = this.holds.has(task.id) && !this.rechecks.has(task.id) ? 'waiting' : 'queued'
-        this.assess(group, unavailable, undefined, freshUnavailable)
+        this.assess(group, unavailable, [checked.coverage], freshUnavailable)
         if (slots(subtract(after, selected.unavailableRanges, step), step) >= before && this.demands(group).some(task => intersects(task, page))) throw new Error('The history source made no persisted coverage progress.')
         for (const task of participants) if (!terminal.has(task.status)) { task.attempts = 0; task.lastError = null }
       }
       if (records.length) {
         entry.writing = true
-        entry.writePromise = commit().finally(() => { entry.writing = false })
-        await entry.writePromise
-      } else await commit()
+        entry.writePromise = persist()
+        try { await entry.writePromise; await assessWrite() } finally { entry.writing = false }
+      } else { observeUnavailable(); await assessWrite() }
 
     } catch (error) {
       if (signal.aborted || this.closed) {
@@ -571,7 +611,7 @@ export class HistorySync {
       // A released hold cannot use an in-flight page's older source proof.
       if (this.rechecks.has(task.id)) continue
       // A newly admitted consumer outside this coverage read remains queued.
-      const cached = coverage.find(value => value && task.from >= value.from && task.through <= value.through)
+      const cached = coverage.find(value => value && !value.dirty.length && task.from >= value.from && task.through <= value.through)
       if (!cached) continue
       const proof = this.isolated.has(task.id) ? [...task.unavailableRanges, ...freshUnavailable] : unavailable
       this.measure(task, cached, proof)
