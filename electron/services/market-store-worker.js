@@ -142,7 +142,7 @@ function writeStatistic(series, source, timestamp, first, second, expiresAt, cha
 function append(rows, { importing = false, replacement, partition } = {}) {
   if (!Array.isArray(rows)) throw new TypeError('Candles must be an array.')
   rows.forEach(validateCandle)
-  const changes = new Map(), seriesCache = new Map(), bounds = new Set()
+  const changes = new Map(), seriesCache = new Map(), bounds = new Set(), additions = new Map()
   const unique = new Map(rows.map(row => [`${row.instrument}:${row.timeframe}:${row.timestamp}`, row]))
   return transaction(() => {
     if (replacement) {
@@ -169,7 +169,12 @@ function append(rows, { importing = false, replacement, partition } = {}) {
         row.open, row.high, row.low, row.close, row.volume, row.baseVolume ?? null, row.quoteVolume ?? null, importing ? importVersion : Date.now(), importing ? 0 : 1, importVersion)
         mutate(changes, series, row.timestamp, true)
         if (!previous) {
-          run('UPDATE series SET candle_count=candle_count+1, first_ts=MIN(COALESCE(first_ts,?),?), last_ts=MAX(COALESCE(last_ts,?),?) WHERE id=?', row.timestamp, row.timestamp, row.timestamp, row.timestamp, series.id)
+          const added = additions.get(series.id)
+          if (added) {
+            added.count += 1
+            added.first = Math.min(added.first, row.timestamp)
+            added.last = Math.max(added.last, row.timestamp)
+          } else additions.set(series.id, { count: 1, first: row.timestamp, last: row.timestamp })
         }
       } else if (!importing && (previous?.origin === 0 || previous?.origin === DERIVED_CANDLE_ORIGIN)) {
         run('UPDATE candles SET origin=1,import_version=0 WHERE series_id=? AND timestamp=?', series.id, row.timestamp)
@@ -182,6 +187,10 @@ function append(rows, { importing = false, replacement, partition } = {}) {
         writeStatistic(series, 2, row.timestamp, volumes?.sell ?? null, volumes?.buy ?? null, row.statisticsTakerExpiresAt ?? null, changes,
           { importing, importVersion, observedAt: row.statisticsTakerObservedAt ?? (importing ? importVersion : row.writtenAt ?? (volumes ? Date.now() : 0)) })
       }
+    }
+    for (const [id, added] of additions) if (!bounds.has(id)) {
+      run('UPDATE series SET candle_count=candle_count+?, first_ts=MIN(COALESCE(first_ts,?),?), last_ts=MAX(COALESCE(last_ts,?),?) WHERE id=?',
+        added.count, added.first, added.first, added.last, added.last, id)
     }
     for (const id of bounds) refreshBounds(id)
     if (partition) {

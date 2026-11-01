@@ -367,6 +367,12 @@ export class MarketService {
       onUnsubscribed: (instId, channel, context) => {
         if (channel === 'tickers') this.tickerDisconnected([instId], context)
         if (channel === 'books') this.bookUnsubscribed(instId)
+        if (channel === 'open-interest') {
+          const observations = this.observations.get(instId)
+          if (observations?.openInterest?.source === 'websocket') delete observations.openInterest
+          this.liveStatistics.clearInterest(instId)
+          this.scheduleLiveStatistics(instId)
+        }
         if (channel === 'trades') {
           this.liveStatistics.disconnect([instId], context.receivedAt)
           this.scheduleLiveStatistics(instId)
@@ -522,6 +528,7 @@ export class MarketService {
     if (ids.size === this.listedUniverse.size && [...ids].every(id => this.listedUniverse.has(id))) return
     this.listedUniverse = ids
     this.preparedCharts.setUniverse([...ids])
+    this.scheduleSubscriptions()
   }
 
   /** Reuse one canonical projection until its market facts or freshness proof change. */
@@ -1528,7 +1535,7 @@ export class MarketService {
     }
     if (collectorChanged) this.realtime.setSubscriptions([...subscriptions.values()])
     const config = this.prefs().liquidity, configKey = JSON.stringify(config), now = Date.now()
-    const books = new Set(), trades = new Set()
+    const books = new Set(), trades = new Set(), openInterest = new Set()
     const prerequisites = Object.entries(LIQUIDITY_SOURCE_CRITERIA).filter(([source]) => source !== 'book')
       .flatMap(([source, criteria]) => criteria.filter(key => config[key].enabled).map(key => ({ key, source })))
     for (const instId of ids) {
@@ -1547,14 +1554,15 @@ export class MarketService {
         }
       } else this.bookRetirements.delete(instId)
       if (this.statisticsDemand(instId)) trades.add(instId)
+      if (config.openInterest.enabled || this.statisticsDemand(instId)) openInterest.add(instId)
     }
     const previous = this.publicSubscriptionDemand
     const same = (left, right) => left && left.size === right.size && [...right].every(id => left.has(id))
-    if (this.publicRealtime && (!previous || !same(previous.books, books) || !same(previous.trades, trades)
+    if (this.publicRealtime && (!previous || !same(previous.books, books) || !same(previous.trades, trades) || !same(previous.openInterest, openInterest)
       || this.publicRealtime.instruments.size !== ids.size || [...ids].some(id => !this.publicRealtime.instruments.has(id)))) {
       for (const instId of books) if (!previous?.books.has(instId)) this.nativeBookDeadlines.set(instId, now + TICKER_BOOTSTRAP_MS)
-      this.publicRealtime.setSubscriptions([...ids], { books, trades })
-      this.publicSubscriptionDemand = { books, trades }
+      this.publicRealtime.setSubscriptions([...ids], { books, trades, openInterest })
+      this.publicSubscriptionDemand = { books, trades, openInterest }
     }
     if (collectorChanged && !this.closing) this.preparedCharts.sourceStateChanged()
     this.scheduleMarketDeadline()

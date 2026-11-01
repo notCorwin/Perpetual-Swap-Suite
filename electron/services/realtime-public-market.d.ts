@@ -7,6 +7,8 @@ export type PublicMarketRawRecord = Record<string, string | number>
 export type PublicInstrumentRecord = Record<string, unknown>
 export type PublicMarketSubscription = { instId: string; channel: PublicMarketChannel } | { channel: 'instruments'; instType: 'SWAP' }
 export type PublicMarketChannelDemand = {
+  /** Defaults to true. Disable or list instruments when open interest is not needed. */
+  openInterest?: boolean | Iterable<string>
   /** Defaults to true. Disable or list instruments when depth/slippage is not needed. */
   books?: boolean | Iterable<string>
   /** Defaults to true. Disable or list instruments when trade flow is not needed. */
@@ -14,7 +16,7 @@ export type PublicMarketChannelDemand = {
 }
 export type PublicMarketBook = { bids: (readonly string[])[]; asks: (readonly string[])[]; ts: string; seqId: number }
 export type PublicMarketEventContext = {
-  /** Socket lifetime, or the individual subscription lifetime for books/tickers. */
+  /** Socket lifetime, or the individual subscription lifetime for books/tickers/open interest. */
   signal: AbortSignal
   receivedAt: number
   /** Subscription proof captured before callback queuing. */
@@ -78,7 +80,7 @@ export class RealtimePublicMarket {
   constructor(options: RealtimePublicMarketOptions)
   readonly instruments: Set<string>
   readonly subscriptions: Map<string, PublicMarketSubscription>
-  /** Tickers and open interest cover every instrument; books and trades follow independent demand. */
+  /** Tickers cover every instrument; other channels follow independent demand. */
   setSubscriptions(instIds: string[], demand?: PublicMarketChannelDemand): void
   start(): void
   getState(): RealtimeMarketState

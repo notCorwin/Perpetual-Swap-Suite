@@ -29,6 +29,31 @@ test('confirmed facts use worker-owned SQLite and indexed bounded native ranges'
   } finally { await f.close() }
 })
 
+test('coverage remains exact across mixed-series batches, repairs, and protected imports', async () => {
+  const f = await fixture(), eth = 'ETH-USDT-SWAP'
+  const ethCandle = (index: number) => ({ ...candle(index), instrument: eth })
+  try {
+    await f.store.appendCandles([candle(3), ethCandle(2), candle(1), candle(3, 105), ethCandle(0)])
+    assert.deepEqual(await f.store.coverage(query.instrument, query.timeframe), { count: 2, first: base + step, last: base + 3 * step })
+    assert.deepEqual(await f.store.coverage(eth, query.timeframe), { count: 2, first: base, last: base + 2 * step })
+
+    await f.store.appendCandles([candle(3, 110), candle(0), candle(4), ethCandle(1)])
+    assert.deepEqual(await f.store.coverage(query.instrument, query.timeframe), { count: 4, first: base, last: base + 4 * step })
+    assert.deepEqual(await f.store.coverage(eth, query.timeframe), { count: 3, first: base, last: base + 2 * step })
+
+    await f.store.replaceCandles({ ...query, from: base, through: base + step }, [candle(1)])
+    assert.deepEqual(await f.store.coverage(query.instrument, query.timeframe), { count: 3, first: base + step, last: base + 4 * step })
+    // Importing cannot resurrect the repaired range or replace a newer native price.
+    await (f.store as any).writer.request('append', [[{ ...candle(0), writtenAt: 100 }, { ...candle(3, 120), writtenAt: 100 },
+      { ...candle(5), writtenAt: 100 }, { ...ethCandle(3), writtenAt: 100 }], { importing: true }])
+    assert.deepEqual(await f.store.coverage(query.instrument, query.timeframe), { count: 4, first: base + step, last: base + 5 * step })
+    assert.deepEqual(await f.store.coverage(eth, query.timeframe), { count: 4, first: base, last: base + 3 * step })
+    assert.deepEqual((await f.store.candles(query)).map(row => [row.timestamp, row.close]), [
+      [base + step, 100], [base + 3 * step, 110], [base + 4 * step, 100], [base + 5 * step, 100],
+    ])
+  } finally { await f.close() }
+})
+
 test('source observations commit before candles and preserve numeric truth across empty renewals', async () => {
   const f = await fixture()
   try {

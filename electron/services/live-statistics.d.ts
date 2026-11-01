@@ -23,6 +23,7 @@ export class LiveStatistics {
   /** Forget delisted instruments, including their previous subscription coverage. */
   remove(instIds: string[]): void
   disconnect(instIds: string[], receivedAt?: number): void
+  clearInterest(instId: string): void
   trades(instId: string, rows: LiveTrade[], receivedAt?: number): void
   openInterest(instId: string, observation: LiveOpenInterest, receivedAt?: number): void
   /** Copy a candle and add only trustworthy native-period observations. */

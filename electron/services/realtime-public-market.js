@@ -77,7 +77,7 @@ class PublicMarketConnection {
   getState() { return copy(this.state) }
   getTelemetry() { return copy(this.telemetry) }
 
-  setSubscriptions(instIds, { books, trades }) {
+  setSubscriptions(instIds, { books, trades, openInterest }) {
     if (this.closed) throw new Error('Realtime public market is closed.')
     const instruments = new Set()
     const next = new Map()
@@ -89,6 +89,7 @@ class PublicMarketConnection {
       if (!validInstrumentId(instId)) throw new TypeError('Invalid public market subscription.')
       instruments.add(instId)
       for (const channel of channels) {
+        if (channel === 'open-interest' && !openInterest.has(instId)) continue
         if (channel === 'books' && !books.has(instId)) continue
         if (channel === 'trades' && !trades.has(instId)) continue
         const value = { instId, channel }, key = keyFor(value)
@@ -255,7 +256,7 @@ class PublicMarketConnection {
         for (const [key, value] of chunk) {
           const pending = { id, subscription: value, deadline: now + this.ackTimeoutMs }
           if (op === 'subscribe') {
-            const controller = value.channel === 'books' || value.channel === 'tickers' ? new AbortController() : connection.controller
+            const controller = ['books', 'tickers', 'open-interest'].includes(value.channel) ? new AbortController() : connection.controller
             connection.sessions.set(key, { controller, ingress: connection.ingress })
             connection.sent.set(key, value)
             connection.pending.set(key, pending)
@@ -461,10 +462,12 @@ class PublicMarketConnection {
       return
     }
     if (message.event != null || ingress <= session.ingress) return
-    // Book frames admitted before the ACK may belong to the retired wire
-    // subscription. They can neither seed reconstruction nor fault a new book.
-    if (subscription.channel === 'books') {
+    // Frames received before the ACK may belong to a retired subscription.
+    // Neither books nor OI may initialize a newly admitted session from them.
+    if (subscription.channel === 'books' || subscription.channel === 'open-interest') {
       if (connection.pending.has(key)) return
+    }
+    if (subscription.channel === 'books') {
       if (!Array.isArray(message.data)) {
         this.telemetry.rejectedEvents++
         this.recoverBook(connection, subscription.instId, `Invalid OKX order book data for ${subscription.instId}.`)
@@ -685,7 +688,7 @@ export class RealtimePublicMarket {
     this.controlShard = null
     if (typeof options.onInstruments === 'function') {
       this.controlShard = this.makeShard(true)
-      this.controlShard.setSubscriptions([], { books: new Set(), trades: new Set() })
+      this.controlShard.setSubscriptions([], { books: new Set(), trades: new Set(), openInterest: new Set() })
       this.subscriptions = new Map(this.controlShard.subscriptions)
     }
   }
@@ -725,6 +728,7 @@ export class RealtimePublicMarket {
     for (const instId of next) if (!validInstrumentId(instId)) throw new TypeError('Invalid public market subscription.')
     const books = normalizeDemand(demand.books, next, 'Book')
     const trades = normalizeDemand(demand.trades, next, 'Trade')
+    const openInterest = normalizeDemand(demand.openInterest, next, 'Open interest')
     this.changing = true
     this.instruments = next
     const assigned = new Set()
@@ -743,6 +747,7 @@ export class RealtimePublicMarket {
       market.setSubscriptions(ids, {
         books: new Set(ids.filter(instId => books.has(instId))),
         trades: new Set(ids.filter(instId => trades.has(instId))),
+        openInterest: new Set(ids.filter(instId => openInterest.has(instId))),
       })
       if (!ids.length && market !== this.controlShard) {
         this.shards = this.shards.filter(value => value !== market)

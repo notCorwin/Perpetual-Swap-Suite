@@ -23,6 +23,9 @@ const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 
 const priceFields = ['open', 'high', 'low', 'close', 'volume', 'baseVolume', 'quoteVolume', 'confirmed']
 const TIMEFRAMES = ['5m', '15m', '1H']
 const intervalFor = timeframe => ({ '5m': 300_000, '15m': 900_000, '1H': 3_600_000 })[timeframe]
+const assertCandleGrid = (timestamp, interval) => {
+  if (!interval || !Number.isSafeInteger(timestamp) || timestamp < 0 || timestamp % interval) throw new TypeError('Candle timestamp must lie on its timeframe grid.')
+}
 const seriesKey = (instId, timeframe) => `${instId}:${timeframe}`
 const numeric = value => typeof value === 'number' && Number.isFinite(value)
 const abortable = (operation, signal) => new Promise((resolve, reject) => {
@@ -480,7 +483,21 @@ export class PreparedChartPipeline {
   frame(state, end = state.latestHour, historical = false) {
     const latest = this.liveStates.get(state.key)
     if (end === state.latestHour && !state.rows.has(end) && latest !== state && latest?.rows.has(end)) return this.frame(latest, end, historical)
-    const rows = [...state.rows.values()].filter(row => end === null || row.timestamp <= end && row.timestamp >= end - (VISIBLE - 1) * state.intervalMS).sort((a, b) => a.timestamp - b.timestamp)
+    let rows
+    if (end === null) rows = [...state.rows.values()].sort((a, b) => a.timestamp - b.timestamp)
+    else {
+      // Resident candles are admitted on the native interval grid. A viewport
+      // therefore needs at most 96 keyed lookups, independent of reserve size.
+      rows = []
+      const step = state.intervalMS, first = Math.ceil((end - (VISIBLE - 1) * step) / step) * step
+      const last = Math.floor(end / step) * step
+      for (let index = 0; index < VISIBLE; index += 1) {
+        const timestamp = first + index * step
+        if (timestamp > last) break
+        const row = state.rows.get(timestamp)
+        if (row) rows.push(row)
+      }
+    }
     state.barCaches ??= new Map()
     const bars = this.projectBars(state, rows, 'viewport', end)
     const live = state.live && (end === state.latestHour || end === null) ? state.live : null
@@ -713,6 +730,7 @@ export class PreparedChartPipeline {
     const rows = await this.store.candles({ instrument: state.instId, timeframe: state.timeframe, from, through, limit, order: 'desc' }, priority)
     if (this.closed || options.wanted && !options.wanted()) return false
     if (admittedPrice !== state.priceVersion || residentRevision !== this.store.candleRevision?.(state.instId, state.timeframe)) return this.readRows(state, end, limit, priority, options)
+    for (const row of rows) if (row.confirmed) assertCandleGrid(row.timestamp, state.intervalMS)
     const residentFirst = Math.min(...state.rows.keys()), residentLast = Math.max(...state.rows.keys())
     let pricesChanged = false, observationsChanged = false, changedFrom = Infinity, oiChanged = false, takerChanged = false
     for (const row of rows) if (row.confirmed) {
@@ -1722,6 +1740,7 @@ export class PreparedChartPipeline {
 
   observe(rows, previous) {
     return measureOperation({ category: 'cpu', name: 'indicators.observe', attributes: { candles: rows.length, execution: 'inline' } }, () => {
+    for (const row of rows) assertCandleGrid(row.timestamp, intervalFor(row.timeframe))
     for (const [key, batch] of Map.groupBy(rows, row => seriesKey(row.instrument, row.timeframe))) {
       const state = this.series.get(key), live = this.liveStates.get(key)
       let changedFrom = Infinity

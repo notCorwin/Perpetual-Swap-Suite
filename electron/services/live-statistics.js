@@ -56,6 +56,11 @@ export class LiveStatistics {
     for (const instId of instIds) this.instruments.delete(instId)
   }
 
+  /** Retire OI observations without disturbing trade coverage. */
+  clearInterest(instId) {
+    this.instruments.get(instId)?.interest.clear()
+  }
+
   /** Every interruption breaks coverage, even when reconnection is immediate. */
   disconnect(instIds, receivedAt = this.now()) {
     if (!Array.isArray(instIds) || !timestamp(receivedAt)) return

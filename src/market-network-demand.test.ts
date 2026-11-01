@@ -104,7 +104,7 @@ test('book demand waits for fresh cheap checks, survives a failed book, and reti
   try {
     await f.discover(); await f.open()
     const id = value.instId, socket = f.sockets.get(OKX_PUBLIC_WEBSOCKET_URL)![0]
-    assert.deepEqual(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL), [`open-interest:${id}`, `tickers:${id}`].sort())
+    assert.deepEqual(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL), [`tickers:${id}`])
     assert.deepEqual(f.subscriptions(OKX_BUSINESS_WEBSOCKET_URL), [`candle5m:${id}`])
 
     f.push(OKX_PUBLIC_WEBSOCKET_URL, id, 'tickers', [ticker(id)])
@@ -167,12 +167,13 @@ test('trades follow qualified-list and focus demand, and focus removal breaks co
   try {
     await f.discover(); await f.open()
     const [focused, qualified, idle] = values.map(value => value.instId)
-    assert.deepEqual(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL), values.flatMap(value => [`tickers:${value.instId}`, `open-interest:${value.instId}`]).sort())
+    assert.deepEqual(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL), values.map(value => `tickers:${value.instId}`).sort())
     f.service.preparedCharts.prepareFocus = async () => null
     f.service.preparedCharts.setFocus({ instId: focused, timeframe: '15m' }, 'first-focus')
     await waitFor(() => f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL).includes(`trades:${focused}`))
     await f.idle()
     assert.deepEqual(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL).filter(key => key.startsWith('trades:')), [`trades:${focused}`])
+    assert.deepEqual(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL).filter(key => key.startsWith('open-interest:')), [`open-interest:${focused}`])
 
     f.push(OKX_PUBLIC_WEBSOCKET_URL, focused, 'trades', [{ instId: focused, tradeId: '1', side: 'buy', sz: '1', ts: String(Date.now()) }])
     await f.idle()
@@ -191,6 +192,7 @@ test('trades follow qualified-list and focus demand, and focus removal breaks co
     assert.equal(coverage?.active, null)
     assert.equal(coverage?.coverage.length, 1, 'Removing the focus-only trade channel retires its continuous coverage.')
     assert.deepEqual(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL).filter(key => key.startsWith('trades:')).sort(), [`trades:${idle}`, `trades:${qualified}`].sort())
+    assert.deepEqual(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL).filter(key => key.startsWith('open-interest:')).sort(), [`open-interest:${idle}`, `open-interest:${qualified}`].sort())
     assert.equal(f.sockets.get(OKX_PUBLIC_WEBSOCKET_URL)?.length, 1)
   } finally { await f.close() }
 })

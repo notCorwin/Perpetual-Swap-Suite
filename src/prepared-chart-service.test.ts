@@ -76,6 +76,41 @@ const sqliteFixture = async (rows: any[]) => {
   return { store, pipeline, async close() { await pipeline.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) } }
 }
 
+test('viewport grid lookup preserves boundaries, gaps and corrected candles regardless of insertion order', async () => {
+  const rows = source(180), { pipeline } = fixture([])
+  const state = pipeline.liveState(instId, '15m')
+  state.rows = new Map(rows.toReversed().map(row => [row.timestamp, Object.freeze(row)]))
+  state.latestHour = rows.at(-1)!.timestamp
+  state.floor = rows[0].timestamp
+  const target = rows[150].timestamp
+  const expected = (through: number) => rows.filter(row => state.rows.has(row.timestamp)
+    && row.timestamp <= through && row.timestamp >= through - 95 * interval)
+  try {
+    for (const through of [target, target + interval / 2]) {
+      const frame = pipeline.frame(state, through)
+      assert.deepEqual(frame.bars.map((bar: any) => bar.hour), expected(through).map(row => row.timestamp))
+    }
+    state.rows.delete(rows[100].timestamp)
+    const corrected = { ...rows[120], close: rows[120].close + 0.5 }
+    state.rows.set(corrected.timestamp, Object.freeze(corrected))
+    const frame = pipeline.frame(state, target)
+    assert.deepEqual(frame.bars.map((bar: any) => bar.hour), expected(target).map(row => row.timestamp))
+    assert.equal(frame.bars.find((bar: any) => bar.hour === corrected.timestamp).close, corrected.close)
+    assert.equal(frame.priceState, 'partial')
+    assert.deepEqual(pipeline.frame(state, null).bars.map((bar: any) => bar.hour),
+      rows.filter(row => state.rows.has(row.timestamp)).map(row => row.timestamp))
+  } finally { await pipeline.dispose() }
+})
+
+test('chart admission rejects off-grid candles from both local and observed sources', async () => {
+  const invalid = { ...source(1)[0], timestamp: end() - 1 }
+  const { pipeline } = fixture([invalid])
+  try {
+    await assert.rejects(pipeline.read(pipeline.liveState(instId, '15m'), undefined), /timeframe grid/)
+    assert.throws(() => pipeline.observe([invalid], new Map()), /timeframe grid/)
+  } finally { await pipeline.dispose() }
+})
+
 test('local and historical reads expose durable facts without creating backend demand', async () => {
   const rows = source(2000), calls: string[] = []
   const { pipeline, store } = fixture(rows, {

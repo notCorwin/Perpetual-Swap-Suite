@@ -90,7 +90,7 @@ function fixture(overrides: Partial<RealtimePublicMarketOptions> = {}) {
     logger: { error: message => { errors.push(String(message)) } },
     ...overrides,
   })
-  const open = async (instIds = [btc], demand?: { books?: boolean | Iterable<string>; trades?: boolean | Iterable<string> }) => {
+  const open = async (instIds = [btc], demand?: { books?: boolean | Iterable<string>; trades?: boolean | Iterable<string>; openInterest?: boolean | Iterable<string> }) => {
     market.setSubscriptions(instIds, demand)
     market.start()
     const expected = Math.ceil(new Set(instIds).size / 25)
@@ -645,6 +645,26 @@ test('a disabled initial book demand retains the other streams and defaults stil
   await f.market.whenIdle()
   assert.deepEqual(socket.commands().at(-1)?.args, [{ instId: btc, channel: 'books' }])
   assert.throws(() => f.market.setSubscriptions([btc], { books: 'false' as unknown as boolean }), /boolean/)
+})
+
+test('open interest demand gates messages through the new subscription acknowledgement', async t => {
+  const f = fixture()
+  t.after(() => f.market.close())
+  const socket = await f.open([btc, eth], { books: false, trades: false })
+  f.market.setSubscriptions([btc, eth], { books: false, trades: false, openInterest: [btc] })
+  await f.market.whenIdle()
+  assert.equal(f.market.subscriptions.has(`open-interest:${eth}`), false)
+  socket.autoAck = false
+  f.market.setSubscriptions([btc, eth], { books: false, trades: false, openInterest: [btc, eth] })
+  const command = socket.commands().at(-1)!
+  assert.deepEqual(command.args, [{ channel: 'open-interest', instId: eth }])
+  push(socket, 'open-interest', [{ oi: 'old' }], eth)
+  await f.market.whenIdle()
+  assert.deepEqual(f.oi, [])
+  socket.message({ id: command.id, event: 'subscribe', arg: command.args[0] })
+  push(socket, 'open-interest', [{ oi: 'new' }], eth)
+  await f.market.whenIdle()
+  assert.deepEqual(f.oi, [`${eth}:new`])
 })
 
 test('book recovery requires a snapshot and repeated faults back off without duplicate operations', async t => {

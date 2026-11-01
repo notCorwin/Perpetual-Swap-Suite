@@ -122,7 +122,7 @@ test('discovery subscribes candidates including failed and unknown filters witho
     await f.open()
     const ids = instruments.map(value => value.instId)
     assert.deepEqual(f.subscriptions(OKX_BUSINESS_WEBSOCKET_URL), ids.map(instId => `candle5m:${instId}`).sort())
-    assert.deepEqual(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL), ids.flatMap(instId => ['tickers', 'open-interest'].map(channel => `${channel}:${instId}`)).sort())
+    assert.deepEqual(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL), ids.map(instId => `tickers:${instId}`).sort())
     assert.deepEqual([...f.service.realtime.subscriptions.keys()].sort(), ids.map(instId => `5m:${instId}`).sort())
     assert.equal(f.service.preparedCharts.realtimeKeys.size, ids.length * 3)
     for (const instId of ids) for (const timeframe of ['5m', '15m', '1H']) assert.ok(f.service.preparedCharts.realtimeKeys.has(`${instId}:${timeframe}`))
@@ -274,7 +274,7 @@ test('liquidity settings retain books while either dependent rule is enabled and
     previous = structuredClone(config)
     config.liquidity.slippage.enabled = false
     await f.service.reconfigure(previous); await f.idle()
-    assert.deepEqual(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL), ids.flatMap(instId => ['tickers', 'open-interest'].map(channel => `${channel}:${instId}`)).sort())
+    assert.deepEqual(f.subscriptions(OKX_PUBLIC_WEBSOCKET_URL), ids.map(instId => `tickers:${instId}`).sort())
     assert.deepEqual(f.subscriptions(OKX_BUSINESS_WEBSOCKET_URL), candles)
     for (const [key, value] of stable) assert.equal(f.service.publicRealtime.subscriptions.get(key), value)
     previous = structuredClone(config)
@@ -294,6 +294,36 @@ test('liquidity settings retain books while either dependent rule is enabled and
     assert.equal(f.service.observations.get(ids[0]).book.value.seqId, 100)
     assert.deepEqual(paths, ['/api/v5/public/instruments'])
     assert.equal(f.sockets.get(OKX_PUBLIC_WEBSOCKET_URL)?.length, 1)
+  } finally { await f.close() }
+})
+
+test('OI follows qualification and chart demand and retires old observations when unsubscribed', async () => {
+  const instruments = [instrument(), instrument('ETH')], config = preferences('openInterest')
+  const f = await fixture(config, async input => {
+    assert.ok(new URL(String(input)).pathname.endsWith('/public/instruments'))
+    return response(instruments)
+  })
+  try {
+    await f.discover(); await f.open()
+    const [first, second] = instruments.map(value => value.instId)
+    assert.ok([first, second].every(id => f.service.publicRealtime.subscriptions.has(`open-interest:${id}`)))
+    for (const id of [first, second]) f.push(OKX_PUBLIC_WEBSOCKET_URL, id, 'open-interest', [{ instId: id, oi: '123', oiUsd: '6000000', ts: String(Date.now()) }])
+    await f.idle()
+    assert.equal(f.service.observations.get(second).openInterest.value.oi, '123')
+    config.liquidity.openInterest.enabled = false
+    f.service.listedUniverse = new Set([first])
+    f.service.updateSubscriptions(); await f.idle()
+    assert.equal(f.service.publicRealtime.subscriptions.has(`open-interest:${first}`), true)
+    assert.equal(f.service.publicRealtime.subscriptions.has(`open-interest:${second}`), false)
+    assert.equal(f.service.observations.get(second).openInterest, undefined)
+    assert.equal(f.service.liveStatistics.instruments.get(second).interest.size, 0)
+    config.liquidity.openInterest.enabled = true
+    f.service.updateSubscriptions(); await f.idle()
+    assert.equal(f.service.publicRealtime.subscriptions.has(`open-interest:${second}`), true)
+    assert.equal(f.service.observations.get(second).openInterest, undefined, 'A new subscription cannot revive its previous observation.')
+    f.push(OKX_PUBLIC_WEBSOCKET_URL, second, 'open-interest', [{ instId: second, oi: '456', oiUsd: '7000000', ts: String(Date.now()) }])
+    await f.idle()
+    assert.equal(f.service.observations.get(second).openInterest.value.oi, '456')
   } finally { await f.close() }
 })
 
