@@ -22,6 +22,19 @@ const response = (values: PreparedChartBar[], overrides: Partial<PreparedChartRe
   oiState: 'ready', takerState: 'ready', indicatorState: 'ready', error: '', ...overrides,
 })
 
+test('out-of-order incremental batches retain sorted unique resident bars', () => {
+  const store = new PreparedChartStore({ maxBarsPerSeries: 12_000 })
+  const values = bars(0, 10_000)
+  store.ingest(response([], { endHour: 9_999 * hour, latestEnd: 9_999 * hour }))
+  for (let start = 9_900, revision = 1; start >= 0; start -= 100, revision++) {
+    const batch = values.slice(start, start + 100).toReversed()
+    batch.push(batch[0])
+    store.ingest(response(batch, { revision, endHour: 9_999 * hour, latestEnd: 9_999 * hour }))
+  }
+  assert.deepEqual(store.knownBars(instId, '1H', values.map(value => value.hour)).map(value => value?.hour), values.map(value => value.hour))
+  assert.deepEqual(store.knownBars(instId, '1H', [-hour, 10_000 * hour]), [undefined, undefined])
+})
+
 test('resident window projection is reused until canonical bars or source metadata change', () => {
   const store = new PreparedChartStore(), events: OperationEvent[] = []
   store.ingest(response(bars(0, 400)))

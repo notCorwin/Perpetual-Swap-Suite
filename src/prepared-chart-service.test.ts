@@ -76,6 +76,43 @@ const sqliteFixture = async (rows: any[]) => {
   return { store, pipeline, async close() { await pipeline.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) } }
 }
 
+test('source range pruning and pending jobs preserve overlapping and out-of-order ranges', async () => {
+  const { pipeline } = fixture([])
+  const state = pipeline.state(instId, '15m')
+  try {
+    const origin = 100 * interval
+    for (let index = 0; index < 300; index += 3) state.rows.set(origin + index * interval, candle(origin + index * interval))
+    const jobs = [
+      { from: origin + 80 * interval, through: origin + 110 * interval },
+      { from: origin + 5 * interval, through: origin + 7 * interval },
+      { from: origin + 7 * interval, through: origin + 15 * interval },
+      { from: origin + 80 * interval, through: origin + 81 * interval },
+    ]
+    const expected = (from: number, through: number, active: typeof jobs) => {
+      const ranges: Array<{ from: number; through: number }> = []
+      for (let time = from; time <= through; time += interval) {
+        if (state.rows.has(time) || active.some(job => job.from <= time && job.through >= time)) continue
+        const previous = ranges.at(-1)
+        if (previous?.through === time - interval) previous.through = time
+        else ranges.push({ from: time, through: time })
+      }
+      return ranges
+    }
+    for (const active of [[], jobs.slice(0, 1), jobs]) {
+      pipeline.sourceTasks.clear()
+      active.forEach((job, index) => pipeline.sourceTasks.set(String(index), { ...job, seriesKey: state.key, source: 'candles' }))
+      assert.deepEqual(pipeline.pendingSourceRanges(state, 'candles', origin, origin + 299 * interval), expected(origin, origin + 299 * interval, active))
+      assert.deepEqual(pipeline.pendingSourceRanges(state, 'candles', origin, origin - interval), [])
+    }
+    for (let index = 0; index < 300; index++) pipeline.sourceAttempts.set(String(index), {
+      seriesKey: state.key, from: origin + index * interval, through: origin + index * interval,
+    })
+    pipeline.sourceAttempts.set('other', { seriesKey: 'other', from: origin, through: origin })
+    pipeline.pruneSourceAttempts(state)
+    assert.deepEqual([...pipeline.sourceAttempts.keys()], [...Array.from({ length: 100 }, (_, index) => String(index * 3)), 'other'])
+  } finally { pipeline.sourceTasks.clear(); await pipeline.dispose() }
+})
+
 test('viewport grid lookup preserves boundaries, gaps and corrected candles regardless of insertion order', async () => {
   const rows = source(180), { pipeline } = fixture([])
   const state = pipeline.liveState(instId, '15m')

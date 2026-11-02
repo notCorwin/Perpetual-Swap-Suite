@@ -158,6 +158,42 @@ test('audit fills explicit inspector gaps and persists each completed daily chun
   } finally { await audit.close() }
 })
 
+test('gap deduplication keeps ordered coverage semantics for a large unsorted inspection', async () => {
+  const ranges = Array.from({ length: 5_000 }, (_, index) => ({ from: (4_999 - index) * 4, through: (4_999 - index) * 4 + 1 }))
+  ranges.splice(20, 0, { ...ranges[5] }, { from: ranges[7].through, through: ranges[7].through })
+  const initial = [finding('gap', ranges[10].from, ranges[10].through), finding('invalid-grid', 0)]
+  const expected = [...initial]
+  for (const range of ranges) if (!expected.some(issue => issue.reason === 'gap' && issue.from <= range.from && issue.through >= range.through)) {
+    expected.push(finding('gap', range.from, range.through))
+  }
+  const audit = new DataAudit({ metadata: new MemoryMetadata(), inspect: async () => ({ ...inspected(initial), missingRanges: ranges }) })
+  try {
+    const { id } = audit.start({ targets: [target(0, 20_000)] })
+    await audit.whenIdle()
+    assert.equal(audit.get(id)!.status, 'completed')
+    assert.deepEqual(audit.get(id)!.issues.map(({ reason, from, through }) => ({ reason, from, through })), expected.map(({ reason, from, through }) => ({ reason, from, through })))
+  } finally { await audit.close() }
+})
+
+test('malformed and accessor-based gap observations retain the original evaluation behavior', async () => {
+  let reads = 0
+  const accessor = { ...finding('gap', 0), get reason() { reads++; return 'gap' } }
+  const audit = new DataAudit({ metadata: new MemoryMetadata(), inspect: async () => ({ ...inspected([accessor]), missingRanges: [{ from: 0, through: 0 }] }) })
+  try {
+    const { id } = audit.start({ targets: [target()] })
+    await audit.whenIdle()
+    assert.equal(audit.get(id)!.status, 'completed')
+    assert.equal(reads, 5)
+  } finally { await audit.close() }
+  const malformed = new DataAudit({ metadata: new MemoryMetadata(), inspect: async () => ({ ...inspected([null as unknown as AuditFinding]), missingRanges: [{ from: 0, through: 0 }] }) })
+  try {
+    const { id } = malformed.start({ targets: [target()] })
+    await malformed.whenIdle()
+    assert.equal(malformed.get(id)!.status, 'failed')
+    assert.match(malformed.get(id)!.error!, /Cannot read properties of null/)
+  } finally { await malformed.close() }
+})
+
 test('cancel aborts the current operation and resume retries only its uncommitted chunk', async () => {
   const metadata = new MemoryMetadata()
   const entered = deferred<AbortSignal>()
@@ -245,6 +281,27 @@ test('repair fetches only reported anomalies and verification narrows remaining 
     assert.deepEqual(report.issues.find(issue => issue.reason === 'gap')!.originalRange, { from: 0, through: 2 * interval })
     assert.equal(report.issues.find(issue => issue.reason === 'invalid-ohlc')!.status, 'resolved')
     assert.deepEqual(report.summary, { open: 3, resolved: 1, repairFailed: 0 })
+  } finally { await audit.close() }
+})
+
+test('repair verification closes overlapping chains while excluding unrelated findings', async () => {
+  const metadata = new MemoryMetadata(), inspections: Array<[number, number]> = []
+  const defects = [finding('gap', 4 * interval, 5 * interval), finding('middle', 2 * interval, 4 * interval, false),
+    finding('earlier', 0, 2 * interval, false), finding('unrelated', 8 * interval, 8 * interval, false)]
+  let initial = true
+  const audit = new DataAudit({ metadata, inspect: async query => {
+    inspections.push([query.from, query.through])
+    if (initial) { initial = false; return inspected([...defects, defects[0]]) }
+    return inspected(defects.filter(issue => !issue.repairable && issue.from >= query.from && issue.through <= query.through))
+  }, repair: async () => {} })
+  try {
+    const { id } = audit.start({ targets: [target(0, 8 * interval)] })
+    await audit.whenIdle()
+    assert.equal(audit.get(id)!.issues.length, 4)
+    audit.repair(id)
+    await audit.whenIdle()
+    assert.deepEqual(inspections, [[0, 8 * interval], [0, 5 * interval]])
+    assert.deepEqual(audit.get(id)!.issues.filter(issue => issue.status === 'open').map(issue => issue.reason), ['middle', 'earlier', 'unrelated'])
   } finally { await audit.close() }
 })
 

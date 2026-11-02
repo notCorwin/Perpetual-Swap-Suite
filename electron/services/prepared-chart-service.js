@@ -172,14 +172,22 @@ export class PreparedChartPipeline {
   }
 
   updateMemory(state) {
-    const cached = new Set([...(state.barCaches?.values() ?? [])].flatMap(value => value.bars))
+    const cached = new Set()
+    for (const value of state.barCaches?.values() ?? []) for (const bar of value.bars) cached.add(bar)
     for (const value of state.historyBarsCache?.bars ?? []) cached.add(value)
     for (const value of state.projectedBars?.values() ?? []) cached.add(value.bar)
-    state.byteSize = [...state.rows.values(), ...state.indicators.values(), ...cached].reduce((sum, value) => sum + this.objectBytes(value), 0)
-    state.statisticsDeadline = Math.min(Infinity, ...[...state.rows.values()].flatMap(row => [
-      !numeric(row.oi) ? Number(row.statisticsOIExpiresAt) : 0,
-      !numeric(row.buy) || !numeric(row.sell) ? Number(row.statisticsTakerExpiresAt) : 0,
-    ].filter(value => value > Date.now())))
+    let bytes = 0, deadline = Infinity
+    for (const row of state.rows.values()) {
+      bytes += this.objectBytes(row)
+      const oi = !numeric(row.oi) ? Number(row.statisticsOIExpiresAt) : 0
+      const taker = !numeric(row.buy) || !numeric(row.sell) ? Number(row.statisticsTakerExpiresAt) : 0
+      if (oi > Date.now()) deadline = Math.min(deadline, oi)
+      if (taker > Date.now()) deadline = Math.min(deadline, taker)
+    }
+    for (const value of state.indicators.values()) bytes += this.objectBytes(value)
+    for (const value of cached) bytes += this.objectBytes(value)
+    state.byteSize = bytes
+    state.statisticsDeadline = deadline
   }
 
   trim() {
@@ -837,12 +845,21 @@ export class PreparedChartPipeline {
     // The latest tail cannot retire errors owned by a resident historical
     // reserve of the same series. Both share one bounded source lifetime.
     if (this.series.get(state.key) !== state) return
-    const hours = [...state.rows.keys(), ...(this.liveStates.get(state.key)?.rows.keys() ?? [])]
+    const attempts = []
+    for (const entry of this.sourceAttempts) if (entry[1].seriesKey === state.key) attempts.push(entry)
+    if (!attempts.length) return
+    const hours = [...state.rows.keys(), ...(this.liveStates.get(state.key)?.rows.keys() ?? [])].sort((left, right) => left - right)
     const selected = this.focus?.key === state.key ? this.focus.end ?? state.latestHour ?? Math.floor(Date.now() / state.intervalMS) * state.intervalMS - state.intervalMS : null
     const from = selected === null ? null : selected - (VISIBLE - 1) * state.intervalMS
-    for (const [key, attempt] of this.sourceAttempts) if (attempt.seriesKey === state.key
-      && !hours.some(hour => hour >= attempt.from && hour <= attempt.through)
-      && !(selected !== null && attempt.from <= selected && attempt.through >= from)) this.sourceAttempts.delete(key)
+    for (const [key, attempt] of attempts) {
+      let low = 0, high = hours.length
+      while (low < high) {
+        const middle = Math.floor((low + high) / 2)
+        if (hours[middle] < attempt.from) low = middle + 1
+        else high = middle
+      }
+      if (!(hours[low] >= attempt.from && hours[low] <= attempt.through) && !(selected !== null && attempt.from <= selected && attempt.through >= from)) this.sourceAttempts.delete(key)
+    }
   }
 
   invalidateDerived(state, from) {
@@ -1417,12 +1434,18 @@ export class PreparedChartPipeline {
   }
 
   pendingSourceRanges(state, source, from, through) {
-    const jobs = [...this.sourceTasks.values()].filter(job => job.seriesKey === state.key && job.source === source)
+    const jobs = [...this.sourceTasks.values()].filter(job => job.seriesKey === state.key && job.source === source && job.from <= through && job.through >= from)
+      .sort((left, right) => left.from - right.from)
     const ranges = []
+    let index = 0, coveredThrough = -Infinity
     for (let hour = from; hour <= through; hour += state.intervalMS) {
+      while (index < jobs.length && jobs[index].from <= hour) {
+        const job = jobs[index++]
+        if (job.through >= hour) coveredThrough = Math.max(coveredThrough, job.through)
+      }
       const row = state.rows.get(hour)
       if ((source === 'candles' ? completePriceCandle(row) : sourceFresh(row, source === 'oi' ? 1 : 2))
-        || jobs.some(job => job.from <= hour && job.through >= hour)) continue
+        || coveredThrough >= hour) continue
       const previous = ranges.at(-1)
       if (previous?.through + state.intervalMS === hour) previous.through = hour
       else ranges.push({ from: hour, through: hour })

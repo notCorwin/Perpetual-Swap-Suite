@@ -10,8 +10,25 @@ export const PUBLIC_MARKET_CONTRACTS_PER_CONNECTION = 25
 const channels = ['tickers', 'open-interest', 'books', 'trades']
 const keyFor = ({ instId, instType, channel }) => `${channel}:${channel === 'instruments' ? instType : instId}`
 const hour = 3_600_000
+const MAX_PENDING_MESSAGES = 256
+const MAX_PENDING_CALLBACKS = 256
 const copy = value => ({ ...value })
 const validInstrumentId = value => typeof value === 'string' && /^[A-Za-z0-9-]{1,128}$/.test(value)
+const number = value => (typeof value === 'number' || typeof value === 'string' && value.trim() !== '') && Number.isFinite(Number(value)) ? Number(value) : null
+function snapshotTimestamp(subscription, message) {
+  if (message.data.length !== 1) return null
+  const value = message.data[0], time = number(value?.ts)
+  if (!Number.isSafeInteger(time) || time < 0 || value?.instId !== undefined && value.instId !== subscription.instId) return null
+  if (subscription.channel === 'tickers') {
+    const last = number(value.last), bid = number(value.bidPx), ask = number(value.askPx)
+    return last > 0 && bid > 0 && ask >= bid ? time : null
+  }
+  if (subscription.channel === 'open-interest') {
+    const interest = number(value.oi), usd = number(value.oiUsd)
+    return interest !== null && interest >= 0 && usd !== null && usd >= 0 ? time : null
+  }
+  return null
+}
 
 function normalizeDemand(value, instruments, channel) {
   if (value === undefined || value === true) return new Set(instruments)
@@ -55,6 +72,7 @@ class PublicMarketConnection {
     this.instruments = new Set()
     this.books = new Map()
     this.tails = new Map()
+    this.backlogs = new Map()
     this.tasks = new Set()
     this.retirements = new Set()
     this.started = false
@@ -66,6 +84,7 @@ class PublicMarketConnection {
     this.closePromise = null
     this.recoveryTail = Promise.resolve()
     this.scheduledConnect = null
+    this.overloadFence = null
   }
 
   positive(name, fallback) {
@@ -150,7 +169,7 @@ class PublicMarketConnection {
   }
 
   connect() {
-    if (this.closed || !this.started || !this.subscriptions.size || this.connection || this.scheduledConnect) return
+    if (this.closed || !this.started || !this.subscriptions.size || this.connection || this.scheduledConnect || this.overloadFence) return
     this.setState({ status: this.hasOpened || this.attempt ? 'reconnecting' : 'connecting' })
     let dispatched = false
     const request = this.options.scheduleConnect(() => {
@@ -377,11 +396,17 @@ class PublicMarketConnection {
 
   message(connection, data) {
     if (!this.active(connection)) return
+    connection.pendingMessages ??= 0
+    if (connection.pendingMessages >= MAX_PENDING_MESSAGES) {
+      this.overload(connection, 'Public market message decoding fell behind.')
+      return
+    }
     const trafficProbeEnabled = typeof this.options.onMarketTrafficIngress === 'function'
     const nativeHandlerEnteredAtMonotonicUS = trafficProbeEnabled ? monotonicMicroseconds() : null
     const receivedAt = this.now()
     const ingress = ++connection.ingress
     this.armHeartbeat(connection)
+    connection.pendingMessages++
     const task = (connection.messageTail ?? Promise.resolve()).then(async () => {
       let text = data
       if (typeof data !== 'string') {
@@ -390,7 +415,7 @@ class PublicMarketConnection {
         else throw new TypeError('Unsupported WebSocket message data.')
       }
       if (this.active(connection)) this.consume(connection, text, receivedAt, ingress, nativeHandlerEnteredAtMonotonicUS)
-    }).catch(error => this.report('WebSocket message decoding failed.', error, this.active(connection) ? true : 'log'))
+    }).catch(error => this.report('WebSocket message decoding failed.', error, this.active(connection) ? true : 'log')).then(() => { connection.pendingMessages-- })
     connection.messageTail = task
     this.track(task)
   }
@@ -480,10 +505,7 @@ class PublicMarketConnection {
   enqueue(connection, subscription, session, message, receivedAt, nativeMessageSequence, nativeHandlerEnteredAtMonotonicUS) {
     this.telemetry.receivedEvents += message.data.length
     this.telemetry.lastReceivedAt = receivedAt
-    this.telemetry.pendingEvents++
     const key = keyFor(subscription)
-    const acknowledged = !connection.pending.has(key)
-    const current = () => this.active(connection) && this.subscriptions.get(key) === subscription && connection.sessions.get(key) === session
     let trafficEvents = null
     const trafficObserver = this.options.onMarketTrafficIngress
     if (Number.isSafeInteger(nativeHandlerEnteredAtMonotonicUS) && typeof trafficObserver === 'function') {
@@ -496,9 +518,49 @@ class PublicMarketConnection {
       const probeCostMonotonicUS = monotonicMicroseconds() - probeStartedAtMonotonicUS
       trafficObserver(trafficEvents, probeCostMonotonicUS)
     }
+    let backlog = this.backlogs.get(key)
+    if (!backlog) { backlog = { pending: 0, coalesced: null }; this.backlogs.set(key, backlog) }
+    const snapshot = subscription.channel === 'tickers' || subscription.channel === 'open-interest'
+    let acknowledged = !connection.pending.has(key)
+    const queued = backlog.coalesced
+    if (queued && queued.connection === connection && queued.session === session) {
+      const timestamp = snapshotTimestamp(subscription, message)
+      if (timestamp === null || queued.acknowledged !== acknowledged) {
+        this.overload(connection, `Public market ${subscription.channel} callback fell behind.`)
+        return
+      }
+      if (timestamp < queued.timestamp) { this.telemetry.ignoredEvents += message.data.length; return }
+      this.telemetry.ignoredEvents += queued.message.data.length
+      queued.message = message; queued.receivedAt = receivedAt; queued.nativeMessageSequence = nativeMessageSequence
+      queued.nativeHandlerEnteredAtMonotonicUS = nativeHandlerEnteredAtMonotonicUS
+      queued.trafficEvents = trafficEvents
+      queued.acknowledged = acknowledged
+      queued.timestamp = timestamp
+      return
+    }
+    if (backlog.pending >= MAX_PENDING_CALLBACKS && !snapshot) {
+      this.overload(connection, `Public market ${subscription.channel} callback fell behind.`)
+      return
+    }
+    if (backlog.pending >= MAX_PENDING_CALLBACKS && queued) {
+      this.overload(connection, `Public market ${subscription.channel} callback fell behind.`)
+      return
+    }
+    const timestamp = backlog.pending >= MAX_PENDING_CALLBACKS ? snapshotTimestamp(subscription, message) : null
+    if (backlog.pending >= MAX_PENDING_CALLBACKS && timestamp === null) {
+      this.overload(connection, `Public market ${subscription.channel} callback fell behind.`)
+      return
+    }
+    const delivery = { connection, session, message, receivedAt, nativeMessageSequence, nativeHandlerEnteredAtMonotonicUS, trafficEvents, acknowledged, timestamp }
+    if (backlog.pending >= MAX_PENDING_CALLBACKS) backlog.coalesced = delivery
+    backlog.pending++
+    this.telemetry.pendingEvents++
+    const current = () => this.active(connection) && this.subscriptions.get(key) === subscription && connection.sessions.get(key) === session
     const contextFor = trafficEvent => ({ signal: session.controller.signal, receivedAt, acknowledged,
       ...(trafficEvent ? { marketTrafficEvents: [trafficEvent] } : {}) })
     const task = (this.tails.get(key) ?? Promise.resolve()).then(async () => {
+      if (backlog.coalesced === delivery) backlog.coalesced = null
+      ;({ message, receivedAt, nativeMessageSequence, nativeHandlerEnteredAtMonotonicUS, trafficEvents, acknowledged } = delivery)
       if (!await connection.readyTask || !current()) return
       const { instId, channel } = subscription
       if (channel === 'instruments') {
@@ -526,6 +588,8 @@ class PublicMarketConnection {
       this.setState({ updatedAt: Math.max(this.state.updatedAt ?? -Infinity, receivedAt), ...(this.state.status === 'live' ? { error: '' } : {}) })
     }).catch(error => this.report('Public market callback failed.', error, this.active(connection) ? true : 'log')).then(() => {
       this.telemetry.pendingEvents--
+      backlog.pending--
+      if (!backlog.pending) this.backlogs.delete(key)
       if (this.tails.get(key) === task) this.tails.delete(key)
     })
     this.tails.set(key, task)
@@ -584,6 +648,21 @@ class PublicMarketConnection {
     const text = this.report(message, error)
     this.retire(connection)
     this.scheduleReconnect(text)
+  }
+
+  overload(connection, message) {
+    if (!this.active(connection)) return
+    const fence = {}
+    this.overloadFence = fence
+    const text = this.report(message)
+    const barrier = Promise.allSettled([connection.messageTail, ...this.tails.values()])
+    this.retire(connection)
+    if (!this.closed && this.started && this.subscriptions.size) this.setState({ status: 'reconnecting', error: text })
+    void barrier.then(() => {
+      if (this.overloadFence !== fence) return
+      this.overloadFence = null
+      if (!this.connection && this.retryTimer === null) this.scheduleReconnect(text)
+    })
   }
 
   scheduleReconnect(error) {
@@ -737,9 +816,11 @@ export class RealtimePublicMarket {
       ids.forEach(instId => assigned.add(instId))
       return { market, ids }
     })
+    let available = 0
     for (const instId of next) {
       if (assigned.has(instId)) continue
-      let allocation = allocations.find(value => value.ids.length < PUBLIC_MARKET_CONTRACTS_PER_CONNECTION)
+      while (available < allocations.length && allocations[available].ids.length >= PUBLIC_MARKET_CONTRACTS_PER_CONNECTION) available++
+      let allocation = allocations[available]
       if (!allocation) { allocation = { market: this.makeShard(), ids: [] }; allocations.push(allocation) }
       allocation.ids.push(instId)
     }

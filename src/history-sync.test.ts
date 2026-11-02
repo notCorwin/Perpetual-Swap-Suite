@@ -52,6 +52,39 @@ test('validates source identities, ranges, priorities and scheduling limits', as
   await assert.rejects(sync.enqueue({ ...query, priority: 'urgent' as 'foreground' }), /priority/)
 })
 
+test('source priority follows live demand and keeps first arrival for equal ranks', t => {
+  const { sync } = fixture(); t.after(() => sync.close())
+  const internal = sync as any, group = internal.group(query)
+  const first = { ...query, id: 'first', status: 'queued', priority: 'foreground' }
+  const second = { ...query, id: 'second', status: 'queued', priority: 'interactive' }
+  const disjoint = { ...query, id: 'disjoint', from: query.through + step, through: query.through + step, status: 'queued', priority: 'interactive' }
+  for (const task of [first, second, disjoint]) { internal.tasks.set(task.id, task); group.tasks.add(task.id) }
+  const source = internal.sourceQuery({ group, bounds: query, controller: new AbortController() }, query)
+  assert.equal(source.getPriority(), 'foreground', 'Equal ranks preserve the first consumer, including its priority label.')
+  first.priority = 'background'
+  assert.equal(source.getPriority(), 'interactive', 'Priority changes are read live.')
+  second.status = 'cancelled'
+  assert.equal(source.getPriority(), 'background', 'Disjoint demand does not upgrade the request.')
+  first.status = 'cancelled'
+  assert.equal(source.getPriority(), 'background', 'No eligible demand uses the default priority.')
+})
+
+test('fragmented held coverage retains exact local counts with empty, duplicate, and large exclusions', t => {
+  const { sync } = fixture(); t.after(() => sync.close())
+  const internal = sync as any
+  for (const size of [1, 2, 10_000]) {
+    const task: any = { ...query, id: `fragment-${size}`, from: base, through: base + (size - 1) * step, inspected: false }
+    const remaining = Array.from({ length: Math.ceil(size / 2) }, (_, index) => ({ from: base + index * 2 * step, through: base + index * 2 * step }))
+    const held = Array.from({ length: Math.floor(size / 4) }, (_, index) => ({ from: base + (index * 4 + 1) * step, through: base + (index * 4 + 1) * step }))
+    internal.heldDownloads.set(task.id, [...held, ...held])
+    internal.measure(task, { from: task.from, through: task.through, remaining, leases: [] }, [])
+    assert.equal(task.coveredRecords, Math.floor(size / 2))
+    assert.equal(task.localRecords, Math.floor(size / 2) - held.length)
+    assert.equal(task.emptyRecords, 0)
+    assert.equal(task.unavailableRecords, 0)
+  }
+})
+
 test('held consumers report local coverage without fetching and recheck after release', async t => {
   const { sync, store, requests } = fixture(); t.after(() => sync.close())
   const read = store.missingCandleRanges.bind(store)

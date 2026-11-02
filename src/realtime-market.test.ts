@@ -617,3 +617,82 @@ test('250 ms input cadence has a bounded receive-to-callback budget under an inj
     assert.ok(f.market.getTelemetry().maxCallbackLatencyMs <= 5)
   } finally { await f.market.close() }
 })
+
+test('candle overload waits for the old callback before reconnecting and repairing', async t => {
+  const gate = deferred(), repairs: RealtimeSubscription[][] = []
+  let calls = 0
+  const f = fixture({ onForming: async () => { calls++; await gate.promise }, onReconnect: async values => { repairs.push(values) } })
+  t.after(async () => { gate.resolve(); await f.market.close() })
+  await f.open()
+  const inner = f.market as unknown as { connection: { ingress: number }; consume: (connection: object, text: string, time: number, ingress: number) => void }
+  const connection = inner.connection
+  const submit = (index: number) => inner.consume(connection, JSON.stringify({ arg: { instId: btc.instId, channel: 'candle5m' }, data: [raw(epoch, 101, index + 1)] }), f.clock.time, connection.ingress + 1 + index)
+  submit(0); await turn()
+  for (let index = 1; index < 300 && f.market.getState().status === 'live'; index++) submit(index)
+  assert.equal(f.market.getState().status, 'reconnecting')
+  assert.ok(f.market.getTelemetry().pendingEvents <= 256)
+  f.market.setSubscriptions([btc]); f.market.start()
+  await f.clock.advance(10_000)
+  assert.equal(f.sockets.length, 1)
+  gate.resolve(); await f.market.whenIdle(); await turn(); await f.clock.advance(1_000)
+  assert.equal(f.sockets.length, 2)
+  f.sockets[1].open(); await f.market.whenIdle()
+  assert.deepEqual(repairs, [[btc]])
+  assert.equal(calls, 1, 'Retired forming updates cannot reach the consumer.')
+})
+
+test('durable candle overload retries failed writes without allowing a reconnect past the capacity barrier', async t => {
+  let writable = false, saved = 0
+  const f = fixture({ onConfirmed: async () => { if (!writable) throw new Error('disk unavailable'); saved++ } })
+  t.after(async () => { writable = true; f.market.retryPendingConfirmations(); await f.market.close() })
+  await f.open()
+  const inner = f.market as unknown as { connection: { ingress: number }; consume: (connection: object, text: string, time: number, ingress: number) => void; overloadWait: unknown }
+  const connection = inner.connection
+  for (let index = 0; index < 256; index++) {
+    inner.consume(connection, JSON.stringify({ arg: { instId: btc.instId, channel: 'candle5m' }, data: [raw(epoch, 101 + index / 1000, 1, true)] }), f.clock.time, connection.ingress + index + 1)
+    await turn()
+  }
+  assert.equal(f.market.getProgress(btc.instId, btc.timeframe).pendingConfirmations, 256)
+  inner.consume(connection, JSON.stringify({ arg: { instId: btc.instId, channel: 'candle5m' }, data: [raw(epoch, 104, 1, true)] }), f.clock.time, connection.ingress + 500)
+  await turn()
+  assert.equal(f.market.getState().status, 'reconnecting')
+  f.market.setSubscriptions([btc])
+  await f.clock.advance(1_000)
+  assert.equal(f.sockets.length, 1)
+  assert.ok(inner.overloadWait)
+  writable = true
+  await f.clock.advance(1_000); await turn(); await f.clock.advance(1_000)
+  assert.equal(saved, 256)
+  assert.equal(f.sockets.length, 2)
+  f.sockets[1].open(); await f.market.whenIdle()
+  assert.equal(f.market.getProgress(btc.instId, btc.timeframe).pendingConfirmations, 0)
+})
+
+test('closing while a durable overload retry is waiting cancels its timer', async () => {
+  const f = fixture({ onConfirmed: async () => { throw new Error('disk unavailable') } })
+  await f.open()
+  const inner = f.market as unknown as { connection: { ingress: number }; consume: (connection: object, text: string, time: number, ingress: number) => void; overloadWait: unknown }
+  const connection = inner.connection
+  for (let index = 0; index < 257; index++) {
+    inner.consume(connection, JSON.stringify({ arg: { instId: btc.instId, channel: 'candle5m' }, data: [raw(epoch, 101 + index / 1000, 1, true)] }), f.clock.time, connection.ingress + index + 1)
+    await turn()
+  }
+  assert.ok(inner.overloadWait)
+  await assert.rejects(f.market.close(), /uncommitted candle revisions/)
+  assert.equal(inner.overloadWait, null)
+  assert.equal(f.clock.timers.size, 0)
+})
+
+test('candle decode overload cannot reconnect around a stalled decoder', async t => {
+  const decoded = deferred<string>(), f = fixture()
+  t.after(async () => { decoded.resolve('{}'); await f.market.close() })
+  const socket = await f.open()
+  socket.data({ text: () => decoded.promise }); await turn()
+  for (let index = 0; index < 300; index++) push(socket, raw(epoch, 101, index + 1))
+  assert.equal(f.market.getState().status, 'reconnecting')
+  f.market.setSubscriptions([btc]); await f.clock.advance(5_000)
+  assert.equal(f.sockets.length, 1)
+  decoded.resolve('{}'); await f.market.whenIdle(); await turn(); await f.clock.advance(1_000)
+  assert.equal(f.sockets.length, 2)
+  f.sockets[1].open(); await f.market.whenIdle()
+})

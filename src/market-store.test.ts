@@ -240,6 +240,27 @@ test('integrity inspection detects gaps even if series metadata was corrupted', 
   } finally { await f.close() }
 })
 
+test('inspection preserves issue order, query limits, and covered gaps', async () => {
+  const f = await fixture()
+  try {
+    await f.store.appendCandles([2, 4, 6].map(index => ({ ...candle(index), baseVolume: null })))
+    const database = new DatabaseSync(f.store.path)
+    try {
+      const insert = database.prepare('INSERT INTO import_issues(path,instrument,timeframe,from_ts,through_ts,reason,detail) VALUES(?,?,?,?,?,?,?)')
+      insert.run('z', query.instrument, query.timeframe, base + 5 * step, base + 5 * step, 'corrupt-file', 'first')
+      insert.run('a', query.instrument, query.timeframe, base, base + step, 'corrupt-file', 'second')
+    } finally { database.close() }
+    const report = await f.store.inspectCandles({ ...query, order: 'desc', limit: 2 })
+    assert.equal(report.checkedRows, 2)
+    assert.deepEqual(report.issues.map(issue => [issue.reason, issue.from, issue.file]), [
+      ['missing-base-volume', base + 6 * step, undefined], ['missing-base-volume', base + 4 * step, undefined],
+      ['corrupt-file', base + 5 * step, 'z'], ['corrupt-file', base, 'a'],
+      ['gap', base + 3 * step, undefined], ['gap', base + 7 * step, undefined],
+    ])
+    assert.deepEqual(report.missingRanges, [{ from: base + 3 * step, through: base + 3 * step }, { from: base + 7 * step, through: base + 9 * step }])
+  } finally { await f.close() }
+})
+
 test('a later traded price invalidates Taker zero placeholders without renewing their original proof', async () => {
   const f = await fixture()
   try {

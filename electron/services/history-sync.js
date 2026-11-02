@@ -44,11 +44,29 @@ const merged = (values, step) => {
   }
   return result
 }
-const subtract = (values, exclusions, step) => exclusions.reduce((remaining, exclusion) => remaining.flatMap(value => {
-  if (!intersects(value, exclusion)) return [value]
-  return [...(value.from < exclusion.from ? [{ ...value, through: exclusion.from - step }] : []),
-    ...(value.through > exclusion.through ? [{ ...value, from: exclusion.through + step }] : [])]
-}), values)
+const subtract = (values, exclusions, step) => {
+  if (!exclusions.length || !values.length) return values
+  const ordered = merged(exclusions, step), result = []
+  for (const value of values) {
+    let low = 0, high = ordered.length
+    while (low < high) {
+      const middle = (low + high) >>> 1
+      if (ordered[middle].through < value.from) low = middle + 1
+      else high = middle
+    }
+    let from = value.from, changed = false
+    for (let index = low; index < ordered.length && ordered[index].from <= value.through; index++) {
+      const exclusion = ordered[index]
+      changed = true
+      if (from < exclusion.from) result.push({ ...value, from, through: exclusion.from - step })
+      from = Math.max(from, exclusion.through + step)
+      if (from > value.through) break
+    }
+    if (!changed) result.push(value)
+    else if (from <= value.through) result.push({ ...value, from, through: value.through })
+  }
+  return result
+}
 const slots = (values, step) => values.reduce((total, value) => total + (value.through - value.from) / step + 1, 0)
 
 /** Finite process-local consumers share durable source coverage and one in-flight page per series/source. */
@@ -77,7 +95,7 @@ export class HistorySync {
     this.maxAttempts = integer(options.maxAttempts ?? 5, 'maxAttempts', 1)
     this.maxRetainedTerminalTasks = integer(options.maxRetainedTerminalTasks ?? 512, 'maxRetainedTerminalTasks', 1)
     if (this.minRequestIntervalMS > 2147483647 || this.maxRetryDelayMS > 2147483647) throw new TypeError('History delays cannot exceed 2147483647 milliseconds.')
-    this.tasks = new Map(); this.groups = new Map(); this.waiters = new Map(); this.controls = new Map(); this.holds = new Set(); this.rechecks = new Set(); this.isolated = new Set(); this.heldDownloads = new Map(); this.heldCoverage = new Map(); this.idleWaiters = []
+    this.tasks = new Map(); this.groups = new Map(); this.groupsWithTasks = new Set(); this.nextGroupOrder = 0; this.waiters = new Map(); this.controls = new Map(); this.holds = new Set(); this.rechecks = new Set(); this.isolated = new Set(); this.heldDownloads = new Map(); this.heldCoverage = new Map(); this.idleWaiters = []
     this.active = new Map(); this.coverageChecks = new Map(); this.coverageEpochs = new Map(); this.coverageInvalidations = new Map(); this.coverageReaders = new Map()
     this.closed = false; this.started = null; this.closing = null; this.timer = null; this.draining = false
     this.requestTail = Promise.resolve(); this.lastRequestAt = null
@@ -92,7 +110,7 @@ export class HistorySync {
 
   group(identity) {
     const key = seriesKey(identity)
-    if (!this.groups.has(key)) this.groups.set(key, { key, ...descriptor(identity), tasks: new Set(), active: null, lastServed: 0, urgentPages: 0 })
+    if (!this.groups.has(key)) this.groups.set(key, { key, ...descriptor(identity), tasks: new Set(), active: null, lastServed: 0, urgentPages: 0, order: this.nextGroupOrder++ })
     return this.groups.get(key)
   }
 
@@ -109,7 +127,7 @@ export class HistorySync {
       unavailableRanges: [], remaining: [bounds], writtenRecords: 0, coveredRecords: 0, emptyRecords: 0, unavailableRecords: 0, localRecords: 0, inspected: false, lastError: null }
     if (typeof hold !== 'boolean') throw new TypeError('History hold must be boolean.')
     if (hold) { this.holds.add(id); this.heldDownloads.set(id, []) }
-    this.tasks.set(id, task); this.group(task).tasks.add(id)
+    this.tasks.set(id, task); this.group(task).tasks.add(id); this.groupsWithTasks.add(this.group(task))
     const active = this.group(task).active
     const cached = this.coverageChecks.get(seriesKey(task))
     if (cached && !cached.dirty.length) this.measure(task, cached, this.demands(this.group(task)).flatMap(value => value.unavailableRanges))
@@ -126,7 +144,8 @@ export class HistorySync {
     const tasks = [...this.tasks.values()].filter(task => removed.has(task.instrument))
     await Promise.all(tasks.filter(task => !terminal.has(task.status) || this.controls.has(task.id)).map(task => this.cancel(task.id)))
     for (const task of tasks) {
-      this.holds.delete(task.id); this.rechecks.delete(task.id); this.isolated.delete(task.id); this.heldDownloads.delete(task.id); this.heldCoverage.delete(task.id); this.tasks.delete(task.id); this.group(task).tasks.delete(task.id)
+      this.holds.delete(task.id); this.rechecks.delete(task.id); this.isolated.delete(task.id); this.heldDownloads.delete(task.id); this.heldCoverage.delete(task.id); this.tasks.delete(task.id)
+      const group = this.group(task); group.tasks.delete(task.id); if (!group.tasks.size) this.groupsWithTasks.delete(group)
     }
     for (const group of this.groups.values()) if (removed.has(group.instrument)) {
       group.active?.controller.abort(); this.coverageChecks.delete(group.key)
@@ -243,8 +262,15 @@ export class HistorySync {
   sourceQuery(entry, bounds) {
     // Keep this callback intact through adapters: MarketService.get accepts it
     // in its fifth argument, { getPriority }, and reevaluates queued admission.
-    const getPriority = () => this.demands(entry.group).filter(task => !entry.bounds || intersects(task, entry.bounds))
-      .sort((a, b) => priorities[b.priority] - priorities[a.priority])[0]?.priority ?? 'background'
+    const getPriority = () => {
+      let selected = null
+      for (const id of entry.group.tasks) {
+        const task = this.tasks.get(id)
+        if (task && !terminal.has(task.status) && (!entry.bounds || intersects(task, entry.bounds))
+          && (!selected || priorities[task.priority] > priorities[selected.priority])) selected = task
+      }
+      return selected?.priority ?? 'background'
+    }
     return { instrument: entry.group.instrument, timeframe: entry.group.timeframe, source: entry.group.source, ...bounds,
       priority: getPriority(), getPriority, cursor: null, signal: entry.controller.signal }
   }
@@ -421,16 +447,21 @@ export class HistorySync {
     this.draining = true
     try {
       while (!this.closed && !this.fatalError) {
-        let candidates = [...this.groups.values()].map(group => ({ group, rank: Math.max(-1, ...this.ready(group).map(task => priorities[task.priority])) }))
-          .filter(value => value.rank >= 0 && this.canAdmit(value.group, value.rank))
-          .sort((a, b) => b.rank - a.rank || a.group.lastServed - b.group.lastServed)
-        if (!candidates.length) break
-        // A continuing stream of interactive demands cannot starve maintenance.
-        if (this.urgentTurns >= 8) {
-          const maintenance = candidates.filter(value => value.rank < priorities.continuity).sort((a, b) => a.group.lastServed - b.group.lastServed)[0]
-          if (maintenance) candidates = [maintenance, ...candidates.filter(value => value !== maintenance)]
+        let selected = null, maintenance = null
+        for (const group of this.groupsWithTasks) {
+          let rank = -1
+          for (const task of this.ready(group)) rank = Math.max(rank, priorities[task.priority])
+          if (rank < 0 || !this.canAdmit(group, rank)) continue
+          const candidate = { group, rank }
+          if (!selected || rank > selected.rank || rank === selected.rank && (group.lastServed < selected.group.lastServed
+            || group.lastServed === selected.group.lastServed && group.order < selected.group.order)) selected = candidate
+          // A continuing stream of interactive demands cannot starve maintenance.
+          if (rank < priorities.continuity && (!maintenance || group.lastServed < maintenance.group.lastServed
+            || group.lastServed === maintenance.group.lastServed && (rank > maintenance.rank
+              || rank === maintenance.rank && group.order < maintenance.group.order))) maintenance = candidate
         }
-        const { group, rank } = candidates[0]
+        if (!selected) break
+        const { group, rank } = this.urgentTurns >= 8 && maintenance ? maintenance : selected
         this.urgentTurns = rank >= priorities.continuity ? this.urgentTurns + 1 : 0
         group.lastServed = ++this.turn
         const entry = { group, bounds: null, controller: new AbortController(), promise: null, writing: false, writePromise: null, unavailable: [] }
@@ -513,7 +544,11 @@ export class HistorySync {
       for (const task of initial) this.rechecks.delete(task.id)
       this.assess(group, unavailable, observedCoverage, freshUnavailable)
       const ready = this.ready(group).sort((a, b) => priorities[b.priority] - priorities[a.priority] || a.createdAt - b.createdAt)
-      const needed = task => clipped(subtract(gaps, task.unavailableRanges, step), task)
+      const neededRanges = new Map()
+      const needed = task => {
+        if (!neededRanges.has(task)) neededRanges.set(task, clipped(subtract(gaps, task.unavailableRanges, step), task))
+        return neededRanges.get(task)
+      }
       const available = ready.filter(task => needed(task).length)
       const selected = group.urgentPages >= 8 ? available.find(task => priorities[task.priority] < priorities.continuity) ?? available[0] : available[0]
       if (!selected) return
@@ -656,7 +691,10 @@ export class HistorySync {
   }
   prune() {
     const finished = [...this.tasks.values()].filter(task => terminal.has(task.status) && !this.waiters.has(task.id) && !this.controls.has(task.id))
-    for (const task of finished.slice(0, Math.max(0, finished.length - this.maxRetainedTerminalTasks))) { this.holds.delete(task.id); this.rechecks.delete(task.id); this.isolated.delete(task.id); this.heldDownloads.delete(task.id); this.heldCoverage.delete(task.id); this.tasks.delete(task.id); this.group(task).tasks.delete(task.id) }
+    for (const task of finished.slice(0, Math.max(0, finished.length - this.maxRetainedTerminalTasks))) {
+      this.holds.delete(task.id); this.rechecks.delete(task.id); this.isolated.delete(task.id); this.heldDownloads.delete(task.id); this.heldCoverage.delete(task.id); this.tasks.delete(task.id)
+      const group = this.group(task); group.tasks.delete(task.id); if (!group.tasks.size) this.groupsWithTasks.delete(group)
+    }
   }
   isIdle() { return !this.active.size && !this.controls.size && ![...this.tasks.values()].some(task => !terminal.has(task.status)) }
   settleIdle() { if (this.isIdle()) for (const waiter of this.idleWaiters.splice(0)) waiter.resolve() }

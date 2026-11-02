@@ -85,6 +85,29 @@ test('progress notifications coalesce expensive report updates while snapshots r
   assert.equal((await finished(f.download)).phase, 'completed')
 })
 
+test('completion counters handle many empty streams, duplicate instruments, and invalid listings', async t => {
+  const now = base + 2 * hour, f = fixture(t, { now: () => now })
+  const instruments = Array.from({ length: 1000 }, (_, index) => ({ instId: `CONTRACT-${index}-USDT-SWAP`, listTime: now }))
+  const started = f.download.start([...instruments, instruments[0], { instId: 'INVALID-USDT-SWAP' }])
+  assert.deepEqual(started.contracts, { completed: 0, total: 1001 })
+  const complete = await finished(f.download)
+  assert.equal(complete.phase, 'failed')
+  assert.deepEqual(complete.contracts, { completed: 1000, total: 1001 })
+  assert.deepEqual(complete.streams, { completed: 9000, total: 9000 })
+  assert.equal(complete.progress.total, 0)
+  assert.equal(complete.failures.length, 1)
+  assert.equal(f.calls.length, 0)
+})
+
+test('progress retains stream-order rounding when the total exceeds safe integer precision', t => {
+  const f = fixture(t), download = f.download as any
+  const streams = [10_000_000_000_000_000, 1, 1].map(available => ({ available, empty: 0, unavailable: 0, failed: 0, reused: 0 }))
+  download.report.progress.total = Number.MAX_SAFE_INTEGER + 1
+  download.job = { streams, totals: { available: 10_000_000_000_000_002, empty: 0, unavailable: 0, failed: 0, reused: 0 }, completedStreams: 0, completedContracts: 0 }
+  assert.equal(f.download.snapshot().progress.available, streams.reduce((sum, stream) => sum + stream.available, 0))
+  download.job = null
+})
+
 test('a manual download freezes listing-aligned completed ranges for every native source and ignores duplicate starts', async t => {
   let clock = base + 3 * hour + 123_000
   const gate = deferred()

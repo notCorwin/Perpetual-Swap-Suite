@@ -1289,3 +1289,59 @@ test('same-socket removal notifies consumers synchronously without retiring heal
   await f.market.whenIdle()
   assert.equal(f.market.getState().status, 'live')
 })
+
+test('ticker overload coalesces only the queued snapshot and bounds the stalled callback backlog', async t => {
+  const gate = deferred(), seen: string[] = []
+  const f = fixture({ onTicker: async (_id, value) => { seen.push(String(value.last)); if (seen.length === 1) await gate.promise } })
+  t.after(async () => { gate.resolve(); await f.market.close() })
+  await f.open()
+  const shard = (f.market as unknown as { shards: Array<{ connection: { ingress: number }; consume: (connection: object, text: string, time: number, ingress: number) => void }> }).shards[0]
+  const connection = shard.connection
+  const submit = (index: number, stamp = index) => shard.consume(connection, JSON.stringify({ arg: { channel: 'tickers', instId: btc }, data: [{ last: String(index + 1), bidPx: '1', askPx: '2', ts: String(1_000 + stamp) }] }), f.clock.time, connection.ingress + 1 + index)
+  submit(0); await turn()
+  for (let index = 1; index < 1000; index++) submit(index)
+  submit(1000, 500)
+  assert.ok(f.market.getTelemetry().pendingEvents <= 257)
+  assert.equal(f.market.getState().status, 'live')
+  gate.resolve(); await f.market.whenIdle()
+  assert.equal(seen.at(-1), '1000', 'A later-arriving stale snapshot cannot replace a fresher queued observation.')
+  assert.deepEqual(seen.slice(0, 3), ['1', '2', '3'])
+  assert.equal(f.market.getTelemetry().pendingEvents, 0)
+})
+
+test('trade overload fences reconnect until a stalled consumer settles, then resynchronizes', async t => {
+  const gate = deferred(), disconnected: string[][] = [], recovered: string[][] = []
+  const f = fixture({ onTrades: async () => { await gate.promise }, onDisconnect: ids => { disconnected.push(ids) }, onReconnect: async ids => { recovered.push(ids) } })
+  t.after(async () => { gate.resolve(); await f.market.close() })
+  await f.open()
+  const shard = (f.market as unknown as { shards: Array<{ connection: { ingress: number }; consume: (connection: object, text: string, time: number, ingress: number) => void }> }).shards[0]
+  const connection = shard.connection
+  const submit = (index: number) => shard.consume(connection, JSON.stringify({ arg: { channel: 'trades', instId: btc }, data: [{ tradeId: String(index) }] }), f.clock.time, connection.ingress + 1 + index)
+  submit(0); await turn()
+  for (let index = 1; index < 300 && f.market.getState().status === 'live'; index++) submit(index)
+  assert.equal(f.market.getState().status, 'reconnecting')
+  assert.deepEqual(disconnected, [[btc]])
+  assert.ok(f.market.getTelemetry().pendingEvents <= 256)
+  f.market.setSubscriptions([btc]); f.market.start()
+  await f.clock.advance(10_000)
+  assert.equal(f.sockets.length, 1, 'Subscription changes cannot bypass a stalled-consumer barrier.')
+  gate.resolve(); await f.market.whenIdle(); await turn(); await f.clock.advance(1_000)
+  assert.equal(f.sockets.length, 2)
+  f.sockets[1].open(); await f.market.whenIdle()
+  assert.deepEqual(recovered, [[btc]])
+  assert.equal(f.market.getState().status, 'live')
+})
+
+test('public decode overload cannot reconnect around a stalled decoder', async t => {
+  const decoded = deferred<string>(), f = fixture()
+  t.after(async () => { decoded.resolve('{}'); await f.market.close() })
+  const socket = await f.open()
+  socket.data({ text: () => decoded.promise }); await turn()
+  for (let index = 0; index < 300; index++) push(socket, 'tickers', [{ last: String(index) }])
+  assert.equal(f.market.getState().status, 'reconnecting')
+  f.market.setSubscriptions([btc]); await f.clock.advance(5_000)
+  assert.equal(f.sockets.length, 1)
+  decoded.resolve('{}'); await f.market.whenIdle(); await turn(); await f.clock.advance(1_000)
+  assert.equal(f.sockets.length, 2)
+  f.sockets[1].open(); await f.market.whenIdle()
+})

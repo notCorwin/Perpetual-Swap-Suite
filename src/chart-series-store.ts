@@ -107,9 +107,21 @@ function retainedSourceMeta(meta: PreparedChartMeta, hours: readonly number[], l
     if (previous && from <= previous.through + meta.intervalMS) previous.through = hour
     else ranges.push({ from, through: hour })
   }
-  const statuses = (meta.sourceStatuses ?? []).flatMap(value => ranges.flatMap(range => value.status.through !== null && value.status.from <= range.through && value.status.through >= range.from
-    ? [{ source: value.source, status: Object.freeze({ ...value.status, from: Math.max(value.status.from, range.from), through: Math.min(value.status.through, range.through) }) }] : []))
-    .sort((left, right) => left.source.localeCompare(right.source) || left.status.from - right.status.from)
+  const statuses: Array<{ source: (typeof meta.sourceStatuses)[number]['source']; status: NonNullable<typeof meta.sourceStatuses>[number]['status'] }> = []
+  for (const value of meta.sourceStatuses) {
+    if (value.status.through === null) continue
+    let low = 0, high = ranges.length
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2)
+      if (ranges[middle].through < value.status.from) low = middle + 1
+      else high = middle
+    }
+    for (let index = low; index < ranges.length && ranges[index].from <= value.status.through; index++) {
+      const range = ranges[index]
+      statuses.push({ source: value.source, status: Object.freeze({ ...value.status, from: Math.max(value.status.from, range.from), through: Math.min(value.status.through, range.through) }) })
+    }
+  }
+  statuses.sort((left, right) => left.source.localeCompare(right.source) || left.status.from - right.status.from)
   const merged: typeof statuses = []
   for (const value of statuses) {
     const prior = merged.at(-1)
@@ -494,7 +506,15 @@ export class PreparedChartStore {
         changed = true
       }
       if (addedHours.length) {
-        current.hours = [...current.hours, ...addedHours].sort((left, right) => left - right)
+        addedHours.sort((left, right) => left - right)
+        const merged = new Array<number>(current.hours.length + addedHours.length)
+        let existing = 0, added = 0, index = 0
+        while (existing < current.hours.length && added < addedHours.length) {
+          merged[index++] = current.hours[existing] <= addedHours[added] ? current.hours[existing++] : addedHours[added++]
+        }
+        while (existing < current.hours.length) merged[index++] = current.hours[existing++]
+        while (added < addedHours.length) merged[index++] = addedHours[added++]
+        current.hours = merged
         current.boundaries = null
       }
       const newestMeta = revision >= current.meta.revision

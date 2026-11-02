@@ -10,6 +10,9 @@ const channels = new Map([['5m', 'candle5m'], ['15m', 'candle15m'], ['1H', 'cand
 const timeframes = new Map([...channels].map(([timeframe, channel]) => [channel, timeframe]))
 const keyFor = ({ instId, timeframe }) => `${timeframe}:${instId}`
 const hour = 3_600_000
+const MAX_PENDING_MESSAGES = 256
+const MAX_PENDING_CALLBACKS = 256
+const MAX_PENDING_CONFIRMATIONS = 256
 const signature = raw => JSON.stringify(raw.slice(0, 8).map(Number))
 const volumes = raw => raw.slice(5, 8).map(Number)
 const copy = value => ({ ...value })
@@ -58,6 +61,8 @@ export class RealtimeMarket {
     this.recoveryTail = Promise.resolve()
     this.retryTimer = null
     this.closePromise = null
+    this.overloadFence = null
+    this.overloadWait = null
   }
 
   positive(name, fallback) {
@@ -100,6 +105,7 @@ export class RealtimeMarket {
     }
     if (!next.size) {
       this.cancelRetry()
+      this.wakeOverloadWait()
       if (this.connection) this.retire(this.connection)
       this.setState({ status: 'disconnected' })
     } else if (this.started) {
@@ -196,7 +202,7 @@ export class RealtimeMarket {
   }
 
   connect() {
-    if (this.closed || !this.started || !this.subscriptions.size || this.connection) return
+    if (this.closed || !this.started || !this.subscriptions.size || this.connection || this.overloadFence) return
     this.setState({ status: this.hasOpened || this.attempt ? 'reconnecting' : 'connecting' })
     if (this.closed || !this.subscriptions.size || this.connection) return
     let socket
@@ -343,6 +349,11 @@ export class RealtimeMarket {
 
   message(connection, data) {
     if (!this.active(connection)) return
+    connection.pendingMessages ??= 0
+    if (connection.pendingMessages >= MAX_PENDING_MESSAGES) {
+      this.overload(connection, 'Candle message decoding fell behind.')
+      return
+    }
     const trafficProbeEnabled = typeof this.options.onMarketTrafficIngress === 'function'
     const nativeHandlerEnteredAtMonotonicUS = trafficProbeEnabled ? monotonicMicroseconds() : null
     const ingress = ++connection.ingress
@@ -350,6 +361,7 @@ export class RealtimeMarket {
     this.armHeartbeat(connection)
     // Blob decoding is also part of the shutdown barrier. Native Node/Electron
     // sockets normally deliver text here, but binary frames are valid too.
+    connection.pendingMessages++
     const task = (connection.messageTail ?? Promise.resolve()).then(async () => {
       let text = data
       if (typeof data !== 'string') {
@@ -358,7 +370,7 @@ export class RealtimeMarket {
         else throw new TypeError('Unsupported WebSocket message data.')
       }
       if (this.active(connection)) this.consume(connection, text, receivedAt, ingress, nativeHandlerEnteredAtMonotonicUS)
-    }).catch(error => this.report('WebSocket message decoding failed.', error, this.active(connection) ? true : 'log'))
+    }).catch(error => this.report('WebSocket message decoding failed.', error, this.active(connection) ? true : 'log')).then(() => { connection.pendingMessages-- })
     connection.messageTail = task
     this.track(task)
   }
@@ -397,6 +409,7 @@ export class RealtimeMarket {
   }
 
   enqueue(connection, subscription, raw, receivedAt, nativeMessageSequence, nativeHandlerEnteredAtMonotonicUS) {
+    if (!this.active(connection)) return
     this.telemetry.receivedEvents++
     this.telemetry.lastReceivedAt = receivedAt
     const key = keyFor(subscription)
@@ -419,6 +432,10 @@ export class RealtimeMarket {
       series = { tail: Promise.resolve(), commitTask: null, commitDemand: 0, pending: 0, forming: null, latestTimestamp: -Infinity,
         confirmedThrough: -Infinity, committedThrough: -Infinity, confirmations: new Map(), pendingConfirmations: new Map() }
       this.series.set(key, series)
+    }
+    if (series.pending >= MAX_PENDING_CALLBACKS || raw?.[8] === '1' && series.pendingConfirmations.size >= MAX_PENDING_CONFIRMATIONS) {
+      this.overload(connection, 'Candle processing fell behind.')
+      return
     }
     series.pending++
     this.telemetry.pendingEvents++
@@ -497,6 +514,45 @@ export class RealtimeMarket {
     this.scheduleReconnect(text)
   }
 
+  overload(connection, message) {
+    if (!this.active(connection)) return
+    const fence = {}
+    this.overloadFence = fence
+    const text = this.report(message)
+    const series = [...this.series.values()]
+    const barrier = Promise.allSettled([connection.messageTail, ...series.map(value => value.tail)])
+    this.retire(connection)
+    if (!this.closed && this.started && this.subscriptions.size) this.setState({ status: 'reconnecting', error: text })
+    void barrier.then(async () => {
+      // Confirmed revisions cannot be discarded. Wait for durable capacity
+      // before resuming ingress; retries are needed because no new candle can
+      // arrive to trigger the normal writer retry while the socket is closed.
+      while (!this.closed && this.started && this.subscriptions.size
+        && series.some(value => value.pendingConfirmations.size >= MAX_PENDING_CONFIRMATIONS)) {
+        this.retryPendingConfirmations()
+        await Promise.allSettled(series.map(value => value.commitTask).filter(Boolean))
+        if (!this.closed && this.subscriptions.size && series.some(value => value.pendingConfirmations.size >= MAX_PENDING_CONFIRMATIONS)) {
+          await new Promise(resolve => {
+            const wait = { timer: null, resolve }
+            wait.timer = this.setTimer(() => { if (this.overloadWait === wait) this.overloadWait = null; resolve() }, this.baseDelay)
+            this.overloadWait = wait
+          })
+        }
+      }
+      if (this.overloadFence !== fence) return
+      this.overloadFence = null
+      if (!this.connection && this.retryTimer === null) this.scheduleReconnect(text)
+    })
+  }
+
+  wakeOverloadWait() {
+    const wait = this.overloadWait
+    if (!wait) return
+    this.overloadWait = null
+    this.clearTimer(wait.timer)
+    wait.resolve()
+  }
+
   scheduleReconnect(error) {
     if (this.closed || !this.started || !this.subscriptions.size) return
     this.cancelRetry()
@@ -556,6 +612,7 @@ export class RealtimeMarket {
     })
     this.closed = true
     this.cancelRetry()
+    this.wakeOverloadWait()
     if (this.connection) this.retire(this.connection)
     this.setState({ status: 'disconnected' })
     return this.closePromise

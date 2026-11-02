@@ -81,7 +81,10 @@ export class HistoryDownload {
       progress: { ...emptyHistoryDownload().progress, total: streams.reduce((sum, stream) => sum + count(stream.from, stream.through, stream.step), 0) },
       failures, error: unique.length ? '' : 'No currently qualified contracts are available. Wait for qualification or update the saved conditions.' }
     this.report.progress.pending = this.report.progress.total
-    const job = { streams, cancelled: false, failure: '', promise: null }
+    const remainingByInstrument = new Map()
+    for (const stream of streams) remainingByInstrument.set(stream.instrument, (remainingByInstrument.get(stream.instrument) ?? 0) + 1)
+    const job = { streams, cancelled: false, failure: '', promise: null, remainingByInstrument,
+      totals: { available: 0, empty: 0, unavailable: 0, failed: 0, reused: 0 }, completedStreams: 0, completedContracts: 0 }
     this.job = job
     this.publish(true)
     // Allow start to return immediately with its immutable denominator.
@@ -112,13 +115,22 @@ export class HistoryDownload {
   }
 
   update() {
-    const streams = this.job?.streams ?? []
+    const job = this.job
     const progress = this.report.progress
-    progress.available = streams.reduce((sum, value) => sum + value.available, 0)
-    progress.empty = streams.reduce((sum, value) => sum + value.empty, 0)
-    progress.unavailable = streams.reduce((sum, value) => sum + value.unavailable, 0)
-    progress.failed = streams.reduce((sum, value) => sum + value.failed, 0)
-    progress.reused = streams.reduce((sum, value) => sum + value.reused, 0)
+    progress.available = job?.totals.available ?? 0
+    progress.empty = job?.totals.empty ?? 0
+    progress.unavailable = job?.totals.unavailable ?? 0
+    progress.failed = job?.totals.failed ?? 0
+    progress.reused = job?.totals.reused ?? 0
+    // Beyond the exact integer range, page completion order can change IEEE-754
+    // rounding. Retain the original stream-order summation for that case.
+    if (!Number.isSafeInteger(progress.total)) {
+      progress.available = 0; progress.empty = 0; progress.unavailable = 0; progress.failed = 0; progress.reused = 0
+      for (const stream of job?.streams ?? []) {
+        progress.available += stream.available; progress.empty += stream.empty; progress.unavailable += stream.unavailable
+        progress.failed += stream.failed; progress.reused += stream.reused
+      }
+    }
     progress.available += this.heldProgress.available
     progress.empty += this.heldProgress.empty
     progress.unavailable += this.heldProgress.unavailable
@@ -131,18 +143,20 @@ export class HistoryDownload {
     }
     progress.checked = progress.available + progress.empty + progress.unavailable
     progress.pending = Math.max(0, progress.total - progress.checked - progress.failed)
-    this.report.streams.completed = streams.filter(stream => stream.done).length
-    const byInstrument = new Map()
-    for (const stream of streams) {
-      const values = byInstrument.get(stream.instrument) ?? []
-      values.push(stream); byInstrument.set(stream.instrument, values)
-    }
-    this.report.contracts.completed = [...byInstrument.values()].filter(values => values.every(stream => stream.done)).length
+    this.report.streams.completed = job?.completedStreams ?? 0
+    this.report.contracts.completed = job?.completedContracts ?? 0
     this.report.active = [...this.active.values()].map(({ task }) => ({ instrument: task.instrument, timeframe: task.timeframe, source: task.source,
       from: task.from, through: task.through, status: task.status, attempts: task.attempts, nextAttemptAt: task.nextAttemptAt, error: task.lastError ?? '' }))
   }
 
   async run(job) {
+    const completeStream = stream => {
+      stream.done = true
+      job.completedStreams += 1
+      const remaining = job.remainingByInstrument.get(stream.instrument) - 1
+      job.remainingByInstrument.set(stream.instrument, remaining)
+      if (!remaining) job.completedContracts += 1
+    }
     const states = job.streams.map(stream => ({ stream, through: stream.through, settledFrom: null, terminal: false, running: false, queued: false, pending: null }))
     const fine = new Map(states.filter(({ stream }) => stream.source === 'candles' && stream.timeframe === '5m').map(state => [state.stream.instrument, state]))
     const parents = new Map()
@@ -150,7 +164,7 @@ export class HistoryDownload {
       const values = parents.get(state.stream.instrument) ?? []
       values.push(state); parents.set(state.stream.instrument, values)
     }
-    for (const state of states) if (state.through < state.stream.from) { state.terminal = true; state.stream.done = true }
+    for (const state of states) if (state.through < state.stream.from) { state.terminal = true; completeStream(state.stream) }
     const ready = [], active = new Set()
     let head = 0
     const schedule = state => {
@@ -228,10 +242,12 @@ export class HistoryDownload {
           // A fatal scheduler error can reject the waiter after earlier pages
           // committed. Keep the last verified durable checkpoint.
           const checkpoint = outcome?.result ?? this.sync.getTask(pending.id) ?? this.active.get(pending.id)?.task
-          stream.available += checkpoint?.coveredRecords ?? 0
-          stream.empty += checkpoint?.emptyRecords ?? 0
-          stream.unavailable += checkpoint?.unavailableRecords ?? 0
-          stream.reused += Math.min(checkpoint?.localRecords ?? 0, checkpoint?.coveredRecords ?? 0)
+          const available = checkpoint?.coveredRecords ?? 0, empty = checkpoint?.emptyRecords ?? 0, unavailable = checkpoint?.unavailableRecords ?? 0
+          const reused = Math.min(checkpoint?.localRecords ?? 0, checkpoint?.coveredRecords ?? 0)
+          stream.available += available; job.totals.available += available
+          stream.empty += empty; job.totals.empty += empty
+          stream.unavailable += unavailable; job.totals.unavailable += unavailable
+          stream.reused += reused; job.totals.reused += reused
           attempt.checked = (checkpoint?.coveredRecords ?? 0) + (checkpoint?.emptyRecords ?? 0) + (checkpoint?.unavailableRecords ?? 0)
           this.active.delete(pending.id); state.pending = null
           this.update(); this.publish()
@@ -242,13 +258,14 @@ export class HistoryDownload {
         if (!['completed', 'unavailable'].includes(result.status)) throw new Error(result.lastError || `Source task ${result.status}.`)
         state.settledFrom = from
         state.through = from - stream.step
-        if (state.through < stream.from) { state.terminal = true; stream.done = true }
+        if (state.through < stream.from) { state.terminal = true; completeStream(stream) }
       } catch (error) {
         if (!job.cancelled) {
           // Failed fine work releases its parent dependency, not source absence.
           // The parent checks local coverage and acquires its own missing slots.
           state.terminal = true
-          stream.failed += Math.max(0, count(from, through, stream.step) - attempt.checked)
+          const failed = Math.max(0, count(from, through, stream.step) - attempt.checked)
+          stream.failed += failed; job.totals.failed += failed
           this.report.failures.push({ instrument: stream.instrument, timeframe: stream.timeframe, source: stream.source,
             from, through, error: message(error) })
         }

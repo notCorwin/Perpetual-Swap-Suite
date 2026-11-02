@@ -2,6 +2,25 @@ import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
 import { HistorySync } from '../electron/services/history-sync.js'
 
+test('groups first observed before acquiring tasks keep their original scheduling order', async t => {
+  const calls: string[] = [], covered = new Set<string>()
+  const sync = new HistorySync({
+    store: { async missingCandleRanges(query) { return { gaps: covered.has(query.instrument) ? [] : [{ from: query.from, through: query.through }], leases: [] } } },
+    write(records, task) { if (records.length) covered.add(task.instrument) },
+    sources: { candles: { fetchGap(query) {
+      calls.push(query.instrument)
+      return [{ instrument: query.instrument, timeframe: query.timeframe, timestamp: query.from, open: 1, high: 1, low: 1, close: 1, volume: 1, confirmed: true }]
+    } } },
+  })
+  t.after(() => sync.close())
+  const query = { instrument: 'FIRST', timeframe: '5m' as const, source: 'candles', from: 0, through: 0 }
+  ;(sync as any).group(query)
+  const second = await sync.enqueue({ ...query, instrument: 'SECOND' })
+  const first = await sync.enqueue(query)
+  await Promise.all([sync.waitFor(first.id), sync.waitFor(second.id)])
+  assert.deepEqual(calls, ['FIRST', 'SECOND'])
+})
+
 // Scheduling is a domain policy. Storage worker scheduling is exercised through
 // actual SQLite reads/writes in market-store tests, without exposing a generic queue.
 test('maintenance is bounded while continuity and interactive work retain independent source capacity', async t => {

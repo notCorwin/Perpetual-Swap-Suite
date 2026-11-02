@@ -38,7 +38,8 @@ else {
       path TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, status TEXT NOT NULL, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS import_issues (
       path TEXT PRIMARY KEY, instrument TEXT NOT NULL, timeframe TEXT NOT NULL, from_ts INTEGER NOT NULL,
-      through_ts INTEGER NOT NULL, reason TEXT NOT NULL, detail TEXT NOT NULL);`)
+      through_ts INTEGER NOT NULL, reason TEXT NOT NULL, detail TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS import_issues_range ON import_issues(instrument,timeframe,from_ts);`)
   const version = database.prepare('PRAGMA user_version').get().user_version
   if (version < 2) {
     database.exec('BEGIN IMMEDIATE')
@@ -511,8 +512,13 @@ const commands = {
     return { result: undefined }
   },
   inspect: query => {
-    const valid = validateQuery(query), rows = candleRows(valid), gaps = missingRanges(valid, 'candles', true), issues = []
+    const valid = validateQuery(query), series = identity(valid), gaps = missingRanges(valid, 'candles', true), issues = []
+    let checkedRows = 0
+    const rows = series ? statement(`SELECT timestamp,open,high,low,close,volume,base_volume AS baseVolume,quote_volume AS quoteVolume FROM candles
+      WHERE series_id=? AND timestamp>=? AND timestamp<=? ORDER BY timestamp ${valid.order === 'desc' ? 'DESC' : 'ASC'}${valid.limit ? ' LIMIT ?' : ''}`)
+      .iterate(series.id, valid.from, valid.through, ...(valid.limit ? [valid.limit] : [])) : []
     for (const row of rows) {
+      checkedRows++
       const first = Math.floor(row.timestamp / CANDLE_INTERVALS[query.timeframe]) * CANDLE_INTERVALS[query.timeframe]
       const issue = reason => issues.push({ instrument: query.instrument, timeframe: query.timeframe, source: 'candles', from: first, through: first, reason, repairable: true })
       if (row.baseVolume == null) issue('missing-base-volume')
@@ -522,10 +528,24 @@ const commands = {
         || row.high < Math.max(row.open,row.close,row.low) || row.low > Math.min(row.open,row.close,row.high)) issue('invalid-ohlc')
       if (['volume','baseVolume','quoteVolume'].some(field => row[field] !== null && (!Number.isFinite(row[field]) || row[field] < 0))) issue('negative-volume')
     }
-    const failures = all('SELECT * FROM import_issues WHERE instrument=? AND timeframe=? AND from_ts<=? AND through_ts>=?', query.instrument, query.timeframe, query.through, query.from)
+    const failures = all('SELECT * FROM import_issues WHERE instrument=? AND timeframe=? AND from_ts<=? AND through_ts>=? ORDER BY rowid', query.instrument, query.timeframe, query.through, query.from)
     for (const row of failures) issues.push({ instrument: row.instrument, timeframe: row.timeframe, source: 'candles', from: row.from_ts, through: row.through_ts, reason: row.reason, repairable: true, file: row.path, detail: row.detail })
-    for (const gap of gaps) if (!failures.some(row => row.from_ts <= gap.from && row.through_ts >= gap.through)) issues.push({ instrument: query.instrument, timeframe: query.timeframe, source: 'candles', ...gap, reason: 'gap', repairable: true })
-    return { result: { issues, checkedRows: rows.length, files: 1, missingRanges: gaps.filter(gap => !failures.some(row => row.from_ts <= gap.from && row.through_ts >= gap.through)) } }
+    const orderedFailures = failures.toSorted((left, right) => left.from_ts - right.from_ts)
+    const furthest = []
+    for (const row of orderedFailures) furthest.push(Math.max(furthest.at(-1) ?? -Infinity, row.through_ts))
+    const uncoveredGaps = []
+    for (const gap of gaps) {
+      let left = 0, right = orderedFailures.length
+      while (left < right) {
+        const middle = Math.floor((left + right) / 2)
+        if (orderedFailures[middle].from_ts <= gap.from) left = middle + 1
+        else right = middle
+      }
+      if (left && furthest[left - 1] >= gap.through) continue
+      uncoveredGaps.push(gap)
+      issues.push({ instrument: query.instrument, timeframe: query.timeframe, source: 'candles', ...gap, reason: 'gap', repairable: true })
+    }
+    return { result: { issues, checkedRows, files: 1, missingRanges: uncoveredGaps } }
   },
   integrity: () => ({ result: all('PRAGMA quick_check').map(row => row.quick_check) }),
   close: () => { if (!workerData.reader) database.exec('PRAGMA wal_checkpoint(PASSIVE)'); database.close(); return { result: undefined } },

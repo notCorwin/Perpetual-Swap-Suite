@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { setImmediate as yieldToBackground } from 'node:timers/promises'
+import { isProxy } from 'node:util/types'
 
 const DAY = 86_400_000
 const INTERVALS = { '5m': 300_000, '15m': 900_000, '1H': 3_600_000 }
@@ -22,8 +23,35 @@ function targetOf(target) {
 function findingsOf(result, target) {
   if (!result || !Array.isArray(result.issues) || !Number.isSafeInteger(result.checkedRows) || result.checkedRows < 0 || !Number.isSafeInteger(result.files) || result.files < 0) throw new TypeError('The audit inspector returned an invalid result.')
   const findings = [...result.issues]
-  for (const range of result.missingRanges ?? []) {
-    if (!findings.some(issue => issue.reason === 'gap' && issue.from <= range.from && issue.through >= range.through)) findings.push({ ...target, ...range, reason: 'gap', repairable: true })
+  const ranges = result.missingRanges ?? []
+  const plain = value => value !== null && typeof value === 'object' && !isProxy(value) && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)
+  const data = (value, key) => { const property = Object.getOwnPropertyDescriptor(value, key); return property && 'value' in property ? property.value : undefined }
+  const validRange = value => plain(value) && Number.isSafeInteger(data(value, 'from')) && data(value, 'from') >= 0
+    && Number.isSafeInteger(data(value, 'through')) && data(value, 'through') >= data(value, 'from')
+  let plainRanges = Array.isArray(ranges) && !isProxy(ranges) && Object.getPrototypeOf(ranges) === Array.prototype && !Object.hasOwn(ranges, Symbol.iterator) && ranges.length > 0
+  if (plainRanges) plainRanges = findings.every(issue => plain(issue) && typeof data(issue, 'reason') === 'string'
+    && (data(issue, 'reason') !== 'gap' || validRange(issue)))
+  if (plainRanges) for (let index = 0; index < ranges.length; index++) {
+    const property = Object.getOwnPropertyDescriptor(ranges, index)
+    if (!property || !('value' in property) || !validRange(property.value)) { plainRanges = false; break }
+  }
+  if (plainRanges) {
+    const gaps = findings.filter(issue => issue.reason === 'gap')
+    const starts = [...new Set([...gaps.map(issue => issue.from), ...Array.prototype.map.call(ranges, range => range.from)])].sort((left, right) => left - right)
+    const indexes = new Map(starts.map((value, index) => [value, index + 1]))
+    const furthest = new Float64Array(starts.length + 1); furthest.fill(-Infinity)
+    const add = range => { for (let index = indexes.get(range.from); index < furthest.length; index += index & -index) furthest[index] = Math.max(furthest[index], range.through) }
+    const covered = range => {
+      let maximum = -Infinity
+      for (let index = indexes.get(range.from); index > 0; index -= index & -index) maximum = Math.max(maximum, furthest[index])
+      return maximum >= range.through
+    }
+    for (const gap of gaps) add(gap)
+    for (const range of ranges) if (!covered(range)) { findings.push({ ...target, ...range, reason: 'gap', repairable: true }); add(range) }
+  } else {
+    for (const range of ranges) {
+      if (!findings.some(issue => issue.reason === 'gap' && issue.from <= range.from && issue.through >= range.through)) findings.push({ ...target, ...range, reason: 'gap', repairable: true })
+    }
   }
   const unique = new Map()
   for (const issue of findings) {
@@ -93,29 +121,21 @@ function recoveredJob(row) {
 // makes the result authoritative without declaring a partially checked finding
 // resolved or leaving stale ranges in the report.
 function verificationRanges(repaired, issues) {
-  let ranges = repaired.map(rangeOf)
-  let expanded = true
-  while (expanded) {
-    expanded = false
-    for (const range of ranges) {
-      for (const issue of issues) {
-        if (issue.status !== 'open' || !overlaps(range, issue)) continue
-        const from = Math.min(range.from, issue.from)
-        const through = Math.max(range.through, issue.through)
-        if (from !== range.from || through !== range.through) { range.from = from; range.through = through; expanded = true }
-      }
+  const values = repaired.map(value => ({ ...rangeOf(value), repaired: true }))
+  for (const issue of issues) if (issue.status === 'open') values.push({ ...rangeOf(issue), repaired: false })
+  values.sort((left, right) => left.instrument.localeCompare(right.instrument) || left.timeframe.localeCompare(right.timeframe) || left.from - right.from)
+  const ranges = []
+  let current = null
+  for (const value of values) {
+    if (current && overlaps(current, value)) {
+      current.through = Math.max(current.through, value.through)
+      current.repaired ||= value.repaired
+    } else {
+      if (current?.repaired) ranges.push(rangeOf(current))
+      current = value
     }
-    const merged = []
-    ranges.sort((left, right) => left.instrument.localeCompare(right.instrument) || left.timeframe.localeCompare(right.timeframe) || left.from - right.from)
-    for (const range of ranges) {
-      const previous = merged.at(-1)
-      if (previous && overlaps(previous, range)) {
-        previous.through = Math.max(previous.through, range.through)
-        expanded = true
-      } else merged.push(range)
-    }
-    ranges = merged
   }
+  if (current?.repaired) ranges.push(rangeOf(current))
   return ranges
 }
 
@@ -133,6 +153,8 @@ export class DataAudit {
     this.now = now
     this.chunkMilliseconds = chunkMilliseconds
     this.jobs = new Map()
+    this.issueKeys = new WeakMap()
+    this.issueIDs = new WeakMap()
     this.queue = []
     this.pending = new Set()
     this.controllers = new Map()
@@ -161,11 +183,12 @@ export class DataAudit {
 
   save(job) {
     job.updatedAt = this.now()
-    job.summary = {
-      open: job.issues.filter(issue => issue.status === 'open').length,
-      resolved: job.issues.filter(issue => issue.status === 'resolved').length,
-      repairFailed: job.issues.filter(issue => issue.status === 'open' && issue.repairStatus === 'failed').length,
+    const summary = { open: 0, resolved: 0, repairFailed: 0 }
+    for (const issue of job.issues) {
+      if (issue.status === 'open') { summary.open++; if (issue.repairStatus === 'failed') summary.repairFailed++ }
+      else if (issue.status === 'resolved') summary.resolved++
     }
+    job.summary = summary
     this.metadata.saveAudit(clone(job))
     // Actions can publish before replacing jobs.get(id). The saved payload,
     // rather than a subsequent read, is the authoritative checkpoint.
@@ -243,8 +266,10 @@ export class DataAudit {
     job.verifyIndex = 0
     job.verificationCheckedRows = 0
     job.verificationFiles = 0
+    const issuesByID = new Map(job.issues.map(issue => [issue.id, issue]))
+    this.issueIDs.set(job, issuesByID)
     for (const target of repairTargets) {
-      const issue = job.issues.find(row => row.id === target.issueId)
+      const issue = issuesByID.get(target.issueId)
       issue.repairStatus = 'pending'
       delete issue.repairError
     }
@@ -316,8 +341,11 @@ export class DataAudit {
     const result = await this.inspect(query, { signal, priority: 'background' })
     if (!this.isCurrent(job, signal)) return
     const findings = findingsOf(result, query)
+    let keys = this.issueKeys.get(job)
+    if (!keys) { keys = new Set(job.issues.map(issueKey)); this.issueKeys.set(job, keys) }
     for (const finding of findings) {
-      if (!job.issues.some(issue => issueKey(issue) === issueKey(finding))) job.issues.push({ ...finding, id: randomUUID(), status: 'open' })
+      const key = issueKey(finding)
+      if (!keys.has(key)) { keys.add(key); job.issues.push({ ...finding, id: randomUUID(), status: 'open' }) }
     }
     job.checkedRows += result.checkedRows
     job.files += result.files
@@ -331,7 +359,9 @@ export class DataAudit {
   async repairNext(job, signal) {
     const target = job.repairTargets[job.repairIndex]
     if (!target) { job.phase = 'verify'; this.save(job); return }
-    const issue = job.issues.find(row => row.id === target.issueId)
+    let issuesByID = this.issueIDs.get(job)
+    if (!issuesByID) { issuesByID = new Map(job.issues.map(issue => [issue.id, issue])); this.issueIDs.set(job, issuesByID) }
+    const issue = issuesByID.get(target.issueId)
     if (!issue) throw new Error('The audit repair checkpoint references a missing issue.')
     try {
       await this.repairRange(clone(issue), { signal })
@@ -354,10 +384,19 @@ export class DataAudit {
     if (!this.isCurrent(job, signal)) return
     const findings = findingsOf(result, target)
     const previous = job.issues.filter(issue => issue.status === 'open' && matches(issue, target) && issue.from >= target.from && issue.through <= target.through)
+    const exact = new Map(), byReason = new Map()
+    for (const issue of previous) {
+      const key = issueKey(issue), matches = exact.get(key) ?? []
+      matches.push(issue); exact.set(key, matches)
+      let files = byReason.get(issue.reason)
+      if (!files) { files = new Map(); byReason.set(issue.reason, files) }
+      const group = files.get(issue.file) ?? []
+      group.push(issue); files.set(issue.file, group)
+    }
     const retained = new Set()
     for (const finding of findings) {
-      const existing = previous.find(issue => !retained.has(issue.id) && issueKey(issue) === issueKey(finding))
-        ?? previous.find(issue => !retained.has(issue.id) && issue.reason === finding.reason && overlaps(issue, finding) && issue.file === finding.file)
+      const existing = exact.get(issueKey(finding))?.find(issue => !retained.has(issue.id))
+        ?? byReason.get(finding.reason)?.get(finding.file)?.find(issue => !retained.has(issue.id) && overlaps(issue, finding))
       if (existing) {
         if (existing.from !== finding.from || existing.through !== finding.through) existing.originalRange ??= { from: existing.from, through: existing.through }
         Object.assign(existing, finding)

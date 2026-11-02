@@ -206,6 +206,7 @@ export class MarketService {
     this.rankingPersistenceImmediate = null
     this.listUpdatedAt = null
     this.canonicalList = null
+    this.canonicalOrdering = null
     this.dataRevisions = new Map()
     this.publicSubscriptionDemand = null
     this.subscriptionImmediate = null
@@ -230,7 +231,7 @@ export class MarketService {
     this.barTasks = new Set()
     this.backgroundTasks = new Set()
     this.backgroundTaskSources = new WeakMap()
-    this.requestLanes = new Map(Object.entries(REQUEST_LANE_INTERVALS).map(([name, interval]) => [name, { name, interval, queue: [], task: null, running: false, active: new Map(), buckets: new Map(), wake: null, nextAt: 0, rateLimitedUntil: 0,
+    this.requestLanes = new Map(Object.entries(REQUEST_LANE_INTERVALS).map(([name, interval]) => [name, { name, interval, queue: new Set(), task: null, running: false, active: new Map(), buckets: new Map(), wake: null, nextAt: 0, rateLimitedUntil: 0,
       ...(instrumentRateLimit(name) ? { concurrency: 8 } : {}) }]))
     this.activeRequests = new Set()
     this.abortControllers = new Set()
@@ -542,24 +543,38 @@ export class MarketService {
     if (cached?.revision === this.revision && cached.lookback === lookback && cached.configKey === configKey
       && now >= cached.observedAt && now < cached.expiresAt) return cached
     const entries = [...this.listedCatalogEntries(now).values()]
-    const qualifiedCount = [...this.catalog.values()].filter(entry => this.validCatalogEntry(entry, now)).length
-    const rows = measureOperation({ category: 'cpu', name: 'market.list.sort', attributes: { inputRows: entries.length } }, () => entries.map(entry => {
+    let qualifiedCount = 0
+    for (const entry of this.catalog.values()) if (this.validCatalogEntry(entry, now)) qualifiedCount++
+    const projected = entries.map(entry => {
       const instId = entry.instrument.instId, ranking = this.rankings.get(instId)
       const current = ranking?.lookback === lookback && ranking.rankingAsOf === asOf
       const ticker = this.observations.get(instId)?.ticker?.value ?? entry.ticker
       return { instId, lastPrice: number(ticker.last), turnover24hUSDT: number(this.catalogChecks.get(instId)?.result.turnover ?? entry.result.turnover),
         rankingChange: current ? ranking.rankingChange : null, rankingAsOf: current ? ranking.rankingAsOf : null }
-    }).sort(compareRanking))
-    const turnoverOrder = measureOperation({ category: 'cpu', name: 'market.list.turnover-sort', attributes: { inputRows: rows.length } }, () => [...rows]
-      .sort((left, right) => (right.turnover24hUSDT ?? -Infinity) - (left.turnover24hUSDT ?? -Infinity) || (left.instId < right.instId ? -1 : left.instId > right.instId ? 1 : 0))
-      .map(row => row.instId))
-    const expiries = entries.map(entry => {
-      const expiry = this.catalogEntryExpiry(entry, now)
-      return this.listRemovals.get(entry.instrument.instId)?.removeAt ?? (expiry > now ? expiry : expiry + LIST_REMOVAL_DELAY_MS)
     })
+    const previousOrder = this.canonicalOrdering, byId = new Map(projected.map(row => [row.instId, row]))
+    let sameRanking = previousOrder?.keys.size === byId.size, sameTurnover = sameRanking
+    if (sameRanking) for (const row of projected) {
+      const key = previousOrder.keys.get(row.instId)
+      if (!key || !Object.is(key.rankingChange, row.rankingChange)) sameRanking = false
+      if (!key || !Object.is(key.turnover24hUSDT, row.turnover24hUSDT)) sameTurnover = false
+    }
+    const rows = sameRanking ? previousOrder.ranking.map(id => byId.get(id))
+      : measureOperation({ category: 'cpu', name: 'market.list.sort', attributes: { inputRows: entries.length } }, () => projected.toSorted(compareRanking))
+    const turnoverOrder = sameTurnover ? previousOrder.turnover.slice()
+      : measureOperation({ category: 'cpu', name: 'market.list.turnover-sort', attributes: { inputRows: rows.length } }, () => [...projected]
+        .sort((left, right) => (right.turnover24hUSDT ?? -Infinity) - (left.turnover24hUSDT ?? -Infinity) || (left.instId < right.instId ? -1 : left.instId > right.instId ? 1 : 0))
+        .map(row => row.instId))
+    this.canonicalOrdering = { keys: new Map(projected.map(row => [row.instId, { rankingChange: row.rankingChange, turnover24hUSDT: row.turnover24hUSDT }])),
+      ranking: sameRanking ? previousOrder.ranking : rows.map(row => row.instId), turnover: sameTurnover ? previousOrder.turnover : turnoverOrder.slice() }
+    let expiresAt = asOf + FIVE_MINUTES
+    for (const entry of entries) {
+      const expiry = this.catalogEntryExpiry(entry, now)
+      expiresAt = Math.min(expiresAt, this.listRemovals.get(entry.instrument.instId)?.removeAt ?? (expiry > now ? expiry : expiry + LIST_REMOVAL_DELAY_MS))
+    }
     this.canonicalList = { revision: this.revision, lookback, configKey, observedAt: now, qualifiedCount,
       current: qualifiedCount === this.catalog.size && [...this.listRemovals.values()].every(removal => removal.removeAt > now),
-      expiresAt: Math.min(asOf + FIVE_MINUTES, ...expiries), rows, turnoverOrder }
+      expiresAt, rows, turnoverOrder }
     return this.canonicalList
   }
 
@@ -779,7 +794,13 @@ export class MarketService {
     let bucket = lane.buckets.get(key)
     if (!bucket) {
       const now = Date.now()
-      for (const [id, value] of lane.buckets) if (!value.pending && Math.max(value.nextAt, value.rateLimitedUntil) <= now) lane.buckets.delete(id)
+      lane.bucketCursor ??= lane.buckets.entries()
+      for (let count = 0; count < 4; count++) {
+        const entry = lane.bucketCursor.next()
+        if (entry.done) { lane.bucketCursor = null; break }
+        const [id, value] = entry.value
+        if (!value.pending && Math.max(value.nextAt, value.rateLimitedUntil) <= now) lane.buckets.delete(id)
+      }
       bucket = { nextAt: 0, rateLimitedUntil: 0, pending: 0 }
       lane.buckets.set(key, bucket)
     }
@@ -793,16 +814,18 @@ export class MarketService {
     // of starving an archive behind an endless stream of closes.
     const now = Date.now()
     const score = request => requestPriority(request.priority) + Math.min(5, (now - (request.enqueuedAt ?? now)) / 5_000)
-    const candidates = lane.queue.map((request, index) => ({ request, index })).filter(({ request }) => eligible(request))
+    const candidates = []
+    for (const request of lane.queue) if (eligible(request)) candidates.push(request)
     if (!candidates.length) return null
-    let next = candidates[0].index
-    for (const { request, index } of candidates) if (score(request) > score(lane.queue[next])) next = index
+    let next = candidates[0]
+    for (const request of candidates) if (score(request) > score(next)) next = request
     lane.served = (lane.served ?? 0) + 1
     if (lane.served % 8 === 0) {
-      const background = candidates.find(({ request }) => requestPriority(request.priority) <= 1)?.index ?? -1
-      if (background >= 0) next = background
+      const background = candidates.find(request => requestPriority(request.priority) <= 1)
+      if (background) next = background
     }
-    return lane.queue.splice(next, 1)[0]
+    lane.queue.delete(next)
+    return next
   }
 
   cleanupRequest(request) {
@@ -817,9 +840,7 @@ export class MarketService {
 
   rejectQueuedRequest(request) {
     const lane = this.requestLane(request.lane)
-    const index = lane.queue.indexOf(request)
-    if (index < 0) return
-    lane.queue.splice(index, 1)
+    if (!lane.queue.delete(request)) return
     request.reject(request.controller.signal.reason ?? new Error('The request was aborted.'))
     this.cleanupRequest(request)
     lane.wake?.()
@@ -921,7 +942,7 @@ export class MarketService {
     if (lane.running) return lane.task
     lane.running = true
     const task = (async () => {
-      while (lane.queue.length || lane.active.size) {
+      while (lane.queue.size || lane.active.size) {
         const limit = lane.concurrency ?? (name === 'books' ? 16 : 4)
         const maintenanceActive = [...lane.active.values()].filter(request => requestPriority(request.priority) < 3).length
         const globalMaintenance = [...this.activeRequests].filter(request => requestPriority(request.priority) < 3).length
@@ -929,10 +950,16 @@ export class MarketService {
           || maintenanceActive < Math.max(1, limit - 1) && globalMaintenance < MAX_HTTP_REQUESTS - 2
         const now = Date.now()
         const eligible = request => capacity(request) && Math.max(request.bucket.nextAt, request.bucket.rateLimitedUntil) <= now
-        const canStart = lane.active.size < limit && this.activeRequests.size < MAX_HTTP_REQUESTS && lane.queue.some(capacity)
+        let hasCapacity = false, hasEligible = false, delay = Infinity
+        for (const request of lane.queue) if (capacity(request)) {
+          hasCapacity = true
+          const wait = Math.max(request.bucket.nextAt, request.bucket.rateLimitedUntil) - now
+          if (wait <= 0) hasEligible = true
+          else delay = Math.min(delay, wait)
+        }
+        const canStart = lane.active.size < limit && this.activeRequests.size < MAX_HTTP_REQUESTS && hasCapacity
         if (!canStart) { await this.waitRequestLane(lane); continue }
-        if (!lane.queue.some(eligible)) {
-          const delay = Math.min(...lane.queue.filter(capacity).map(request => Math.max(request.bucket.nextAt, request.bucket.rateLimitedUntil) - now))
+        if (!hasEligible) {
           await this.waitRequestLane(lane, Math.min(2_147_483_647, Math.max(1, delay))); continue
         }
         // Choose at admission time so newly queued chart/qualification work
@@ -950,7 +977,7 @@ export class MarketService {
     })().finally(() => {
       lane.running = false
       if (lane.task === task) lane.task = null
-      if (lane.queue.length) void this.drainRequestLane(name)
+      if (lane.queue.size) void this.drainRequestLane(name)
     })
     lane.task = task
     return task
@@ -980,7 +1007,7 @@ export class MarketService {
     controller.signal.addEventListener('abort', request.onAbort, { once: true })
     if (controller.signal.aborted) request.onAbort()
     else {
-      queue.queue.push(request)
+      queue.queue.add(request)
       queue.wake?.()
       void this.drainRequestLane(lane)
     }
@@ -1472,7 +1499,6 @@ export class MarketService {
 
   publishStreamRecords(records) {
     if (!records.length || this.closing || this.disposed) return
-    const next = new Map(this.catalog)
     let membershipChanged = false
     for (const record of records) {
       const instrument = record.instrument, instId = instrument.instId
@@ -1480,10 +1506,9 @@ export class MarketService {
       const existing = this.catalog.has(instId)
       if (record.status === 'verified') {
         this.listRemovals.delete(instId)
-        next.set(instId, record); this.renewalTargets.set(instId, instrument)
+        this.renewalTargets.set(instId, instrument)
         membershipChanged ||= !existing
       } else {
-        next.delete(instId)
         if (record.status === 'failed') this.renewalTargets.delete(instId)
         membershipChanged ||= existing
       }
@@ -1492,8 +1517,12 @@ export class MarketService {
     this.catalogSource = 'live'; this.catalogUpdatedAt = Date.now()
     // Durable catalog checkpoints belong to discovery/renewal. High-frequency
     // ticks update memory; membership alone controls the prepared-chart universe.
+    const next = membershipChanged ? new Map(this.catalog) : this.catalog
+    for (const record of records) {
+      if (record.status === 'verified') next.set(record.instrument.instId, record)
+      else next.delete(record.instrument.instId)
+    }
     if (membershipChanged) this.replaceCatalog([...next.values()])
-    else this.catalog = next
     this.scheduleSubscriptions()
     this.touchList()
     this.scheduleMarketDeadline()

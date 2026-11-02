@@ -204,6 +204,69 @@ test('canonical rows contain only list facts and own both ranking and turnover o
   } finally { await f.close() }
 })
 
+test('price-only updates reuse ordering while changed keys and membership rebuild the right order', async () => {
+  const f = await fixture(), ids = [instId, 'ETH-USDT-SWAP', 'SOL-USDT-SWAP']
+  try {
+    f.service.updateRanking = async () => undefined
+    localCatalog(f.service, ids)
+    const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
+    for (const [index, id] of ids.entries()) {
+      f.service.catalog.get(id).result.turnover = 10 + index
+      f.service.rankings.set(id, { lookback: f.preferences.rankingLookback, rankingChange: index, rankingAsOf: asOf })
+    }
+    const operations: string[] = [], detach = attachOperationSink(event => { operations.push(event.name) })
+    try {
+      const first = f.service.canonicalMarketList()
+      const catalog = f.service.catalog
+      const record = catalog.get(ids[0])
+      f.service.publishStreamRecords([{ ...record, ticker: { ...record.ticker, last: '123' } }])
+      assert.equal(f.service.catalog, catalog)
+      const price = f.service.canonicalMarketList()
+      assert.deepEqual(price.rows.map((row: { instId: string }) => row.instId), first.rows.map((row: { instId: string }) => row.instId))
+      assert.equal(price.rows.find((row: { instId: string }) => row.instId === ids[0]).lastPrice, 123)
+      assert.deepEqual(price.turnoverOrder, first.turnoverOrder)
+      assert.equal(operations.filter(name => name === 'market.list.sort').length, 1)
+      assert.equal(operations.filter(name => name === 'market.list.turnover-sort').length, 1)
+      f.service.rankings.set(ids[0], { lookback: f.preferences.rankingLookback, rankingChange: 10, rankingAsOf: asOf })
+      f.service.touchList()
+      assert.equal(f.service.canonicalMarketList().rows[0].instId, ids[0])
+      assert.equal(operations.filter(name => name === 'market.list.sort').length, 2)
+      assert.equal(operations.filter(name => name === 'market.list.turnover-sort').length, 1)
+      f.service.catalog.get(ids[0]).result.turnover = 100
+      f.service.touchList()
+      assert.equal(f.service.canonicalMarketList().turnoverOrder[0], ids[0])
+      assert.equal(operations.filter(name => name === 'market.list.turnover-sort').length, 2)
+      f.service.replaceCatalog([])
+      assert.deepEqual(f.service.canonicalMarketList(Date.now() + 31_000).rows, [])
+    } finally { detach() }
+  } finally { await f.close() }
+})
+
+test('request queues retain priority, fairness and per-instrument rate limits at scale', async context => {
+  let now = 1_800_000_000_000
+  context.mock.method(Date, 'now', () => now)
+  const f = await fixture()
+  try {
+    const lane = f.service.requestLane('oi')
+    const retained = f.service.requestBucket(lane, { instId: instId })
+    retained.nextAt = now + 1_000
+    for (let index = 0; index < 10_000; index++) f.service.requestBucket(lane, { instId: `TEST${index}` })
+    assert.equal(f.service.requestBucket(lane, { instId }), retained)
+    assert.equal(lane.buckets.get(instId).nextAt, now + 1_000)
+    assert.ok(lane.buckets.size < 10)
+    now += 1_000
+    const first = { priority: 'background', enqueuedAt: now }, last = { priority: 'interactive', enqueuedAt: now }
+    lane.queue.add(first)
+    for (let index = 0; index < 10_000; index++) lane.queue.add({ priority: 'interactive', enqueuedAt: now })
+    lane.queue.add(last)
+    for (let index = 0; index < 7; index++) assert.equal(f.service.nextQueuedRequest(lane).priority, 'interactive')
+    assert.equal(f.service.nextQueuedRequest(lane), first)
+    assert.equal(lane.queue.has(last), true)
+    lane.queue.clear()
+    assert.equal(f.service.nextQueuedRequest(lane), null)
+  } finally { await f.close() }
+})
+
 test('canonical list reads reuse both sort orders and expire before stale eligibility or ranking can report unchanged', async context => {
   const now = Math.floor(Date.now() / fiveMinutes) * fiveMinutes + 10_000
   let currentTime = now
