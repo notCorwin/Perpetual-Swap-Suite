@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import test from 'node:test'
 import { graphicsAccelerationSupport, graphicsCapabilities, graphicsRequirementFailures, graphicsSystemSnapshot, inspectGraphicsTrace, readGraphicsTrace } from '../../electron/services/graphics-trace.js'
-import { startGraphicsRecording } from '../../electron/services/operation-graphics.js'
+import { graphicsRecordingRequested, startGraphicsRecording } from '../../electron/services/operation-graphics.js'
 
 const gpu = { auxAttributes: { glRenderer: 'ANGLE Metal Renderer: Apple M3', skiaBackendType: 'GraphiteDawnMetal', displayType: 'ANGLE_METAL', private: 'secret' },
   gpuDevice: [{ active: true, vendorId: 4203, deviceId: 0, driverVendor: 'Apple', driverVersion: '15.8.1', private: 'secret' }] }
@@ -142,6 +142,13 @@ test('large native task batches drain incrementally and file reads retain a cont
   assert.match(source.sha256, /^[a-f0-9]{64}$/)
   assert.ok(source.bytes > 0)
   await assert.rejects(readGraphicsTrace(file, { maxBytes: 4 }), /byte limit/)
+})
+
+test('graphics recording is enabled for explicit diagnostics and sandbox recordings only', () => {
+  assert.equal(graphicsRecordingRequested({}), false)
+  assert.equal(graphicsRecordingRequested({ PERPETUAL_SWAP_OPERATION_DIR: '/sandbox/operations' }), true)
+  assert.equal(graphicsRecordingRequested({ PERPETUAL_SWAP_GPU_TRACE: '1' }), true)
+  assert.equal(graphicsRecordingRequested({ PERPETUAL_SWAP_OPERATION_DIR: '', PERPETUAL_SWAP_GPU_TRACE: '0' }), false)
 })
 
 test('graphics stop imports each completed task once, flushes before success, and records fresh driver capabilities', async t => {

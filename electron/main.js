@@ -10,7 +10,7 @@ import { createDesktopSecurity } from './desktop-security.js'
 import { assertBackgroundTestLaunch, testPresentation, testWindowOptions } from './test-presentation.js'
 import { startTestOwnerWatchdog } from './test-owner.js'
 import { initializeOperationRecording, closeOperationRecording, closeExternalOperationSource } from './services/operation-runtime.js'
-import { startGraphicsRecording } from './services/operation-graphics.js'
+import { graphicsRecordingRequested, startGraphicsRecording } from './services/operation-graphics.js'
 import { beginOperation, measureOperation, recordOperation, runWithOperationContext, withOperationSuppressed } from './services/operations.js'
 import { createRendererOperationReceiver } from './services/renderer-operations.js'
 import { createOperationSession, enforceOperationRetention } from './services/operation-retention.js'
@@ -33,6 +33,7 @@ if (process.env.PERPETUAL_SWAP_USER_DATA) {
   app.setPath('userData', userData)
   app.setPath('sessionData', sessionData)
 }
+const recordGraphics = graphicsRecordingRequested()
 const operationSessionRoot = join(app.getPath('userData'), 'Operations')
 const operationSession = !process.env.PERPETUAL_SWAP_OPERATION_DIR
   ? await withOperationSuppressed(() => createOperationSession({ root: operationSessionRoot })) : undefined
@@ -222,7 +223,7 @@ async function createWindow() {
 }
 
 async function startDesktop() {
-  stopGraphicsRecording = await startGraphicsRecording(app, contentTracing, operationRecording.directory)
+  if (recordGraphics) stopGraphicsRecording = await startGraphicsRecording(app, contentTracing, operationRecording.directory)
   backend = new MarketBackend({ userData: app.getPath('userData'), testMode, e2eLiveRefresh })
   if (testMode) globalThis.__marketBackend = backend
   const send = (channel, value) => {

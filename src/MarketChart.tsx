@@ -26,9 +26,17 @@ import type { Bar, ChartSourceStatus, PreparedChartState, ReadyChartWindow } fro
 import { measureOperation } from '../electron/services/operations.js'
 
 const EMPTY_BARS: readonly Bar[] = []
-const PriceStatus = memo(function PriceStatus({ observedAt, realtime }: { observedAt?: number | null; realtime?: 'live' | 'stale' }) {
+const PriceStatus = memo(function PriceStatus({ observedAt, realtime, active }: { observedAt?: number | null; realtime?: 'live' | 'stale'; active: boolean }) {
   const [now, setNow] = useState(Date.now)
-  useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(timer) }, [])
+  useEffect(() => {
+    if (!active || realtime !== 'live' || observedAt == null) return
+    const current = Date.now()
+    const remaining = observedAt + 30_000 - current
+    if ((now - observedAt < 30_000) !== (remaining > 0)) setNow(current)
+    if (remaining <= 0) return
+    const timer = window.setTimeout(() => setNow(Date.now()), remaining)
+    return () => window.clearTimeout(timer)
+  }, [active, observedAt, realtime, now])
   const fresh = realtime === 'live' && observedAt != null && now - observedAt < 30_000
   return fresh ? null : <Badge variant="secondary" role="status" title={observedAt ? `Last price observation ${new Date(observedAt).toLocaleTimeString('en-US')}` : 'Waiting for a current price observation'}>Cached price</Badge>
 })
@@ -61,6 +69,11 @@ const chartTextWidth = (text: string, fontSize: number = chartTokens.textSize) =
 }
 const legendWidth = (text: string) => chartTextWidth(text)
 const PlotVisible = createContext(true)
+const subscribeVisibility = (listener: () => void) => {
+  document.addEventListener('visibilitychange', listener)
+  return () => document.removeEventListener('visibilitychange', listener)
+}
+const documentVisible = () => document.visibilityState !== 'hidden'
 const PriceCountdown = memo(function PriceCountdown({ hour, intervalMS, x, y }: { hour: number; intervalMS: number; x: number; y: number }) {
   const [now, setNow] = useState(Date.now)
   const visible = useContext(PlotVisible)
@@ -272,8 +285,8 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
 
 type PlotSize = { width: number; height: number }
 
-const ChartSurface = memo(function ChartSurface({ surface, size, selected, inspected, inspectedBar, wheelFraction }: {
-  surface: ReadyChartWindow; size: PlotSize; selected: boolean; inspected: number | null
+const ChartSurface = memo(function ChartSurface({ surface, size, selected, visible, inspected, inspectedBar, wheelFraction }: {
+  surface: ReadyChartWindow; size: PlotSize; selected: boolean; visible: boolean; inspected: number | null
   inspectedBar?: Bar; wheelFraction: number
 }) {
   const overscan = chartOverscan(surface)
@@ -284,7 +297,7 @@ const ChartSurface = memo(function ChartSurface({ surface, size, selected, inspe
   if (!plot) return null
   const { bars, geometry } = plot
   const contentOffset = chartWheelContentOffset(wheelFraction, geometry.barPitch, Boolean(plot.before), Boolean(plot.after))
-  return <PlotVisible value={selected}>
+  return <PlotVisible value={visible}>
     <svg strokeWidth="var(--chart-line-width)" data-prepared-chart-inst={surface.instId} data-prepared-chart-timeframe={surface.timeframe}
       data-prepared-chart-ready={ready} data-prepared-indicator-state={surface.indicatorState} data-prepared-oi-state={surface.oiState} data-prepared-taker-state={surface.takerState}
       data-rendered-inst={selected ? surface.instId : undefined} data-rendered-timeframe={selected ? surface.timeframe : undefined}
@@ -301,6 +314,7 @@ const ChartSurface = memo(function ChartSurface({ surface, size, selected, inspe
 })
 
 export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, turnoverOrder, onSelect }: { instId: string; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; candidateIds?: string[]; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
+  const windowVisible = useSyncExternalStore(subscribeVisibility, documentVisible)
   const controlsHelp = useRef<HTMLDialogElement>(null)
   const view = useSyncExternalStore(chartController.subscribe, chartController.getSnapshot)
   useLayoutEffect(() => {
@@ -543,7 +557,7 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
       <Button variant="ghost" size="sm" onClick={() => controlsHelp.current?.showModal()}>Chart controls</Button>
       <span role="status" className="sr-only">{captureStatus === 'flashing' ? 'Chart copied to clipboard' : ''}</span>
       {(historical || displayedFrame !== timeframe) && <Badge variant="secondary">{timeframeLabel(displayedFrame)}{historical ? ' history' : ' chart'}</Badge>}
-      {!historical && <PriceStatus observedAt={surface?.priceObservedAt} realtime={surface?.realtimeState} />}
+      {!historical && <PriceStatus observedAt={surface?.priceObservedAt} realtime={surface?.realtimeState} active={isActive && windowVisible} />}
     </header>
     <dialog ref={controlsHelp} aria-labelledby="chart-controls-title" className="m-auto w-[min(28rem,calc(100%-2rem))] rounded-lg border bg-popover p-6 text-popover-foreground backdrop:bg-background/80">
       <div className="flex flex-col gap-4">
@@ -606,7 +620,7 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
         const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : -event.deltaY
         queueWheel(delta * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 240 : 1))
       }}>
-        {surface && <ChartSurface surface={surface} size={plotSize} selected={matchesSelection} inspected={inspected} inspectedBar={inspectedBar} wheelFraction={activeWheelFraction} />}
+        {surface && <ChartSurface surface={surface} size={plotSize} selected={matchesSelection} visible={matchesSelection && isActive && windowVisible} inspected={inspected} inspectedBar={inspectedBar} wheelFraction={activeWheelFraction} />}
       </div>
       {captureStatus === 'flashing' && <div aria-hidden="true" className="pointer-events-none absolute inset-0 z-10 bg-[var(--chart-capture-flash)] motion-safe:animate-[chart-capture-flash_550ms_ease-out_both] motion-reduce:hidden" />}
     </section>
