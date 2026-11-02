@@ -12,6 +12,76 @@ const overlaps = (left, right) => matches(left, right) && left.from <= right.thr
 const issueKey = issue => JSON.stringify([issue.instrument, issue.timeframe, issue.source, issue.from, issue.through, issue.reason, issue.file ?? null])
 const rangeOf = issue => ({ instrument: issue.instrument, timeframe: issue.timeframe, source: issue.source, from: issue.from, through: issue.through })
 
+// Keep report order while finding the first unretained interval intersecting a
+// finding. Each outer subtree indexes its intervals by start; its inner max
+// tree supports prefix queries and removal when an issue is retained.
+class VerificationIntervals {
+  constructor(entries) {
+    const build = (from, through) => {
+      if (through - from === 1) return this.node(from, through, [entries[from]], null, null)
+      const middle = Math.floor((from + through) / 2), left = build(from, middle), right = build(middle, through), ordered = []
+      let a = 0, b = 0
+      while (a < left.ordered.length && b < right.ordered.length) {
+        const l = left.ordered[a], r = right.ordered[b]
+        if (l.from < r.from || l.from === r.from && l.index < r.index) { ordered.push(l); a++ }
+        else { ordered.push(r); b++ }
+      }
+      while (a < left.ordered.length) ordered.push(left.ordered[a++])
+      while (b < right.ordered.length) ordered.push(right.ordered[b++])
+      return this.node(from, through, ordered, left, right)
+    }
+    this.root = entries.length ? build(0, entries.length) : null
+  }
+
+  node(from, through, ordered, left, right) {
+    let base = 1
+    while (base < ordered.length) base *= 2
+    const maximum = new Float64Array(base * 2); maximum.fill(-Infinity)
+    for (let index = 0; index < ordered.length; index++) if (!ordered[index].retained) maximum[base + index] = ordered[index].issue.through
+    for (let index = base - 1; index; index--) maximum[index] = Math.max(maximum[index * 2], maximum[index * 2 + 1])
+    return { from, through, ordered, left, right, base, maximum }
+  }
+
+  hasOverlap(node, finding) {
+    let low = 0, high = node.ordered.length
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2)
+      if (node.ordered[middle].from <= finding.through) low = middle + 1
+      else high = middle
+    }
+    let left = node.base, right = node.base + low, maximum = -Infinity
+    while (left < right) {
+      if (left % 2) maximum = Math.max(maximum, node.maximum[left++])
+      if (right % 2) maximum = Math.max(maximum, node.maximum[--right])
+      left = Math.floor(left / 2); right = Math.floor(right / 2)
+    }
+    return maximum >= finding.from
+  }
+
+  first(finding) {
+    let node = this.root
+    if (!node || !this.hasOverlap(node, finding)) return null
+    while (node.left) node = this.hasOverlap(node.left, finding) ? node.left : node.right
+    return node.ordered[0]
+  }
+
+  remove(entry) {
+    let node = this.root
+    while (node) {
+      let low = 0, high = node.ordered.length
+      while (low < high) {
+        const middle = Math.floor((low + high) / 2), candidate = node.ordered[middle]
+        if (candidate.from < entry.from || candidate.from === entry.from && candidate.index < entry.index) low = middle + 1
+        else high = middle
+      }
+      let index = node.base + low
+      node.maximum[index] = -Infinity
+      while (index > 1) { index = Math.floor(index / 2); node.maximum[index] = Math.max(node.maximum[index * 2], node.maximum[index * 2 + 1]) }
+      node = node.left ? entry.index < node.left.through ? node.left : node.right : null
+    }
+  }
+}
+
 function targetOf(target) {
   if (!target || typeof target !== 'object' || typeof target.instrument !== 'string' || !target.instrument.trim()) throw new TypeError('An audit target needs an instrument.')
   if (!Object.hasOwn(INTERVALS, target.timeframe)) throw new TypeError('Audit timeframe must be 5m, 15m, or 1H.')
@@ -386,18 +456,28 @@ export class DataAudit {
     const previous = job.issues.filter(issue => issue.status === 'open' && matches(issue, target) && issue.from >= target.from && issue.through <= target.through)
     const exact = new Map(), byReason = new Map()
     for (const issue of previous) {
-      const key = issueKey(issue), matches = exact.get(key) ?? []
-      matches.push(issue); exact.set(key, matches)
       let files = byReason.get(issue.reason)
       if (!files) { files = new Map(); byReason.set(issue.reason, files) }
-      const group = files.get(issue.file) ?? []
-      group.push(issue); files.set(issue.file, group)
+      let group = files.get(issue.file)
+      if (!group) { group = { entries: [], intervals: null }; files.set(issue.file, group) }
+      const entry = { issue, from: issue.from, group, index: group.entries.length, retained: false }
+      group.entries.push(entry)
+      const key = issueKey(issue), matches = exact.get(key) ?? { entries: [], next: 0 }
+      matches.entries.push(entry); exact.set(key, matches)
     }
     const retained = new Set()
     for (const finding of findings) {
-      const existing = exact.get(issueKey(finding))?.find(issue => !retained.has(issue.id))
-        ?? byReason.get(finding.reason)?.get(finding.file)?.find(issue => !retained.has(issue.id) && overlaps(issue, finding))
+      const matches = exact.get(issueKey(finding))
+      while (matches && matches.next < matches.entries.length && matches.entries[matches.next].retained) matches.next++
+      let entry = matches?.entries[matches.next]
+      if (!entry) {
+        const group = byReason.get(finding.reason)?.get(finding.file)
+        if (group) { group.intervals ??= new VerificationIntervals(group.entries); entry = group.intervals.first(finding) }
+      }
+      const existing = entry?.issue
       if (existing) {
+        entry.group.intervals?.remove(entry)
+        entry.retained = true
         if (existing.from !== finding.from || existing.through !== finding.through) existing.originalRange ??= { from: existing.from, through: existing.through }
         Object.assign(existing, finding)
         retained.add(existing.id)

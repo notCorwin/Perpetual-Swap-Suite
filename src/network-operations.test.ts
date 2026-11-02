@@ -59,7 +59,7 @@ test('WebSocket failures, abandoned connections and already-open injected socket
 // Exercise the physical HTTP boundary without starting market background work.
 function request(fetcher: typeof fetch, controller = new AbortController(), timeout = 1_000) {
   const service = Object.assign(Object.create(MarketService.prototype), { fetcher, requestTimeout: timeout, disposed: false })
-  const lane = { name: 'candles', interval: 0, concurrency: 4, rateLimitedUntil: 0 }
+  const lane = { name: 'candles', interval: 0, concurrency: 4, rateLimitedUntil: 0, queue: { bucketChanged: () => {} } }
   const result = new Promise((resolve, reject) => {
     void service.performRequest(lane, { path: '/market/history-candles', parameters: { instId: 'BTC-USDT-SWAP', privateValue: 'secret' }, priority: 'foreground', bucket: lane, enqueuedAt: Date.now(), controller, cleaned: true, resolve, reject })
   })
@@ -78,7 +78,7 @@ test('HTTP records actual attempts through JSON completion with safe response fa
   assert.equal(entries.length, 0, 'Headers alone do not finish the network operation.')
   release()
   assert.deepEqual(await task, [['private payload']])
-  await assert.rejects(request(async () => new Response('rate limited', { status: 429 })))
+  await assert.rejects(request(async () => new Response('rate limited', { status: 429 })), /rate limited/)
   await assert.rejects(request(async () => new Response('invalid JSON', { status: 200 })))
   assert.deepEqual(entries.map(entry => entry.status), ['ok', 'error', 'error'])
   assert.equal(entries[0].attributes?.rows, 1)

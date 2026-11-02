@@ -305,6 +305,63 @@ test('repair verification closes overlapping chains while excluding unrelated fi
   } finally { await audit.close() }
 })
 
+test('verification retains the first matching issue in report order across exact and overlapping ranges', async () => {
+  type Row = AuditFinding & { id?: string; status?: 'open' | 'resolved'; originalRange?: { from: number; through: number }; resolvedAt?: number }
+  const metadata = new MemoryMetadata(), scope = target(0, 100 * interval)
+  let seed = 0x12345678
+  const random = (limit: number) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed % limit }
+  const makeFinding = (): AuditFinding => {
+    const from = random(80) * interval, through = from + random(10) * interval
+    return { ...finding(['gap', 'invalid-ohlc', 'missing-volume'][random(3)], from, through), ...(random(3) ? { file: `part-${random(3)}` } : {}) }
+  }
+  const previous: Row[] = Array.from({ length: 800 }, (_, index) => ({ ...makeFinding(), id: `issue-${index}`, status: 'open' }))
+  const inputs = Array.from({ length: 800 }, makeFinding)
+  inputs.push(...previous.slice(0, 50).map(({ id: _id, status: _status, ...issue }) => issue))
+  const key = (issue: Row) => JSON.stringify([issue.instrument, issue.timeframe, issue.source, issue.from, issue.through, issue.reason, issue.file ?? null])
+  const findings = [...new Map(inputs.map(issue => [key(issue), issue])).values()]
+  const expected: Row[] = structuredClone(previous), retained = new Set<string>()
+  for (const current of findings) {
+    const existing = expected.slice(0, previous.length).find(issue => !retained.has(issue.id!) && key(issue) === key(current))
+      ?? expected.slice(0, previous.length).find(issue => !retained.has(issue.id!) && issue.reason === current.reason && issue.file === current.file
+        && issue.from <= current.through && issue.through >= current.from)
+    if (existing) {
+      if (existing.from !== current.from || existing.through !== current.through) existing.originalRange ??= { from: existing.from, through: existing.through }
+      Object.assign(existing, current); retained.add(existing.id!)
+    } else expected.push({ ...current, status: 'open' })
+  }
+  for (const issue of expected.slice(0, previous.length)) if (!retained.has(issue.id!)) { issue.status = 'resolved'; issue.resolvedAt = 17 }
+
+  const audit = new DataAudit({ metadata, now: () => 17, inspect: async () => inspected(inputs) })
+  const internal = audit as unknown as { jobs: Map<string, unknown>; verifyNext(job: unknown, signal: AbortSignal): Promise<void> }
+  const job = { id: 'verify-index', status: 'running', issues: structuredClone(previous), verifyTargets: [{ ...scope, source: 'candles' }],
+    verifyIndex: 0, verificationCheckedRows: 0, verificationFiles: 0 }
+  internal.jobs.set(job.id, job)
+  try {
+    await internal.verifyNext(job, new AbortController().signal)
+    const actual = job.issues.map((issue, index) => index < previous.length ? issue : (({ id: _id, ...rest }) => rest)(issue))
+    assert.deepEqual(actual, expected)
+  } finally { internal.jobs.clear(); await audit.close() }
+})
+
+test('verification matches a large reversed sequence of overlapping issues without losing ranges', async () => {
+  const metadata = new MemoryMetadata(), count = 5_000
+  const previous = Array.from({ length: count }, (_, index) => {
+    const from = index * 2 * interval
+    return { ...finding('gap', from, from + interval), id: `issue-${index}`, status: 'open' as const }
+  })
+  const findings = previous.toReversed().map(issue => finding('gap', issue.through))
+  const audit = new DataAudit({ metadata, now: () => 17, inspect: async () => inspected(findings) })
+  const internal = audit as unknown as { jobs: Map<string, unknown>; verifyNext(job: unknown, signal: AbortSignal): Promise<void> }
+  const job = { id: 'large-verify-index', status: 'running', issues: structuredClone(previous),
+    verifyTargets: [{ ...target(0, count * 2 * interval), source: 'candles' }], verifyIndex: 0, verificationCheckedRows: 0, verificationFiles: 0 }
+  internal.jobs.set(job.id, job)
+  try {
+    await internal.verifyNext(job, new AbortController().signal)
+    assert.equal(job.issues.length, count)
+    assert.ok(job.issues.every((issue, index) => issue.status === 'open' && issue.from === (index * 2 + 1) * interval && issue.through === issue.from))
+  } finally { internal.jobs.clear(); await audit.close() }
+})
+
 test('failed repair stays unresolved, successful ranges are verified, and retries remain explicit', async () => {
   const metadata = new MemoryMetadata()
   let current = [finding('gap', 0), finding('invalid-ohlc', 2 * interval)]

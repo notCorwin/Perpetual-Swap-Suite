@@ -73,13 +73,66 @@ test('a shared queued request can acquire interactive priority without another H
   const requests: Promise<unknown>[] = []
   for (let index = 0; index < 3; index++) requests.push(service.get('/market/history-candles', { id: `archive-${index}` }, undefined, 'background'))
   let priority = 'background'
-  requests.push(service.get('/market/history-candles', { id: 'shared' }, undefined, 'background', { getPriority: () => priority }))
+  let changed = () => {}
+  requests.push(service.get('/market/history-candles', { id: 'shared' }, undefined, 'background', { getPriority: () => priority, subscribePriority: (listener: () => void) => { changed = listener; return () => { changed = () => {} } } }))
   await tick(0); assert.equal(starts.length, 3)
-  priority = 'interactive'; service.wakeRequestQueues()
+  priority = 'interactive'; changed()
   await tick(0)
   assert.deepEqual(starts, ['archive-0', 'archive-1', 'archive-2', 'shared'])
   for (const release of releases) release()
   await Promise.all(requests)
+})
+
+test('active priority changes wake other lanes and cancellation detaches notification listeners', async context => {
+  const starts: string[] = [], controller = new AbortController(), listeners = new Set<() => void>()
+  const { service, tick } = await fixture(context, async (input, options) => {
+    starts.push(new URL(String(input)).searchParams.get('instId')!)
+    return new Promise<Response>((_resolve, reject) => options?.signal?.addEventListener('abort', () => reject(options.signal!.reason), { once: true }))
+  })
+  for (const lane of service.requestLanes.values()) lane.interval = 0
+  let priority = 'background'
+  const subscribePriority = (listener: () => void) => { listeners.add(listener); return () => listeners.delete(listener) }
+  const requests: Promise<unknown>[] = []
+  requests.push(service.get('/rubik/stat/contracts/open-interest-history', { instId: 'DYNAMIC' }, controller.signal, 'background', { getPriority: () => priority, subscribePriority }))
+  for (let index = 0; index < 6; index++) requests.push(service.get('/rubik/stat/contracts/open-interest-history', { instId: `OI${index}` }, controller.signal, 'background'))
+  for (let index = 0; index < 7; index++) requests.push(service.get('/rubik/stat/taker-volume-contract', { instId: `TAKER${index}` }, controller.signal, 'background'))
+  for (let index = 0; index < 9; index++) requests.push(service.get('/market/books', { instId: `BOOK${index}` }, controller.signal, 'background'))
+  for (const request of requests) void request.catch(() => undefined)
+  await tick(0)
+  assert.equal(starts.length, 22)
+  assert.equal(listeners.size, 1)
+  priority = 'interactive'
+  for (const listener of listeners) listener()
+  await tick(0)
+  assert.equal(starts.length, 23, 'The priority change releases global maintenance capacity in a different lane.')
+  controller.abort()
+  await Promise.allSettled(requests)
+  assert.equal(listeners.size, 0)
+})
+
+test('invalid priority subscriptions fail without retaining request resources', async context => {
+  const { service } = await fixture(context, async () => response())
+  const before = service.abortControllers.size
+  assert.throws(() => service.get('/market/history-candles', {}, undefined, 'background', { getPriority: () => 'background' }), /require change notifications/)
+  assert.throws(() => service.get('/rubik/stat/contracts/open-interest-history', { instId: 'BTC-USDT-SWAP' }, undefined, 'background', {
+    getPriority: () => 'background', subscribePriority: () => { throw new Error('Subscription failed.') },
+  }), /Subscription failed/)
+  assert.throws(() => service.get('/rubik/stat/contracts/open-interest-history', { instId: 'BTC-USDT-SWAP' }, undefined, 'background', {
+    getPriority: () => 'background', subscribePriority: () => null,
+  }), /return an unsubscribe function/)
+  assert.equal(service.abortControllers.size, before)
+  assert.equal(service.requestLanes.get('oi').buckets.get('BTC-USDT-SWAP').pending, 0)
+})
+
+test('abort during priority subscription rejects and cleans up without admitting a request', async context => {
+  let starts = 0, detached = 0
+  const { service } = await fixture(context, async () => { starts++; return response() })
+  const controller = new AbortController(), before = service.abortControllers.size
+  const result = service.get('/market/history-candles', {}, controller.signal, 'background', {
+    getPriority: () => 'background', subscribePriority: () => { controller.abort(); return () => { detached++ } },
+  })
+  await assert.rejects(result)
+  assert.equal(starts, 0); assert.equal(detached, 1); assert.equal(service.abortControllers.size, before)
 })
 
 test('a malformed successful envelope cannot certify an empty statistics observation', async context => {

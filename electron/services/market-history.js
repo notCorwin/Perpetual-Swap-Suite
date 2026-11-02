@@ -167,7 +167,7 @@ export class MarketHistory {
       return { records: [], cursor: null }
     }
     const cursor = Math.min(numeric(query.cursor) ?? through + interval, through + interval)
-    const values = await this.get('/market/history-candles', { instId: instrument, bar: timeframe, limit: Math.min(300, (cursor - from) / interval), after: cursor }, signal, priority, { getPriority: query.getPriority })
+    const values = await this.get('/market/history-candles', { instId: instrument, bar: timeframe, limit: Math.min(300, (cursor - from) / interval), after: cursor }, signal, priority, { getPriority: query.getPriority, subscribePriority: query.subscribePriority })
     const rows = this.parsed(instrument, timeframe, values).filter(row => row.timestamp < cursor)
     return { records: rows, cursor: rows.length ? Math.min(...rows.map(row => row.timestamp)) : null }
   }
@@ -180,7 +180,7 @@ export class MarketHistory {
     // OKX excludes both boundaries. Ask each source about the actual page;
     // a shared local retention cutoff cannot establish its availability.
     const values = await this.get(path, { instId: instrument, period: timeframe, limit: 100,
-      begin: pageFrom - interval, end: through + interval, ...(source === 'taker' ? { unit: 1 } : {}) }, signal, priority, { getPriority: query.getPriority })
+      begin: pageFrom - interval, end: through + interval, ...(source === 'taker' ? { unit: 1 } : {}) }, signal, priority, { getPriority: query.getPriority, subscribePriority: query.subscribePriority })
     if (!Array.isArray(values)) throw new TypeError('OKX statistics must contain an array.')
     const byTimestamp = new Map()
     for (const value of values) {

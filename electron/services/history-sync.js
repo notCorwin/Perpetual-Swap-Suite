@@ -110,7 +110,7 @@ export class HistorySync {
 
   group(identity) {
     const key = seriesKey(identity)
-    if (!this.groups.has(key)) this.groups.set(key, { key, ...descriptor(identity), tasks: new Set(), active: null, lastServed: 0, urgentPages: 0, order: this.nextGroupOrder++ })
+    if (!this.groups.has(key)) this.groups.set(key, { key, ...descriptor(identity), tasks: new Set(), priorityListeners: new Set(), active: null, lastServed: 0, urgentPages: 0, order: this.nextGroupOrder++ })
     return this.groups.get(key)
   }
 
@@ -271,8 +271,9 @@ export class HistorySync {
       }
       return selected?.priority ?? 'background'
     }
+    const subscribePriority = listener => { entry.group.priorityListeners.add(listener); return () => entry.group.priorityListeners.delete(listener) }
     return { instrument: entry.group.instrument, timeframe: entry.group.timeframe, source: entry.group.source, ...bounds,
-      priority: getPriority(), getPriority, cursor: null, signal: entry.controller.signal }
+      priority: getPriority(), getPriority, subscribePriority, cursor: null, signal: entry.controller.signal }
   }
   invalidate(query) {
     if (!query || typeof query.instrument !== 'string' || !query.instrument.trim() || !Object.hasOwn(intervals, query.timeframe)
@@ -677,7 +678,11 @@ export class HistorySync {
     } else if (!task.inspected) task.localRecords = task.coveredRecords
     task.inspected = true
   }
-  notify(task) { task.updatedAt = this.now(); try { Promise.resolve(this.onProgress?.(clone(task))).catch(() => undefined) } catch { /* Detached observer. */ } }
+  notify(task) {
+    task.updatedAt = this.now()
+    for (const listener of this.groups.get(seriesKey(task))?.priorityListeners ?? []) listener()
+    try { Promise.resolve(this.onProgress?.(clone(task))).catch(() => undefined) } catch { /* Detached observer. */ }
+  }
   requestError(task) { return Object.assign(new Error(task.lastError), { retryAt: task.nextAttemptAt }) }
   settle(task) {
     const waiting = this.waiters.get(task.id) ?? [], remaining = []

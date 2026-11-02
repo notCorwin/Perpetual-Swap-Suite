@@ -52,6 +52,8 @@ export type HistorySourceQuery = HistoryRange & {
   priority: HistoryPriority
   /** Dynamic priority of live consumers overlapping this shared page. Pass to MarketService.get's fifth options argument. */
   getPriority(): HistoryPriority
+  /** Notify the HTTP scheduler whenever the shared demand priority may change. */
+  subscribePriority(listener: () => void): () => void
   cursor: string | number | null
   signal: AbortSignal
 }

@@ -5,7 +5,8 @@ import type { HistoryRange, HistoryRecord, HistorySourceQuery, HistoryTask, Hist
 import type { CandleRecord } from '../electron/services/market-store.js'
 
 const step = 300_000, base = Date.UTC(2026, 9, 1)
-const query = { instrument: 'BTC-USDT-SWAP', timeframe: '5m' as const, source: 'candles', from: base, through: base + 2 * step }
+const query = { instrument: 'BTC-USDT-SWAP', timeframe: '5m' as const, source: 'candles', from: base, through: base + 2 * step,
+  subscribePriority: (_listener: () => void) => () => {} }
 const deferred = () => { let resolve!: () => void; const promise = new Promise<void>(done => { resolve = done }); return { promise, resolve } }
 const waitFor = async (condition: () => boolean) => {
   const deadline = performance.now() + 4000
