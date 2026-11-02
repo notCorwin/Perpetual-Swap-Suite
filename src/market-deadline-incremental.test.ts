@@ -39,11 +39,107 @@ async function pair(t: TestContext, now: () => number) {
 }
 
 function equalDeadlines(expected: MarketService, actual: MarketService) {
-  assert.deepEqual([...actual.marketDeadlines], [...expected.marketDeadlines], 'Simultaneously due contracts retain the original processing order.')
+  const ordered = (service: MarketService) => [...service.marketDeadlines].sort(([left], [right]) => left.localeCompare(right))
+  assert.deepEqual(ordered(actual), ordered(expected))
   if (expected.marketDeadlineAt === null) assert.equal(actual.marketDeadlineAt, null)
   else assert.ok(actual.marketDeadlineAt !== null && actual.marketDeadlineAt <= expected.marketDeadlineAt,
     'A retained early wake is allowed; an incrementally armed timer must never fire later.')
 }
+
+test('moving, deleting and restoring the earliest deadline avoid full rescans and preserve catalog order', async t => {
+  let now = Math.floor(Date.now() / 300000) * 300000 + 20000
+  t.mock.method(Date, 'now', () => now)
+  const { expected, actual } = await pair(t, () => now)
+  const assign = (service: MarketService, id: string, deadline: number) => {
+    const assessed = service.catalogChecks.get(id), published = service.catalog.get(id)
+    assessed.expiresAt = deadline
+    published.expiresAt = deadline
+    assessed.observations.ticker.expiresAt = deadline
+    published.observations.ticker.expiresAt = deadline
+    service.observations.get(id).ticker.expiresAt = deadline
+    service.instrumentObservations.get(id).expiresAt = deadline
+  }
+  for (const service of [expected, actual]) {
+    assign(service, ids[0], now + 500)
+    assign(service, ids[1], now + 1000)
+    service.scheduleMarketDeadline()
+  }
+  let scans = 0
+  const full = actual.scheduleMarketDeadline.bind(actual)
+  actual.scheduleMarketDeadline = () => { scans++; return full() }
+  const update = (id: string, deadline: number) => {
+    for (const service of [expected, actual]) assign(service, id, deadline)
+    expected.scheduleMarketDeadline()
+    actual.scheduleTickerDeadline(id)
+    equalDeadlines(expected, actual)
+  }
+  update(ids[0], now + 2000)
+  assert.equal(actual.marketDeadlineAt, now + 1000)
+  update(ids[0], Number.MAX_SAFE_INTEGER)
+  assert.equal(actual.marketDeadlines.has(ids[0]), false)
+  update(ids[0], now + 1000)
+  assert.equal(scans, 0, 'Local changes must not rebuild every contract deadline.')
+  const due: string[] = []
+  actual.pruneCatalog = () => undefined
+  actual.checkCandleWaits = () => undefined
+  actual.flushStreamQualifications = () => undefined
+  actual.recoverRequiredSources = () => undefined
+  actual.scheduleQualification = (id: string) => { due.push(id) }
+  now += 1000
+  actual.processMarketDeadline()
+  assert.deepEqual(due, ids, 'Tied deadlines are processed in catalog order after restoration.')
+})
+
+test('a changed catalog removal deadline is indexed without replacing an already due wake', async t => {
+  let now = Math.floor(Date.now() / 300000) * 300000 + 20000
+  t.mock.method(Date, 'now', () => now)
+  const { expected, actual } = await pair(t, () => now)
+  const assign = (service: MarketService, deadline: number) => {
+    const assessed = service.catalogChecks.get(ids[0]), published = service.catalog.get(ids[0])
+    assessed.expiresAt = deadline; published.expiresAt = deadline
+    assessed.observations.ticker.expiresAt = deadline; published.observations.ticker.expiresAt = deadline
+    service.observations.get(ids[0]).ticker.expiresAt = deadline
+    service.instrumentObservations.get(ids[0]).expiresAt = deadline
+    const other = service.catalogChecks.get(ids[1]), otherPublished = service.catalog.get(ids[1])
+    other.expiresAt = Number.MAX_SAFE_INTEGER; otherPublished.expiresAt = Number.MAX_SAFE_INTEGER
+    other.observations.ticker.expiresAt = Number.MAX_SAFE_INTEGER; otherPublished.observations.ticker.expiresAt = Number.MAX_SAFE_INTEGER
+    service.observations.get(ids[1]).ticker.expiresAt = Number.MAX_SAFE_INTEGER
+    service.instrumentObservations.get(ids[1]).expiresAt = Number.MAX_SAFE_INTEGER
+  }
+  for (const service of [expected, actual]) { assign(service, now - 1000); service.scheduleMarketDeadline() }
+  assert.equal(actual.marketDeadlineAt, now + 29000)
+  let scans = 0
+  const full = actual.scheduleMarketDeadline.bind(actual)
+  actual.scheduleMarketDeadline = () => { scans++; return full() }
+  for (const service of [expected, actual]) assign(service, now + 50000)
+  expected.scheduleMarketDeadline(); actual.scheduleTickerDeadline(ids[0]); equalDeadlines(expected, actual)
+  assert.equal(actual.marketDeadlineAt, now + 50000)
+  for (const service of [expected, actual]) assign(service, now - 2000)
+  expected.scheduleMarketDeadline(); actual.scheduleTickerDeadline(ids[0]); equalDeadlines(expected, actual)
+  assert.equal(actual.marketDeadlineAt, now + 28000)
+  assert.equal(scans, 0)
+  now += 28000
+  for (const service of [expected, actual]) assign(service, now + 50000)
+  expected.scheduleMarketDeadline(); actual.scheduleTickerDeadline(ids[0]); equalDeadlines(expected, actual)
+  assert.equal(actual.marketDeadlineAt, now, 'A due callback owns its original timer even after a later observation.')
+})
+
+test('publishing or flushing a local stream assessment reuses the deadline index', async t => {
+  let now = Math.floor(Date.now() / 300000) * 300000 + 20000
+  t.mock.method(Date, 'now', () => now)
+  const { expected, actual } = await pair(t, () => now)
+  let scans = 0
+  const full = actual.scheduleMarketDeadline.bind(actual)
+  actual.scheduleMarketDeadline = () => { scans++; return full() }
+  for (const service of [expected, actual]) service.publishStreamRecords([{ ...service.catalog.get(ids[0]) }])
+  equalDeadlines(expected, actual)
+  for (const service of [expected, actual]) {
+    service.queueStreamQualification(ids[0])
+    service.flushStreamQualifications()
+  }
+  equalDeadlines(expected, actual)
+  assert.equal(scans, 0, 'A same-membership update must not rebuild all market deadlines.')
+})
 
 test('ticker-local deadlines match full recomputation through early, late, tied and due observations', async t => {
   let now = Math.floor(Date.now() / 300000) * 300000 + 20000
@@ -159,7 +255,7 @@ test('a wall-clock rollback rebuilds other contracts after their deadlines had e
     for (const service of [expected, actual]) service.receivePublicObservation(id, 'ticker', quote(id, now))
     equalDeadlines(expected, actual)
   }
-  assert.deepEqual([...actual.marketDeadlines.keys()], ids, 'A new earlier catalog member must not be appended after a later member.')
+  assert.deepEqual(new Set(actual.marketDeadlines.keys()), new Set(ids))
   now = start + 1000
   // Keep source timestamps monotonic while the local wall clock moves back.
   for (const service of [expected, actual]) service.receivePublicObservation(ids[0], 'ticker', quote(ids[0], start + 90001))

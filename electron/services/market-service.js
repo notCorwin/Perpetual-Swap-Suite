@@ -16,6 +16,7 @@ import { MarketOpenInterest } from './market-open-interest.js'
 import { MarketBook } from './market-book.js'
 import { CandleDerivations } from './candle-derivations.js'
 import { statisticsMask, statisticsVersionFor, validTakerVolumes, STATISTICS_OI, STATISTICS_TAKER } from './statistics-state.js'
+import { DeadlineIndex } from './deadline-index.js'
 
 const OKX_ORIGIN = 'https://www.okx.com/api/v5'
 const FIVE_MINUTES = 300_000
@@ -290,6 +291,8 @@ export class MarketService {
     this.marketDeadlineTimer = null
     this.marketDeadlineAt = null
     this.marketDeadlines = new Map()
+    this.marketDeadlineIndex = new DeadlineIndex()
+    this.marketRemovalIndex = new DeadlineIndex()
     this.marketDeadlineState = null
     this.marketDeadlineDirty = new Map()
     this.marketDeadlineRevision = 0
@@ -326,6 +329,10 @@ export class MarketService {
     this.dataRevisions = new Map()
     this.publicSubscriptionDemand = null
     this.subscriptionImmediate = null
+    this.subscriptionDirty = new Set()
+    this.subscriptionFullPending = false
+    this.subscriptionState = null
+    this.subscriptionDeadlines = new DeadlineIndex()
     this.statisticsTasks = new Map()
     this.liveCandles = new Map()
     this.liveCandleSources = new Map()
@@ -456,6 +463,7 @@ export class MarketService {
       onState: state => {
         this.scheduleCandleWaitCheck()
         if (this.realtimeStatus !== state.status) {
+          this.subscriptionState = null
           this.realtimeStatus = state.status; this.touchList()
           if (!this.closing) this.preparedCharts.sourceStateChanged()
           this.scheduleMarketDeadline()
@@ -463,6 +471,7 @@ export class MarketService {
       },
       ...(this.webSocketFactory ? { webSocketFactory: this.webSocketFactory } : {}),
       onSubscribed: ({ instId }) => {
+        this.#markMarketDeadlineDirty(instId)
         const record = this.catalog.get(instId)
         if (record) this.rememberHistoricalAssessment(record)
       },
@@ -1421,6 +1430,7 @@ export class MarketService {
   tickerSubscribed(instId, { signal, receivedAt }) {
     const subscription = this.publicRealtime.subscriptions.get(`tickers:${instId}`)
     if (!subscription || signal.aborted || !this.candidateIDs?.has(instId)) return
+    this.#markMarketDeadlineDirty(instId)
     this.cancelTickerRecovery(instId)
     this.tickerSubscriptions.set(instId, { signal, receivedAt, subscription, observation: null, faulted: false })
     this.capTickerAssessment(instId)
@@ -1432,6 +1442,7 @@ export class MarketService {
     for (const instId of ids) {
       const session = this.tickerSubscriptions.get(instId)
       if (!session || session.signal !== signal && !session.signal.aborted) continue
+      this.#markMarketDeadlineDirty(instId)
       this.tickerSubscriptions.delete(instId)
       this.cancelTickerRecovery(instId)
       this.capTickerAssessment(instId)
@@ -1477,6 +1488,7 @@ export class MarketService {
   tickerFault(instId, error) {
     const session = this.tickerSubscriptions.get(instId)
     if (!session || session.signal.aborted) return
+    this.#markMarketDeadlineDirty(instId)
     session.faulted = true
     this.tickerFaults.set(instId, error); this.sourceError('tickers', error)
     this.capTickerAssessment(instId)
@@ -1619,7 +1631,7 @@ export class MarketService {
       } else records.push(this.observedCandidate(instrument, config, configKey, observations, {}, now, undefined, cheap))
     }
     this.publishStreamRecords(records)
-    this.scheduleMarketDeadline()
+    if (ids.length) this.scheduleTickerDeadline(ids[0]); else this.scheduleMarketDeadline()
   }
 
   publishStreamRecords(records) {
@@ -1627,6 +1639,7 @@ export class MarketService {
     let membershipChanged = false
     for (const record of records) {
       const instrument = record.instrument, instId = instrument.instId
+      this.#markMarketDeadlineDirty(instId)
       this.catalogChecks.set(instId, record)
       const existing = this.catalog.has(instId)
       if (record.status === 'verified') {
@@ -1648,9 +1661,9 @@ export class MarketService {
       else next.delete(record.instrument.instId)
     }
     if (membershipChanged) this.replaceCatalog([...next.values()])
-    this.scheduleSubscriptions()
+    this.scheduleSubscriptions(records.map(record => record.instrument.instId))
     this.touchList()
-    this.scheduleMarketDeadline()
+    this.scheduleTickerDeadline(records[0].instrument.instId)
   }
 
   onHistoryProgress(task) {
@@ -1685,6 +1698,7 @@ export class MarketService {
 
   updateSubscriptions() {
     if (!this.realtime) return
+    this.subscriptionDirty.clear()
     const subscriptions = new Map()
     const ids = this.candidateIDs ?? new Set([...this.instruments.values()].filter(eligibleInstrument).map(value => value.instId))
     // Every contract remains live. Larger periods share the same five-minute
@@ -1698,27 +1712,29 @@ export class MarketService {
     }
     if (collectorChanged) this.realtime.setSubscriptions([...subscriptions.values()])
     const config = this.prefs().liquidity, configKey = JSON.stringify(config), now = Date.now()
-    const books = new Set(), trades = new Set(), openInterest = new Set()
+    const books = new Set(), trades = new Set(), openInterest = new Set(), proofDeadlines = []
     const prerequisites = Object.entries(LIQUIDITY_SOURCE_CRITERIA).filter(([source]) => source !== 'book')
       .flatMap(([source, criteria]) => criteria.filter(key => config[key].enabled).map(key => ({ key, source })))
     for (const instId of ids) {
       const record = this.catalogChecks.get(instId)
+      const evidence = { deadline: Infinity }
       // Reuse the already calculated cheap assessments. A failed book must
       // remain observed so it can recover; only independent prerequisites gate it.
       const possible = prerequisites.every(({ key, source }) => record?.configKey === configKey
         && record.result.checks?.some(check => check.key === key && check.status === 'verified')
-        && this.qualificationObservation(record.observations ?? {}, source, instId, configKey, now))
+        && this.qualificationObservation(record.observations ?? {}, source, instId, configKey, now, evidence))
       if (config.depth.enabled || config.slippage.enabled) {
-        if (possible) { books.add(instId); this.bookRetirements.delete(instId) }
+        if (possible) { books.add(instId); this.bookRetirements.delete(instId); if (Number.isSafeInteger(evidence.deadline)) proofDeadlines.push([instId, evidence.deadline]) }
         else if (this.publicSubscriptionDemand?.books.has(instId)) {
           const retireAt = this.bookRetirements.get(instId) ?? now + LIST_REMOVAL_DELAY_MS
-          if (retireAt > now) { books.add(instId); this.bookRetirements.set(instId, retireAt) }
+          if (retireAt > now) { books.add(instId); this.bookRetirements.set(instId, retireAt); if (Number.isSafeInteger(retireAt) && retireAt >= 0) proofDeadlines.push([instId, retireAt]) }
           else this.bookRetirements.delete(instId)
         }
       } else this.bookRetirements.delete(instId)
       if (this.statisticsDemand(instId)) trades.add(instId)
       if (config.openInterest.enabled || this.statisticsDemand(instId)) openInterest.add(instId)
     }
+    this.subscriptionDeadlines = new DeadlineIndex(proofDeadlines)
     const previous = this.publicSubscriptionDemand
     const same = (left, right) => left && left.size === right.size && [...right].every(id => left.has(id))
     if (this.publicRealtime && (!previous || !same(previous.books, books) || !same(previous.trades, trades) || !same(previous.openInterest, openInterest)
@@ -1729,11 +1745,73 @@ export class MarketService {
     }
     if (collectorChanged && !this.closing) this.preparedCharts.sourceStateChanged()
     this.scheduleMarketDeadline()
+    this.subscriptionState = this.subscriptionSignature(now, configKey)
   }
 
-  scheduleSubscriptions() {
-    if (this.closing || this.disposed || this.subscriptionImmediate) return
-    this.subscriptionImmediate = setImmediate(() => { this.subscriptionImmediate = null; this.updateSubscriptions() })
+  subscriptionSignature(now, configKey) {
+    const connection = this.realtime?.connection
+    return { now, configKey, boundary: closedBoundary('5m', now), ids: this.candidateIDs, idCount: this.candidateIDs?.size,
+      checks: this.catalogChecks, checkCount: this.catalogChecks.size, universe: this.listedUniverse, focus: this.preparedCharts.focus,
+      realtime: this.realtime, connection, connectionOpened: connection?.opened, connectionRetired: connection?.retired,
+      socketState: connection?.socket?.readyState, realtimeSubscriptions: this.realtime?.subscriptions,
+      realtimeCount: this.realtime?.subscriptions.size, realtimeKeys: this.preparedCharts.realtimeKeys,
+      publicRealtime: this.publicRealtime, publicInstruments: this.publicRealtime?.instruments, publicSubscriptions: this.publicRealtime?.subscriptions,
+      demand: this.publicSubscriptionDemand, assessments: this.historicalAssessments }
+  }
+
+  updateDirtySubscriptions() {
+    const now = Date.now(), config = this.prefs().liquidity, configKey = JSON.stringify(config), state = this.subscriptionState
+    const current = this.subscriptionSignature(now, configKey)
+    if (!state || !this.candidateIDs || !this.publicSubscriptionDemand || !this.publicRealtime
+      || !this.marketDeadlineTimer || this.marketDeadlineAt === null || this.marketDeadlineAt <= now || now < state.now
+      || (this.subscriptionDeadlines.peek()?.deadline ?? Infinity) <= now
+      || Object.keys(current).some(key => key !== 'now' && current[key] !== state[key])) return this.updateSubscriptions()
+    const prerequisites = Object.entries(LIQUIDITY_SOURCE_CRITERIA).filter(([source]) => source !== 'book')
+      .flatMap(([source, criteria]) => criteria.filter(key => config[key].enabled).map(key => ({ key, source })))
+    const retire = [], restore = [], proofDeadlines = []
+    for (const instId of this.subscriptionDirty) {
+      if (!this.candidateIDs.has(instId)) return this.updateSubscriptions()
+      const record = this.catalogChecks.get(instId), previousBook = this.publicSubscriptionDemand.books.has(instId)
+      const evidence = { deadline: Infinity }
+      const possible = prerequisites.every(({ key, source }) => record?.configKey === configKey
+        && record.result.checks?.some(check => check.key === key && check.status === 'verified')
+        && this.qualificationObservation(record.observations ?? {}, source, instId, configKey, now, evidence))
+      const retirement = this.bookRetirements.get(instId)
+      let book = false
+      if (config.depth.enabled || config.slippage.enabled) {
+        if (possible) { book = true; if (retirement !== undefined) restore.push(instId) }
+        else if (previousBook) {
+          const deadline = retirement ?? now + LIST_REMOVAL_DELAY_MS
+          if (deadline > now) { book = true; evidence.deadline = deadline; if (retirement === undefined) retire.push([instId, deadline]) }
+          else restore.push(instId)
+        }
+      } else if (retirement !== undefined) restore.push(instId)
+      const statistics = this.statisticsDemand(instId)
+      if (book !== previousBook || statistics !== this.publicSubscriptionDemand.trades.has(instId)
+        || (config.openInterest.enabled || statistics) !== this.publicSubscriptionDemand.openInterest.has(instId)) return this.updateSubscriptions()
+      proofDeadlines.push([instId, book && Number.isSafeInteger(evidence.deadline) && evidence.deadline >= 0 ? evidence.deadline : undefined])
+    }
+    this.subscriptionDirty.clear()
+    for (const id of restore) this.bookRetirements.delete(id)
+    for (const [id, deadline] of retire) this.bookRetirements.set(id, deadline)
+    for (const [id, deadline] of proofDeadlines) {
+      if (deadline === undefined) this.subscriptionDeadlines.delete(id)
+      else this.subscriptionDeadlines.set(id, deadline)
+    }
+    this.subscriptionState = current
+    if (retire.length || restore.length) this.scheduleMarketDeadline()
+  }
+
+  scheduleSubscriptions(instIds) {
+    if (this.closing || this.disposed) return
+    if (instIds) for (const id of instIds) this.subscriptionDirty.add(id)
+    else this.subscriptionFullPending = true
+    if (this.subscriptionImmediate) return
+    this.subscriptionImmediate = setImmediate(() => {
+      this.subscriptionImmediate = null
+      const full = this.subscriptionFullPending; this.subscriptionFullPending = false
+      if (full) this.updateSubscriptions(); else this.updateDirtySubscriptions()
+    })
     this.subscriptionImmediate.unref?.()
   }
 
@@ -1866,14 +1944,21 @@ export class MarketService {
       && observation.value.asOf === boundary - timeframeMilliseconds(timeframe) ? deadline : expiry
   }
 
-  qualificationObservation(observations, key, instId, configKey, now = Date.now()) {
+  qualificationObservation(observations, key, instId, configKey, now = Date.now(), evidence) {
     const observation = observations[key]
-    if (!observation || !Number.isSafeInteger(observation.observedAt)
-      || this.qualificationExpiry(observation, key, instId, configKey, now) <= now) return null
+    if (!observation || !Number.isSafeInteger(observation.observedAt)) return null
+    const expiry = this.qualificationExpiry(observation, key, instId, configKey, now)
+    if (expiry <= now) return null
     if (key === 'turnover' || key === 'hourly') {
       const timeframe = key === 'turnover' ? '5m' : '1H', boundary = closedBoundary(timeframe, now)
       if (observation.value.asOf !== boundary
         && !(observation.value.asOf === boundary - timeframeMilliseconds(timeframe) && observation.expiresAt === boundary)) return null
+    }
+    if (evidence) {
+      if (typeof expiry === 'number' || typeof expiry === 'string') {
+        const numeric = Number(expiry), deadline = Math.ceil(numeric)
+        if (Number.isFinite(numeric)) evidence.deadline = Math.min(evidence.deadline, Number.isSafeInteger(deadline) && deadline >= 0 ? deadline : now)
+      } else if (expiry !== undefined && expiry !== null) evidence.deadline = Math.min(evidence.deadline, now)
     }
     return observation
   }
@@ -1959,6 +2044,7 @@ export class MarketService {
 
   #markMarketDeadlineDirty(instId) {
     this.marketDeadlineDirty.set(instId, ++this.marketDeadlineRevision)
+    this.subscriptionDirty.add(instId)
   }
 
   #deadlineForInstrument(instId, now, configKey, required, continuousMetadata) {
@@ -1989,12 +2075,12 @@ export class MarketService {
     if (this.closing || this.disposed || this.processingMarketDeadline) return
     // Keep the full synchronous cleanup if any source recovery may need to
     // be cancelled. The common live case has none.
-    if (this.sourceRecoveries.size) return this.scheduleMarketDeadline()
+    if (this.sourceRecoveries.size || this.tickerRecoveries.size || this.candleWaits.size || this.listRemovals.size || this.bookRetirements.size) return this.scheduleMarketDeadline()
     const now = Date.now()
     // Once due, the existing callback owns its captured set of deadlines.
     if (this.marketDeadlineTimer && this.marketDeadlineAt <= now) return
     const previous = this.marketDeadlineState
-    if (!previous || !this.marketDeadlineTimer || now < previous.now) return this.scheduleMarketDeadline()
+    if (!previous || !previous.indexUsable || !this.marketDeadlineTimer || now < previous.now) return this.scheduleMarketDeadline()
     const config = this.prefs().liquidity, configKey = JSON.stringify(config)
     const continuousMetadata = this.instrumentStream?.synchronized && !this.instrumentStream.signal.aborted
     const realtime = this.realtime, connection = realtime?.connection
@@ -2014,31 +2100,31 @@ export class MarketService {
     const dirtyRevision = this.marketDeadlineRevision, dirty = new Map(this.marketDeadlineDirty)
     if (!dirty.has(instId)) dirty.set(instId, undefined)
     const changes = [], required = requiredLiquiditySources(config)
-    let earliest = this.marketDeadlineAt
     for (const [id, revision] of dirty) {
       const member = this.catalogChecks.has(id) || this.catalog.has(id)
       if (previous.ids.has(id) !== member) return this.scheduleMarketDeadline()
-      const old = this.marketDeadlines.get(id)
       const next = member ? this.#deadlineForInstrument(id, now, configKey, required, continuousMetadata) : undefined
-      // A new map entry needs the original order. If the old minimum moves
-      // later, recompute the whole minimum to avoid an obsolete wake.
-      if (old === undefined && next !== undefined
-        || old === this.marketDeadlineAt && (next === undefined || next > old)) return this.scheduleMarketDeadline()
-      changes.push({ id, revision, next })
-      if (next !== undefined) earliest = Math.min(earliest, next)
+      const entry = this.catalog.get(id), expiry = entry && this.catalogEntryExpiry(entry, now)
+      const removal = entry && expiry <= now && expiry + LIST_REMOVAL_DELAY_MS > now ? expiry + LIST_REMOVAL_DELAY_MS : undefined
+      if (removal !== undefined && (!Number.isSafeInteger(removal) || removal < 0)) return this.scheduleMarketDeadline()
+      changes.push({ id, revision, next, removal })
     }
     // A synchronous observer can mutate a source during deadline calculation.
     if (this.marketDeadlineRevision !== dirtyRevision || changes.some(({ id, revision }) => this.marketDeadlineDirty.get(id) !== revision)) return this.scheduleMarketDeadline()
-    for (const { id, revision, next } of changes) {
-      if (next === undefined) this.marketDeadlines.delete(id); else this.marketDeadlines.set(id, next)
+    for (const { id, revision, next, removal } of changes) {
+      if (next === undefined) { this.marketDeadlines.delete(id); this.marketDeadlineIndex.delete(id) }
+      else { this.marketDeadlines.set(id, next); this.marketDeadlineIndex.set(id, next) }
+      if (removal === undefined) this.marketRemovalIndex.delete(id); else this.marketRemovalIndex.set(id, removal)
       if (this.marketDeadlineDirty.get(id) === revision) this.marketDeadlineDirty.delete(id)
     }
     previous.now = now
-    if (earliest < this.marketDeadlineAt) {
+    const earliest = Math.min(previous.ids.size ? previous.boundary + FIVE_MINUTES : Infinity,
+      this.marketDeadlineIndex.peek()?.deadline ?? Infinity, this.marketRemovalIndex.peek()?.deadline ?? Infinity)
+    if (earliest !== this.marketDeadlineAt) {
       clearTimeout(this.marketDeadlineTimer)
-      this.marketDeadlineAt = earliest
-      this.marketDeadlineTimer = setTimeout(() => this.processMarketDeadline(), Math.min(2_147_483_647, Math.max(1, earliest - now)))
-      this.marketDeadlineTimer.unref?.()
+      this.marketDeadlineAt = Number.isFinite(earliest) ? earliest : null
+      this.marketDeadlineTimer = this.marketDeadlineAt === null ? null : setTimeout(() => this.processMarketDeadline(), Math.min(2_147_483_647, Math.max(1, earliest - now)))
+      this.marketDeadlineTimer?.unref?.()
     }
   }
 
@@ -2052,6 +2138,7 @@ export class MarketService {
     const dirty = new Map(this.marketDeadlineDirty)
     const config = this.prefs().liquidity, configKey = JSON.stringify(config), required = requiredLiquiditySources(config)
     const ids = new Set([...this.catalogChecks.keys(), ...this.catalog.keys()]), deadlines = new Map()
+    const indexedRemovals = []
     const continuousMetadata = this.instrumentStream?.synchronized && !this.instrumentStream.signal.aborted
     for (const instId of ids) {
       const deadline = this.#deadlineForInstrument(instId, now, configKey, required, continuousMetadata)
@@ -2066,10 +2153,19 @@ export class MarketService {
     const candleDeadlines = [...this.candleWaits.values()].map(wait => wait.deadline)
     const removalDeadlines = [...this.listRemovals.values()].map(removal => removal.removeAt)
     removalDeadlines.push(...this.bookRetirements.values())
-    for (const entry of this.catalog.values()) {
+    let indexUsable = true
+    for (const [instId, entry] of this.catalog) {
       const expiry = this.catalogEntryExpiry(entry, now)
-      if (expiry <= now && expiry + LIST_REMOVAL_DELAY_MS > now) removalDeadlines.push(expiry + LIST_REMOVAL_DELAY_MS)
+      if (expiry <= now && expiry + LIST_REMOVAL_DELAY_MS > now) {
+        const removal = expiry + LIST_REMOVAL_DELAY_MS
+        removalDeadlines.push(removal)
+        if (Number.isSafeInteger(removal) && removal >= 0) indexedRemovals.push([instId, removal])
+        else indexUsable = false
+      }
     }
+    this.marketDeadlineIndex = new DeadlineIndex(deadlines)
+    this.marketRemovalIndex = new DeadlineIndex(indexedRemovals)
+    this.marketDeadlineState.indexUsable = indexUsable
     const next = Math.min(boundary, ...deadlines.values(), ...tickerRetries, ...sourceRetries, ...candleDeadlines, ...removalDeadlines)
     if (this.marketDeadlineAt === next) return
     if (this.marketDeadlineTimer) clearTimeout(this.marketDeadlineTimer)
@@ -2088,7 +2184,10 @@ export class MarketService {
     try {
       this.checkCandleWaits()
       const now = Date.now(), asOf = closedBoundary('5m', now)
-      const due = new Set([...this.marketDeadlines].filter(([, deadline]) => deadline <= now).map(([instId]) => instId))
+      // A deadline may disappear and later return. Catalog order, rather than
+      // the Map's reinsertion order, determines processing of tied deadlines.
+      const due = new Set()
+      for (const instId of this.marketDeadlineState?.ids ?? this.marketDeadlines.keys()) if (this.marketDeadlines.get(instId) <= now) due.add(instId)
       if (asOf !== this.marketBoundary) {
         this.marketBoundary = asOf
         this.touchList()
@@ -2235,11 +2334,12 @@ export class MarketService {
 
   bookUnsubscribed(instId) {
     const now = Date.now(), published = this.catalog.get(instId), publishedExpiry = this.catalogEntryExpiry(published, now)
+    this.#markMarketDeadlineDirty(instId)
     this.bookGenerations.set(instId, (this.bookGenerations.get(instId) ?? 0) + 1)
     this.books.invalidate(instId)
     this.nativeBookDeadlines.delete(instId)
     const observations = this.observations.get(instId)
-    if (observations) { this.#markMarketDeadlineDirty(instId); delete observations.book }
+    if (observations) delete observations.book
     const { depth, slippage } = this.prefs().liquidity
     if (this.closing || !depth.enabled && !slippage.enabled) return
     const record = this.catalogChecks.get(instId)
@@ -3127,6 +3227,8 @@ export class MarketService {
     if (this.instrumentRetryTimer) clearTimeout(this.instrumentRetryTimer)
     if (this.marketDeadlineTimer) clearTimeout(this.marketDeadlineTimer)
     this.marketDeadlineTimer = null; this.marketDeadlineAt = null; this.marketDeadlineState = null
+    this.marketDeadlineIndex.clear(); this.marketRemovalIndex.clear()
+    this.subscriptionDeadlines.clear(); this.subscriptionDirty.clear()
     this.marketDeadlineDirty.clear()
     if (this.qualificationImmediate) clearImmediate(this.qualificationImmediate)
     if (this.marketPublicationTimer) clearTimeout(this.marketPublicationTimer)
