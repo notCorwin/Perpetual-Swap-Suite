@@ -13,3 +13,11 @@ export function chartCaptureBounds(element: HTMLElement): ChartCaptureBounds {
   const backgroundRGB = Array.from(context.getImageData(0, 0, 1, 1).data).slice(0, 3).map(value => value / 255)
   return { x: rect.x, y: rect.y, width: rect.width, height: rect.height, backgroundRGB }
 }
+
+/** Reject captures when the chart changes before the asynchronous pixels arrive. */
+export async function captureStableChart<T>(capture: () => Promise<T>, current: () => boolean): Promise<T> {
+  if (!current()) throw new Error('Chart changed before capture. Start again.')
+  const image = await capture()
+  if (!current()) throw new Error('Chart changed during capture. Start again.')
+  return image
+}

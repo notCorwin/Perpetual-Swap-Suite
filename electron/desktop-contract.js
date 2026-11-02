@@ -192,7 +192,7 @@ function candle(value, index) {
 
 /** Validate the complete request before dispatching any operation or side effect. */
 export function parseDesktopRequest(value, { allowE2E = false } = {}) {
-  const operations = ['snapshot', 'preferences', 'dataAudit', 'historyDownload', 'chartFocus', 'chartWindow', 'chartLocal', 'chartHistory', 'chartUniverse', 'captureChart', 'copyText', 'analysisSettings', 'gatewayFetch', 'cancelGatewayFetch', 'e2e']
+  const operations = ['snapshot', 'preferences', 'dataAudit', 'historyDownload', 'chartFocus', 'chartWindow', 'chartLocal', 'chartHistory', 'chartUniverse', 'captureChart', 'copyText', 'copyImage', 'analysisSettings', 'gatewayFetch', 'cancelGatewayFetch', 'e2e']
   record(value, 'request', operations)
   const keys = Object.keys(value)
   if (keys.length !== 1) invalid('request', 'must contain exactly one operation')
@@ -222,6 +222,11 @@ export function parseDesktopRequest(value, { allowE2E = false } = {}) {
     }
     case 'captureChart': return { captureChart: captureChart(input) }
     case 'copyText': return { copyText: text(input, operation, { empty: true, maximum: 16_777_216 }) }
+    case 'copyImage': {
+      const image = text(input, operation, { maximum: 33_554_432 })
+      if (!/^data:image\/png;base64,(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(image)) invalid(operation, 'must be a PNG data URL')
+      return { copyImage: image }
+    }
     case 'analysisSettings': return { analysisSettings: analysisSettings(input) }
     case 'gatewayFetch': {
       record(input, operation, ['id', 'body'], ['id', 'body'])

@@ -738,6 +738,65 @@ test('overlapping discovery and renewal checks share one instrument observation 
   } finally { release(); await Promise.allSettled([first, second]); await f.close() }
 })
 
+test('instrument discovery survives cancellation of one shared consumer', async () => {
+  const gate = deferred(), started = deferred()
+  let calls = 0, underlyingAborted = false
+  const f = await fixture(disabled(), async (_input, init) => {
+    calls += 1; started.resolve()
+    init?.signal?.addEventListener('abort', () => { underlyingAborted = true }, { once: true })
+    await gate.promise
+    init?.signal?.throwIfAborted()
+    return response([instrument])
+  })
+  const firstController = new AbortController(), secondController = new AbortController()
+  let first: Promise<unknown> | undefined, second: Promise<unknown> | undefined
+  try {
+    const key = f.service.catalogCriteriaKey()
+    first = f.service.discoverInstruments(key, firstController.signal, 'foreground')
+    const rejected = assert.rejects(first!, { name: 'AbortError' })
+    await started.promise
+    second = f.service.discoverInstruments(key, secondController.signal, 'foreground')
+    firstController.abort(); await rejected
+    assert.equal(underlyingAborted, false)
+    gate.resolve()
+    assert.deepEqual((await second as typeof instrument[]).map(value => value.instId), [instId])
+    assert.equal(calls, 1)
+  } finally { firstController.abort(); secondController.abort(); gate.resolve(); await Promise.allSettled([first, second]); await f.close() }
+})
+
+test('candidate qualification survives cancellation of one shared consumer', async () => {
+  const config = disabled(); config.liquidity.openInterest.enabled = true
+  const gate = deferred(), started = deferred()
+  let calls = 0, underlyingAborted = false
+  const f = await fixture(config, async (input, init) => {
+    const url = new URL(String(input))
+    if (url.pathname.endsWith('/market/ticker')) return response([ticker])
+    if (!url.pathname.endsWith('/public/open-interest')) throw new Error(`Unexpected ${url}`)
+    calls += 1; started.resolve()
+    init?.signal?.addEventListener('abort', () => { underlyingAborted = true }, { once: true })
+    await gate.promise
+    init?.signal?.throwIfAborted()
+    return response([{ instId, oiUsd: '6000000' }])
+  })
+  const firstController = new AbortController(), secondController = new AbortController()
+  let first: Promise<unknown> | undefined, second: Promise<unknown> | undefined
+  try {
+    f.service.updateRanking = async () => undefined
+    const observedAt = Date.now()
+    f.service.instrumentObservations.set(instId, { observedAt, expiresAt: observedAt + 90_000 })
+    const key = f.service.catalogCriteriaKey()
+    first = f.service.checkCandidate(instrument, config.liquidity, key, firstController.signal)
+    const rejected = assert.rejects(first!, { name: 'AbortError' })
+    await started.promise
+    second = f.service.checkCandidate(instrument, config.liquidity, key, secondController.signal)
+    firstController.abort(); await rejected
+    assert.equal(underlyingAborted, false)
+    gate.resolve(); await second
+    assert.equal(calls, 1)
+    assert.equal(f.service.metadata.getCatalogEntry(instId).status, 'verified')
+  } finally { firstController.abort(); secondController.abort(); gate.resolve(); await Promise.allSettled([first, second]); await f.close() }
+})
+
 test('empty or unverifiable discovery reports unavailable market verification rather than no qualified contracts', async () => {
   for (const missing of ['instruments', 'tickers', 'supported-metadata'] as const) {
     const f = await fixture(disabled(), async input => {

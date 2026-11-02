@@ -117,7 +117,10 @@ function writeStatistic(series, source, timestamp, first, second, expiresAt, cha
   const absent = first === null || source === 2 && (second === null || first === 0 && second === 0 && traded)
   const previousNumeric = previous?.value1 != null && (source === 1 || previous.value2 != null
     && !(previous.value1 === 0 && previous.value2 === 0 && traded))
-  if (preserveExistingSource && previousNumeric && !staleDerived) return false
+  // Local, price-bound trade totals can improve as late trades arrive even if
+  // candle volume is unchanged. Preserve independently acquired source data.
+  if (preserveExistingSource && previousNumeric && !staleDerived
+    && (observedVolume === null || previous.observed_volume == null)) return false
   // Absence is a bounded source observation, never a correction to a numeric fact.
   if (absent && previousNumeric && !staleDerived) return false
   if (absent && previous && observedAt < previous.written_at) return false

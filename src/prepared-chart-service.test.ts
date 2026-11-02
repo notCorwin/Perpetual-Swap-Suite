@@ -3351,3 +3351,83 @@ test('a drained obsolete focus read releases its pinned resident state without a
     assert.equal(pipeline.series.has(`${other}:15m`), true)
   } finally { gate.resolve(); await pipeline.dispose() }
 })
+
+test('a statistic acquisition cannot replace a newer observation while its committed projection is in flight', async () => {
+  const old = source(1)[0], initial = { ...old, oi: null, statisticsVersion: 10 }
+  const entered = deferred(), release = deferred()
+  const { pipeline, store } = fixture([initial] as any, {
+    async ensureStatistics(_id: string, _timeframe: string, _from: number, _through: number, _priority: string, _signal: AbortSignal, source: string) {
+      assert.equal(source, 'oi')
+      const result = { rows: [{ ...old }] }
+      entered.resolve(); await release.promise
+      return result
+    },
+  })
+  const state = pipeline.state(instId, '15m')
+  state.rows.set(old.timestamp, initial)
+  const demand = { key: state.key, instId, timeframe: '15m', end: old.timestamp }
+  pipeline.focus = demand; pipeline.focusKey = state.key
+  try {
+    pipeline.refreshStatistics(state, old.timestamp, old.timestamp, 'interactive', undefined, demand)
+    await entered.promise
+    const task = [...pipeline.sourceTasks.values()][0].task
+    const newest = { ...old, oi: 9000 }
+    store.rows = [newest]
+    await pipeline.observeStatistics(instId, '15m', old.timestamp, old.timestamp, 'interactive', [newest], 'oi')
+    release.resolve(); await task
+    assert.equal(state.rows.get(old.timestamp).oi, 9000)
+  } finally { release.resolve(); pipeline.focus = null; await pipeline.dispose() }
+})
+
+test('a local read invalidated during coverage reloads the new generation', async () => {
+  const original = source(5), { pipeline, store } = fixture(original)
+  const entered = deferred(), release = deferred(), coverage = store.coverage.bind(store)
+  let first = true
+  store.coverage = async () => {
+    const result = await coverage()
+    if (first) { first = false; entered.resolve(); await release.promise }
+    return result
+  }
+  const state = pipeline.state(instId, '15m')
+  try {
+    const read = pipeline.read(state)
+    await entered.promise
+    const newest = { ...original.at(-1)!, close: 100.25 }
+    store.rows = [newest]
+    pipeline.invalidate(instId, '15m')
+    release.resolve(); await read
+    assert.equal(state.loaded, true)
+    assert.equal(state.rows.size, 1)
+    assert.equal(state.rows.get(newest.timestamp).close, newest.close)
+    assert.ok(store.queries.length >= 2, 'The invalidated generation must be read again.')
+  } finally { release.resolve(); await pipeline.dispose() }
+})
+
+test('statistics acquired while a new price row becomes resident cover the new row', async () => {
+  const rows = source(2), [first, second] = rows
+  const missing = (row: typeof first) => ({ ...row, oi: null, statisticsVersion: 10 })
+  const entered = deferred(), release = deferred()
+  const { pipeline, store } = fixture([missing(first)] as any, {
+    async ensureStatistics(_id: string, _timeframe: string, _from: number, _through: number, _priority: string, _signal: AbortSignal, source: string) {
+      if (source === 'oi') { entered.resolve(); await release.promise }
+      return { rows }
+    },
+  })
+  const state = pipeline.state(instId, '15m')
+  state.rows.set(first.timestamp, missing(first))
+  state.latestHour = first.timestamp
+  const demand = { key: state.key, instId, timeframe: '15m', end: second.timestamp }
+  pipeline.focus = demand; pipeline.focusKey = state.key
+  pipeline.prefetchStatistics = () => {}; pipeline.scheduleRefresh = () => {}
+  try {
+    pipeline.refreshStatistics(state, first.timestamp, second.timestamp, 'interactive', undefined, demand)
+    await entered.promise
+    const task = [...pipeline.sourceTasks.values()].find((job: any) => job.source === 'oi').task
+    store.rows = rows
+    pipeline.observe([missing(second)], new Map())
+    release.resolve(); assert.equal(await task, true)
+    assert.equal(state.rows.get(first.timestamp).oi, first.oi)
+    assert.equal(state.rows.get(second.timestamp).oi, second.oi)
+    assert.equal(pipeline.sourceAttempts.size, 0)
+  } finally { release.resolve(); pipeline.focus = null; await pipeline.dispose() }
+})

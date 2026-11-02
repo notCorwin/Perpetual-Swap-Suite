@@ -56,6 +56,24 @@ const abortable = (promise, signal) => new Promise((resolve, reject) => {
   signal?.addEventListener('abort', abort, { once: true })
   Promise.resolve(promise).then(resolve, reject).finally(() => signal?.removeEventListener('abort', abort))
 })
+// Each consumer owns only its wait. Retire the shared work when its last
+// consumer leaves, and detach it before aborting so a new caller starts fresh.
+function sharedWait(entry, signal, retire) {
+  return new Promise((resolve, reject) => {
+    const waiter = {}
+    const finish = (complete, value) => {
+      if (!entry.waiters.delete(waiter)) return
+      signal?.removeEventListener('abort', onAbort)
+      complete(value)
+      if (!entry.settled && !entry.waiters.size) retire(entry, signal?.reason)
+    }
+    const onAbort = () => finish(reject, signal.reason ?? new DOMException('The request was aborted.', 'AbortError'))
+    entry.waiters.add(waiter)
+    signal?.addEventListener('abort', onAbort, { once: true })
+    entry.task.then(value => finish(resolve, value), error => finish(reject, error))
+    if (signal?.aborted) onAbort()
+  })
+}
 class RetryAfterError extends Error {
   constructor(path, retryAfter, lane) {
     super(`OKX ${path} is rate limited.`)
@@ -261,6 +279,7 @@ export class MarketService {
     this.catalogChecks = new Map()
     this.renewalTargets = new Map()
     this.candidateTasks = new Map()
+    this.candidateAcquisitions = new Map()
     this.pendingCandidates = new Map()
     this.refreshAdmission = null
     this.catalogControllers = new Set()
@@ -1246,37 +1265,45 @@ export class MarketService {
   confirmStatistics(row) {
     const key = `${row.instrument}:${row.timeframe}:${row.timestamp}`
     const previous = this.statisticsTasks.get(key)
-    if (previous) { previous.row = row; return previous.task }
-    const entry = { row, task: null }
+    if (previous) { previous.row = row; previous.version++; return previous.task }
+    const entry = { row, version: 0, task: null }
     entry.task = Promise.resolve().then(async () => {
-      const calculate = () => this.liveStatistics.enrich({ ...entry.row, buy: null, sell: null, oi: null })
-      let calculated = calculate()
-      if (!validTakerVolumes(calculated) && this.publicRealtime.started && this.liveStatistics.canFinalize(entry.row)
-        && this.publicRealtime.subscriptions.has(`trades:${row.instrument}`)) {
-        // The final public trade and business candle can arrive on different
-        // sockets. A bounded grace period never delays price durability or UI.
-        await new Promise(resolve => setTimeout(resolve, 250))
-        calculated = calculate()
+      try {
+        do {
+          const version = entry.version, current = entry.row
+          try {
+            const calculate = () => this.liveStatistics.enrich({ ...current, buy: null, sell: null, oi: null })
+            let calculated = calculate()
+            if (!validTakerVolumes(calculated) && this.publicRealtime.started && this.liveStatistics.canFinalize(current)
+              && this.publicRealtime.subscriptions.has(`trades:${row.instrument}`)) {
+              // The final trade and candle can arrive on different sockets.
+              await new Promise(resolve => setTimeout(resolve, 250))
+              calculated = calculate()
+            }
+            if (this.closing || !this.statisticsDemand(row.instrument)) return
+            if (validTakerVolumes(calculated)) {
+              const changed = await this.store.appendStatistics({ instrument: current.instrument, timeframe: current.timeframe,
+                source: 'taker', from: current.timestamp, through: current.timestamp,
+                values: [[current.timestamp, calculated.sell, calculated.buy]], priceVolume: current.volume,
+                observedAt: Date.now(), preserveExistingSource: true }, 'continuity')
+              if (changed) {
+                this.markChartDataChanged(current.instrument)
+                await this.preparedCharts.observeStatistics(current.instrument, current.timeframe, current.timestamp, current.timestamp, 'continuity', undefined, 'taker')
+              }
+            }
+            // OI remains an independently observed stock quantity.
+            if (this.statisticsAcquisitionDemand(current.instrument, current.timeframe)) {
+              await this.history.ensureStatistics(current.instrument, current.timeframe, current.timestamp, current.timestamp, 'continuity', this.shutdownController.signal)
+            }
+          } catch (error) {
+            if (entry.version === version) throw error
+          }
+          if (entry.version === version) return
+        } while (!this.closing)
+      } finally {
+        if (this.statisticsTasks.get(key) === entry) this.statisticsTasks.delete(key)
       }
-      if (this.closing || !this.statisticsDemand(row.instrument)) return
-      if (validTakerVolumes(calculated)) {
-        const current = entry.row
-        const changed = await this.store.appendStatistics({ instrument: current.instrument, timeframe: current.timeframe,
-          source: 'taker', from: current.timestamp, through: current.timestamp,
-          values: [[current.timestamp, calculated.sell, calculated.buy]], priceVolume: current.volume,
-          observedAt: Date.now(), preserveExistingSource: true }, 'continuity')
-        if (changed) {
-          this.markChartDataChanged(current.instrument)
-          await this.preparedCharts.observeStatistics(current.instrument, current.timeframe, current.timestamp, current.timestamp, 'continuity', undefined, 'taker')
-        }
-      }
-      // Valid local quantities satisfy coverage. Only missing native sources
-      // are acquired; OI remains an independently observed stock quantity.
-      const current = entry.row
-      if (this.statisticsAcquisitionDemand(current.instrument, current.timeframe)) {
-        await this.history.ensureStatistics(current.instrument, current.timeframe, current.timestamp, current.timestamp, 'continuity', this.shutdownController.signal)
-      }
-    }).finally(() => { if (this.statisticsTasks.get(key) === entry) this.statisticsTasks.delete(key) })
+    })
     this.statisticsTasks.set(key, entry)
     return entry.task
   }
@@ -2500,18 +2527,26 @@ export class MarketService {
   }
 
   async checkCandidate(instrument, config, configKey, signal, priority = 'foreground', options = {}) {
+    signal?.throwIfAborted()
     const key = `${configKey}:${JSON.stringify(instrument)}:${options.localOnly ? 'local' : 'remote'}`
-    if (this.candidateTasks.has(key)) return this.candidateTasks.get(key)
-    this.pendingCandidates.set(key, { instId: instrument.instId, configKey })
-    this.touchList()
-    const task = this.evaluateCandidate(instrument, config, configKey, signal, priority, options)
-      .finally(() => {
-        if (this.candidateTasks.get(key) === task) {
-          this.candidateTasks.delete(key); this.pendingCandidates.delete(key); this.touchList()
-        }
-      })
-    this.candidateTasks.set(key, task)
-    return task
+    let entry = this.candidateAcquisitions.get(key)
+    const remove = current => {
+      if (this.candidateAcquisitions.get(key) !== current) return
+      this.candidateAcquisitions.delete(key); this.candidateTasks.delete(key); this.pendingCandidates.delete(key); this.touchList()
+    }
+    if (!entry) {
+      entry = { controller: new AbortController(), waiters: new Set(), settled: false, task: null }
+      this.candidateAcquisitions.set(key, entry)
+      this.pendingCandidates.set(key, { instId: instrument.instId, configKey })
+      this.touchList()
+      const current = entry
+      entry.task = Promise.resolve().then(() => this.evaluateCandidate(instrument, config, configKey, current.controller.signal, priority, options))
+        .finally(() => { current.settled = true; remove(current) })
+      this.candidateTasks.set(key, entry.task)
+    }
+    return sharedWait(entry, signal, (current, reason) => {
+      remove(current); this.track(current.task); current.controller.abort(reason)
+    })
   }
 
   readQualificationCandles(query, signal) {
@@ -2635,7 +2670,7 @@ export class MarketService {
     return null
   }
 
-  async evaluateCandidate(instrument, config, configKey, signal, priority, { localOnly = false, sources = {} } = {}) {
+  async evaluateCandidate(instrument, config, configKey, signal, priority, { localOnly = false } = {}) {
     if (!this.currentCandidate(instrument, configKey, signal)) return
     const asOf = closedBoundary('5m')
     const instId = instrument.instId, observations = this.observations.get(instId) ?? {}
@@ -2653,14 +2688,7 @@ export class MarketService {
     }
     const observeOpenInterest = async () => {
       try {
-        if (!sources.openInterest) {
-          const task = this.openInterest.observe(signal, priority).catch(error => {
-            if (sources.openInterest === task) sources.openInterest = null
-            throw error
-          })
-          sources.openInterest = task
-        }
-        let values = await sources.openInterest
+        let values = await this.openInterest.observe(signal, priority)
         if (values.values().next().value?.expiresAt <= Date.now()) values = await this.openInterest.observe(signal, priority)
         const observation = values.get(instId)
         if (!observation) throw new Error(`Missing open-interest observation for ${instId}.`)
@@ -2797,14 +2825,20 @@ export class MarketService {
 
   async discoverInstruments(configKey, signal, priority) {
     try {
-      if (!this.instrumentTask || this.instrumentTask.signal.aborted) {
+      signal.throwIfAborted()
+      if (!this.instrumentTask) {
         const version = this.instrumentEventVersion
-        const task = this.get('/public/instruments', { instType: 'SWAP' }, signal, priority)
-          .finally(() => { if (this.instrumentTask?.task === task) this.instrumentTask = null })
-        this.instrumentTask = { signal, task, version }
+        const entry = { controller: new AbortController(), waiters: new Set(), settled: false, task: null, version }
+        this.instrumentTask = entry
+        entry.task = Promise.resolve().then(() => this.get('/public/instruments', { instType: 'SWAP' }, entry.controller.signal, priority))
+          .finally(() => { entry.settled = true; if (this.instrumentTask === entry) this.instrumentTask = null })
       }
       const acquisition = this.instrumentTask
-      const instruments = await abortable(acquisition.task, signal)
+      const instruments = await sharedWait(acquisition, signal, (entry, reason) => {
+        if (this.instrumentTask === entry) this.instrumentTask = null
+        this.track(entry.task)
+        entry.controller.abort(reason)
+      })
       signal.throwIfAborted()
       if (!Array.isArray(instruments) || !instruments.length) throw new Error('OKX returned no swap instruments; market verification is unavailable.')
       const definitions = new Map(instruments.map(value => [value.instId, value]))
@@ -2966,9 +3000,8 @@ export class MarketService {
       this.verifyCatalog()
       // An explicit renewal does not wait for historical windows before
       // admitting independent candidates.
-      const sources = {}
       const checks = [...this.renewalTargets.values()].map(
-        instrument => this.checkCandidate(instrument, config, configKey, controller.signal, 'foreground', { sources }))
+        instrument => this.checkCandidate(instrument, config, configKey, controller.signal, 'foreground'))
       collecting = true
       this.track(Promise.allSettled(checks).finally(() => this.catalogControllers.delete(controller)))
       this.sourceError('refresh', null)
@@ -3012,9 +3045,8 @@ export class MarketService {
         // their position in the exchange's instrument response.
         candidates.sort((a, b) => Number(this.renewalTargets.has(b.instId)) - Number(this.renewalTargets.has(a.instId)))
         // A successful check publishes independently; the first row does not wait for the full exchange scan.
-        const sources = {}
         const checks = candidates.filter(instrument => !reuse || this.catalogChecks.get(instrument.instId)?.status === 'unknown')
-          .map(instrument => this.checkCandidate(instrument, config, configKey, controller.signal, 'foreground', { sources }))
+          .map(instrument => this.checkCandidate(instrument, config, configKey, controller.signal, 'foreground'))
         if (this.refreshAdmission === admission) this.refreshAdmission = null
         await Promise.all(checks)
         if (!controller.signal.aborted && this.catalogCriteriaKey() === configKey) {

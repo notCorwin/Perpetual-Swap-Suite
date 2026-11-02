@@ -767,9 +767,13 @@ export class PreparedChartPipeline {
     const retained = this.retainRows(state, this.liveStates.get(state.key) === state ? TAIL : this.focus?.key === state.key ? HISTORY_RESIDENT : HISTORY, end)
     const inspectedPriceVersion = state.priceVersion
     const inspectedRetentionVersion = state.retentionVersion ?? 0
+    const coverageGeneration = state.generation
     this.updateMemory(state)
     const coverage = await this.store.coverage(state.instId, state.timeframe, priority)
     if (this.closed || options.wanted && !options.wanted()) return false
+    // Invalidation may clear the rows while coverage is in flight. Neither the
+    // old metadata nor its read proof belongs to the replacement generation.
+    if (coverageGeneration !== state.generation) return this.readRows(state, end, limit, priority, options)
     state.latestHour = coverage.last === null ? state.latestHour : Math.max(state.latestHour ?? -Infinity, coverage.last)
     const listing = Number(this.instrument(state.instId)?.listTime)
     state.floor = Number.isFinite(listing) && listing > 0 ? Math.ceil(listing / state.intervalMS) * state.intervalMS : null
@@ -1338,9 +1342,21 @@ export class PreparedChartPipeline {
       }
       for (const bounds of this.pendingSourceRanges(state, source, from, through)) {
         this.sourceJob(`${source}:${state.key}:${bounds.from}:${bounds.through}`, async (signal, job) => {
+          const field = source === 'oi' ? 'oiVersion' : 'takerVersion'
+          const resident = [this.series.get(state.key), this.liveStates.get(state.key)]
+            .map(current => current && { current, generation: current.generation, version: current[field], rows: new Map(current.rows) })
           const result = await this.history.ensureStatistics(instId, timeframe, bounds.from, bounds.through, job.priority, signal, source)
           signal.throwIfAborted()
-          await this.observeStatistics(instId, timeframe, bounds.from, bounds.through, job.priority, result?.rows, source)
+          // The projection can predate a newer notification. Re-read only if
+          // this source changed, then fence changes during that read per slot.
+          const current = [this.series.get(state.key), this.liveStates.get(state.key)]
+          const unchanged = resident.every((entry, index) => entry ? current[index] === entry.current
+            && entry.generation === entry.current.generation && entry.version === entry.current[field] : !current[index]
+              || [...current[index].rows].every(([hour, row]) => {
+                const previous = resident.find(value => value?.rows.has(hour))?.rows.get(hour)
+                return previous ? !changedSource(previous, row, bit) : !(statisticsMask(row) & bit)
+              }))
+          await this.observeStatistics(instId, timeframe, bounds.from, bounds.through, job.priority, unchanged ? result?.rows : undefined, source)
           signal.throwIfAborted()
           for (let hour = bounds.from; hour <= bounds.through; hour += step) { const row = state.rows.get(hour); if (row && !sourceFresh(row, bit)) return false }
           return true

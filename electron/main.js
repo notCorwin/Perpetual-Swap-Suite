@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, contentTracing, ipcMain, net, session, shell } from 'electron'
+import { app, BrowserWindow, clipboard, contentTracing, ipcMain, nativeImage, net, session, shell } from 'electron'
 import { mkdirSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -154,6 +154,11 @@ async function handleRequest(event, payload, context) {
   if (request.gatewayFetch) return gatewayFetch(event, request.gatewayFetch)
   if (request.cancelGatewayFetch) { gatewayRequests.get(request.cancelGatewayFetch)?.controller.abort(); return { ok: true } }
   if ('copyText' in request) { clipboard.writeText(request.copyText); return { ok: true } }
+  if ('copyImage' in request) {
+    const image = nativeImage.createFromDataURL(request.copyImage)
+    if (image.isEmpty()) throw new Error('Invalid chart image.')
+    clipboard.writeImage(image); return { ok: true }
+  }
   if (request.captureChart) {
     const { x, y, width, height, output } = request.captureChart
     const image = await measureOperation({ category: 'gpu', name: 'chart.capture', attributes: { measurement: 'submission-wall', width, height } }, () => event.sender.capturePage({ x: Math.floor(x), y: Math.floor(y), width: Math.ceil(x + width) - Math.floor(x), height: Math.ceil(y + height) - Math.floor(y) }))

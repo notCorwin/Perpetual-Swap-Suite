@@ -100,3 +100,65 @@ test('unselected closes save local Taker facts without acquiring remote statisti
     assert.equal(f.service.statisticsAcquisitionDemand(instId, '1H'), false)
   } finally { await f.close() }
 })
+
+test('a corrected close arriving during the local Taker write is recalculated and persisted', async context => {
+  context.mock.method(Date, 'now', () => base + step + 100)
+  const f = await fixture(() => { throw new Error('An unselected close must not acquire history.') })
+  let release!: () => void, entered!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const writing = new Promise<void>(resolve => { entered = resolve })
+  try {
+    const candle = row(0), corrected = { ...candle, volume: 6 }
+    await f.store.appendCandles([candle])
+    f.service.listedUniverse.add(instId)
+    f.preferences.chartTimeframe = '15m'
+    f.service.liveStatistics.start(instId, base)
+    f.service.liveStatistics.trades(instId, [{ instId, tradeId: '1', ts: String(base + 1), side: 'buy', sz: '5' }], base + 2)
+    const append = f.store.appendStatistics.bind(f.store)
+    let writes = 0
+    f.store.appendStatistics = async (...args) => {
+      if (++writes === 1) { entered(); await gate }
+      return append(...args)
+    }
+    const original = f.service.confirmStatistics(candle)
+    await writing
+    await f.store.appendCandles([corrected])
+    f.service.liveStatistics.trades(instId, [{ instId, tradeId: '2', ts: String(base + 2), side: 'sell', sz: '1' }], base + 3)
+    const update = f.service.confirmStatistics(corrected)
+    release(); await Promise.all([original, update])
+    const [saved] = await f.store.candles({ instrument: instId, timeframe: '5m', from: base, through: base })
+    assert.equal(writes, 2)
+    assert.deepEqual([saved.volume, saved.buy, saved.sell], [6, 5, 1])
+  } finally { release(); await f.close() }
+})
+
+test('a late trade updates a local Taker proof even when the candle volume is unchanged', async context => {
+  context.mock.method(Date, 'now', () => base + step + 100)
+  const f = await fixture(() => { throw new Error('An unselected close must not acquire history.') })
+  let release!: () => void, entered!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const written = new Promise<void>(resolve => { entered = resolve })
+  try {
+    const candle = row(0)
+    await f.store.appendCandles([candle])
+    f.service.listedUniverse.add(instId)
+    f.preferences.chartTimeframe = '15m'
+    f.service.liveStatistics.start(instId, base)
+    f.service.liveStatistics.trades(instId, [{ instId, tradeId: '1', ts: String(base + 1), side: 'buy', sz: '4.999999995' }], base + 2)
+    const append = f.store.appendStatistics.bind(f.store)
+    let writes = 0
+    f.store.appendStatistics = async (...args) => {
+      const result = await append(...args)
+      if (++writes === 1) { entered(); await gate }
+      return result
+    }
+    const first = f.service.confirmStatistics(candle)
+    await written
+    f.service.liveStatistics.trades(instId, [{ instId, tradeId: '2', ts: String(base + 2), side: 'sell', sz: '0.000000005' }], base + 3)
+    const second = f.service.confirmStatistics(candle)
+    release(); await Promise.all([first, second])
+    const [saved] = await f.store.candles({ instrument: instId, timeframe: '5m', from: base, through: base })
+    assert.equal(writes, 2)
+    assert.deepEqual([saved.volume, saved.buy, saved.sell], [5, 4.999999995, 0.000000005])
+  } finally { release(); await f.close() }
+})

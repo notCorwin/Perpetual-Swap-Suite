@@ -1628,6 +1628,29 @@ test('delisting during admission cannot resurrect a finite consumer', async t =>
   assert.deepEqual(sync.listTasks(), [])
 })
 
+test('delisting cleanup cannot cancel or detach a re-listed instrument’s new work', async t => {
+  const cancellation = deferred(), entered = deferred(), sourceStarted = deferred(), sourceRelease = deferred()
+  let aborted = false
+  const { sync } = fixture({ sources: { candles: { fetchGap: async request => {
+    request.signal.addEventListener('abort', () => { aborted = true })
+    sourceStarted.resolve(); await sourceRelease.promise
+    return rows(request)
+  } } } })
+  t.after(async () => { cancellation.resolve(); sourceRelease.resolve(); await sync.close() })
+  const retired = await sync.enqueue(query, { hold: true })
+  const originalCancel = sync.cancel.bind(sync)
+  sync.cancel = async id => { if (id === retired.id) { entered.resolve(); await cancellation.promise }; return originalCancel(id) }
+  const removing = sync.removeTargets([query.instrument])
+  await entered.promise
+  const current = await sync.enqueue(query)
+  await sourceStarted.promise
+  cancellation.resolve(); await removing
+  assert.equal(aborted, false, 'Retirement must not abort work admitted after retirement began.')
+  sourceRelease.resolve()
+  assert.equal((await sync.waitFor(current.id)).status, 'completed')
+  assert.equal(sync.getTask(retired.id), null)
+})
+
 test('completed consumer handles stay bounded while durable coverage is reused', async t => {
   const { sync, requests } = fixture({ maxRetainedTerminalTasks: 4 })
   t.after(() => sync.close())

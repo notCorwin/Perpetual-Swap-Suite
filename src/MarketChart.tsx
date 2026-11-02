@@ -8,8 +8,8 @@ import { Spinner } from "@/components/ui/spinner"
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { ChartAnalysisPanel } from '@/ChartAnalysisPanel'
 import { chartAnalysis } from '@/analysis-service'
-import { type AnalysisDirection } from '@/chart-analysis'
-import { chartCaptureBounds } from '@/chart-capture'
+import { analysisSessionKey, type AnalysisDirection } from '@/chart-analysis'
+import { captureStableChart, chartCaptureBounds } from '@/chart-capture'
 import { CHART_PANELS, chartContentClip, chartPanelClip, chartPriceLabelLayout, type ChartPanel as Panel } from "@/chart-layout"
 import { chartCompact as compact, chartPrice as price, chartPercent, type ChartGeometry } from "@/chart-geometry"
 import { chartRsiNavigationTarget, chartWheelContentOffset, createChartWheelBatch, createChartWheelScheduler } from '@/chart-navigation'
@@ -351,8 +351,9 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
     if (held?.target.hasPointerCapture(held.pointerId)) held.target.releasePointerCapture(held.pointerId)
   }, [])
   const endInspection = useCallback(() => { releaseInspection(); setInspection(null) }, [releaseInspection, setInspection])
-  const analysis = useSyncExternalStore(chartAnalysis.subscribe, () => chartAnalysis.get(instId))
-  const [analysisOpen, setAnalysisOpen] = useState(() => chartAnalysis.get(instId) !== null)
+  const sessionKey = analysisSessionKey(instId, timeframe)
+  const analysis = useSyncExternalStore(chartAnalysis.subscribe, () => chartAnalysis.get(sessionKey))
+  const [analysisOpen, setAnalysisOpen] = useState(() => chartAnalysis.get(sessionKey) !== null)
   const analysisBusy = analysis?.phase === 'capturing' || analysis?.phase === 'streaming'
   const [capture, setCapture] = useState<{ status: 'idle' | 'copying' | 'flashing' | 'failed'; error: string }>({ status: 'idle', error: '' })
   const captureStatus = capture.status
@@ -374,7 +375,9 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
     Boolean(preparedPlot?.before), Boolean(preparedPlot?.after))
   const navigationId = useRef(instId)
   const navigationTask = useRef<object | null>(null)
-  useEffect(() => () => chartAnalysis.stop(instId), [instId, timeframe])
+  useEffect(() => () => chartAnalysis.stop(sessionKey), [sessionKey])
+  const captureVersion = useRef(0)
+  useLayoutEffect(() => { captureVersion.current += 1 }, [surface, instId, timeframe, wheelContentOffset, plotSize.width, plotSize.height, inspection, pending, isActive])
   useLayoutEffect(() => {
     navigationId.current = instId
     navigationTask.current = null
@@ -503,11 +506,25 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
     setInspection(current => hour === null ? null : current?.instId === surface.instId && current.timeframe === surface.timeframe && current.hour === hour
       ? current : { instId: surface.instId, timeframe: surface.timeframe, hour })
   }
+  const captureCurrentChart = async (expected: typeof surface) => {
+    const element = chartRef.current
+    if (!element || !expected) throw new Error('Chart is not ready for capture.')
+    const bounds = chartCaptureBounds(element), version = captureVersion.current
+    const current = () => {
+      const snapshot = chartController.getSnapshot()
+      if (chartRef.current !== element || captureVersion.current !== version || snapshot.presented !== expected || snapshot.pending) return false
+      const rect = element.getBoundingClientRect()
+      return rect.x === bounds.x && rect.y === bounds.y && rect.width === bounds.width && rect.height === bounds.height
+    }
+    return captureStableChart(() => window.radarDesktop.request({ captureChart: { ...bounds, output: 'png' } }), current)
+  }
   const captureChart = async () => {
     if (pending || !surface || !chartRef.current) return
-    setCapture({ status: 'copying', error: '' })
+    flushSync(() => setCapture({ status: 'copying', error: '' }))
     try {
-      const result = await window.radarDesktop.request({ captureChart: chartCaptureBounds(chartRef.current) })
+      await new Promise<void>(resolve => window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve())))
+      const image = await captureCurrentChart(surface)
+      const result = await window.radarDesktop.request({ copyImage: image.imageDataURL })
       if (!result.ok) throw new Error('Could not copy chart.')
       setCapture({ status: 'flashing', error: '' })
     } catch (cause) { setCapture({ status: 'failed', error: cause instanceof Error ? cause.message : 'Could not copy chart.' }) }
@@ -516,11 +533,9 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
     if (pending || !surface || plotSize.width <= 0 || captureStatus === 'copying') return
     const capturedSurface = surface
     flushSync(() => { setAnalysisOpen(true); setCapture({ status: 'idle', error: '' }) })
-    void chartAnalysis.analyze(instId, async () => {
+    void chartAnalysis.analyze(sessionKey, async () => {
       await new Promise<void>(resolve => window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve())))
-      const element = chartRef.current
-      if (!element || chartController.getSnapshot().presented !== capturedSurface || chartController.getSnapshot().pending) throw new Error('Chart changed before capture. Start a new analysis.')
-      const image = await window.radarDesktop.request({ captureChart: { ...chartCaptureBounds(element), output: 'png' } })
+      const image = await captureCurrentChart(capturedSurface)
       return { ...image, capturedAt: Date.now(), rangeLabel: `${time(capturedSurface.bars[0]!.hour)} – ${time(capturedSurface.endHour)}` }
     }, direction)
   }
@@ -624,7 +639,7 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
       </div>
       {captureStatus === 'flashing' && <div aria-hidden="true" className="pointer-events-none absolute inset-0 z-10 bg-[var(--chart-capture-flash)] motion-safe:animate-[chart-capture-flash_550ms_ease-out_both] motion-reduce:hidden" />}
     </section>
-    {analysisOpen && <ChartAnalysisPanel instId={instId} timeframe={timeframeLabel(timeframe)} session={analysis} ready={isActive && !pending && bars.length > 0 && plotSize.width > 0 && captureStatus !== 'copying'} onNew={() => analyzeChart(analysis?.direction ?? 'long')} onClose={() => { chartAnalysis.stop(instId); setAnalysisOpen(false) }} />}
+    {analysisOpen && <ChartAnalysisPanel instId={instId} sessionKey={sessionKey} timeframe={timeframeLabel(timeframe)} session={analysis} ready={isActive && !pending && bars.length > 0 && plotSize.width > 0 && captureStatus !== 'copying'} onNew={() => analyzeChart(analysis?.direction ?? 'long')} onClose={() => { chartAnalysis.stop(sessionKey); setAnalysisOpen(false) }} />}
     </div>
   </section>
 })

@@ -109,7 +109,11 @@ before(async () => {
       if (value.chartWindow) return state.coldTimeframes.includes(value.chartWindow.timeframe)
         ? { ...prepared(value.chartWindow), bars: [], priceState: 'loading', indicatorState: 'loading', oiState: 'loading', takerState: 'loading' }
         : prepared(value.chartWindow)
-      if (value.captureChart) return { ok: true }
+      if (value.captureChart) {
+        if (state.holdCapture) { state.holdCapture = false; await new Promise(resolve => { state.releaseCapture = resolve }); state.releaseCapture = null }
+        return { imageDataURL: 'data:image/png;base64,AA==', width: 10, height: 10 }
+      }
+      if (value.copyImage) return { ok: true }
       if (value.analysisSettings) {
         if (value.analysisSettings.action === 'save') state.analysisSettings = {
           model: value.analysisSettings.model, hasAPIKey: Boolean(value.analysisSettings.apiKey) || state.analysisSettings.hasAPIKey,
@@ -821,6 +825,20 @@ test('market notifications wait while hidden and refresh immediately when the wo
     })
     await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '100')
   }
+})
+
+test('a delayed chart capture cannot copy pixels after the selected timeframe changes', async () => {
+  await electron.evaluate(() => { globalThis.__workspaceFixture.holdCapture = true })
+  const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.copyImage).length)
+  await page.getByRole('button', { name: 'Copy chart', exact: true }).click()
+  await page.waitForFunction(() => document.querySelector('button') && [...document.querySelectorAll('button')].some(button => button.textContent.includes('Copying…')))
+  await selectTimeframe(page, '1h')
+  await electron.evaluate(() => globalThis.__workspaceFixture.releaseCapture())
+  await page.waitForFunction(() => [...document.querySelectorAll('[role="alert"]')].some(element => element.textContent.includes('Chart changed during capture')))
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.copyImage).length), before)
+  await selectTimeframe(page, '15m')
+  await page.getByRole('button', { name: 'Copy chart', exact: true }).click()
+  await page.getByRole('status').filter({ hasText: 'Chart copied to clipboard' }).waitFor()
 })
 
 test('search preserves selection while six width/DPR combinations share page, pointer, and capture coordinates', async () => {

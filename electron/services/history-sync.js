@@ -140,16 +140,21 @@ export class HistorySync {
   async removeTargets(instIds) {
     const removed = new Set(instIds)
     for (const id of removed) this.instrumentEpochs.set(id, (this.instrumentEpochs.get(id) ?? 0) + 1)
-    await this.start(); this.assertOpen()
+    // Capture the retired generation before yielding. A re-listed instrument
+    // may admit new consumers while cancellation waits for a durable write.
     const tasks = [...this.tasks.values()].filter(task => removed.has(task.instrument))
+    for (const group of this.groups.values()) if (removed.has(group.instrument)) {
+      group.active?.controller.abort()
+      this.coverageChecks.delete(group.key)
+    }
+    await this.start(); this.assertOpen()
     await Promise.all(tasks.filter(task => !terminal.has(task.status) || this.controls.has(task.id)).map(task => this.cancel(task.id)))
     for (const task of tasks) {
       this.holds.delete(task.id); this.rechecks.delete(task.id); this.isolated.delete(task.id); this.heldDownloads.delete(task.id); this.heldCoverage.delete(task.id); this.tasks.delete(task.id)
       const group = this.group(task); group.tasks.delete(task.id); if (!group.tasks.size) this.groupsWithTasks.delete(group)
     }
     for (const group of this.groups.values()) if (removed.has(group.instrument)) {
-      group.active?.controller.abort(); this.coverageChecks.delete(group.key)
-      if (!group.active) this.groups.delete(group.key)
+      if (!group.active && !group.tasks.size) this.groups.delete(group.key)
     }
     this.kick(); this.settleIdle()
   }

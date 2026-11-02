@@ -15,6 +15,7 @@ export const ANALYSIS_PROMPTS = {
   },
 }
 export type AnalysisDirection = keyof typeof ANALYSIS_PROMPTS
+export const analysisSessionKey = (instId: string, timeframe: string) => JSON.stringify([instId, timeframe])
 export type AnalysisSettings = { model: string; hasAPIKey: boolean }
 export type AnalysisSettingsRequest = { action: 'read' } | { action: 'save'; model: string; apiKey: string } | { action: 'removeKey' }
 export type AnalysisTurn = { id: string; question: string; text: string; status: 'streaming' | 'complete' | 'stopped' | 'error'; error: string }

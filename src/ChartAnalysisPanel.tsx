@@ -16,7 +16,7 @@ import { ANALYSIS_PROMPTS, type AnalysisSession } from '@/chart-analysis'
 const MessageResponse = lazy(() => import('@/components/ai-elements/message').then(module => ({ default: module.MessageResponse })))
 const captureTime = (value: number) => new Date(value).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
 
-export function ChartAnalysisPanel({ instId, timeframe = '15m', session, ready, onNew, onClose }: { instId: string; timeframe?: string; session: AnalysisSession | null; ready: boolean; onNew: () => void; onClose: () => void }) {
+export function ChartAnalysisPanel({ instId, sessionKey = instId, timeframe = '15m', session, ready, onNew, onClose }: { instId: string; sessionKey?: string; timeframe?: string; session: AnalysisSession | null; ready: boolean; onNew: () => void; onClose: () => void }) {
   const busy = session?.phase === 'capturing' || session?.phase === 'streaming'
   const canRetry = Boolean(session?.turns.at(-1) && ['error', 'stopped'].includes(session.turns.at(-1)!.status))
   const [copyState, setCopyState] = useState<{ id: string; error: string } | null>(null)
@@ -30,8 +30,8 @@ export function ChartAnalysisPanel({ instId, timeframe = '15m', session, ready, 
   }
   const send = () => {
     if (busy || !session?.image) return
-    if (session.draft.trim()) void chartAnalysis.send(instId, session.draft)
-    else if (canRetry) void chartAnalysis.retry(instId)
+    if (session.draft.trim()) void chartAnalysis.send(sessionKey, session.draft)
+    else if (canRetry) void chartAnalysis.retry(sessionKey)
   }
   return <aside className="flex min-h-0 w-(--analysis-panel-width) shrink-0 flex-col border-l bg-card" aria-label="Chart analysis">
     <div className="flex shrink-0 items-center gap-2 border-b px-4 py-2">
@@ -42,12 +42,12 @@ export function ChartAnalysisPanel({ instId, timeframe = '15m', session, ready, 
     </div>
     <div className="flex shrink-0 flex-col gap-2 border-b p-3">
       {session?.capturedAt ? <p className="truncate text-xs text-muted-foreground" title={`${session.model} · Captured ${captureTime(session.capturedAt)} · ${session.rangeLabel}`}>Snapshot · {session.rangeLabel}</p> : null}
-      <div className="flex items-center gap-2"><Button variant="outline" size="sm" disabled={busy || !ready} onClick={onNew}>{session?.image ? 'New analysis' : 'Analyze chart'}</Button>{busy && <Button variant="ghost" size="sm" onClick={() => chartAnalysis.stop(instId)}><Square data-icon="inline-start" />Stop</Button>}</div>
+      <div className="flex items-center gap-2"><Button variant="outline" size="sm" disabled={busy || !ready} onClick={onNew}>{session?.image ? 'New analysis' : 'Analyze chart'}</Button>{busy && <Button variant="ghost" size="sm" onClick={() => chartAnalysis.stop(sessionKey)}><Square data-icon="inline-start" />Stop</Button>}</div>
     </div>
     {session?.error && <Alert variant="destructive"><AlertDescription>{session.error}</AlertDescription></Alert>}
     {copyState?.error && <Alert variant="destructive"><AlertDescription>{copyState.error}</AlertDescription></Alert>}
     <div className="min-h-0 flex-1">
-      <MessageScrollerProvider key={instId} autoScroll>
+      <MessageScrollerProvider key={sessionKey} autoScroll>
         <MessageScroller role="log" aria-label="Analysis conversation">
           <MessageScrollerViewport><MessageScrollerContent className="p-3">
             {!session?.turns.length && (session?.phase === 'capturing' || session?.phase === 'stopped') && <Empty><EmptyHeader><EmptyTitle>{session.phase === 'capturing' ? 'Preparing chart…' : 'Analysis stopped'}</EmptyTitle></EmptyHeader></Empty>}
@@ -66,7 +66,7 @@ export function ChartAnalysisPanel({ instId, timeframe = '15m', session, ready, 
     </div>
     <form className="shrink-0 border-t p-3" onSubmit={event => { event.preventDefault(); send() }}>
       <InputGroup>
-        <InputGroupTextarea name="analysis-question" aria-label="Ask a follow-up" placeholder={canRetry ? 'Retry the response or ask something new…' : 'Ask about this snapshot…'} value={session?.draft ?? ''} disabled={!session?.image || busy} onChange={event => chartAnalysis.draft(instId, event.target.value)} onCompositionStart={() => setComposing(true)} onCompositionEnd={() => setComposing(false)} onKeyDown={event => {
+        <InputGroupTextarea name="analysis-question" aria-label="Ask a follow-up" placeholder={canRetry ? 'Retry the response or ask something new…' : 'Ask about this snapshot…'} value={session?.draft ?? ''} disabled={!session?.image || busy} onChange={event => chartAnalysis.draft(sessionKey, event.target.value)} onCompositionStart={() => setComposing(true)} onCompositionEnd={() => setComposing(false)} onKeyDown={event => {
           if (event.key === 'Enter' && !event.shiftKey && !composing && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229) { event.preventDefault(); send() }
         }} />
         <InputGroupAddon align="block-end" className="justify-end"><InputGroupButton type="submit" variant="outline" aria-label="Send follow-up" disabled={busy || !session?.image || (!session.draft.trim() && !canRetry)}><Send /></InputGroupButton></InputGroupAddon>
