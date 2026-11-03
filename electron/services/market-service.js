@@ -320,6 +320,7 @@ export class MarketService {
     this.renewing = null
     this.instruments = new Map()
     this.instrumentGenerations = new Map()
+    this.instrumentRetirements = new Map()
     this.instrumentDefinitions = new Map()
     this.instrumentSnapshotReady = false
     this.instrumentSnapshotObservedAt = 0
@@ -464,7 +465,7 @@ export class MarketService {
       instrument: instId => this.instruments.get(instId),
       liveRevision: (instId, timeframe) => this.liveSourceRevisions.get(`${instId}:${timeframe}`) ?? 0,
       onLive: (instId, timeframe, row) => this.setLive(instId, timeframe, row),
-      replaceCandles: (range, rows, priority) => this.replaceCandles(range, rows, priority),
+      replaceCandles: (range, rows, priority, options) => this.replaceCandles(range, rows, priority, options),
       derivePrices: (range, priority) => this.materializePrices(range, priority),
       onProgress: task => this.onHistoryProgress(task),
       onAuditCheckpoint: job => this.onAuditCheckpoint(job),
@@ -501,7 +502,8 @@ export class MarketService {
         // same-series socket event or its selected higher-timeframe derivative.
         this.track(this.setLive(row.instrument, row.timeframe, row, context))
       },
-      onConfirmed: row => this.confirmPriceCandle(row),
+      sourceEpoch: instId => this.instrumentGenerations.get(instId) ?? 0,
+      onConfirmed: (row, context) => this.confirmPriceCandle(row, context),
       onReconnect: (subscriptions, context) => this.reconcileRealtime(subscriptions, context),
     })
     this.realtimeStatus = this.realtime.getState().status
@@ -1177,7 +1179,7 @@ export class MarketService {
     })
   }
 
-  async appendChangedCandlesLocked(candles, priority = 'background') {
+  async appendChangedCandlesLocked(candles, priority = 'background', canWrite) {
     if (!candles.length) return []
     const instrument = candles[0].instrument, timeframe = candles[0].timeframe
     const from = Math.min(...candles.map(value => value.timestamp)), through = Math.max(...candles.map(value => value.timestamp))
@@ -1185,7 +1187,9 @@ export class MarketService {
     const byTimestamp = new Map(existing.map(value => [value.timestamp, value]))
     const changed = candles.filter(value => !sameCandle(byTimestamp.get(value.timestamp) ?? {}, value)).map(priceRecord)
     if (changed.length) {
-      await this.store.appendCandles(changed, priority)
+      const originals = new Map(candles.map(row => [row.timestamp, row]))
+      const guard = canWrite && Object.assign(row => canWrite(originals.get(row.timestamp)), { lifetime: canWrite.lifetime })
+      await this.store.appendCandles(changed, priority, { canWrite: guard })
       const timestamps = new Set(changed.map(row => row.timestamp))
       const committed = (await this.store.candles({ instrument, timeframe, from, through }, priority)).filter(row => timestamps.has(row.timestamp))
       this.preparedCharts.observe(committed, byTimestamp)
@@ -1194,14 +1198,14 @@ export class MarketService {
     return changed
   }
 
-  async persistCandles(instrument, candles, { priority = 'foreground' } = {}) {
+  async persistCandles(instrument, candles, { priority = 'foreground', canWrite } = {}) {
     const confirmed = candles.filter(value => value.confirmed)
     await this.ready
     if (this.disposed || !confirmed.length) return false
     const result = await this.enqueueCandleMutation(instrument, async () => {
       if (this.disposed) return false
       const changed = []
-      for (const rows of Map.groupBy(confirmed, row => row.timeframe).values()) changed.push(...await this.appendChangedCandlesLocked(rows, priority))
+      for (const rows of Map.groupBy(confirmed, row => row.timeframe).values()) changed.push(...await this.appendChangedCandlesLocked(canWrite ? rows.filter(canWrite) : rows, priority, canWrite))
       if (!changed.length) return false
       this.invalidateLiquidityHistory(instrument, changed)
       this.markChartDataChanged(instrument)
@@ -1245,15 +1249,21 @@ export class MarketService {
     return result
   }
 
-  async confirmPriceCandle(row) {
+  async confirmPriceCandle(row, context = {}) {
+    const generation = context.sourceEpoch ?? this.instrumentGenerations.get(row.instrument) ?? 0
+    const current = () => generation === (this.instrumentGenerations.get(row.instrument) ?? 0) && !this.instrumentRetirements.has(row.instrument)
+    if (!current()) return
     this.track(this.candleDerivations.observe(row, { receivedAt: Date.now() }))
-    try { await this.persistCandles(row.instrument, [row]) }
+    try { await this.persistCandles(row.instrument, [row], { canWrite: this.history.lifetimeGuard(row.instrument, current) }) }
+    catch (error) { if (current()) throw error; return }
     finally { this.scheduleCandleWaitCheck() }
+    if (!current()) return
     for (const timeframe of CHART_TIMEFRAMES) {
       const step = timeframeMilliseconds(timeframe), end = row.timestamp + FIVE_MINUTES
       if (end % step) continue
       const stamp = end - step
       const confirmed = timeframe === '5m' ? row : (await this.store.candles({ instrument: row.instrument, timeframe, from: stamp, through: stamp }, 'continuity'))[0]
+      if (!current()) return
       this.finishCandleWait(this.candleWaits.get(`${row.instrument}:${timeframe}:${stamp}`), Boolean(confirmed))
       if (confirmed && this.statisticsDemand(row.instrument)) this.track(this.confirmStatistics(confirmed))
       const live = this.liveCandles.get(`${row.instrument}:${timeframe}`)
@@ -1308,13 +1318,16 @@ export class MarketService {
     return entry.task
   }
 
-  async replaceCandles(range, candles, priority = 'foreground') {
+  async replaceCandles(range, candles, priority = 'foreground', { canWrite } = {}) {
     await this.ready
     return this.enqueueCandleMutation(range.instrument, async () => {
       if (this.disposed) throw new Error('Market service is closed.')
+      if (canWrite && !candles.every(canWrite)) throw Object.assign(new Error('Price history changed during repair; retrying the source observation.'), { code: 'HISTORY_SOURCE_CHANGED' })
       // Statistics belong to their own sources. Replacing prices must never
       // replay an earlier read over a newer independent statistic commit.
-      await this.store.replaceCandles(range, candles.map(priceRecord), priority)
+      const originals = new Map(candles.map(row => [row.timestamp, row]))
+      const guard = canWrite && Object.assign(row => canWrite(originals.get(row.timestamp)), { lifetime: canWrite.lifetime })
+      await this.store.replaceCandles(range, candles.map(priceRecord), priority, { canWrite: guard })
       this.onHistoryReplaced(range.instrument, range.timeframe)
       if (range.timeframe === '5m') this.candleDerivations.correct(range.instrument, candles, range)
       if (range.timeframe === '5m') for (const timeframe of ['15m', '1H']) {
@@ -1636,8 +1649,7 @@ export class MarketService {
             || this.instrumentObservations.get(instId) !== instrumentObservation) return
           if (capturedSources.includes('book') && (this.bookGenerations.get(instId) ?? 0) !== bookGeneration) return
           const current = this.observations.get(instId) ?? {}, now = Date.now()
-          if (config.volume24h.enabled && current.turnover !== observations.turnover
-            || config.volumeStability.enabled && current.hourly !== observations.hourly) return
+          if (capturedSources.some(source => current[source] !== observations[source])) return
           const currentInput = this.liquidityInput(instrument, config, current, now)
           const expiredSource = capturedSources.some(key => observations[key] && !this.qualificationObservation(observations, key, instId, configKey, now))
           const record = expiredSource || this.cheapLiquidity(currentInput).status === 'failed'
@@ -2481,6 +2493,7 @@ export class MarketService {
     if (!force && this.tickerCache && Date.now() - this.tickerCache.observedAt < CATALOG_RENEW_INTERVAL) return this.tickerCache.values
     let pending = this.tickerTask
     if (!pending) {
+      const initial = new Map(this.tickerCache?.values ?? [])
       pending = { controller: new AbortController(), waiters: new Set(), settled: false, task: null }
       this.tickerTask = pending
       pending.task = Promise.resolve().then(() => this.get('/market/tickers', { instType: 'SWAP' }, pending.controller.signal, priority)).then(values => {
@@ -2488,7 +2501,14 @@ export class MarketService {
         if (!Array.isArray(values) || !values.length) throw new Error('OKX returned no swap tickers.')
         const observedAt = Date.now()
         const observations = new Map(values.map(value => [value.instId, { value, observedAt, expiresAt: observedAt + OBSERVATION_TTL }]))
-        for (const [id, observation] of this.tickerCache?.values ?? []) if (observation.source === 'websocket' && this.observationExpiry(observation, 'ticker', id) > observedAt) observations.set(id, observation)
+        for (const [id, observation] of this.tickerCache?.values ?? []) {
+          if (this.observationExpiry(observation, 'ticker', id) <= observedAt) continue
+          const previousTimestamp = observation.sourceTimestamp ?? number(observation.value?.ts)
+          const incomingTimestamp = number(observations.get(id)?.value?.ts)
+          if (observation.source === 'websocket'
+            || previousTimestamp != null && incomingTimestamp != null && previousTimestamp > incomingTimestamp
+            || observation !== initial.get(id) && (previousTimestamp == null || incomingTimestamp == null || previousTimestamp >= incomingTimestamp)) observations.set(id, observation)
+        }
         if (this.tickerTask === pending && !this.disposed) {
           this.tickerCache = { values: observations, observedAt }
           for (const [id, value] of observations) if (this.validTicker(value.value)) this.clearTickerFault(id)
@@ -2860,12 +2880,24 @@ export class MarketService {
 
   installInstruments(definitions, observedIDs) {
     this.instrumentDefinitions = definitions
-    const candidates = [...definitions.values()].filter(eligibleInstrument).map(value => value.ctMult === '' ? { ...value, ctMult: '1' } : value)
+    const candidates = [...definitions.values()].filter(value => eligibleInstrument(value) && !this.instrumentRetirements.has(value.instId)).map(value => value.ctMult === '' ? { ...value, ctMult: '1' } : value)
     const nextIDs = new Set(candidates.map(value => value.instId))
     const removedIDs = [...(this.candidateIDs ?? [])].filter(id => !nextIDs.has(id))
-    if (removedIDs.length) this.track(this.history.removeTargets(removedIDs))
+    for (const instId of removedIDs) {
+      const task = this.history.removeTargets([instId]).then(() => {
+        if (this.instrumentRetirements.get(instId) !== task) return
+        this.instrumentRetirements.delete(instId)
+        if (this.closing || this.disposed || !eligibleInstrument(this.instrumentDefinitions.get(instId))) return
+        this.installInstruments(this.instrumentDefinitions, new Set([instId]))
+        this.queueStreamQualification(instId); this.touchList()
+        if (this.autoRefresh) this.track(this.refresh({ reuse: true }))
+      })
+      this.instrumentRetirements.set(instId, task)
+      this.track(task)
+    }
     this.liveStatistics.remove(removedIDs)
     this.candleDerivations.remove(removedIDs)
+    this.realtime.removeInstruments(removedIDs)
     for (const instId of removedIDs) {
       this.instrumentGenerations.set(instId, (this.instrumentGenerations.get(instId) ?? 0) + 1)
       // Invalidate in-flight latest reads even before this series has ever

@@ -41,7 +41,12 @@ export class MarketHistory {
     this.closeTask = null
     this.controllers = new Set()
     this.latestTasks = new Map()
+    this.latestControllers = new Map()
     this.seeds = new Map()
+    this.instrumentEpochs = new Map()
+    this.instrumentFences = new Map()
+    this.retirements = new Map()
+    this.priceOrigins = new WeakMap()
     this.repairs = new Map()
     const statistics = source => ({
       inspect: query => this.inspectSource(query),
@@ -75,7 +80,7 @@ export class MarketHistory {
       maxConcurrentTasks: 20,
       maxConcurrentPerSource: { candles: 4, oi: 8, taker: 8 },
     })
-    this.audit = new DataAudit({ metadata, now, onCheckpoint: onAuditCheckpoint,
+    this.audit = new DataAudit({ store, metadata, now, onCheckpoint: onAuditCheckpoint,
       inspect: async (target, { signal }) => {
         signal.throwIfAborted()
         const bounds = this.bounds(target.instrument, target.timeframe)
@@ -167,8 +172,10 @@ export class MarketHistory {
       return { records: [], cursor: null }
     }
     const cursor = Math.min(numeric(query.cursor) ?? through + interval, through + interval)
+    const origin = { revision: this.store.candlePriceRevision?.(instrument, timeframe), epoch: this.instrumentEpochs.get(instrument) ?? 0 }
     const values = await this.get('/market/history-candles', { instId: instrument, bar: timeframe, limit: Math.min(300, (cursor - from) / interval), after: cursor }, signal, priority, { getPriority: query.getPriority, subscribePriority: query.subscribePriority })
     const rows = this.parsed(instrument, timeframe, values).filter(row => row.timestamp < cursor)
+    for (const row of rows) this.priceOrigins.set(row, origin)
     return { records: rows, cursor: rows.length ? Math.min(...rows.map(row => row.timestamp)) : null }
   }
 
@@ -220,12 +227,16 @@ export class MarketHistory {
         }
         for (const run of runs) {
           const bounds = { instrument: task.instrument, timeframe: task.timeframe, from: run[0].timestamp, through: run.at(-1).timestamp }
-          await this.replaceCandles(bounds, run, task.priority)
+          try { await this.replaceCandles(bounds, run, task.priority, { canWrite: this.priceGuard(task.instrument, run) }) }
+          catch (error) {
+            for (const row of run) if (observations?.get(row.timestamp) === row && !this.priceOriginCurrent(row)) observations.delete(row.timestamp)
+            throw error
+          }
           for (const repair of repairs) { repair.remaining = subtractRange(repair.remaining, bounds, interval); repair.written = repair.remaining.length === 0 }
         }
         for (const row of replacement) if (observations?.get(row.timestamp) === row) observations.delete(row.timestamp)
       } else {
-        await this.persistCandles(task.instrument, rows, { priority: task.priority })
+        await this.persistCandles(task.instrument, rows, { priority: task.priority, canWrite: this.priceGuard(task.instrument, rows) })
         for (const row of rows) if (observations?.get(row.timestamp) === row) observations.delete(row.timestamp)
       }
       return
@@ -237,7 +248,35 @@ export class MarketHistory {
       { from, through, intervalMS: CANDLE_INTERVALS[task.timeframe] }, task.priority)
   }
 
+  priceOriginCurrent(row) {
+    const origin = this.priceOrigins.get(row)
+    if (!origin) return true
+    if (origin.epoch !== (this.instrumentEpochs.get(row.instrument) ?? 0)) return false
+    if (origin.revision === undefined || !this.store.candlePriceChangesSince) return true
+    const { ranges } = this.store.candlePriceChangesSince(row.instrument, row.timeframe, origin.revision)
+    return ranges !== null && !ranges.some(range => range.from <= row.timestamp && row.timestamp <= range.through)
+  }
+
+  priceGuard(instrument, rows) {
+    const origin = rows.map(row => this.priceOrigins.get(row)).find(Boolean)
+    return this.lifetimeGuard(instrument, () => true, origin?.epoch, row => this.priceOriginCurrent(row))
+  }
+
+  lifetimeGuard(instrument, current, epoch = this.instrumentEpochs.get(instrument) ?? 0, predicate = current) {
+    let fence = this.instrumentFences.get(instrument)
+    if (!fence) { fence = new Int32Array(new SharedArrayBuffer(8)); Atomics.store(fence, 0, this.instrumentEpochs.get(instrument) ?? 0); this.instrumentFences.set(instrument, fence) }
+    const canWrite = row => current() && predicate(row)
+    canWrite.lifetime = { buffer: fence.buffer, epoch }
+    return canWrite
+  }
+
+  async awaitRetirement(instrument, signal) {
+    while (this.retirements.has(instrument)) await abortable(this.retirements.get(instrument), signal)
+  }
+
   async request(instId, timeframe, source, from, through, priority, signal) {
+    this.assertOpen()
+    await this.awaitRetirement(instId, signal)
     this.assertOpen()
     signal?.throwIfAborted()
     const task = await this.sync.enqueue({ instrument: instId, timeframe, source, from, through, priority })
@@ -270,6 +309,7 @@ export class MarketHistory {
 
   async promoteSource(instId, timeframe, source, from, through, priority) {
     await this.ready
+    await this.awaitRetirement(instId)
     return this.sync.promote({ instrument: instId, timeframe, source, from, through }, priority)
   }
 
@@ -278,19 +318,28 @@ export class MarketHistory {
     const key = keyOf(instId, timeframe)
     if (this.latestTasks.has(key)) return this.latestTasks.get(key)
     const liveRevision = this.liveRevision?.(instId, timeframe)
+    const epoch = this.instrumentEpochs.get(instId) ?? 0
+    const current = () => epoch === (this.instrumentEpochs.get(instId) ?? 0)
     const controller = new AbortController()
     this.controllers.add(controller)
+    this.latestControllers.set(key, controller)
     const task = (async () => {
       await this.ready
+      await this.awaitRetirement(instId, controller.signal)
       const bounds = this.bounds(instId, timeframe)
       if (await this.awaitRealtimeCandle?.({ instrument: instId, timeframe, from: bounds.through, through: bounds.through, signal: controller.signal, priority })) return { floor: bounds.floor }
+      if (!current()) return { floor: bounds.floor }
+      const revision = this.store.candlePriceRevision?.(instId, timeframe)
       const values = await this.get('/market/candles', { instId, bar: timeframe, limit: 2 }, controller.signal, priority)
+      if (!current()) return { floor: bounds.floor }
       const parsed = values.map(value => this.parseCandle(instId, timeframe, value)).filter(Boolean)
       const live = parsed.filter(row => !row.confirmed).sort((a, b) => b.timestamp - a.timestamp)[0] ?? null
       // The stream can advance while source acquisition waits. Equal volumes
       // do not prove that the REST close is newer than an accepted native tick.
       if (live && liveRevision === this.liveRevision?.(instId, timeframe)) await this.onLive?.(instId, timeframe, live)
+      if (!current()) return { floor: bounds.floor }
       const confirmed = this.parsed(instId, timeframe, values)
+      for (const row of confirmed) this.priceOrigins.set(row, { revision, epoch })
       this.seeds.set(key, new Map(confirmed.map(row => [row.timestamp, row])))
       for (const row of confirmed) this.sync.invalidate({ instrument: instId, timeframe, source: 'candles', from: row.timestamp, through: row.timestamp })
       const { floor } = this.bounds(instId, timeframe)
@@ -298,22 +347,48 @@ export class MarketHistory {
       // Empty/forming-only responses never invent a range to the local clock;
       // history targets and window requests own all gap coverage decisions.
       for (const row of confirmed.sort((a, b) => a.timestamp - b.timestamp)) {
+        if (!current()) break
         await this.request(instId, timeframe, 'candles', row.timestamp, row.timestamp, 'foreground', controller.signal)
       }
       return { floor }
-    })().finally(() => {
+    })().catch(error => {
+      if (!current()) return { floor: this.bounds(instId, timeframe).floor }
+      throw error
+    }).finally(() => {
       this.controllers.delete(controller)
-      this.seeds.delete(key)
-      if (this.latestTasks.get(key) === task) this.latestTasks.delete(key)
+      if (this.latestControllers.get(key) === controller) this.latestControllers.delete(key)
+      if (this.latestTasks.get(key) === task) { this.seeds.delete(key); this.latestTasks.delete(key) }
     })
     this.latestTasks.set(key, task)
     return task
   }
 
-  async removeTargets(instIds) { await this.ready; return this.sync.removeTargets(instIds) }
+  removeTargets(instIds) {
+    const retirements = []
+    const ids = [...instIds]
+    for (const instId of ids) {
+      this.instrumentEpochs.set(instId, (this.instrumentEpochs.get(instId) ?? 0) + 1)
+      const fence = this.instrumentFences.get(instId)
+      if (fence) {
+        Atomics.add(fence, 0, 1)
+        const wait = Atomics.waitAsync(fence, 1, 1)
+        if (wait.async) retirements.push(wait.value)
+      }
+      for (const key of this.latestTasks.keys()) if (key.startsWith(`${instId}:`)) {
+        this.latestControllers.get(key)?.abort()
+        this.latestControllers.delete(key); this.latestTasks.delete(key); this.seeds.delete(key)
+      }
+    }
+    const task = Promise.all([this.sync.removeTargets(ids), ...retirements]).finally(() => {
+      for (const id of ids) if (this.retirements.get(id) === task) this.retirements.delete(id)
+    })
+    for (const id of ids) this.retirements.set(id, task)
+    return task.then(() => undefined)
+  }
 
   async repair(issue, { signal }) {
     await this.ready
+    await this.awaitRetirement(issue.instrument, signal)
     this.assertOpen()
     signal.throwIfAborted()
     const interval = CANDLE_INTERVALS[issue.timeframe]

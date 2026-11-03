@@ -59,7 +59,12 @@ export type AuditInspect = (target: AuditTarget, options: { signal: AbortSignal;
 export type AuditRepair = (issue: AuditIssue, options: { signal: AbortSignal }) => Promise<void>
 export class DataAudit {
   constructor(options: {
-    store?: { inspectCandles(target: AuditTarget, priority?: 'background'): Promise<AuditInspection> }
+    store?: {
+      inspectCandles(target: AuditTarget, priority?: 'background'): Promise<AuditInspection>
+      withCandleCommitFence?<T>(callback: () => T): Promise<T>
+      candlePriceRevision?(instrument: string, timeframe: string): number
+      candlePriceChangesSince?(instrument: string, timeframe: string, revision: number): { revision: number; ranges: Array<{ from: number; through: number }> | null }
+    }
     metadata: AuditMetadata
     inspect?: AuditInspect
     /** Repair is explicit; unavailable observations are never synthesized. */

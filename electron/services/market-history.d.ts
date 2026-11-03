@@ -6,19 +6,19 @@ type MaybePromise<T> = T | Promise<T>
 type Timeframe = '5m' | '15m' | '1H'
 type Instrument = { instId: string; listTime?: number | string; [key: string]: unknown }
 export type MarketHistoryOptions = {
-  store: Pick<MarketStore, 'candles' | 'coverage' | 'inspectCandles' | 'missingCompletePriceRanges' | 'statisticsCoverage'> & Partial<Pick<MarketStore, 'candleRevision' | 'candleChangesSince'>>
+  store: Pick<MarketStore, 'candles' | 'coverage' | 'inspectCandles' | 'missingCompletePriceRanges' | 'statisticsCoverage'> & Partial<Pick<MarketStore, 'candleRevision' | 'candleChangesSince' | 'candlePriceRevision' | 'candlePriceChangesSince'>>
   metadata: AuditMetadata
   get(path: string, parameters: Record<string, string | number>, signal: AbortSignal, priority: StorePriority, options?: { getPriority?: () => StorePriority }): Promise<unknown[][]>
   /** Reuse a just-closed candle from the acknowledged stream before REST acquisition. */
   awaitRealtimeCandle?(query: { instrument: string; timeframe: string; from: number; through: number; signal: AbortSignal; priority: StorePriority }): Promise<boolean>
   // Raw API JSON is checked by the adapter before reaching durable storage.
   parseCandle(instrument: string, timeframe: string, value: unknown[]): CandleRecord | null
-  persistCandles(instrument: string, rows: CandleRecord[], options: { priority: StorePriority }): MaybePromise<unknown>
+  persistCandles(instrument: string, rows: CandleRecord[], options: { priority: StorePriority; canWrite?: (row: CandleRecord) => boolean }): MaybePromise<unknown>
   persistStatistics(instrument: Instrument, timeframe: string, end: number, source: number, values: (number | null)[][],
     range: CandleRange & { intervalMS: number }, priority: StorePriority): MaybePromise<unknown>
   instrument?(instId: string): Instrument | undefined
   /** Owner serializes replacement, statistics preservation and invalidation with every candle mutation. */
-  replaceCandles(range: CandleRange & { instrument: string; timeframe: string }, rows: CandleRecord[], priority: StorePriority): MaybePromise<unknown>
+  replaceCandles(range: CandleRange & { instrument: string; timeframe: string }, rows: CandleRecord[], priority: StorePriority, options?: { canWrite?: (row: CandleRecord) => boolean }): MaybePromise<unknown>
   /** Materialize only complete already-local 5m buckets before requesting missing coarse history. */
   derivePrices?(range: CandleRange & { instrument: string; timeframe: string }, priority: StorePriority): MaybePromise<unknown>
   onProgress?(task: HistoryTask): MaybePromise<void>

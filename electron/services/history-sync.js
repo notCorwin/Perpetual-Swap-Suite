@@ -633,6 +633,10 @@ export class HistorySync {
         for (const task of this.demands(group)) if (task.status === 'running') task.status = 'queued'
         return
       }
+      if (error?.code === 'HISTORY_SOURCE_CHANGED') {
+        for (const task of this.demands(group)) if (task.status === 'running') { task.status = 'queued'; task.nextAttemptAt = null }
+        return
+      }
       for (const task of this.demands(group).filter(task => (!entry.bounds || !this.holds.has(task.id)) && (!entry.bounds || intersects(task, entry.bounds)))) {
         task.attempts++; task.lastError = error instanceof Error ? error.message : String(error)
         task.status = task.attempts >= this.maxAttempts ? 'paused' : 'retry'

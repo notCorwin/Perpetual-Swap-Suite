@@ -41,8 +41,9 @@ export type MarketTrafficProbeEvent = {
   nativeMessageSequence: number
   nativeHandlerEnteredAtMonotonicUS: number
 }
-export type RealtimeEventContext = { signal: AbortSignal; receivedAt: number; marketTrafficEvents?: readonly MarketTrafficProbeEvent[] }
+export type RealtimeEventContext = { signal: AbortSignal; receivedAt: number; sourceEpoch?: number; marketTrafficEvents?: readonly MarketTrafficProbeEvent[] }
 export type RealtimeMarketOptions<Candle extends CandleRecord = CandleRecord> = {
+  sourceEpoch?: (instId: string) => number
   parseCandle: (instId: string, timeframe: RadarTimeframe, raw: string[]) => Candle | null
   /** Memory projection only. Same-volume OHLC corrections follow receive order. */
   onForming: (candle: Candle, context: RealtimeEventContext) => void | Promise<void>
@@ -78,6 +79,7 @@ export type RealtimeMarketOptions<Candle extends CandleRecord = CandleRecord> = 
 export class RealtimeMarket<Candle extends CandleRecord = CandleRecord> {
   constructor(options: RealtimeMarketOptions<Candle>)
   setSubscriptions(subscriptions: RealtimeSubscription[]): void
+  removeInstruments(instIds: Iterable<string>): void
   start(): void
   getState(): RealtimeMarketState
   getTelemetry(): RealtimeMarketTelemetry

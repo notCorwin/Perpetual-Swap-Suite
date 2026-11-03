@@ -537,3 +537,61 @@ test('off-grid observations preserve the inspector containing-bar repair range',
     assert.deepEqual(audit.get(id)!.issues.map(issue => [issue.from, issue.through]), [[interval, interval]])
   } finally { await audit.close() }
 })
+
+test('completion rechecks only candle ranges changed after an earlier inspection, including changes during recheck', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-audit-race-'))
+  const store = await MarketStore.open(root)
+  const entered = deferred<void>(), release = deferred<void>(), recheck = deferred<void>(), releaseRecheck = deferred<void>()
+  const candle = (timestamp: number) => ({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp, open: 100, high: 101, low: 99, close: 100, volume: 1, baseVolume: 1, quoteVolume: 100, confirmed: true })
+  const calls: number[] = []
+  const audit = new DataAudit({ metadata: new MemoryMetadata(), store, inspect: async (query, { signal }) => {
+    calls.push(query.from)
+    if (query.from === day && calls.filter(value => value === day).length === 1) { entered.resolve(); await release.promise }
+    if (query.from === 0 && calls.filter(value => value === 0).length === 2) { recheck.resolve(); await releaseRecheck.promise }
+    signal.throwIfAborted()
+    return store.inspectCandles(query, 'background')
+  } })
+  try {
+    await store.appendCandles([candle(day)])
+    const { id } = audit.start({ targets: [target(0, 0), target(day, day)] })
+    await entered.promise
+    await store.appendCandles([candle(0)])
+    release.resolve()
+    await recheck.promise
+    await store.replaceCandles(target(0, 0), [])
+    releaseRecheck.resolve()
+    await audit.whenIdle()
+    const report = audit.get(id)!
+    assert.equal(report.status, 'completed')
+    assert.deepEqual(report.issues.filter(issue => issue.status === 'open').map(issue => [issue.reason, issue.from]), [['gap', 0]])
+    assert.equal(calls.filter(value => value === day).length, 1, 'unchanged chunks are not rescanned')
+    assert.equal(calls.filter(value => value === 0).length, 3, 'a concurrent change during recheck triggers another pass')
+  } finally { release.resolve(); releaseRecheck.resolve(); await audit.close(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('completion waits for an already dispatched write before publishing its report', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-radar-audit-fence-'))
+  const store = await MarketStore.open(root)
+  const candle = { instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp: 0, open: 100, high: 101, low: 99, close: 100, volume: 1, baseVolume: 1, quoteVolume: 100, confirmed: true }
+  const fence = store.withCandleCommitFence.bind(store)
+  let injected = false, write: Promise<number> | undefined
+  store.withCandleCommitFence = async callback => {
+    if (!injected) {
+      injected = true
+      write = store.appendCandles([candle])
+      // Let the operation dispatch its write before the completion fence.
+      await Promise.resolve()
+    }
+    return fence(callback)
+  }
+  const audit = new DataAudit({ metadata: new MemoryMetadata(), store })
+  try {
+    const { id } = audit.start({ targets: [target(0, 0)] })
+    await audit.whenIdle()
+    await write
+    const report = audit.get(id)!
+    assert.equal(report.status, 'completed')
+    assert.deepEqual(report.issues.filter(issue => issue.status === 'open'), [])
+    assert.equal(report.summary.resolved, 1)
+  } finally { await audit.close(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})

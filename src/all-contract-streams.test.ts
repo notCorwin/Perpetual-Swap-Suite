@@ -453,7 +453,7 @@ for (const change of ['contract units', 'preferences', 'completed history'] as c
   } finally { gate.resolve(); await f.close() }
 })
 
-test('worker results preserve original book leases, evaluate the newest queued book, and reject expired sources', async context => {
+test('worker results discard superseded books, evaluate the newest queued book, and reject expired sources', async context => {
   let now = Date.now()
   context.mock.method(Date, 'now', () => now)
   const value = instrument(), gates = [deferred(), deferred(), deferred()], inputs: LiquidityInput[] = []
@@ -473,16 +473,12 @@ test('worker results preserve original book leases, evaluate the newest queued b
     f.push(OKX_PUBLIC_WEBSOCKET_URL, value.instId, 'books', [deepBook()], 'snapshot')
     await f.idle(); f.service.flushStreamQualifications()
     const evaluation = f.service.streamEvaluations.get(value.instId)
-    const originalBook = f.service.observations.get(value.instId).book
     f.push(OKX_PUBLIC_WEBSOCKET_URL, value.instId, 'books', [deepBook(100, '1', 2)], 'snapshot')
     await f.idle()
     const newestBook = f.service.observations.get(value.instId).book
     gates[0].resolve(); await evaluation
-    const qualified = f.service.catalog.get(value.instId)
-    assert.equal(qualified?.status, 'verified')
-    assert.equal(qualified.observations.book, originalBook, 'The result describes its original immutable book observation.')
-    assert.ok(qualified.expiresAt <= originalBook.expiresAt, 'A delayed calculation must not renew the original source lease.')
-    assert.equal(f.service.observations.get(value.instId).book, newestBook, 'Publishing a completed calculation must preserve the latest acquired book.')
+    assert.equal(f.service.catalog.has(value.instId), false, 'An obsolete book must not admit the contract.')
+    assert.equal(f.service.observations.get(value.instId).book, newestBook)
     await waitFor(() => inputs.length === 2)
     assert.equal(inputs[1].book, newestBook.value)
     const newestEvaluation = f.service.streamEvaluations.get(value.instId)

@@ -72,6 +72,8 @@ function App() {
   const [updatedAt, setUpdatedAt] = useState<number | null>(null)
   const order = useRef(new SnapshotOrder())
   const preferenceWrite = useRef(0)
+  const committedPreferences = useRef<Preferences>(DEFAULT_PREFERENCES)
+  const preferenceQueue = useRef<Promise<void>>(Promise.resolve())
   const timeframe = preferences.chartTimeframe
 
   useEffect(() => {
@@ -83,7 +85,7 @@ function App() {
     let stopped = false
     const write = preferenceWrite.current
     window.radarDesktop.request({ preferences: { action: 'read' } }).then(value => {
-      if (!stopped && write === preferenceWrite.current) { setPreferences(value); setPreferencesError('') }
+      if (!stopped && write === preferenceWrite.current) { committedPreferences.current = value; setPreferences(value); setPreferencesError('') }
     }).catch(cause => { if (!stopped) setPreferencesError(message(cause)) }).finally(() => { if (!stopped) setPreferencesLoaded(true) })
     return () => { stopped = true }
   }, [])
@@ -166,21 +168,34 @@ function App() {
   useEffect(() => { if (ready) chartController.setUniverse(retainedChart && selectedID ? [selectedID] : candidateIds, timeframe) }, [ready, candidateIds, timeframe, retainedChart, selectedID])
   const savePreferences = useCallback(async (values: Partial<Preferences>) => {
     const write = ++preferenceWrite.current
+    const task = preferenceQueue.current.then(() => window.radarDesktop.request({ preferences: { action: 'update', values } }))
+    preferenceQueue.current = task.then(() => undefined, () => undefined)
     let saved: Preferences
-    try { saved = await window.radarDesktop.request({ preferences: { action: 'update', values } }) }
-    catch (cause) { if (write !== preferenceWrite.current) return; throw cause }
+    try { saved = await task }
+    catch (cause) {
+      if (write !== preferenceWrite.current) return
+      // A failed response does not prove that the backend did not commit.
+      try {
+        const actual = await window.radarDesktop.request({ preferences: { action: 'read' } })
+        if (write !== preferenceWrite.current) return
+        committedPreferences.current = actual
+        setPreferences(actual)
+      } catch { /* Keep the last confirmed value if reconciliation is unavailable. */ }
+      if (write !== preferenceWrite.current) return
+      throw cause
+    }
+    committedPreferences.current = saved
     if (write !== preferenceWrite.current) return
     // Backend notifications own market updates; view preferences do not reload rows.
     setPreferences(saved); setPreferencesError('')
   }, [])
   const changeTimeframe = useCallback((chartTimeframe: RadarTimeframe) => {
-    const previous = preferences.chartTimeframe
     setPreferences(current => ({ ...current, chartTimeframe }))
     void savePreferences({ chartTimeframe }).catch(cause => {
-      setPreferences(current => current.chartTimeframe === chartTimeframe ? { ...current, chartTimeframe: previous } : current)
+      setPreferences(current => current.chartTimeframe === chartTimeframe ? { ...current, chartTimeframe: committedPreferences.current.chartTimeframe } : current)
       setPreferencesError(message(cause))
     })
-  }, [preferences.chartTimeframe, savePreferences])
+  }, [savePreferences])
 
   return <WorkspaceViewport>
     <div hidden={settingsSection !== null} inert={settingsSection !== null} className={cn('h-full min-w-0 flex-1', settingsSection === null ? 'flex' : 'hidden')}>

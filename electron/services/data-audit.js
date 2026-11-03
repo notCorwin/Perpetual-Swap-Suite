@@ -217,6 +217,8 @@ export class DataAudit {
     if (!Number.isSafeInteger(chunkMilliseconds) || chunkMilliseconds < INTERVALS['1H']) throw new TypeError('Audit chunks must span at least one hour.')
     if (onCheckpoint !== undefined && typeof onCheckpoint !== 'function') throw new TypeError('Audit onCheckpoint must be a function.')
     this.metadata = metadata
+    this.store = store
+    this.auditRevisions = new WeakMap()
     this.inspect = inspect ?? ((target, _options) => store.inspectCandles(target, 'background'))
     this.repairRange = repair
     this.onCheckpoint = onCheckpoint
@@ -282,6 +284,7 @@ export class DataAudit {
       verificationCheckedRows: 0, verificationFiles: 0,
       createdAt: timestamp, updatedAt: timestamp, completedAt: null,
     }
+    this.trackRevisions(job)
     this.save(job)
     this.jobs.set(id, job)
     this.enqueue(id)
@@ -326,6 +329,7 @@ export class DataAudit {
     if (!repairTargets.length) return clone(current)
     if (typeof this.repairRange !== 'function') throw new Error('A repair callback is required; audit never invents missing market data.')
     const job = clone(current)
+    this.trackRevisions(job)
     job.phase = 'repair'
     job.status = 'queued'
     job.completedAt = null
@@ -399,9 +403,86 @@ export class DataAudit {
     this.save(job)
   }
 
+  // Track the canonical price revision from before inspection or repair starts.
+  // A resumed job cannot reuse an in-memory revision from another process, so
+  // it is conservatively rechecked in full before it can complete.
+  trackRevisions(job) {
+    if (!this.store?.candlePriceRevision || !this.store?.candlePriceChangesSince) return
+    const revisions = new Map()
+    for (const target of job.targets) {
+      const key = JSON.stringify([target.instrument, target.timeframe])
+      if (!revisions.has(key)) revisions.set(key, this.store.candlePriceRevision(target.instrument, target.timeframe))
+    }
+    this.auditRevisions.set(job, revisions)
+  }
+
+  async stabilize(job, signal) {
+    if (!this.store?.candlePriceRevision || !this.store?.candlePriceChangesSince) { this.complete(job); return }
+    let revisions = this.auditRevisions.get(job)
+    if (!revisions) {
+      revisions = new Map()
+      for (const target of job.targets) revisions.set(JSON.stringify([target.instrument, target.timeframe]), -1)
+      this.auditRevisions.set(job, revisions)
+    }
+    while (this.isCurrent(job, signal)) {
+      const changed = new Map()
+      for (const target of job.targets) {
+        const key = JSON.stringify([target.instrument, target.timeframe])
+        if (changed.has(key)) continue
+        const result = this.store.candlePriceChangesSince(target.instrument, target.timeframe, revisions.get(key) ?? -1)
+        changed.set(key, result.ranges)
+        revisions.set(key, result.revision)
+      }
+      const queries = []
+      for (const target of job.targets) {
+        const ranges = changed.get(JSON.stringify([target.instrument, target.timeframe]))
+        if (ranges?.length === 0) continue
+        const interval = INTERVALS[target.timeframe]
+        for (let from = target.from; from <= target.through;) {
+          const boundary = (Math.floor(from / this.chunkMilliseconds) + 1) * this.chunkMilliseconds
+          const next = Math.ceil(boundary / interval) * interval
+          const through = Math.min(target.through, next - 1)
+          if (!ranges || ranges.some(range => range.from <= through && range.through >= from)) {
+            // Recheck an entire existing finding when it crosses the chunk.
+            let query = { ...target, from, through }, expanded = true
+            while (expanded) {
+              expanded = false
+              for (const issue of job.issues) if (issue.status === 'open' && overlaps(query, issue)
+                && (issue.from < query.from || issue.through > query.through)) {
+                query = { ...query, from: Math.min(query.from, issue.from), through: Math.max(query.through, issue.through) }
+                expanded = true
+              }
+            }
+            queries.push(query)
+          }
+          from = next
+        }
+      }
+      if (!queries.length) {
+        const finish = () => {
+          if (!this.isCurrent(job, signal)) return true
+          if (job.targets.some(target => this.store.candlePriceRevision(target.instrument, target.timeframe)
+            !== revisions.get(JSON.stringify([target.instrument, target.timeframe])))) return false
+          this.complete(job)
+          return true
+        }
+        if (this.store.withCandleCommitFence ? await this.store.withCandleCommitFence(finish) : finish()) return
+        continue
+      }
+      for (const query of queries) {
+        await yieldToBackground()
+        if (!this.isCurrent(job, signal)) return
+        const result = await this.inspect(query, { signal, priority: 'background' })
+        if (!this.isCurrent(job, signal)) return
+        this.reconcile(job, query, result)
+        this.save(job)
+      }
+    }
+  }
+
   async inspectNext(job, signal) {
     const target = job.targets[job.cursor.targetIndex]
-    if (!target) { this.complete(job); return }
+    if (!target) { await this.stabilize(job, signal); return }
     const from = job.cursor.nextFrom ?? target.from
     const interval = INTERVALS[target.timeframe]
     const boundary = (Math.floor(from / this.chunkMilliseconds) + 1) * this.chunkMilliseconds
@@ -449,9 +530,17 @@ export class DataAudit {
 
   async verifyNext(job, signal) {
     const target = job.verifyTargets[job.verifyIndex]
-    if (!target) { this.complete(job); return }
+    if (!target) { await this.stabilize(job, signal); return }
     const result = await this.inspect(clone(target), { signal, priority: 'background' })
     if (!this.isCurrent(job, signal)) return
+    this.reconcile(job, target, result)
+    job.verificationCheckedRows += result.checkedRows
+    job.verificationFiles += result.files
+    job.verifyIndex += 1
+    this.save(job)
+  }
+
+  reconcile(job, target, result) {
     const findings = findingsOf(result, target)
     const previous = job.issues.filter(issue => issue.status === 'open' && matches(issue, target) && issue.from >= target.from && issue.through <= target.through)
     const exact = new Map(), byReason = new Map()
@@ -486,10 +575,6 @@ export class DataAudit {
     for (const issue of previous) {
       if (!retained.has(issue.id)) { issue.status = 'resolved'; issue.resolvedAt = this.now() }
     }
-    job.verificationCheckedRows += result.checkedRows
-    job.verificationFiles += result.files
-    job.verifyIndex += 1
-    this.save(job)
   }
 
   async whenIdle() { while (this.runner) await this.runner }

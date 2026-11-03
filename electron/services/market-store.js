@@ -224,6 +224,7 @@ class DatabaseWorkers {
     this.tasks = new Set()
     this.nextID = 0
     this.foregroundBurst = 0
+    this.fences = []; this.fencing = false
     this.failed = null
     this.closing = false
     this.metrics = { requests: 0, completed: 0, failed: 0, maximumQueued: 0, rowsReturned: 0, durationMS: 0 }
@@ -233,7 +234,7 @@ class DatabaseWorkers {
         if (message.ready) return
         const job = worker.current
         if (!job || job.id !== message.id) return
-        worker.current = null; worker.busy = false
+        worker.current = null; worker.currentLifetime = null; worker.busy = false
         if (message.error) {
           this.metrics.failed += 1
           const error = new Error(message.error.message); error.name = message.error.name; error.code = message.error.code
@@ -248,12 +249,20 @@ class DatabaseWorkers {
         if (!worker.busy) worker.unref()
       })
       worker.on('error', error => this.fail(error))
-      worker.on('exit', code => { if (!this.closing) this.fail(new Error(`Market database worker exited (${code}).`)) })
+      worker.on('exit', code => {
+        if (worker.currentLifetime) {
+          const fence = new Int32Array(worker.currentLifetime.buffer)
+          Atomics.store(fence, 1, 0); Atomics.notify(fence, 1)
+          worker.currentLifetime = null
+        }
+        if (!this.closing) this.fail(new Error(`Market database worker exited (${code}).`))
+      })
       worker.unref()
     }
   }
   fail(error) {
     this.failed = error
+    for (const fence of this.fences.splice(0)) fence.reject(error)
     for (const worker of this.workers) { worker.current?.reject(error); worker.current = null; worker.busy = false }
     while (this.queuedCount) {
       let rank = -1, oldestID = Infinity
@@ -265,11 +274,11 @@ class DatabaseWorkers {
       this.queuedCount -= 1
     }
   }
-  request(command, args = [], priority = 'background') {
+  request(command, args = [], priority = 'background', prepare) {
     if (this.failed) return Promise.reject(this.failed)
     const task = new Promise((resolve, reject) => {
       const request = createWorkerRequest('market-store', command, resolve, reject, { priority })
-      enqueue(this.buckets, { id: ++this.nextID, command, args, priority, rank: priorityRank(priority), ...request })
+      enqueue(this.buckets, { id: ++this.nextID, command, args, priority, prepare, rank: priorityRank(priority), ...request })
       this.queuedCount += 1
       this.metrics.requests += 1; this.metrics.maximumQueued = Math.max(this.metrics.maximumQueued, this.queuedCount)
       this.drain()
@@ -278,7 +287,24 @@ class DatabaseWorkers {
     task.then(() => this.tasks.delete(task), () => this.tasks.delete(task))
     return task
   }
+  // Execute synchronous publication after all dispatched writes have reported
+  // their commits, while preventing the next queued write from starting.
+  fence(callback) {
+    if (this.failed) return Promise.reject(this.failed)
+    return new Promise((resolve, reject) => { this.fences.push({ callback, resolve, reject }); this.drain() })
+  }
   drain() {
+    if (this.fencing) return
+    if (this.fences.length) {
+      if (this.workers.some(worker => worker.busy)) return
+      this.fencing = true
+      try {
+        for (const fence of this.fences.splice(0)) {
+          try { fence.resolve(fence.callback()) } catch (error) { fence.reject(error) }
+        }
+      } finally { this.fencing = false }
+      if (this.fences.length) return this.drain()
+    }
     for (const worker of this.workers) {
       if (worker.busy || !this.queuedCount) continue
       let rank = -1
@@ -298,7 +324,11 @@ class DatabaseWorkers {
       this.queuedCount -= 1
       this.foregroundBurst = job.rank >= 3 ? this.foregroundBurst + 1 : 0
       worker.busy = true; worker.current = job; worker.ref()
-      try { job.dispatch(worker, { id: job.id, command: job.command, args: job.args }) }
+      try {
+        const args = job.prepare ? job.prepare() : job.args
+        worker.currentLifetime = args[1]?.lifetime ?? null
+        job.dispatch(worker, { id: job.id, command: job.command, args })
+      }
       catch (error) { worker.current = null; worker.busy = false; worker.unref(); job.reject(error); queueMicrotask(() => this.drain()) }
     }
   }
@@ -343,6 +373,7 @@ export class MarketStore {
   constructor(root, path, writer, readers) {
     this.root = root; this.path = path; this.closed = false; this.closeTask = null
     this.revisions = new Map(); this.priceRevisions = new Map(); this.statisticsRevisions = new Map(); this.mutations = new Map(); this.operations = new Set()
+    this.statisticsWrites = new Map()
     this.listeners = new Set(); this.migration = null; this.migrationPending = new Map(); this.migrationWrites = new Set(); this.nextMigrationID = 0
     this.writeMetrics = { partitions: 0, rowsSubmitted: 0, bytesRead: 0, bytesWritten: 0, durationMS: 0 }
     this.writer = new DatabaseWorkers([writer], (mutations, duration) => this.committed(mutations, duration))
@@ -394,6 +425,7 @@ export class MarketStore {
   subscribe(listener) { this.listeners.add(listener); return () => this.listeners.delete(listener) }
   candleRevision(instrument, timeframe) { return this.revisions.get(keyOf(instrument, timeframe)) ?? 0 }
   candlePriceRevision(instrument, timeframe) { return this.priceRevisions.get(keyOf(instrument, timeframe)) ?? 0 }
+  withCandleCommitFence(callback) { return this.writer.fence(callback) }
   statisticsCoverageRevision(instrument, timeframe, source) {
     if (!['oi', 'taker'].includes(source)) throw new TypeError('Invalid statistics source.')
     return this.statisticsRevisions.get(`${keyOf(instrument, timeframe)}:${source}`) ?? 0
@@ -549,24 +581,30 @@ export class MarketStore {
       }
     })
   }
-  appendCandles(candles, priority = 'background') {
+  appendCandles(candles, priority = 'background', { canWrite } = {}) {
     return this.operation(async () => {
       let result = 0
       if (candles.length > 2_048) {
         // Validate the entire logical batch before the first bounded transaction.
         await this.writer.request('validateCandles', [candles], priority)
-        for (let offset = 0; offset < candles.length; offset += 2_048) result += await this.writer.request('append', [candles.slice(offset, offset + 2_048)], priority)
-      } else result = await this.writer.request('append', [candles], priority)
+        for (let offset = 0; offset < candles.length; offset += 2_048) {
+          const chunk = candles.slice(offset, offset + 2_048)
+          result += await this.writer.request('append', [chunk], priority, canWrite && (() => [chunk.filter(canWrite), { lifetime: canWrite.lifetime }]))
+        }
+      } else result = await this.writer.request('append', [candles], priority, canWrite && (() => [candles.filter(canWrite), { lifetime: canWrite.lifetime }]))
       this.writeMetrics.rowsSubmitted += candles.length
       return result
     })
   }
-  replaceCandles(query, candles, priority = 'background') {
+  replaceCandles(query, candles, priority = 'background', { canWrite } = {}) {
     return this.operation(async () => {
       const range = validateQuery(query), step = CANDLE_INTERVALS[range.timeframe]
       if (range.from % step || range.through % step || !Array.isArray(candles)) throw new TypeError('Repair range must lie on the candle grid.')
       for (const candle of candles) if (candle.instrument !== range.instrument || candle.timeframe !== range.timeframe || candle.timestamp < range.from || candle.timestamp > range.through) throw new TypeError('Replacement candle lies outside its repair range.')
-      return this.writer.request('append', [candles, { replacement: range }], priority)
+      return this.writer.request('append', [candles, { replacement: range }], priority, canWrite && (() => {
+        if (!candles.every(canWrite)) throw Object.assign(new Error('Price history changed during repair; retrying the source observation.'), { code: 'HISTORY_SOURCE_CHANGED' })
+        return [candles, { replacement: range, lifetime: canWrite.lifetime }]
+      }))
     })
   }
   aggregateCandles(query, priority = 'background') {
@@ -582,7 +620,17 @@ export class MarketStore {
       return this.writer.request('aggregateCandles', [{ ...range, invalidateIncomplete: query.invalidateIncomplete === true }], priority)
     })
   }
-  appendStatistics(input, priority = 'background') { return this.operation(() => this.writer.request('appendStatistics', [input], priority)) }
+  appendStatistics(input, priority = 'background') {
+    const snapshot = { ...input, values: Array.isArray(input?.values) ? input.values.map(value => Array.isArray(value) ? [...value] : value) : input?.values, observedAt: input?.observedAt ?? Date.now() }
+    const key = `${snapshot.instrument}:${snapshot.timeframe}:${snapshot.source}`
+    return this.operation(() => {
+      const previous = this.statisticsWrites.get(key) ?? Promise.resolve()
+      const task = previous.catch(() => {}).then(() => this.writer.request('appendStatistics', [snapshot], priority))
+      this.statisticsWrites.set(key, task)
+      task.finally(() => { if (this.statisticsWrites.get(key) === task) this.statisticsWrites.delete(key) }).catch(() => {})
+      return task
+    })
+  }
   candles(query, priority = 'background') { return this.read('candles', query, priority) }
   statistics(query, priority = 'background') { return this.read('statistics', query, priority) }
   statisticsCoverage(query, priority = 'background') { return this.read('statisticsCoverage', query, priority) }

@@ -85,9 +85,9 @@ const mutate = (changes, series, timestamp, price = false, statistic = null) => 
     change[from] = Math.min(change[from] ?? timestamp, timestamp); change[through] = Math.max(change[through] ?? timestamp, timestamp)
   }
 }
-const transaction = operation => {
+const transaction = (operation, validate) => {
   database.exec('BEGIN IMMEDIATE')
-  try { const value = operation(); database.exec('COMMIT'); return value } catch (error) { database.exec('ROLLBACK'); throw error }
+  try { const value = operation(); validate?.(); database.exec('COMMIT'); return value } catch (error) { database.exec('ROLLBACK'); throw error }
 }
 const finishMutations = (changes, imported = false) => {
   for (const [id, change] of changes) {
@@ -123,7 +123,7 @@ function writeStatistic(series, source, timestamp, first, second, expiresAt, cha
     && (observedVolume === null || previous.observed_volume == null)) return false
   // Absence is a bounded source observation, never a correction to a numeric fact.
   if (absent && previousNumeric && !staleDerived) return false
-  if (absent && previous && observedAt < previous.written_at) return false
+  if (!importing && previous && observedAt < previous.written_at && (absent || previousNumeric && !staleDerived)) return false
   if (first === null && previous?.value1 === 0 && previous.value2 === 0 && traded && !staleDerived) {
     // A fresh empty response can renew a contradicted zero placeholder's
     // unavailable proof. Merely receiving its price never renews that proof.
@@ -148,11 +148,18 @@ function writeStatistic(series, source, timestamp, first, second, expiresAt, cha
   return true
 }
 
-function append(rows, { importing = false, replacement, partition } = {}) {
+function append(rows, { importing = false, replacement, partition, lifetime } = {}) {
   if (!Array.isArray(rows)) throw new TypeError('Candles must be an array.')
   rows.forEach(validateCandle)
   const changes = new Map(), seriesCache = new Map(), bounds = new Set(), additions = new Map()
   const unique = new Map(rows.map(row => [`${row.instrument}:${row.timeframe}:${row.timestamp}`, row]))
+  const currentLifetime = () => {
+    if (lifetime && Atomics.load(new Int32Array(lifetime.buffer), 0) !== lifetime.epoch) throw Object.assign(new Error('The instrument lifetime was removed before the price commit.'), { name: 'AbortError' })
+  }
+  const fence = lifetime && new Int32Array(lifetime.buffer)
+  if (fence && Atomics.compareExchange(fence, 1, 0, 1) !== 0) throw new Error('A price lifetime commit is already in progress.')
+  try {
+  currentLifetime()
   return transaction(() => {
     if (replacement) {
       const series = ensureSeries(replacement)
@@ -203,11 +210,17 @@ function append(rows, { importing = false, replacement, partition } = {}) {
     }
     for (const id of bounds) refreshBounds(id)
     if (partition) {
+      const previousIssue = get('SELECT * FROM import_issues WHERE path=?', partition.path)
+      if (previousIssue) {
+        const series = ensureSeries({ instrument: previousIssue.instrument, timeframe: previousIssue.timeframe })
+        mutate(changes, series, previousIssue.from_ts, true); mutate(changes, series, previousIssue.through_ts, true)
+      }
       run('INSERT OR REPLACE INTO migration_partitions(path,fingerprint,status,value) VALUES(?,?,?,?)', partition.path, partition.fingerprint, 'completed', JSON.stringify({ rows: rows.length }))
       run('DELETE FROM import_issues WHERE path=?', partition.path)
     }
     return { result: unique.size, mutations: finishMutations(changes, importing) }
-  })
+  }, currentLifetime)
+  } finally { if (fence) { Atomics.store(fence, 1, 0); Atomics.notify(fence, 1) } }
 }
 
 function aggregateCandles(input) {
@@ -509,11 +522,18 @@ const commands = {
     importedRows: get("SELECT COALESCE(SUM(json_extract(value,'$.rows')),0) AS count FROM migration_partitions WHERE status='completed' AND path!='__complete__'").count,
     issues: all('SELECT path,instrument,timeframe,from_ts AS "from",through_ts AS through,reason,detail FROM import_issues') } }),
   migrationComplete: () => { run("INSERT OR REPLACE INTO migration_partitions(path,fingerprint,status,value) VALUES('__complete__','','completed','{}')"); return { result: undefined } },
-  migrationFailure: value => {
+  migrationFailure: value => transaction(() => {
+    const changes = new Map(), series = ensureSeries(value)
+    const previous = get('SELECT * FROM import_issues WHERE path=?', value.path)
+    if (previous) {
+      const prior = ensureSeries({ instrument: previous.instrument, timeframe: previous.timeframe })
+      mutate(changes, prior, previous.from_ts, true); mutate(changes, prior, previous.through_ts, true)
+    }
     run('INSERT OR REPLACE INTO migration_partitions(path,fingerprint,status,value) VALUES(?,?,?,?)', value.path, value.fingerprint, 'failed', JSON.stringify({ error: value.detail }))
     run('INSERT OR REPLACE INTO import_issues(path,instrument,timeframe,from_ts,through_ts,reason,detail) VALUES(?,?,?,?,?,?,?)', value.path, value.instrument, value.timeframe, value.from, value.through, value.reason ?? 'corrupt-file', value.detail)
-    return { result: undefined }
-  },
+    mutate(changes, series, value.from, true); mutate(changes, series, value.through, true)
+    return { result: undefined, mutations: finishMutations(changes, true) }
+  }),
   inspect: query => {
     const valid = validateQuery(query), series = identity(valid), gaps = missingRanges(valid, 'candles', true), issues = []
     let checkedRows = 0

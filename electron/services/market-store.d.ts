@@ -76,20 +76,21 @@ export class MarketStore {
   path: string
   workerThreadIds: { writer: number; readers: number[] }
   subscribe(listener: (change: { instrument: string; timeframe: string; from: number; through: number; priceFrom: number | null; priceThrough: number | null; revision: number; priceRevision: number; imported: boolean }) => void): () => void
-  appendCandles(candles: CandleRecord[], priority?: StorePriority): Promise<number>
+  appendCandles(candles: CandleRecord[], priority?: StorePriority, options?: { canWrite?: (row: CandleRecord) => boolean }): Promise<number>
   appendStatistics(page: StatisticsPage, priority?: StorePriority): Promise<number>
   statistics(query: CandleQuery & { source?: 'oi' | 'taker' }, priority?: StorePriority): Promise<StatisticsRecord[]>
   /** One snapshot of time-independent gaps and absence expiries. */
   statisticsCoverage(query: CandleQuery & CandleRange & { source: 'oi' | 'taker' }, priority?: StorePriority): Promise<{ gaps: CandleRange[]; expiries: Array<CandleRange & { expiresAt: number }> }>
   statisticsMissingRanges(query: CandleQuery & CandleRange & { source: 'oi' | 'taker' }, priority?: StorePriority): Promise<CandleRange[]>
   /** Replace the inclusive grid range, including malformed records within each covered bar. */
-  replaceCandles(query: CandleQuery & CandleRange, candles: CandleRecord[], priority?: StorePriority): Promise<number>
+  replaceCandles(query: CandleQuery & CandleRange, candles: CandleRecord[], priority?: StorePriority, options?: { canWrite?: (row: CandleRecord) => boolean }): Promise<number>
   /** Fill missing prices from complete 5m buckets; preserve native parent prices and independent statistics. */
   aggregateCandles(query: AggregateCandleQuery, priority?: StorePriority): Promise<AggregateCandleResult>
   inspectCandles(query: CandleQuery & CandleRange, priority?: StorePriority): Promise<CandleInspection>
   getWriteMetrics(): { partitions: number; rowsSubmitted: number; bytesRead: number; bytesWritten: number; durationMS: number }
   getDiagnostics(): { workerThreadIds: { writer: number; readers: number[] }; reads: Record<string, number>; writes: Record<string, number>; candleCache: { entries: number; estimatedBytes: number; pending: number; pendingKeyBytes: number }; migrationComplete: boolean; migrationProcessId: number | null }
   candleRevision(instrument: string, timeframe: string): number
+  withCandleCommitFence<T>(callback: () => T): Promise<T>
   candlePriceRevision(instrument: string, timeframe: string): number
   statisticsCoverageRevision(instrument: string, timeframe: string, source: 'oi' | 'taker'): number
   statisticsCoverageChangesSince(instrument: string, timeframe: string, source: 'oi' | 'taker', revision: number): { revision: number; ranges: CandleRange[] | null }

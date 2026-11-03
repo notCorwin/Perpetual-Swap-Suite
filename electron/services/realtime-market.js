@@ -114,6 +114,16 @@ export class RealtimeMarket {
     }
   }
 
+  removeInstruments(instIds) {
+    const removed = new Set(instIds)
+    for (const [key, series] of this.series) {
+      const separator = key.indexOf(':')
+      if (!removed.has(key.slice(separator + 1))) continue
+      this.series.delete(key)
+      this.commitFailures.delete(series)
+    }
+  }
+
   start() {
     if (this.closed) throw new Error('Realtime market is closed.')
     if (this.started) return
@@ -413,6 +423,7 @@ export class RealtimeMarket {
     this.telemetry.receivedEvents++
     this.telemetry.lastReceivedAt = receivedAt
     const key = keyFor(subscription)
+    const sourceEpoch = this.options.sourceEpoch?.(subscription.instId)
     let trafficContext = null
     const trafficObserver = this.options.onMarketTrafficIngress
     if (Number.isSafeInteger(nativeHandlerEnteredAtMonotonicUS) && typeof trafficObserver === 'function') {
@@ -443,7 +454,7 @@ export class RealtimeMarket {
       // A confirmed event accepted before cancellation still needs durable
       // ingestion. Retired transports must not publish queued forming events.
       if (raw?.[8] !== '1' && (!this.active(connection) || this.subscriptions.get(key) !== subscription)) return
-      await this.process(connection, series, subscription, raw, receivedAt, trafficContext)
+      await this.process(connection, series, subscription, raw, receivedAt, trafficContext, sourceEpoch)
     }).catch(error => this.report('Candle callback failed.', error, this.active(connection) ? true : 'log')).then(() => {
       series.pending--
       this.telemetry.pendingEvents--
@@ -453,7 +464,7 @@ export class RealtimeMarket {
     this.track(task)
   }
 
-  async process(connection, series, subscription, raw, receivedAt, trafficContext = null) {
+  async process(connection, series, subscription, raw, receivedAt, trafficContext = null, sourceEpoch) {
     if (!Array.isArray(raw) || raw.length < 9 || !['0', '1'].includes(raw[8]) || raw.slice(0, 8).some(value => typeof value !== 'string' || !value.trim() || !Number.isFinite(Number(value))) || volumes(raw).some(value => value < 0)) {
       this.telemetry.rejectedEvents++
       this.report('Invalid OKX candle payload.')
@@ -481,6 +492,7 @@ export class RealtimeMarket {
     this.telemetry.maxDispatchLatencyMs = Math.max(this.telemetry.maxDispatchLatencyMs, this.telemetry.lastDispatchLatencyMs)
     series.latestTimestamp = Math.max(series.latestTimestamp, timestamp)
     const context = { signal: candle.confirmed ? this.durableController.signal : connection.controller.signal, receivedAt,
+      sourceEpoch,
       ...(trafficContext ?? {}) }
     if (candle.confirmed) {
       // Exchange confirmation and local durability are independent progress.

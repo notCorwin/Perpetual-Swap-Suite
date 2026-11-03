@@ -227,9 +227,11 @@ test('a repair admitted during stream delivery still queries its authoritative s
     repair = f.service.history.repair({ instrument: instId, timeframe: '5m', source: 'candles', from: f.asOf, through: f.asOf, reason: 'invalid-ohlc', repairable: true }, { signal: new AbortController().signal })
     await settle(() => f.service.history.repairs.size === 1)
     f.socket.candle(candle(f.asOf, 400_000))
-    await settle(() => f.priceRequests.length === 1 && f.service.history.repairs.size === 0)
+    await settle(() => f.priceRequests.length >= 1 && f.service.history.repairs.size === 0)
     await repair
-    assert.deepEqual(f.priceRequests, ['/market/history-candles'])
+    assert.ok(f.priceRequests.every(path => path === '/market/history-candles'))
+    const rows = await f.store.candles({ instrument: instId, timeframe: '5m', from: f.asOf, through: f.asOf })
+    assert.equal(rows[0]?.quoteVolume, 400_000)
     assert.equal(f.service.candleWaits.size, 0)
   } finally { repair?.catch(() => {}); await f.close(); await repair?.catch(() => {}) }
 })

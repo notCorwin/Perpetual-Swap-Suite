@@ -44,6 +44,7 @@ function fixture(snapshotFailure = false) {
     metadata: { loading: false, catalogSource: 'live', error: '' } as Pick<MarketSnapshot, 'loading' | 'catalogSource' | 'error' | 'catalogProgress'>,
     rows: [{ instId: 'BTC-USDT-SWAP', lastPrice: 100, rankingChange: 2, rankingAsOf: 900_000, turnover24hUSDT: 100 }] as RankedMarketRow[],
     afterUpdate: undefined as undefined | (() => Promise<void>),
+    beforeUpdate: undefined as undefined | (() => Promise<void>),
   }
   const window = Object.assign(new EventTarget(), {
     setTimeout(callback: () => void, delay: number) { const id = ++timers; pendingTimers.set(id, { callback, at: now + delay }); return id },
@@ -54,6 +55,7 @@ function fixture(snapshotFailure = false) {
     }) {
       if (command.preferences) {
         if (command.preferences.action === 'update') {
+          await state.beforeUpdate?.()
           state.preferences = { ...state.preferences, ...command.preferences.values }
           await state.afterUpdate?.()
         }
@@ -207,6 +209,49 @@ test('switching every chart timeframe preserves the list and never reloads its s
     assert.equal(app.snapshotRequests.length, requests)
   }
   assert.deepEqual(app.snapshotRequests, [{ sinceRevision: -1, serviceSession: undefined }])
+})
+
+test('consecutive failed timeframe writes roll back to the last committed value', async context => {
+  const app = fixture(); context.after(() => app.close())
+  await app.flush()
+  let release!: () => void
+  let calls = 0
+  app.state.beforeUpdate = async () => {
+    if (++calls === 1) await new Promise<void>(resolve => { release = resolve })
+    throw new Error('Write failed')
+  }
+  app.view.changeTimeframe('1H'); await app.flush()
+  app.view.changeTimeframe('5m'); await app.flush()
+  assert.equal(calls, 1)
+  release(); await app.flush()
+  assert.equal(calls, 2)
+  assert.equal(app.view.preferences.chartTimeframe, '15m')
+  assert.equal(app.state.preferences.chartTimeframe, '15m')
+})
+
+test('a failed newer timeframe write restores the preceding successful write', async context => {
+  const app = fixture(); context.after(() => app.close())
+  await app.flush()
+  let release!: () => void
+  let calls = 0
+  app.state.beforeUpdate = async () => {
+    if (++calls === 1) await new Promise<void>(resolve => { release = resolve })
+    else throw new Error('Write failed')
+  }
+  app.view.changeTimeframe('1H'); await app.flush()
+  app.view.changeTimeframe('5m'); await app.flush()
+  release(); await app.flush()
+  assert.equal(app.view.preferences.chartTimeframe, '1H')
+  assert.equal(app.state.preferences.chartTimeframe, '1H')
+})
+
+test('a failed response after commit reconciles the actual saved timeframe', async context => {
+  const app = fixture(); context.after(() => app.close())
+  await app.flush()
+  app.state.afterUpdate = async () => { throw new Error('Response failed') }
+  app.view.changeTimeframe('1H'); await app.flush()
+  assert.equal(app.state.preferences.chartTimeframe, '1H')
+  assert.equal(app.view.preferences.chartTimeframe, '1H')
 })
 
 test('backend exclusion is applied immediately without a renderer grace period', async context => {

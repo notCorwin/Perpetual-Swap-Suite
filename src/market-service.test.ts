@@ -1112,6 +1112,29 @@ for (const status of ['verified', 'failed'] as const) test(`a published ${status
   } finally { gate.resolve(); await f.close() }
 })
 
+test('a delayed liquidity calculation cannot publish an obsolete open interest assessment', async () => {
+  const now = Date.now(), preferences = disabled(), gate = deferred()
+  preferences.liquidity.depth.enabled = true
+  preferences.liquidity.openInterest.enabled = true
+  const f = await fixture(preferences)
+  try {
+    f.service.instruments.set(instId, instrument); f.service.candidateIDs = new Set([instId])
+    f.service.instrumentObservations.set(instId, { observedAt: now, expiresAt: now + 90_000 })
+    f.service.observations.set(instId, {
+      book: { value: { bids: [['99.99', '200001']], asks: [['100', '200001']] }, observedAt: now, expiresAt: now + 90_000 },
+      openInterest: { value: { instId, oiUsd: '6000000' }, observedAt: now, expiresAt: now + 90_000 },
+    })
+    f.service.streamLiquidity = { evaluate: async (input: LiquidityInput) => { await gate.promise; return f.service.evaluateLiquidity(input) }, close: async () => { gate.resolve() } }
+    f.service.queueStreamQualification(instId); f.service.flushStreamQualifications()
+    const evaluation = f.service.streamEvaluations.get(instId)
+    assert.ok(evaluation)
+    f.service.acceptObservation(instId, 'openInterest', { value: { instId, oiUsd: '1' }, observedAt: now + 1, expiresAt: now + 90_000 })
+    gate.resolve(); await evaluation
+    assert.notEqual(f.service.catalogChecks.get(instId)?.status, 'verified')
+    assert.equal(f.service.catalog.has(instId), false)
+  } finally { gate.resolve(); await f.close() }
+})
+
 for (const source of ['book', 'ticker', 'openInterest'] as const) test(`a late failing worker result cannot resurrect evidence after its ${source} lease expires`, async context => {
   const now = Math.floor(Date.now() / fiveMinutes) * fiveMinutes + 10_000
   context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })

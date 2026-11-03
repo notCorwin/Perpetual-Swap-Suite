@@ -377,6 +377,12 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
   const navigationTask = useRef<object | null>(null)
   useEffect(() => () => chartAnalysis.stop(sessionKey), [sessionKey])
   const captureVersion = useRef(0)
+  const captureOwner = useRef<object | null>(null)
+  useLayoutEffect(() => {
+    captureOwner.current = null
+    setCapture({ status: 'idle', error: '' })
+    return () => { captureOwner.current = null }
+  }, [instId, timeframe])
   useLayoutEffect(() => { captureVersion.current += 1 }, [surface, instId, timeframe, wheelContentOffset, plotSize.width, plotSize.height, inspection, pending, isActive])
   useLayoutEffect(() => {
     navigationId.current = instId
@@ -520,14 +526,17 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
   }
   const captureChart = async () => {
     if (pending || !surface || !chartRef.current) return
+    const owner = {}
+    captureOwner.current = owner
     flushSync(() => setCapture({ status: 'copying', error: '' }))
     try {
       await new Promise<void>(resolve => window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve())))
       const image = await captureCurrentChart(surface)
+      if (captureOwner.current !== owner) return
       const result = await window.radarDesktop.request({ copyImage: image.imageDataURL })
       if (!result.ok) throw new Error('Could not copy chart.')
-      setCapture({ status: 'flashing', error: '' })
-    } catch (cause) { setCapture({ status: 'failed', error: cause instanceof Error ? cause.message : 'Could not copy chart.' }) }
+      if (captureOwner.current === owner) setCapture({ status: 'flashing', error: '' })
+    } catch (cause) { if (captureOwner.current === owner) setCapture({ status: 'failed', error: cause instanceof Error ? cause.message : 'Could not copy chart.' }) }
   }
   const analyzeChart = (direction: AnalysisDirection) => {
     if (pending || !surface || plotSize.width <= 0 || captureStatus === 'copying') return

@@ -73,6 +73,23 @@ test('concurrent ticker consumers retain one download when the first consumer ca
   } finally { release?.(response([])); await f.close() }
 })
 
+test('bulk ticker response cannot replace a newer per-contract REST observation', async () => {
+  let release!: (value: Response) => void, started!: () => void
+  const entered = new Promise<void>(resolve => { started = resolve })
+  const held = new Promise<Response>(resolve => { release = resolve })
+  const f = await fixture(false, { tickers: () => { started(); return held } })
+  try {
+    const pending = f.service.tickerObservations(undefined, 'foreground', true)
+    await entered
+    const now = Date.now()
+    const newer = { value: { instId, last: '200', bidPx: '199.99', askPx: '200', ts: '200' }, source: 'rest', sourceTimestamp: 200, observedAt: now, expiresAt: now + 90_000 }
+    f.service.tickerCache = { values: new Map([[instId, newer]]), observedAt: now }
+    release(response([{ instId, last: '100', bidPx: '99.99', askPx: '100', ts: '100' }]))
+    assert.equal((await pending).get(instId), newer)
+    assert.equal(f.service.tickerCache.values.get(instId), newer)
+  } finally { release?.(response([])); await f.close() }
+})
+
 test('the ticker download aborts only after its last consumer cancels', async () => {
   let started!: (signal: AbortSignal) => void, release!: (value: Response) => void
   const entered = new Promise<AbortSignal>(resolve => { started = resolve })

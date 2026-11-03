@@ -27,6 +27,36 @@ const fixture = async () => {
 const near = (actual: number, expected: number) => assert.ok(Math.abs(actual - expected) <= Math.max(1, Math.abs(expected)) * Number.EPSILON * 8,
   `expected ${actual} to be within floating point rounding of ${expected}`)
 
+test('statistics writes retain acquisition order across priorities and reject older observations', async () => {
+  const f = await fixture()
+  try {
+    const writer = (f.store as unknown as { writer: { request: (command: string, args: unknown[], priority?: string) => Promise<unknown> } }).writer
+    const request = writer.request.bind(writer)
+    let release!: () => void, started!: () => void
+    const entered = new Promise<void>(resolve => { started = resolve })
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const submitted: string[] = []
+    writer.request = async (command, args, priority) => {
+      if (command === 'appendStatistics') {
+        submitted.push(priority!)
+        if (submitted.length === 1) { started(); await gate }
+      }
+      return request(command, args, priority)
+    }
+    const range = { instrument, timeframe: '5m', from: base, through: base, source: 'oi' as const }
+    const first = f.store.appendStatistics({ ...range, values: [[base, 100]], observedAt: 100 }, 'background')
+    await entered
+    const second = f.store.appendStatistics({ ...range, values: [[base, 200]], observedAt: 200 }, 'foreground')
+    await new Promise(resolve => setImmediate(resolve))
+    assert.deepEqual(submitted, ['background'])
+    release(); await Promise.all([first, second])
+    assert.deepEqual(submitted, ['background', 'foreground'])
+    assert.equal(await f.store.appendStatistics({ ...range, values: [[base, 50]], observedAt: 50 }), 0)
+    const [value] = await f.store.statistics(range)
+    assert.equal(value.oi, 200)
+  } finally { await f.close() }
+})
+
 test('aggregates complete contiguous 5m children into 15m and 1H while preserving every volume unit', async () => {
   const f = await fixture()
   try {
