@@ -143,3 +143,39 @@ test('a local renewal cannot extend another contract’s subscription proof', as
   await setImmediate()
   assert.equal(service.bookRetirements.get(id), state.now + 30_000)
 })
+
+test('an unqualified book retires after grace and configuration changes cancel its sampling', async t => {
+  const state = await fixture(t, 1), { service, instruments } = state, id = instruments[0].instId
+  service.autoRefresh = true
+  const record = service.catalogChecks.get(id)
+  record.result.checks.push({ key: 'depth', status: 'unknown', value: 10_000 })
+  service.updateSubscriptions()
+  assert.equal(service.bookSamples.has(id), true)
+  assert.equal(service.publicSubscriptionDemand.books.has(id), true)
+  state.now += 30_000
+  service.updateSubscriptions()
+  assert.equal(service.publicSubscriptionDemand.books.has(id), false)
+  service.preferences().liquidity.depth.enabled = false
+  service.updateSubscriptions()
+  assert.equal(service.bookSamples.has(id), false)
+  service.autoRefresh = false
+})
+
+
+test('a book that recovers during retirement grace remains continuously subscribed', async t => {
+  const state = await fixture(t, 1), { service, instruments } = state, id = instruments[0].instId
+  service.autoRefresh = true
+  const record = service.catalogChecks.get(id)
+  record.result.checks.push({ key: 'depth', status: 'unknown', value: 10_000 })
+  service.updateSubscriptions()
+  assert.equal(service.bookSamples.has(id), true)
+  assert.equal(service.bookRetirements.has(id), true)
+  record.result.checks = record.result.checks.map((check: { key: string }) => check.key === 'depth' ? { ...check, status: 'verified', value: 200_000 } : check)
+  service.updateSubscriptions()
+  assert.equal(service.bookSamples.has(id), false)
+  assert.equal(service.bookRetirements.has(id), false)
+  state.now += 30_000
+  service.updateSubscriptions()
+  assert.equal(service.publicSubscriptionDemand.books.has(id), true)
+  service.autoRefresh = false
+})

@@ -101,6 +101,8 @@ export class MarketBook {
     pending.controller.abort(reason)
   }
 
+  expire(instId) { this.snapshots.delete(instId) }
+
   invalidate(instId) {
     this.snapshots.delete(instId)
     this.retire(instId, retired('The order-book observation was invalidated.'))

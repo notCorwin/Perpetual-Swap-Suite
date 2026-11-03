@@ -15,6 +15,8 @@ export class MarketBook {
   constructor(get: BookGet, now?: () => number)
   /** Fresh supplied memory bypasses REST without changing its original timestamps. */
   observe(instId: string, signal?: AbortSignal, priority?: string, currentObservation?: BookObservation | null): Promise<BookObservation>
+  /** Expire a cached snapshot without interrupting shared in-flight reads. */
+  expire(instId: string): void
   /** Clears the cache and rejects active waiters; call for metadata/delist/WS replacement. */
   invalidate(instId: string): void
   /** Rejects all active and future callers. Idempotent. */

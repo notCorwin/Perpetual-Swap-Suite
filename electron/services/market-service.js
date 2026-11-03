@@ -305,6 +305,8 @@ export class MarketService {
     this.bookGenerations = new Map()
     this.nativeBookDeadlines = new Map()
     this.bookRetirements = new Map()
+    this.bookSamples = new Map()
+    this.bookSampleTimer = null
     this.qualificationQueue = new Set()
     this.qualificationImmediate = null
     this.marketDeadlineTimer = null
@@ -1735,6 +1737,70 @@ export class MarketService {
     if (timeframe === '5m') this.track(this.updateRanking(instId))
   }
 
+  // A bounded REST snapshot can periodically reassess an unqualified book
+  // without maintaining a high-volume book stream or churning WS subscriptions.
+  bookSampleInterval(record, config) {
+    const checks = record?.result?.checks ?? []
+    const depth = checks.find(check => check.key === 'depth')
+    const slip = checks.find(check => check.key === 'slippage')
+    const distances = []
+    if (config.depth.enabled && depth?.status !== 'verified' && Number.isFinite(depth?.value) && depth.value >= 0 && config.depth.minUSDT > 0)
+      distances.push(Math.max(0, 1 - depth.value / config.depth.minUSDT))
+    if (config.slippage.enabled && slip?.status === 'failed' && Number.isFinite(slip.value) && config.slippage.maxPercent > 0)
+      distances.push(Math.max(0, slip.value / config.slippage.maxPercent - 1))
+    if (!distances.length) return null
+    const distance = Math.max(...distances)
+    return distance < 0.1 ? 30_000 : distance < 0.5 ? 60_000 : distance < 1 ? 120_000 : 300_000
+  }
+
+  scheduleBookSamples() {
+    if (this.bookSampleTimer) clearTimeout(this.bookSampleTimer)
+    this.bookSampleTimer = null
+    if (this.closing || this.disposed) return
+    const next = Math.min(...[...this.bookSamples.values()].filter(value => !value.pending).map(value => value.next))
+    if (!Number.isFinite(next)) return
+    this.bookSampleTimer = setTimeout(() => {
+      this.bookSampleTimer = null
+      for (const [id, sample] of this.bookSamples) if (!sample.pending && sample.next <= Date.now()) this.sampleBook(id, sample)
+      this.scheduleBookSamples()
+    }, Math.max(1, next - Date.now()))
+    this.bookSampleTimer.unref?.()
+  }
+
+  sampleBook(instId, sample) {
+    const instrument = this.instruments.get(instId), config = this.prefs().liquidity, configKey = JSON.stringify(config)
+    if (!instrument || !this.candidateIDs?.has(instId) || sample.configKey !== configKey) {
+      this.bookSamples.delete(instId); this.scheduleSubscriptions(); return
+    }
+    // Wait until retirement has completed, including transport reconciliation.
+    if (this.publicRealtime?.subscriptions.has(`books:${instId}`)) {
+      sample.next = Date.now() + 1_000
+      return
+    }
+    sample.pending = true
+    // Do not renew a sample from the 90-second shared snapshot cache.
+    this.books.expire(instId)
+    const task = this.books.observe(instId, this.shutdownController.signal, 'background').then(observation => {
+      if (this.closing || this.bookSamples.get(instId) !== sample || !this.currentCandidate(instrument, configKey, this.shutdownController.signal)) return
+      this.sourceError(`${instId}:book`, null)
+      this.acceptObservation(instId, 'book', observation)
+      const input = this.liquidityInput(instrument, config, this.observations.get(instId))
+      const result = this.evaluateLiquidity(input)
+      const interval = this.bookSampleInterval({ result }, config)
+      const complete = ['depth', 'slippage'].every(key => !config[key].enabled || result.checks.some(check => check.key === key && check.status === 'verified'))
+      if (complete) this.bookSamples.delete(instId)
+      else sample.next = Date.now() + (interval ?? 30_000)
+      this.publishStreamRecords([this.observedCandidate(instrument, config, configKey, this.observations.get(instId), {}, Date.now(), result)])
+      if (complete) this.scheduleSubscriptions()
+    }).catch(error => {
+      if (!this.closing && this.bookSamples.get(instId) === sample) {
+        sample.next = Date.now() + 30_000
+        this.sourceError(`${instId}:book`, error)
+      }
+    }).finally(() => { sample.pending = false; this.scheduleBookSamples() })
+    this.track(task)
+  }
+
   updateSubscriptions() {
     if (!this.realtime) return
     this.subscriptionDirty.clear()
@@ -1762,8 +1828,15 @@ export class MarketService {
       const possible = prerequisites.every(({ key, source }) => record?.configKey === configKey
         && record.result.checks?.some(check => check.key === key && check.status === 'verified')
         && this.qualificationObservation(record.observations ?? {}, source, instId, configKey, now, evidence))
+      const priorSample = this.bookSamples.get(instId)
+      const liveBookRecovered = priorSample && this.publicRealtime?.subscriptions.has(`books:${instId}`)
+        && ['depth', 'slippage'].every(key => !config[key].enabled || record?.result?.checks?.some(check => check.key === key && check.status === 'verified'))
+      if (priorSample && (priorSample.configKey !== configKey || !possible || this.statisticsDemand(instId) || liveBookRecovered)) this.bookSamples.delete(instId)
+      const interval = this.autoRefresh && possible && !this.statisticsDemand(instId) && !this.bookSamples.has(instId) ? this.bookSampleInterval(record, config) : null
+      if (interval !== null) this.bookSamples.set(instId, { configKey, next: now + interval, pending: false })
+      const sampling = this.bookSamples.has(instId)
       if (config.depth.enabled || config.slippage.enabled) {
-        if (possible) { books.add(instId); this.bookRetirements.delete(instId); if (Number.isSafeInteger(evidence.deadline)) proofDeadlines.push([instId, evidence.deadline]) }
+        if (possible && !sampling) { books.add(instId); this.bookRetirements.delete(instId); if (Number.isSafeInteger(evidence.deadline)) proofDeadlines.push([instId, evidence.deadline]) }
         else if (this.publicSubscriptionDemand?.books.has(instId)) {
           const retireAt = this.bookRetirements.get(instId) ?? now + LIST_REMOVAL_DELAY_MS
           if (retireAt > now) { books.add(instId); this.bookRetirements.set(instId, retireAt); if (Number.isSafeInteger(retireAt) && retireAt >= 0) proofDeadlines.push([instId, retireAt]) }
@@ -1773,6 +1846,8 @@ export class MarketService {
       if (this.statisticsDemand(instId)) trades.add(instId)
       if (config.openInterest.enabled || this.statisticsDemand(instId)) openInterest.add(instId)
     }
+    for (const id of this.bookSamples.keys()) if (!ids.has(id) || !(config.depth.enabled || config.slippage.enabled)) this.bookSamples.delete(id)
+    this.scheduleBookSamples()
     this.subscriptionDeadlines = new DeadlineIndex(proofDeadlines)
     const previous = this.publicSubscriptionDemand
     const same = (left, right) => left && left.size === right.size && [...right].every(id => left.has(id))
@@ -1800,6 +1875,7 @@ export class MarketService {
 
   updateDirtySubscriptions() {
     const now = Date.now(), config = this.prefs().liquidity, configKey = JSON.stringify(config), state = this.subscriptionState
+    if ([...this.subscriptionDirty].some(id => this.bookSamples.has(id) || this.bookSampleInterval(this.catalogChecks.get(id), config) !== null)) return this.updateSubscriptions()
     const current = this.subscriptionSignature(now, configKey)
     if (!state || !this.candidateIDs || !this.publicSubscriptionDemand || !this.publicRealtime
       || !this.marketDeadlineTimer || this.marketDeadlineAt === null || this.marketDeadlineAt <= now || now < state.now
@@ -3290,6 +3366,8 @@ export class MarketService {
     this.tickerSubscriptions.clear()
     if (this.instrumentRetryTimer) clearTimeout(this.instrumentRetryTimer)
     if (this.marketDeadlineTimer) clearTimeout(this.marketDeadlineTimer)
+    if (this.bookSampleTimer) clearTimeout(this.bookSampleTimer)
+    this.bookSamples.clear()
     this.marketDeadlineTimer = null; this.marketDeadlineAt = null; this.marketDeadlineState = null
     this.marketDeadlineIndex.clear(); this.marketRemovalIndex.clear()
     this.subscriptionDeadlines.clear(); this.subscriptionDirty.clear()
