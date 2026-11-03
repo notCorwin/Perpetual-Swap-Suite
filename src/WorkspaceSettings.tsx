@@ -303,12 +303,12 @@ export function WorkspaceSettings({ section, preferences, loaded, loadError, onS
           <FieldSet disabled={preferenceDisabled} aria-label="Audit range"><FieldGroup>
             {numericField('historyDays', 'Data audit lookback (days)')}
           </FieldGroup></FieldSet>
-          <p role="status" className="text-sm capitalize">{audit.phase} · {audit.progress.completed} / {audit.progress.total}</p>
-          <Progress aria-label="Data audit progress" value={audit.progress.total ? audit.progress.completed / audit.progress.total * 100 : 0} />
+          <p role="status" className="text-sm">{audit.phase === 'validating' ? 'Validating recent changes · results are provisional' : `${audit.phase} · ${audit.progress.completed} / ${audit.progress.total}`}</p>
+          {audit.phase !== 'validating' && <Progress aria-label="Data audit progress" value={audit.progress.total ? audit.progress.completed / audit.progress.total * 100 : 0} />}
           <div className="flex flex-wrap gap-2">
-            <Button type="button" variant="outline" onClick={() => void auditAction('start')} disabled={auditBusy || audit.phase === 'running'}>Start audit</Button>
-            <Button type="button" variant="outline" onClick={() => void auditAction('cancel')} disabled={auditBusy || audit.phase !== 'running'}>Cancel audit</Button>
-            <Button type="button" variant="outline" onClick={() => void auditAction('repair')} disabled={auditBusy || audit.phase === 'running' || !audit.issues.some(issue => issue.repairable)}>Repair issues</Button>
+            <Button type="button" variant="outline" onClick={() => void auditAction('start')} disabled={auditBusy || audit.phase === 'running' || audit.phase === 'validating'}>Start audit</Button>
+            <Button type="button" variant="outline" onClick={() => void auditAction('cancel')} disabled={auditBusy || (audit.phase !== 'running' && audit.phase !== 'validating')}>Cancel audit</Button>
+            <Button type="button" variant="outline" onClick={() => void auditAction('repair')} disabled={auditBusy || audit.phase === 'running' || audit.phase === 'validating' || !audit.issues.some(issue => issue.repairable)}>Repair issues</Button>
           </div>
           {(auditError || auditStatusError || audit.error) && <p role="alert" className="text-sm text-destructive">{auditError || auditStatusError || audit.error}</p>}
           {audit.issues.length > 0 && <ul className="flex max-h-48 flex-col gap-2 overflow-y-auto text-sm" aria-label="Data audit issues">{audit.issues.map((issue, index) => <li key={`${issue.instrument}-${issue.timeframe}-${issue.from}-${index}`}>

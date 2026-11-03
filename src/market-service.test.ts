@@ -1365,6 +1365,14 @@ test('dispose aborts noncooperative HTTP and Retry-After pacing before closing s
   } finally { await f.close() }
 })
 
+test('audit validation is published as ongoing until the job completes', () => {
+  const snapshot = (MarketService.prototype as any).auditSnapshot
+  const job = { id: 'audit', status: 'running', phase: 'stabilize', targets: [{ instrument: instId, timeframe: '5m', from: 0, through: 0 }], cursor: { targetIndex: 1, nextFrom: 0 }, issues: [], error: '' }
+  assert.equal(snapshot.call(null, job).phase, 'validating')
+  assert.equal(snapshot.call(null, { ...job, status: 'completed' }).phase, 'completed')
+  assert.equal(snapshot.call(null, { ...job, status: 'cancelled' }).phase, 'cancelled')
+})
+
 test('manual audit scans, repairs only its findings, and invalidates canonical generations', async () => {
   const f = await fixture()
   const reports: DataAuditSnapshot[] = []

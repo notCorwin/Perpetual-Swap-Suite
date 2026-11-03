@@ -31,7 +31,7 @@ export type MarketSnapshot = {
 export type UnchangedSnapshot = Partial<Omit<MarketSnapshot, 'rows'>> & { unchanged: true; revision: number; error: string }
 export type DataAudit = {
   revision: number; serviceSession: string
-  id?: string; phase: 'idle' | 'running' | 'completed' | 'cancelled' | 'failed'
+  id?: string; phase: 'idle' | 'running' | 'validating' | 'completed' | 'cancelled' | 'failed'
   progress: { completed: number; total: number }
   issues: { instrument: string; timeframe: string; from: number; through: number; reason: string; repairable: boolean }[]
   error: string

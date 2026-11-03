@@ -47,7 +47,7 @@ test('checkpoints publish the exact saved job and isolate observer mutation, thr
     assert.equal(saved.cursor.targetIndex, 1)
     assert.equal(saved.issues.length, 1)
     assert.deepEqual(audit.get(started.id), saved)
-    assert.deepEqual(reports.map(job => job.status), ['queued', 'running', 'running', 'completed'])
+    assert.deepEqual(reports.map(job => job.status), ['queued', 'running', 'running', 'running', 'completed'])
     assert.deepEqual(reports.at(-1), saved)
   } finally { clearTimeout(timeout); observer.resolve(); await audit.close() }
 })
@@ -274,7 +274,7 @@ test('repair fetches only reported anomalies and verification narrows remaining 
     assert.deepEqual(repairs, [['gap', 0, 2 * interval], ['invalid-ohlc', 4 * interval, 4 * interval]])
     assert.deepEqual(inspections.slice(1), [[0, 2 * interval], [4 * interval, 4 * interval]])
     assert.equal(report.status, 'completed')
-    assert.equal(report.phase, 'verify')
+    assert.equal(report.phase, 'stabilize')
     assert.deepEqual(report.issues.filter(issue => issue.status === 'open').map(issue => [issue.reason, issue.from, issue.through]), [
       ['gap', 2 * interval, 2 * interval], ['missing-base-volume', 3 * interval, 3 * interval], ['negative-volume', 4 * interval, 4 * interval],
     ])
@@ -593,5 +593,103 @@ test('completion waits for an already dispatched write before publishing its rep
     assert.equal(report.status, 'completed')
     assert.deepEqual(report.issues.filter(issue => issue.status === 'open'), [])
     assert.equal(report.summary.resolved, 1)
+  } finally { await audit.close(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('unrelated writes beyond the bounded journal do not cause a target rescan', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-audit-unrelated-'))
+  const store = await MarketStore.open(root)
+  const entered = deferred<void>(), release = deferred<void>()
+  const candle = (timestamp: number, close = 100) => ({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp, open: 100, high: 102, low: 99, close, volume: 1, baseVolume: 1, quoteVolume: 100, confirmed: true })
+  let calls = 0
+  const audit = new DataAudit({ metadata: new MemoryMetadata(), store, inspect: async (query, { signal }) => {
+    calls++
+    const result = await store.inspectCandles(query, 'background')
+    entered.resolve(); await release.promise
+    signal.throwIfAborted(); return result
+  } })
+  try {
+    await store.appendCandles([candle(0)])
+    const { id } = audit.start({ targets: [target(0, 0)] })
+    await entered.promise
+    for (let index = 0; index < 270; index++) await store.appendCandles([candle(day, index % 2 ? 100 : 101)])
+    release.resolve(); await audit.whenIdle()
+    assert.equal(audit.get(id)!.status, 'completed')
+    assert.equal(calls, 1, 'writes outside the target must not trigger a recheck even after journal overflow')
+  } finally { release.resolve(); await audit.close(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a changing candle is checked at bucket granularity and the report remains running until stable', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-audit-continuous-'))
+  const store = await MarketStore.open(root)
+  const entered = deferred<void>(), release = deferred<void>(), checking = deferred<void>(), releaseChecking = deferred<void>()
+  const candle = (timestamp: number, close = 100) => ({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp, open: 100, high: 102, low: 99, close, volume: 1, baseVolume: 1, quoteVolume: 100, confirmed: true })
+  const calls: Array<[number, number]> = []
+  const audit = new DataAudit({ metadata: new MemoryMetadata(), store, inspect: async (query, { signal }) => {
+    calls.push([query.from, query.through])
+    const result = await store.inspectCandles(query, 'background')
+    if (calls.length === 1) { entered.resolve(); await release.promise }
+    if (calls.length === 2) { checking.resolve(); await releaseChecking.promise }
+    signal.throwIfAborted(); return result
+  } })
+  try {
+    await store.appendCandles(Array.from({ length: 288 }, (_, index) => candle(index * interval)))
+    const { id } = audit.start({ targets: [target(0, day - interval)] })
+    await entered.promise
+    const changed = 48 * interval
+    await store.appendCandles([candle(changed, 101)])
+    release.resolve(); await checking.promise
+    assert.equal(audit.get(id)!.status, 'running')
+    assert.equal(audit.get(id)!.phase, 'stabilize')
+    await store.appendCandles([candle(changed, 100)])
+    assert.equal(audit.get(id)!.completedAt, null)
+    releaseChecking.resolve(); await audit.whenIdle()
+    assert.equal(audit.get(id)!.status, 'completed')
+    assert.deepEqual(calls.slice(1), [[changed, changed + interval - 1], [changed, changed + interval - 1]])
+    assert.equal(audit.get(id)!.summary.open, 0)
+  } finally { release.resolve(); releaseChecking.resolve(); await audit.close(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a changed bucket inside a spanning gap rechecks the whole finding before resolving it', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-audit-gap-'))
+  const store = await MarketStore.open(root), entered = deferred<void>(), release = deferred<void>()
+  const calls: Array<[number, number]> = []
+  const audit = new DataAudit({ metadata: new MemoryMetadata(), store, inspect: async (query, { signal }) => {
+    calls.push([query.from, query.through])
+    const result = await store.inspectCandles(query, 'background')
+    if (calls.length === 1) { entered.resolve(); await release.promise }
+    signal.throwIfAborted(); return result
+  } })
+  try {
+    const { id } = audit.start({ targets: [target(0, 2 * interval)] })
+    await entered.promise
+    await store.appendCandles([{ instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp: interval, open: 100, high: 101, low: 99, close: 100, volume: 1, baseVolume: 1, quoteVolume: 100, confirmed: true }])
+    release.resolve(); await audit.whenIdle()
+    assert.deepEqual(calls[1], [0, 2 * interval])
+    assert.deepEqual(audit.get(id)!.issues.filter(issue => issue.status === 'open').map(issue => [issue.from, issue.through]), [[0, 0], [2 * interval, 2 * interval]])
+  } finally { release.resolve(); await audit.close(); await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('repair also refreshes changes made to other targets since the preceding completed report', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-audit-repair-watermark-'))
+  const store = await MarketStore.open(root)
+  const candle = (timestamp: number) => ({ instrument: 'BTC-USDT-SWAP', timeframe: '5m', timestamp, open: 100, high: 101, low: 99, close: 100, volume: 1, baseVolume: 1, quoteVolume: 100, confirmed: true })
+  const calls: Array<[number, number]> = []
+  const audit = new DataAudit({ metadata: new MemoryMetadata(), store, inspect: async query => {
+    calls.push([query.from, query.through])
+    const result = await store.inspectCandles(query, 'background')
+    if (query.from === day) result.issues = result.issues.map(issue => ({ ...issue, repairable: false }))
+    return result
+  }, repair: async issue => { await store.appendCandles([candle(issue.from)]) } })
+  try {
+    await store.appendCandles([candle(day + interval)])
+    const { id } = audit.start({ targets: [target(0, 0), target(day, day + interval)] })
+    await audit.whenIdle()
+    assert.equal(audit.get(id)!.summary.open, 2)
+    await store.appendCandles([candle(day)])
+    audit.repair(id); await audit.whenIdle()
+    assert.equal(audit.get(id)!.status, 'completed')
+    assert.equal(audit.get(id)!.summary.open, 0)
+    assert.deepEqual(calls.filter(([from]) => from === day), [[day, day + interval], [day, day + interval - 1]], 'only the externally changed bucket is rechecked')
   } finally { await audit.close(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })

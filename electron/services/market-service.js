@@ -3177,7 +3177,7 @@ export class MarketService {
     const completed = job.phase !== 'inspect' || job.status === 'completed' ? total
       : job.targets.slice(0, targetIndex).reduce((sum, target) => sum + slots(target), 0)
         + (job.targets[targetIndex] ? Math.max(0, Math.floor((job.cursor.nextFrom - job.targets[targetIndex].from) / timeframeMilliseconds(job.targets[targetIndex].timeframe))) : 0)
-    return { id: job.id, phase: ['queued', 'running', 'paused'].includes(job.status) ? 'running' : job.status,
+    return { id: job.id, phase: ['queued', 'running', 'paused'].includes(job.status) ? job.phase === 'stabilize' ? 'validating' : 'running' : job.status,
       progress: { completed: Math.min(total, completed), total },
       issues: job.issues.filter(issue => issue.status === 'open').map(({ instrument, timeframe, from, through, reason, repairable }) => ({ instrument, timeframe, from, through, reason, repairable })), error: job.error ?? '' }
   }

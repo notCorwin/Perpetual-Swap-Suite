@@ -8,7 +8,7 @@ export type AuditRecord = {
   id: string
   schemaVersion?: 1
   status: 'queued' | 'running' | 'paused' | 'completed' | 'cancelled' | 'failed'
-  phase?: 'inspect' | 'repair' | 'verify'
+  phase?: 'inspect' | 'repair' | 'verify' | 'stabilize'
   [key: string]: unknown
 }
 export type CatalogEntry = {

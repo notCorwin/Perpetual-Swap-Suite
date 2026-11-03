@@ -153,7 +153,7 @@ function recoveredJob(row) {
     if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`Invalid audit checkpoint: ${field}.`)
   }
   if (!job || job.schemaVersion !== 1 || typeof job.id !== 'string' || !job.id.trim()) throw new TypeError('Invalid audit checkpoint identity or schema.')
-  if (!['queued', 'running', 'paused', 'completed', 'cancelled', 'failed'].includes(job.status) || !['inspect', 'repair', 'verify'].includes(job.phase)) throw new TypeError('Invalid audit checkpoint state.')
+  if (!['queued', 'running', 'paused', 'completed', 'cancelled', 'failed'].includes(job.status) || !['inspect', 'repair', 'verify', 'stabilize'].includes(job.phase)) throw new TypeError('Invalid audit checkpoint state.')
   if (!Array.isArray(job.targets) || !job.targets.length) throw new TypeError('Invalid audit checkpoint targets.')
   job.targets = job.targets.map(targetOf)
   if (!job.cursor || typeof job.cursor !== 'object') throw new TypeError('Invalid audit checkpoint cursor.')
@@ -219,6 +219,7 @@ export class DataAudit {
     this.metadata = metadata
     this.store = store
     this.auditRevisions = new WeakMap()
+    this.auditChanges = new Map()
     this.inspect = inspect ?? ((target, _options) => store.inspectCandles(target, 'background'))
     this.repairRange = repair
     this.onCheckpoint = onCheckpoint
@@ -233,9 +234,11 @@ export class DataAudit {
     this.runner = null
     this.closed = false
     this.closeTask = null
+    this.unsubscribeChanges = store?.subscribe?.(change => this.recordChange(change))
     for (const job of metadata.listAudits().map(recoveredJob)) {
       this.jobs.set(job.id, job)
       if (ACTIVE.has(job.status)) {
+        this.trackChanges(job, true)
         job.status = 'queued'
         this.save(job)
         this.enqueue(job.id)
@@ -285,7 +288,8 @@ export class DataAudit {
       createdAt: timestamp, updatedAt: timestamp, completedAt: null,
     }
     this.trackRevisions(job)
-    this.save(job)
+    this.trackChanges(job)
+    try { this.save(job) } catch (error) { this.auditChanges.delete(job.id); throw error }
     this.jobs.set(id, job)
     this.enqueue(id)
     return clone(job)
@@ -304,6 +308,7 @@ export class DataAudit {
     this.save(job)
     this.jobs.set(id, job)
     this.controllers.get(id)?.abort()
+    this.auditChanges.delete(id)
     return clone(job)
   }
 
@@ -313,9 +318,10 @@ export class DataAudit {
     if (ACTIVE.has(current.status) || current.status === 'completed') return clone(current)
     if (current.phase === 'repair' && typeof this.repairRange !== 'function') throw new Error('A repair callback is required to resume this audit.')
     const job = clone(current)
+    this.trackChanges(job, true)
     job.status = 'queued'
     delete job.error
-    this.save(job)
+    try { this.save(job) } catch (error) { this.auditChanges.delete(job.id); throw error }
     this.jobs.set(id, job)
     this.enqueue(id)
     return clone(job)
@@ -330,6 +336,15 @@ export class DataAudit {
     if (typeof this.repairRange !== 'function') throw new Error('A repair callback is required; audit never invents missing market data.')
     const job = clone(current)
     this.trackRevisions(job)
+    this.trackChanges(job)
+    const tracked = this.auditChanges.get(job.id), completed = this.auditRevisions.get(current)
+    if (tracked) for (let index = 0; index < job.targets.length; index++) {
+      const target = job.targets[index], key = JSON.stringify([target.instrument, target.timeframe])
+      const ranges = completed && this.store?.candlePriceChangesSince
+        ? this.store.candlePriceChangesSince(target.instrument, target.timeframe, completed.get(key) ?? -1).ranges : null
+      if (ranges === null) tracked.ranges[index] = null
+      else for (const range of ranges) this.recordTargetChange(tracked, index, { instrument: target.instrument, timeframe: target.timeframe, ...range, priceFrom: range.from, priceThrough: range.through })
+    }
     job.phase = 'repair'
     job.status = 'queued'
     job.completedAt = null
@@ -347,7 +362,7 @@ export class DataAudit {
       issue.repairStatus = 'pending'
       delete issue.repairError
     }
-    this.save(job)
+    try { this.save(job) } catch (error) { this.auditChanges.delete(job.id); throw error }
     this.jobs.set(id, job)
     this.enqueue(id)
     return clone(job)
@@ -380,6 +395,7 @@ export class DataAudit {
           if (job.phase === 'inspect') await this.inspectNext(job, controller.signal)
           else if (job.phase === 'repair') await this.repairNext(job, controller.signal)
           else if (job.phase === 'verify') await this.verifyNext(job, controller.signal)
+          else if (job.phase === 'stabilize') await this.stabilize(job, controller.signal)
           else throw new Error('Unsupported audit phase.')
         }
       } catch (error) {
@@ -387,6 +403,7 @@ export class DataAudit {
           job.status = 'failed'
           job.error = message(error)
           this.save(job)
+          this.auditChanges.delete(job.id)
         }
       } finally {
         if (this.controllers.get(id) === controller) this.controllers.delete(id)
@@ -400,7 +417,46 @@ export class DataAudit {
     job.status = 'completed'
     job.completedAt = this.now()
     delete job.error
+    this.trackRevisions(job)
+    this.auditChanges.delete(job.id)
     this.save(job)
+  }
+
+  // Unlike the bounded store journal, a live subscription retains only changes
+  // intersecting these targets, no matter how busy unrelated candles become.
+  trackChanges(job, full = false) {
+    if (!this.unsubscribeChanges) return
+    this.auditChanges.set(job.id, { job, ranges: job.targets.map(() => full ? null : []) })
+  }
+
+  recordChange(change) {
+    for (const state of this.auditChanges.values()) for (let index = 0; index < state.job.targets.length; index++) this.recordTargetChange(state, index, change)
+  }
+
+  recordTargetChange(state, index, change) {
+    const known = Number.isSafeInteger(change.priceFrom) && Number.isSafeInteger(change.priceThrough)
+      && change.priceFrom >= 0 && change.priceFrom <= change.priceThrough
+      && Number.isSafeInteger(change.from) && Number.isSafeInteger(change.through)
+      && change.priceFrom >= change.from && change.priceThrough <= change.through
+    if (change.priceFrom === null && change.priceThrough === null) return
+      const target = state.job.targets[index], pending = state.ranges[index]
+      if (target.instrument !== change.instrument || target.timeframe !== change.timeframe || pending === null) return
+      if (!known) { state.ranges[index] = null; return }
+      const interval = INTERVALS[target.timeframe]
+      const first = Math.floor(change.priceFrom / interval) * interval
+      const last = Math.floor(change.priceThrough / interval) * interval + interval - 1
+      if (first > target.through || last < target.from) return
+      const from = Math.max(target.from, first), through = Math.min(target.through, last)
+      pending.push({ from, through })
+      pending.sort((a, b) => a.from - b.from)
+      for (let i = 1; i < pending.length;) {
+        if (pending[i].from <= pending[i - 1].through + INTERVALS[target.timeframe]) {
+          pending[i - 1].through = Math.max(pending[i - 1].through, pending[i].through); pending.splice(i, 1)
+        } else i++
+      }
+      // Bound bookkeeping under sparse, sustained writes; a wider recheck is
+      // conservative and cheaper than an indefinitely growing range list.
+      if (pending.length > 256) pending.splice(0, pending.length, { from: pending[0].from, through: pending.at(-1).through })
   }
 
   // Track the canonical price revision from before inspection or repair starts.
@@ -417,6 +473,8 @@ export class DataAudit {
   }
 
   async stabilize(job, signal) {
+    const tracked = this.auditChanges.get(job.id)
+    if (tracked?.job === job) return this.stabilizeTracked(job, signal, tracked)
     if (!this.store?.candlePriceRevision || !this.store?.candlePriceChangesSince) { this.complete(job); return }
     let revisions = this.auditRevisions.get(job)
     if (!revisions) {
@@ -461,8 +519,63 @@ export class DataAudit {
       if (!queries.length) {
         const finish = () => {
           if (!this.isCurrent(job, signal)) return true
-          if (job.targets.some(target => this.store.candlePriceRevision(target.instrument, target.timeframe)
-            !== revisions.get(JSON.stringify([target.instrument, target.timeframe])))) return false
+          if (job.targets.some(target => {
+            const ranges = this.store.candlePriceChangesSince(target.instrument, target.timeframe, revisions.get(JSON.stringify([target.instrument, target.timeframe]))).ranges
+            return ranges === null || ranges.some(range => range.from <= target.through && range.through >= target.from)
+          })) return false
+          this.complete(job)
+          return true
+        }
+        if (this.store.withCandleCommitFence ? await this.store.withCandleCommitFence(finish) : finish()) return
+        continue
+      }
+      for (const query of queries) {
+        await yieldToBackground()
+        if (!this.isCurrent(job, signal)) return
+        const result = await this.inspect(query, { signal, priority: 'background' })
+        if (!this.isCurrent(job, signal)) return
+        this.reconcile(job, query, result)
+        this.save(job)
+      }
+    }
+  }
+
+  async stabilizeTracked(job, signal, tracked) {
+    while (this.isCurrent(job, signal)) {
+      const dirty = tracked.ranges
+      tracked.ranges = job.targets.map(() => [])
+      const queries = []
+      for (let index = 0; index < job.targets.length; index++) {
+        const target = job.targets[index], interval = INTERVALS[target.timeframe]
+        const ranges = dirty[index] === null ? [target] : dirty[index]
+        for (const range of ranges) {
+          let from = Math.max(target.from, Math.floor(range.from / interval) * interval)
+          const end = Math.min(target.through, Math.floor(range.through / interval) * interval + interval - 1)
+          while (from <= end) {
+            const boundary = (Math.floor(from / this.chunkMilliseconds) + 1) * this.chunkMilliseconds
+            const next = Math.ceil(boundary / interval) * interval
+            let query = { ...target, from, through: Math.min(end, next - 1) }, expanded = true
+            // Findings such as gaps or damaged files can span the changed
+            // bucket; only a complete observation can resolve them safely.
+            while (expanded) {
+              expanded = false
+              for (const issue of job.issues) if (issue.status === 'open' && overlaps(query, issue)
+                && (issue.from < query.from || issue.through > query.through)) {
+                query = { ...query, from: Math.min(query.from, issue.from), through: Math.max(query.through, issue.through) }
+                expanded = true
+              }
+            }
+            const previous = queries.find(value => overlaps(value, query))
+            if (previous) { previous.from = Math.min(previous.from, query.from); previous.through = Math.max(previous.through, query.through) }
+            else queries.push(query)
+            from = next
+          }
+        }
+      }
+      if (!queries.length) {
+        const finish = () => {
+          if (!this.isCurrent(job, signal)) return true
+          if (tracked.ranges.some(ranges => ranges === null || ranges.length)) return false
           this.complete(job)
           return true
         }
@@ -482,7 +595,7 @@ export class DataAudit {
 
   async inspectNext(job, signal) {
     const target = job.targets[job.cursor.targetIndex]
-    if (!target) { await this.stabilize(job, signal); return }
+    if (!target) { job.phase = 'stabilize'; this.save(job); await this.stabilize(job, signal); return }
     const from = job.cursor.nextFrom ?? target.from
     const interval = INTERVALS[target.timeframe]
     const boundary = (Math.floor(from / this.chunkMilliseconds) + 1) * this.chunkMilliseconds
@@ -530,7 +643,7 @@ export class DataAudit {
 
   async verifyNext(job, signal) {
     const target = job.verifyTargets[job.verifyIndex]
-    if (!target) { await this.stabilize(job, signal); return }
+    if (!target) { job.phase = 'stabilize'; this.save(job); await this.stabilize(job, signal); return }
     const result = await this.inspect(clone(target), { signal, priority: 'background' })
     if (!this.isCurrent(job, signal)) return
     this.reconcile(job, target, result)
@@ -582,6 +695,8 @@ export class DataAudit {
   close() {
     if (this.closeTask) return this.closeTask
     this.closed = true
+    this.unsubscribeChanges?.()
+    this.auditChanges.clear()
     for (const [id, current] of this.jobs) {
       if (current.status !== 'running') continue
       const job = clone(current)

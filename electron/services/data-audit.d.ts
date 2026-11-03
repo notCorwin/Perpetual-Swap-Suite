@@ -33,7 +33,7 @@ export type AuditJob = {
   id: string
   schemaVersion: 1
   status: 'queued' | 'running' | 'paused' | 'completed' | 'cancelled' | 'failed'
-  phase: 'inspect' | 'repair' | 'verify'
+  phase: 'inspect' | 'repair' | 'verify' | 'stabilize'
   targets: Array<AuditTarget & { source: 'candles' }>
   cursor: { targetIndex: number; nextFrom: number | null }
   issues: AuditIssue[]
@@ -64,6 +64,7 @@ export class DataAudit {
       withCandleCommitFence?<T>(callback: () => T): Promise<T>
       candlePriceRevision?(instrument: string, timeframe: string): number
       candlePriceChangesSince?(instrument: string, timeframe: string, revision: number): { revision: number; ranges: Array<{ from: number; through: number }> | null }
+      subscribe?(listener: (change: { instrument: string; timeframe: string; priceFrom?: number | null; priceThrough?: number | null }) => void): () => void
     }
     metadata: AuditMetadata
     inspect?: AuditInspect

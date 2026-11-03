@@ -72,7 +72,7 @@ function validateAudit(value) {
   identifier(copy.id, 'Job id')
   if (Object.hasOwn(copy, 'schemaVersion') && copy.schemaVersion !== 1) throw new TypeError('Unsupported metadata schema version.')
   if (!AUDIT_STATUSES.has(copy.status)) throw new TypeError('Invalid audit status.')
-  if (Object.hasOwn(copy, 'phase') && !['inspect', 'repair', 'verify'].includes(copy.phase)) throw new TypeError('Invalid audit phase.')
+  if (Object.hasOwn(copy, 'phase') && !['inspect', 'repair', 'verify', 'stabilize'].includes(copy.phase)) throw new TypeError('Invalid audit phase.')
   for (const field of ['createdAt', 'updatedAt', 'completedAt', 'nextAttemptAt', 'attempts', 'writtenRecords', 'checkedRows', 'checkedFiles', 'files', 'verificationCheckedRows', 'verificationFiles', 'repairIndex', 'verifyIndex']) {
     if (Object.hasOwn(copy, field) && copy[field] !== null) integer(copy[field], field)
   }
