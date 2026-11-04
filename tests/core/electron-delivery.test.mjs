@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, readdir, writeFile, cp, rm } from 'node:fs/pr
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { fingerprintInputs, installApp } from '../../scripts/electron-delivery.mjs'
+import { fingerprintInputs, installApp, withBuildCleanup } from '../../scripts/electron-delivery.mjs'
 
 test('packaging fingerprints ignore Finder metadata while detecting changed application inputs', async t => {
   const root = await mkdtemp(join(tmpdir(), 'perpetual-swap-fingerprint-test-'))
@@ -97,3 +97,29 @@ test('delivery rejects a missing verification contract before copying or replaci
   await assert.rejects(installApp(options), /verification contract is required/)
   assert.equal(await readFile(join(options.destination, 'revision'), 'utf8'), 'old')
 })
+
+for (const fails of [false, true]) {
+  test(`app build cleanup removes temporary files after ${fails ? 'failure' : 'success'} and preserves the app`, async t => {
+    const root = await mkdtemp(join(tmpdir(), 'perpetual-swap-cleanup-test-'))
+    t.after(() => rm(root, { recursive: true, force: true }))
+    const build = join(root, '.build')
+    const artifact = join(root, 'dist', 'Suite.app', 'Contents', 'app')
+    await mkdir(join(build, 'old-test-replica'), { recursive: true })
+    await writeFile(join(build, 'old-test-replica', 'data'), 'stale')
+    await mkdir(join(root, 'dist', 'Suite.app', 'Contents'), { recursive: true })
+    await writeFile(artifact, 'packaged app')
+    const failure = new Error('Packaging failed')
+    const operation = withBuildCleanup(root, async () => {
+      assert.equal(await readFile(join(build, 'old-test-replica', 'data'), 'utf8'), 'stale')
+      await writeFile(join(build, 'build-revision.json'), 'metadata')
+      if (fails) throw failure
+      return 'packaged'
+    })
+    if (fails) await assert.rejects(operation, error => error === failure)
+    else assert.equal(await operation, 'packaged')
+    await assert.rejects(readdir(build), { code: 'ENOENT' })
+    assert.equal(await readFile(artifact, 'utf8'), 'packaged app')
+    // Cleanup also succeeds when no temporary directory was created.
+    await withBuildCleanup(root, async () => {})
+  })
+}

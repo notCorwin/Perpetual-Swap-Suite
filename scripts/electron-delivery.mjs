@@ -9,6 +9,26 @@ import { createHash, randomUUID } from 'node:crypto'
 const execute = promisify(execFile)
 export const productName = 'Perpetual Swap Suite'
 
+// Keep packaged artifacts in dist; discard build metadata, reports, and test replicas
+// only after the operation has finished using them, including on failure.
+export async function withBuildCleanup(root, operation) {
+  let operationFailure
+  try {
+    return await operation()
+  } catch (error) {
+    operationFailure = { error }
+    throw error
+  } finally {
+    try {
+      await rm(join(root, '.build'), { recursive: true, force: true })
+    } catch (cause) {
+      const cleanupError = new Error('Could not remove .build after the app build. Close processes using it and remove the directory before rebuilding.', { cause })
+      if (operationFailure) throw new AggregateError([operationFailure.error, cleanupError], 'The app build and .build cleanup both failed.')
+      throw cleanupError
+    }
+  }
+}
+
 export async function fingerprintInputs(root) {
   const hash = createHash('sha256')
   const visit = async (path, relative) => {
