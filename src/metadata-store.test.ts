@@ -76,6 +76,32 @@ test('unchanged preference saves keep their durable revision', async () => {
   } finally { store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
+test('identical metadata checkpoints cause no SQLite commit and changed values survive reopen', async () => {
+  const root = await temporary()
+  let store = await MetadataStore.open(root)
+  const observer = new DatabaseSync(join(root, 'metadata.sqlite'), { readOnly: true })
+  const version = () => observer.prepare('PRAGMA data_version').get()!.data_version
+  const audit = { id: 'checkpoint', status: 'running' as const, phase: 'inspect' as const, checkedRows: 42 }
+  const download = emptyHistoryDownload(), catalog = catalogEntry()
+  try {
+    store.saveAudit(audit); store.saveHistoryDownload(download); store.putCatalogEntry(catalog)
+    const before = version()
+    for (let count = 0; count < 20; count++) {
+      store.saveAudit(structuredClone(audit))
+      store.saveHistoryDownload(structuredClone(download))
+      store.putCatalogEntry(structuredClone(catalog))
+    }
+    assert.equal(version(), before, 'Unchanged checkpoints must not dirty database pages or append to the WAL.')
+    const changed = { ...catalog, observedAt: 1500 }
+    store.putCatalogEntry(changed)
+    assert.notEqual(version(), before)
+    store.close(); store = await MetadataStore.open(root)
+    assert.deepEqual(store.getCatalogEntry(catalog.instrumentID), changed)
+    assert.deepEqual(store.getAudit(audit.id), audit)
+    assert.deepEqual(store.getHistoryDownload(), download)
+  } finally { observer.close(); store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
 test('independent connections merge settings at the latest revision and reject stale conditional writes', async () => {
   const root = await temporary()
   const first = await MetadataStore.open(root)

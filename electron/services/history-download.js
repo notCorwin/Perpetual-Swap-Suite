@@ -4,6 +4,7 @@ import { CANDLE_INTERVALS } from './market-store.js'
 const clone = value => structuredClone(value)
 const count = (from, through, step) => Math.max(0, Math.floor((through - from) / step) + 1)
 const message = error => error instanceof Error ? error.message : String(error)
+const CHECKPOINT_INTERVAL_MS = 1_000
 export const emptyHistoryDownload = () => ({
   schemaVersion: 2, phase: 'idle', startedAt: null, updatedAt: null, finishedAt: null,
   contracts: { completed: 0, total: 0 }, streams: { completed: 0, total: 0 },
@@ -27,6 +28,8 @@ export class HistoryDownload {
     this.heldProgress = { available: 0, empty: 0, unavailable: 0, reused: 0 }
     this.job = null
     this.timer = null
+    this.checkpointTimer = null
+    this.checkpointAt = -Infinity
     this.closed = false
     if (this.report.phase === 'running') {
       this.report.phase = 'cancelled'; this.report.finishedAt = now(); this.report.updatedAt = now()
@@ -42,7 +45,20 @@ export class HistoryDownload {
       clearTimeout(this.timer); this.timer = null
       if (this.job) this.update()
       this.report.updatedAt = this.now()
-      try { this.metadata.saveHistoryDownload(this.report) }
+      // The source rows are already durable. UI progress can advance at 10 Hz
+      // without rewriting its restart summary at the same rate. Lifecycle
+      // transitions still checkpoint synchronously, including cancellation.
+      try {
+        if (immediate || this.report.updatedAt < this.checkpointAt || this.report.updatedAt - this.checkpointAt >= CHECKPOINT_INTERVAL_MS) {
+          clearTimeout(this.checkpointTimer); this.checkpointTimer = null
+          this.metadata.saveHistoryDownload(this.report)
+          this.checkpointAt = this.report.updatedAt
+        } else {
+          // A last partial page may be followed by a stalled source. Save that
+          // progress at the deadline even if no further observation arrives.
+          this.checkpointTimer ??= setTimeout(() => this.publish(true), CHECKPOINT_INTERVAL_MS - (this.report.updatedAt - this.checkpointAt))
+        }
+      }
       catch (error) {
         this.report.error = `Could not save download progress: ${message(error)}`
         if (this.job) {
@@ -321,5 +337,6 @@ export class HistoryDownload {
     this.closed = true
     await this.cancel()
     clearTimeout(this.timer); this.timer = null
+    clearTimeout(this.checkpointTimer); this.checkpointTimer = null
   }
 }

@@ -221,7 +221,7 @@ export class MetadataStore {
 
   #put(table, id, value) {
     this.#assertOpen()
-    this.#database.prepare(`INSERT INTO ${table} (id, value) VALUES (?, ?) ON CONFLICT (id) DO UPDATE SET value = excluded.value`).run(id, JSON.stringify(value))
+    this.#database.prepare(`INSERT INTO ${table} (id, value) VALUES (?, ?) ON CONFLICT (id) DO UPDATE SET value = excluded.value WHERE value IS NOT excluded.value`).run(id, JSON.stringify(value))
     return value
   }
 

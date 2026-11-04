@@ -212,6 +212,15 @@ function readyWindow(meta: PreparedChartMeta, bars: readonly PreparedChartBar[],
   return presentWindow(meta, bars, endHour, liveBar, first, complete, price, oi, taker, indicator, previous)
 }
 
+// Live deltas change freshness and the forming candle, but not the source
+// slots that established a historical window's availability and statuses.
+function refreshHistoricalWindow(meta: PreparedChartMeta, previous: ReadyChartWindow): ReadyChartWindow {
+  const first = Math.max(previous.endHour - (WINDOW_BARS - 1) * meta.intervalMS, meta.historyExhausted ? meta.oldestHour ?? -Infinity : -Infinity)
+  return presentWindow(meta, previous.bars, previous.endHour, undefined, first, previous.priceState === 'ready', previous.priceStatus,
+    { state: previous.oiState, status: previous.oiStatus }, { state: previous.takerState, status: previous.takerStatus },
+    { state: previous.indicatorState, status: previous.indicatorStatus }, previous)
+}
+
 function liveWindow(meta: PreparedChartMeta, liveBar: Bar | undefined, previous: ReadyChartWindow): ReadyChartWindow {
   // A nonempty ready/stale price window has already proven every completed
   // slot. The accepted live delta changes no completed bars, source statuses,
@@ -636,7 +645,12 @@ export class PreparedChartStore {
     // Immutable metadata owns source status/freshness; version owns changed or
     // evicted bars. Repeated navigation reads need no 96-slot projection work.
     const reusable = cached?.meta === entry.meta && cached.version === entry.version && cached.liveBar === liveBar
-    const window = reusable ? cached.window : measureOperation({ category: 'cpu', name: 'chart.window.project', resource: entry.meta.instId,
+    const historicalRefresh = cached && cached.version === entry.version && !liveBar && !cached.liveBar
+      && endHour !== cached.meta.latestEnd && endHour !== entry.meta.latestEnd
+      && cached.meta.generation === entry.meta.generation && cached.meta.intervalMS === entry.meta.intervalMS
+      && cached.meta.latestEnd === entry.meta.latestEnd && cached.meta.oldestHour === entry.meta.oldestHour
+      && cached.meta.historyExhausted === entry.meta.historyExhausted && cached.meta.sourceStatuses === entry.meta.sourceStatuses
+    const window = reusable ? cached.window : historicalRefresh ? refreshHistoricalWindow(entry.meta, cached.window) : measureOperation({ category: 'cpu', name: 'chart.window.project', resource: entry.meta.instId,
       attributes: { inputRows: WINDOW_BARS } }, () => {
       const bars: PreparedChartBar[] = []
       for (let index = WINDOW_BARS - 1; index >= 0; index -= 1) {

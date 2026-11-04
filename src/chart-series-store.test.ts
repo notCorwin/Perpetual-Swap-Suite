@@ -61,6 +61,62 @@ test('resident window projection is reused until canonical bars or source metada
   } finally { stop() }
 })
 
+test('live freshness updates reuse historical source projections without masking corrections', () => {
+  const store = new PreparedChartStore(), events: OperationEvent[] = []
+  const live: Bar = { ...bar(200), confirmed: false }
+  store.setUniverse([instId], '1H', instId)
+  store.ingest(response(bars(0, 200), { liveBar: live, priceObservedAt: 1, realtimeState: 'live', sourceVersions: { price: 1, oi: 2, taker: 3 } }))
+  const endHour = 149 * hour, initial = store.window(instId, '1H', endHour)!
+  const stop = attachOperationSink(event => { if (event.name === 'chart.window.project') events.push(event) })
+  try {
+    for (let revision = 2; revision <= 31; revision++) {
+      assert.equal(store.ingestLive({ type: 'live', instId, timeframe: '1H', generation: 1, revision, endHour: 199 * hour,
+        liveBar: { ...live, close: 101 + revision / 1000 }, priceObservedAt: revision, sourceVersions: { price: revision, oi: 2, taker: 3 } }), true)
+      const historical = store.window(instId, '1H', endHour)!
+      assert.equal(historical.bars, initial.bars)
+      assert.equal(historical.priceObservedAt, revision)
+      assert.equal(historical.sourceVersions?.price, revision)
+      assert.equal(historical.liveBar, undefined)
+      assert.equal(store.window(instId, '1H')!.liveBar!.close, 101 + revision / 1000)
+    }
+    assert.equal(events.length, 0, 'Live-only changes cannot re-project historical source slots.')
+    store.ingest(response([bar(100, hour, { close: 102 })], { revision: 32, endHour, latestEnd: 199 * hour }))
+    const beforeCorrection = events.length
+    const corrected = store.window(instId, '1H', endHour)!
+    assert.equal(corrected.bars.find(value => value.hour === 100 * hour)!.close, 102)
+    assert.equal(events.length, beforeCorrection + 1, 'A completed-bar correction must re-project the historical window.')
+  } finally { stop() }
+})
+
+test('historical live refresh matches a full projection for incomplete and unavailable sources', () => {
+  const endHour = 149 * hour, latestEnd = 199 * hour
+  const live: Bar = { ...bar(200), confirmed: false }
+  const failures = { state: 'error' as const, from: 54 * hour, through: endHour, error: 'Source failed', retryAt: 50 }
+  const cases: Array<{ values: PreparedChartBar[]; overrides?: Partial<PreparedChartResponse> }> = [
+    { values: bars(0, 200) },
+    { values: bars(0, 200).map(value => value.hour === 100 * hour ? { ...value, priceComplete: false } : value) },
+    { values: bars(0, 200).filter(value => value.hour !== 100 * hour), overrides: { priceStatus: failures } },
+    { values: bars(0, 200).map(value => value.hour === 100 * hour ? { ...value, oi: null, ema: null } : value) },
+    { values: bars(0, 200).map(value => value.hour === 100 * hour ? { ...value, oi: null, oiObserved: false, statisticsObserved: false, statisticsSources: 2 } : value), overrides: { oiStatus: failures } },
+    { values: bars(80, 120), overrides: { oldestHour: 80 * hour, historyExhausted: true } },
+  ]
+  for (const { values, overrides } of cases) {
+    const store = new PreparedChartStore(), reference = new PreparedChartStore()
+    store.setUniverse([instId], '1H'); reference.setUniverse([instId], '1H')
+    const initial = response(values, { endHour: latestEnd, latestEnd, liveBar: live, priceState: 'ready', priceObservedAt: 1,
+      realtimeState: 'live', sourceVersions: { price: 1, oi: 2, taker: 3 }, ...overrides })
+    assert.equal(store.ingest(initial), true)
+    store.window(instId, '1H', endHour)
+    const update: PreparedChartLiveUpdate = { type: 'live', instId, timeframe: '1H', generation: 1, revision: 2, endHour: latestEnd,
+      liveBar: { ...live, close: 101.5 }, priceState: 'stale', priceObservedAt: 2, priceAsOf: 200 * hour,
+      realtimeState: 'stale', sourceVersions: { price: 2, oi: 3, taker: 4 } }
+    assert.equal(store.ingestLive(update), true)
+    assert.equal(reference.ingest({ ...initial, revision: 2, liveBar: update.liveBar!, priceState: update.priceState,
+      priceObservedAt: update.priceObservedAt, priceAsOf: update.priceAsOf, realtimeState: update.realtimeState, sourceVersions: update.sourceVersions }), true)
+    assert.deepEqual(store.window(instId, '1H', endHour), reference.window(instId, '1H', endHour))
+  }
+})
+
 test('unchanged prepared bars advance revision and freshness without hiding later corrections', () => {
   for (const compact of [false, true]) {
     const store = new PreparedChartStore()

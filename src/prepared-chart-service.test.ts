@@ -925,6 +925,21 @@ test('queued raw quotes are owned snapshots and no-op repeats keep the winning p
   } finally { await pipeline.dispose() }
 })
 
+test('a newer identical queued quote renews its lease and retains the winning context', async () => {
+  const { pipeline } = fixture([]), seen: any[] = [], now = Date.now()
+  pipeline.queueCandidate = () => {}; pipeline.scheduleCandidates = () => {}
+  pipeline.setUniverse([instId])
+  pipeline.subscribe((frame: any) => seen.push({ observedAt: frame.priceObservedAt, trace: getOperationContext().traceId }))
+  try {
+    const quote = { ...candle(end() + interval), confirmed: false }
+    const first = runWithOperationContext({ traceId: 'first-observation' }, () => pipeline.setLive(instId, '15m', quote, { receivedAt: now }))
+    const newer = runWithOperationContext({ traceId: 'newer-observation' }, () => pipeline.setLive(instId, '15m', { ...quote }, { receivedAt: now + 1 }))
+    assert.strictEqual(newer, first)
+    assert.equal((await newer).priceObservedAt, now + 1)
+    assert.deepEqual(seen, [{ observedAt: now + 1, trace: 'newer-observation' }])
+  } finally { await pipeline.dispose() }
+})
+
 test('either current resident can publish the admitted quote with its winning context', async () => {
   const { pipeline } = fixture([]), key = `${instId}:15m`, seen: any[] = []
   pipeline.queueCandidate = () => {}; pipeline.scheduleCandidates = () => {}
@@ -1204,6 +1219,94 @@ test('warm forming ticks preserve exact confirmed state and never read or replay
     for (const key of indicatorFields) assert.equal(frame.liveBar[key], oracle[key])
     assert.equal(store.queries.length, reads); assert.equal(pipeline.nextCalculation, calculations); assert.equal(store.checkpoints.length, writes)
   } finally { detach(); await pipeline.dispose() }
+})
+
+test('forming indicators reuse their price basis across status, lease and statistic updates', async () => {
+  const rows = source(400), { pipeline, store } = fixture(rows), operations: OperationEvent[] = []
+  const published: any[] = [], now = Date.now()
+  try {
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
+    const detach = attachOperationSink(operation => operations.push(operation))
+    pipeline.subscribe((frame: any) => published.push(frame))
+    try {
+      const quote = { ...candle(end() + interval, 400), high: 150, close: 141, confirmed: false }
+      const first = await pipeline.setLive(instId, '15m', quote, { receivedAt: now })
+      const state = pipeline.series.get(`${instId}:15m`)
+      assert.strictEqual(pipeline.publish(state), first, 'A status check must not publish an unchanged frame.')
+      const renewed = await pipeline.setLive(instId, '15m', { ...quote }, { receivedAt: now + 1 })
+      assert.equal(renewed.priceObservedAt, now + 1, 'An identical observation still renews the quote lease.')
+      assert.strictEqual(renewed.liveBar, first.liveBar)
+      const enriched = { ...quote, open: quote.open - 1, volume: quote.volume + 1, quoteVolume: quote.quoteVolume + 10, oi: 5100, buy: 80, sell: 20 }
+      const statistics = await pipeline.setLive(instId, '15m', enriched, { receivedAt: now + 2 })
+      assert.equal(statistics.liveBar.open, enriched.open)
+      assert.equal(statistics.liveBar.oi, enriched.oi)
+      assert.equal(statistics.liveBar.buy, enriched.buy)
+      assert.equal(statistics.liveBar.sell, enriched.sell)
+      const enrichedOracle = buildIndicatorSeries([...rows, enriched], interval).bars.at(-1) as any
+      for (const field of [...indicatorFields, 'bandPosition', 'rocChange', 'marocChange', 'quoteVolume'])
+        assert.equal(statistics.liveBar[field], enrichedOracle[field], field)
+      assert.equal(operations.filter(operation => operation.name === 'indicators.project').length, 1,
+        'Unchanged price inputs must not repeat indicator work.')
+      const changedVolume = { ...enriched, volume: enriched.volume + 1, baseVolume: enriched.baseVolume + 50 }
+      const changed = await pipeline.setLive(instId, '15m', changedVolume, { receivedAt: now + 3 })
+      const expected = buildIndicatorSeries([...rows, changedVolume], interval).bars.at(-1) as any
+      for (const field of indicatorFields) assert.equal(changed.liveBar[field], expected[field], field)
+      assert.equal(operations.filter(operation => operation.name === 'indicators.project').length, 2,
+        'A VWAP input change must calculate a fresh projection.')
+
+      const corrected = { ...rows[100], close: rows[100].close + .5 }, previous = store.change(corrected)
+      pipeline.observe([corrected], previous)
+      assert.equal(pipeline.cached(`${instId}:15m`).liveBar.indicatorsObserved, false)
+      await finishSeed(pipeline)
+      const rebuilt = pipeline.cached(`${instId}:15m`), oracle = buildIndicatorSeries([...store.rows, changedVolume], interval).bars.at(-1) as any
+      for (const field of indicatorFields) assert.equal(rebuilt.liveBar[field], oracle[field], field)
+      assert.equal(operations.filter(operation => operation.name === 'indicators.project').length, 3,
+        'A corrected confirmed basis must calculate a fresh projection.')
+
+      const confirmed = { ...changedVolume, confirmed: true }
+      pipeline.observe([confirmed], store.change(confirmed))
+      const nextQuote = { ...changedVolume, timestamp: changedVolume.timestamp + interval,
+        open: 141, high: 151, low: 139, close: 142, confirmed: false }
+      const next = await pipeline.setLive(instId, '15m', nextQuote, { receivedAt: now + 4 })
+      const nextOracle = buildIndicatorSeries([...store.rows, nextQuote], interval).bars.at(-1) as any
+      for (const field of indicatorFields) assert.equal(next.liveBar[field], nextOracle[field], field)
+      assert.equal(operations.filter(operation => operation.name === 'indicators.project').length, 4,
+        'Advancing the mutable confirmed basis must calculate the next candle.')
+      assert.ok(published.some(frame => frame.priceObservedAt === now + 1))
+    } finally { detach() }
+  } finally { await pipeline.dispose() }
+})
+
+for (const focused of [true, false]) test(`forming statistic expiry publishes without recomputing indicators for ${focused ? 'focused' : 'background'} charts`, async context => {
+  const now = Math.floor(Date.now() / interval) * interval + 1000
+  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
+  const { pipeline } = fixture(), operations: OperationEvent[] = []
+  try {
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
+    if (!focused) {
+      pipeline.setFocus(null)
+      pipeline.setUniverse([instId])
+      while (pipeline.candidateTasks.size || pipeline.candidateQueue.length) await Promise.all([...pipeline.candidateTasks.values()])
+      await finishSeed(pipeline)
+    }
+    const detach = attachOperationSink(operation => operations.push(operation))
+    try {
+      const quote = { ...candle(end() + interval, 400), confirmed: false, oi: null, buy: null, sell: null,
+        statisticsOIExpiresAt: now + 1000, statisticsTakerExpiresAt: now + 2000 }
+      const first = await pipeline.setLive(instId, '15m', quote, { receivedAt: now })
+      assert.equal(first.liveBar.oiObserved, true); assert.equal(first.liveBar.takerObserved, true)
+      const published: any[] = []
+      pipeline.subscribe((frame: any) => { if (frame.instId === instId && frame.timeframe === '15m') published.push(frame) })
+      context.mock.timers.tick(1000)
+      const oiExpired = published.at(-1)
+      assert.ok(oiExpired, 'The actual deadline must emit a frame without a new source event or explicit publish.')
+      assert.equal(oiExpired.liveBar.oiObserved, false); assert.equal(oiExpired.liveBar.takerObserved, true)
+      context.mock.timers.tick(1000)
+      const bothExpired = published.at(-1)
+      assert.equal(bothExpired.liveBar.oiObserved, false); assert.equal(bothExpired.liveBar.takerObserved, false)
+      assert.equal(operations.filter(operation => operation.name === 'indicators.project').length, 1)
+    } finally { detach() }
+  } finally { await pipeline.dispose(); context.mock.timers.reset() }
 })
 
 test('bounded local historical prices remain navigable across unknown and expired statistic holes', async () => {

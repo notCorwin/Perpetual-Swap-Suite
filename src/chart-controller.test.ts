@@ -2,6 +2,8 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { ChartController, type ChartTarget, type ChartTransport } from './chart-controller.ts'
 import { PreparedChartStore } from './chart-series-store.ts'
+import { createChartPlotCache } from './chart-render.ts'
+import { attachOperationSink, type OperationEvent } from '../electron/services/operations.js'
 import type { PreparedChartBar, PreparedChartResponse } from './chart-data.ts'
 import { timeframeMilliseconds, type RadarTimeframe } from './timeframe.ts'
 
@@ -87,6 +89,37 @@ test('durable history hydrates once and cached scrolling commits synchronously w
     await settled(); context.mock.timers.tick(120_000); await settled()
     assert.equal(reads, 1)
   } finally { close(); context.mock.timers.reset() }
+})
+
+test('history stays stable through live updates and returning to latest shows the newest candle', async () => {
+  const store = cached(), controller = new ChartController(transport(), store)
+  const plot = createChartPlotCache(text => text.length * 6), size = { width: 960, height: 700 }
+  const close = controller.open(btc, '1H')
+  try {
+    await settled()
+    controller.scroll(-50)
+    const initial = controller.getSnapshot().presented!, historyPlot = plot(initial, size)
+    const events: OperationEvent[] = [], stop = attachOperationSink(event => { if (event.name === 'chart.window.project' || event.name === 'chart.geometry') events.push(event) })
+    try {
+      for (let revision = 2; revision <= 31; revision++) {
+        controller.ingestPrepared({ type: 'live', instId: btc, timeframe: '1H', generation: 1, revision, endHour: 1199 * hour,
+          liveBar: { ...bars(1200, 1)[0], confirmed: false, close: 101 + revision / 1000 }, priceObservedAt: revision,
+          sourceVersions: { price: revision, oi: 1, taker: 1 } })
+        const current = controller.getSnapshot().presented!
+        assert.equal(current.endHour, initial.endHour)
+        assert.equal(current.priceObservedAt, revision)
+        assert.equal(plot(current, size), historyPlot)
+      }
+      assert.equal(events.length, 0, 'Live updates do not project or rebuild a fixed historical chart.')
+      controller.scroll(50)
+      const latest = controller.getSnapshot().presented!
+      assert.equal(latest.endHour, 1199 * hour)
+      assert.equal(latest.liveBar?.close, 101.031)
+      assert.equal(latest.priceObservedAt, 31)
+      assert.equal(plot(latest, size)!.bars.at(-1), latest.liveBar)
+      assert.equal(events.filter(event => event.name === 'chart.geometry').length, 1, 'Returning to latest prepares the current candle once.')
+    } finally { stop() }
+  } finally { close() }
 })
 
 test('fractional navigation admits local neighbours once without moving the requested cursor or backend demand', async () => {

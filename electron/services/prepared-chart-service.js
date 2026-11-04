@@ -40,10 +40,25 @@ const freshQuote = (timestamp, observedAt, intervalMS, now = Date.now()) => time
   && observedAt != null && now - observedAt < 30_000
 const samePrice = (left, right) => left && priceFields.every(field => Object.is(left[field], right[field]))
 const sameRecord = (left, right) => left === right || Boolean(left && right && JSON.stringify(left) === JSON.stringify(right))
+// Only these forming-candle fields affect the indicator math. Other output
+// fields, including quote volume and statistics, are taken from the new row.
+const liveIndicatorFields = ['timestamp', 'high', 'low', 'close', 'baseVolume']
+const sameLiveIndicatorInput = (left, right) => left === right || Boolean(left && right
+  && liveIndicatorFields.every(field => Object.is(left[field], right[field])))
 // Cached projections use row/indicator identity. Own and freeze every resident
 // record so no producer can mutate an admitted input behind that cache key.
 const immutableRecord = value => Object.isFrozen(value) ? value : Object.freeze({ ...value })
 const sourceFresh = (row, bit) => Boolean(statisticsMask(row) & bit) && (bit === 1 ? numeric(row.oi) || Number(row.statisticsOIExpiresAt) > Date.now() : numeric(row.buy) && numeric(row.sell) || Number(row.statisticsTakerExpiresAt) > Date.now())
+const liveStatisticsDeadline = (state, now) => {
+  const row = state?.live
+  if (!row) return Infinity
+  let deadline = Infinity
+  for (const bit of [1, 2]) if (sourceFresh(row, bit) && (bit === 1 ? !numeric(row.oi) : !numeric(row.buy) || !numeric(row.sell))) {
+    const expiry = Number(row[bit === 1 ? 'statisticsOIExpiresAt' : 'statisticsTakerExpiresAt'])
+    if (expiry > now) deadline = Math.min(deadline, expiry)
+  }
+  return deadline
+}
 const priorityRank = priority => ({ interactive: 5, foreground: 4, prepared: 4, repair: 4, continuity: 3, statistics: 2, prefetch: 1, chartWarm: 1, background: 0 })[priority] ?? 0
 const sourceState = (rows, bit) => rows.length && rows.every(row => sourceFresh(row, bit))
   ? rows.every(row => bit === 1 ? numeric(row.oi) : numeric(row.buy) && numeric(row.sell)) ? 'ready' : 'unavailable' : 'loading'
@@ -65,15 +80,15 @@ const mergeStatistics = (previous, incoming, allowed = 3) => {
   return value
 }
 const blankIndicators = Object.fromEntries(indicatorFields.map(field => [field, null]))
-const bar = (row, calculated) => ({ ...blankIndicators, ...calculated,
+const bar = (row, calculated, oiFresh = sourceFresh(row, 1), takerFresh = sourceFresh(row, 2)) => ({ ...blankIndicators, ...calculated,
   hour: row.timestamp, open: row.open, high: row.high, low: row.low, close: row.close, confirmed: Boolean(row.confirmed),
   priceComplete: completePriceCandle(row),
   oi: numeric(row.oi) ? row.oi : null, buy: numeric(row.buy) ? row.buy : null, sell: numeric(row.sell) ? row.sell : null,
-  statisticsSources: statisticsMask(row), statisticsObserved: sourceFresh(row, 1) && sourceFresh(row, 2),
-  oiObserved: sourceFresh(row, 1), takerObserved: sourceFresh(row, 2),
+  statisticsSources: statisticsMask(row), statisticsObserved: oiFresh && takerFresh,
+  oiObserved: oiFresh, takerObserved: takerFresh,
   indicatorsObserved: Boolean(calculated),
-  oiUnavailableReason: sourceFresh(row, 1) && !numeric(row.oi) ? 'not-published' : undefined,
-  takerUnavailableReason: sourceFresh(row, 2) && (!numeric(row.buy) || !numeric(row.sell)) ? 'not-published' : undefined,
+  oiUnavailableReason: oiFresh && !numeric(row.oi) ? 'not-published' : undefined,
+  takerUnavailableReason: takerFresh && (!numeric(row.buy) || !numeric(row.sell)) ? 'not-published' : undefined,
 })
 
 const appendConfirmed = (state, candle) => {
@@ -216,7 +231,7 @@ export class PreparedChartPipeline {
       if (projected <= this.maxProjectionBytes) break
       if (key === this.focusKey || this.universe.has(key) || state.active || this.series.get(key)?.active) continue
       projected -= state.byteSize ?? 0
-      state.rows.clear(); state.indicators.clear(); state.barCaches?.clear(); state.projectedBars?.clear(); state.historyBarsCache = null; state.byteSize = 0
+      state.rows.clear(); state.indicators.clear(); state.barCaches?.clear(); state.projectedBars?.clear(); state.historyBarsCache = null; state.liveProjection = null; state.byteSize = 0
       state.indicatorFailures?.clear()
       // Quotes and fixed-size recursive checkpoints remain available on ticks.
     }
@@ -323,6 +338,7 @@ export class PreparedChartPipeline {
       let at = Math.min((Math.floor(now / step) + 1) * step + 1000,
         state?.statisticsDeadline > now ? state.statisticsDeadline : Infinity, retries.get(demand.key) ?? Infinity)
       demand.refreshAt = at; deadline = Math.min(deadline, at)
+      deadline = Math.min(deadline, liveStatisticsDeadline(state, now))
       const frame = this.cached(demand.key)
       if (frame?.realtimeState === 'live' && frame.priceObservedAt != null) deadline = Math.min(deadline, frame.priceObservedAt + 30_000)
     }
@@ -340,7 +356,9 @@ export class PreparedChartPipeline {
         // A quote lease is metadata, not a preparation task. It must expire
         // even while every core preparation slot awaits a slow provider.
         const frame = this.cached(demand.key)
-        if (frame?.realtimeState === 'live' && frame.priceObservedAt + 30_000 <= Date.now() && state) this.publish(state)
+        const statisticsExpired = frame?.liveBar && state?.live && (frame.liveBar.oiObserved && !sourceFresh(state.live, 1)
+          || frame.liveBar.takerObserved && !sourceFresh(state.live, 2))
+        if (state && (statisticsExpired || frame?.realtimeState === 'live' && frame.priceObservedAt + 30_000 <= Date.now())) this.publish(state)
         if (demand.refreshAt <= Date.now()) this.queueCandidate(demand, true)
       }
       this.scheduleCandidates()
@@ -348,9 +366,10 @@ export class PreparedChartPipeline {
     this.candidateTimer.unref?.()
   }
 
-  scheduleQuoteExpiry(state) {
-    if (this.closed || !this.universe.has(state.key) || this.cached(state.key)?.realtimeState !== 'live') return
-    const deadline = this.cached(state.key).priceObservedAt + 30_000
+  scheduleLiveExpiry(state) {
+    if (this.closed || !this.universe.has(state.key)) return
+    const frame = this.cached(state.key)
+    const deadline = Math.min(frame?.realtimeState === 'live' ? frame.priceObservedAt + 30_000 : Infinity, liveStatisticsDeadline(state, Date.now()))
     if (deadline < this.candidateTimerAt) this.armCandidateTimer(deadline)
   }
 
@@ -458,9 +477,29 @@ export class PreparedChartPipeline {
     state.projectedBars ??= new Map()
     const cached = state.projectedBars.get(row.timestamp)
     if (cached?.row === row && cached.indicator === indicator && cached.oiFresh === oiFresh && cached.takerFresh === takerFresh) return cached
-    const entry = { row, indicator, oiFresh, takerFresh, token: ++this.nextProjection, bar: Object.freeze(bar(row, indicator)) }
+    const entry = { row, indicator, oiFresh, takerFresh, token: ++this.nextProjection, bar: Object.freeze(bar(row, indicator, oiFresh, takerFresh)) }
     state.projectedBars.set(row.timestamp, entry)
     return entry
+  }
+
+  projectedLive(state, row, core) {
+    // Both resident views publish the same quote. Keep one bounded projection
+    // with the live resident, and separate its price math from statistic data.
+    const owner = this.liveStates.get(state.key) ?? state
+    const basis = core && core.lastTimestamp + state.intervalMS === row.timestamp ? core : null
+    const previous = owner.liveProjection
+    // Confirmed cores only mutate by appending a strictly later timestamp;
+    // corrections replace or invalidate the core instead.
+    const sameBasis = previous && previous.basis === basis && previous.timestamp === basis?.lastTimestamp
+    const sameInputs = sameBasis && sameLiveIndicatorInput(previous.row, row)
+    const calculated = sameInputs ? previous.calculated : basis ? projectIndicatorCandle(basis, row) : undefined
+    const oiFresh = sourceFresh(row, 1), takerFresh = sourceFresh(row, 2)
+    if (sameInputs && previous.row === row && previous.oiFresh === oiFresh && previous.takerFresh === takerFresh) return previous.bar
+    const value = bar(row, calculated, oiFresh, takerFresh)
+    if (calculated) value.quoteVolume = row.quoteVolume ?? null
+    Object.freeze(value)
+    owner.liveProjection = { row, basis, timestamp: basis?.lastTimestamp, calculated, oiFresh, takerFresh, bar: value }
+    return value
   }
 
   projectBars(state, rows, projection, end) {
@@ -510,7 +549,7 @@ export class PreparedChartPipeline {
     const bars = this.projectBars(state, rows, 'viewport', end)
     const live = state.live && (end === state.latestHour || end === null) ? state.live : null
     const core = latest?.indicatorState?.lastTimestamp === state.latestHour ? latest.indicatorState : state.indicatorState
-    const liveBar = live ? bar(live, core?.lastTimestamp + state.intervalMS === live.timestamp ? projectIndicatorCandle(core, live) : undefined) : undefined
+    const liveBar = live ? this.projectedLive(state, live, core) : undefined
     const realtime = freshQuote(live?.timestamp, state.observedAt, state.intervalMS) && this.streaming(state.instId, state.timeframe)
     const expectedEnd = Math.floor(Date.now() / state.intervalMS) * state.intervalMS - state.intervalMS
     const first = Math.max(0, (end ?? expectedEnd) - (VISIBLE - 1) * state.intervalMS, state.floor ?? 0)
@@ -640,7 +679,7 @@ export class PreparedChartPipeline {
       if (pending) {
         const live = this.liveStates.get(state.key)
         if (state.key === this.focusKey) this.scheduleRefresh()
-        if (live) this.scheduleQuoteExpiry(live)
+        if (live) this.scheduleLiveExpiry(live)
         pending.resolve(frame)
       }
       return frame
@@ -1536,7 +1575,7 @@ export class PreparedChartPipeline {
     if (!state) { this.repairDeadlines.clear(); return }
     const now = Date.now(), step = state.intervalMS, boundary = Math.floor(now / step) * step
     const end = focus.end ?? boundary - step, from = Math.max(0, end - (VISIBLE - 1) * step, state.floor ?? 0)
-    let deadline = boundary + step + 1000, missingPrices = false
+    let deadline = Math.min(boundary + step + 1000, liveStatisticsDeadline(state, now)), missingPrices = false
     const repairDeadlines = new Map()
     const repair = (source, from, through) => {
       const key = `${state.key}:${source}:${from}:${through}`
@@ -1809,6 +1848,7 @@ export class PreparedChartPipeline {
         this.retainRows(current, rowLimit)
         this.updateMemory(current)
       }
+      if (live && !live.live) live.liveProjection = null
       if (changedFrom < Infinity) this.invalidateDerived(state ?? live, changedFrom)
       if (state) {
         this.publish(state); this.seed(state, key === this.focusKey ? 'foreground' : 'background')
@@ -1860,7 +1900,7 @@ export class PreparedChartPipeline {
     for (const current of new Set([state, live].filter(Boolean))) {
       current.priceVersion += 1; current.generation = generation; current.indicatorState = null; current.indicators.clear(); current.loaded = false; current.historyRange = null; current.rows.clear(); current.latestHour = null
       current.indicatorFailures?.clear()
-      current.barCaches?.clear(); current.projectedBars?.clear(); current.historyBarsCache = null
+      current.barCaches?.clear(); current.projectedBars?.clear(); current.historyBarsCache = null; current.liveProjection = null
       current.publishedHistoryFrame = null
     }
     this.snapshots.delete(key)
@@ -1878,13 +1918,16 @@ export class PreparedChartPipeline {
       const live = this.liveState(instId, timeframe), state = this.series.get(live.key)
       if (candle && live.live && (candle.timestamp < live.live.timestamp || candle.timestamp === live.live.timestamp && candle.volume < live.live.volume))
         return this.livePublications.get(live.key)?.promise ?? Promise.resolve(this.cached(live.key))
-      const unchanged = observedAt === live.observedAt && (candle == null ? live.live == null
+      const sameCandle = candle == null ? live.live == null
         : live.live && Object.keys(candle).length === Object.keys(live.live).length
-          && Object.keys(candle).every(key => Object.hasOwn(live.live, key) && Object.is(candle[key], live.live[key])))
+          && Object.keys(candle).every(key => Object.hasOwn(live.live, key) && Object.is(candle[key], live.live[key]))
+      const unchanged = observedAt === live.observedAt && sameCandle
       if (unchanged && this.livePublications.has(live.key)) return this.livePublications.get(live.key).promise
       // With no pending projection, status/lease work may still be due even
-      // for an identical raw fact. Reuse its owned input while checking it.
-      const admitted = unchanged ? live.live : candle ? immutableRecord(candle) : null
+      // for an identical raw fact. A new observation can renew the lease while
+      // retaining the same owned price input and indicator projection.
+      const admitted = sameCandle ? live.live : candle ? immutableRecord(candle) : null
+      if (!admitted) live.liveProjection = null
       for (const current of [live, state].filter(Boolean)) { current.live = admitted; current.observedAt = observedAt }
       if (!state && !this.universe.has(live.key)) return Promise.resolve(null)
       // Collector-only residency cannot materialize a chart.
@@ -1894,7 +1937,7 @@ export class PreparedChartPipeline {
       // Focused data remains visible immediately, including when selection has
       // promoted a quote that was already queued for this series.
       const pending = this.livePublications.has(current.key), frame = this.publish(current)
-      if (!pending) { this.scheduleRefresh(); this.scheduleQuoteExpiry(live) }
+      if (!pending) { this.scheduleRefresh(); this.scheduleLiveExpiry(live) }
       return Promise.resolve(frame)
     } catch (error) { return Promise.reject(error) }
   }

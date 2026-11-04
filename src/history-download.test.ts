@@ -24,8 +24,9 @@ const numeric = (record: HistoryRecord, source: string) => source === 'candles' 
   : source === 'oi' ? typeof record.oi === 'number' : typeof record.buy === 'number' && typeof record.sell === 'number'
 class MemoryMetadata {
   report: HistoryDownloadReport | null = null
+  writes = 0
   getHistoryDownload() { return structuredClone(this.report) }
-  saveHistoryDownload(report: HistoryDownloadReport) { this.report = structuredClone(report) }
+  saveHistoryDownload(report: HistoryDownloadReport) { this.report = structuredClone(report); this.writes++ }
 
 }
 class SourceStore {
@@ -80,9 +81,75 @@ test('progress notifications coalesce expensive report updates while snapshots r
   assert.equal(updates, 0, 'Observer notifications should share the existing publication window.')
   assert.ok(f.download.snapshot().progress.available >= 20, 'An explicit snapshot reads the latest observation immediately.')
   assert.equal(updates, 1)
-  await waitFor(() => (f.metadata.report?.progress.available ?? 0) >= 20)
+  await waitFor(() => (f.reports.at(-1)?.progress.available ?? 0) >= 20)
+  assert.equal(f.metadata.writes, 1, 'UI progress must not force another durable checkpoint inside one second.')
   gate.resolve()
   assert.equal((await finished(f.download)).phase, 'completed')
+})
+
+test('download progress checkpoints once per second and immediately saves completion', async t => {
+  let clock = base + 2 * hour
+  const gate = deferred(), f = fixture(t, { now: () => clock, fetchGap: async request => { await gate.promise; return records(request) } })
+  t.after(() => gate.resolve())
+  f.download.start([instrument])
+  await waitFor(() => f.calls.length > 0)
+  const download = f.download as any, active = [...download.active.values()][0] as { task: any }
+  // Drain the already scheduled publication before installing virtual timers.
+  download.publish(true)
+  const baseline = f.metadata.writes, reports = f.reports.length
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    for (let count = 1; count <= 19; count++) {
+      download.observe({ ...active.task, coveredRecords: count })
+      clock += 100
+      t.mock.timers.tick(100)
+      assert.ok(f.reports.at(-1)!.progress.available >= count)
+      assert.equal(f.metadata.writes, baseline + Math.floor(count / 10))
+    }
+    assert.equal(f.reports.length - reports, 19, 'Checkpoint batching must preserve every coalesced UI publication.')
+    assert.ok(f.metadata.report!.progress.available < f.download.snapshot().progress.available)
+  } finally { t.mock.timers.reset(); gate.resolve() }
+  const complete = await finished(f.download)
+  assert.equal(complete.phase, 'completed')
+  assert.deepEqual(f.metadata.report, complete, 'Completion must save even within the checkpoint interval.')
+  assert.equal(f.metadata.writes, baseline + 2)
+})
+
+test('a stalled download checkpoints its last progress at the deadline and clears the trailing timer on completion', async t => {
+  let clock = base + 2 * hour
+  const gate = deferred(), f = fixture(t, { now: () => clock, fetchGap: async request => { await gate.promise; return records(request) } })
+  t.after(() => gate.resolve())
+  f.download.start([instrument])
+  await waitFor(() => f.calls.length > 0)
+  const download = f.download as any, active = [...download.active.values()][0] as { task: any }
+  download.publish(true)
+  const baseline = f.metadata.writes
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    download.observe({ ...active.task, coveredRecords: 5 })
+    clock += 100; t.mock.timers.tick(100)
+    assert.equal(f.metadata.writes, baseline)
+    clock += 899; t.mock.timers.tick(899)
+    assert.equal(f.metadata.writes, baseline)
+    clock++; t.mock.timers.tick(1)
+    assert.equal(f.metadata.writes, baseline + 1, 'The last update must save even when the source emits nothing else.')
+    assert.ok(f.metadata.report!.progress.available >= 5)
+    assert.equal(download.checkpointTimer, null)
+    download.observe({ ...active.task, coveredRecords: 6 })
+    clock += 100; t.mock.timers.tick(100)
+    assert.notEqual(download.checkpointTimer, null)
+    gate.resolve()
+    for (let turn = 0; turn < 100 && f.download.snapshot().phase === 'running'; turn++) {
+      t.mock.timers.tick(0)
+      await new Promise<void>(resolve => setImmediate(resolve))
+    }
+    assert.equal(f.download.snapshot().phase, 'completed')
+    assert.deepEqual(f.metadata.report, f.download.snapshot())
+    assert.equal(download.checkpointTimer, null, 'Completion must cancel the pending checkpoint.')
+    const completedWrites = f.metadata.writes
+    clock += 1000; t.mock.timers.tick(1000)
+    assert.equal(f.metadata.writes, completedWrites)
+  } finally { t.mock.timers.reset(); gate.resolve() }
 })
 
 test('completion counters handle many empty streams, duplicate instruments, and invalid listings', async t => {
@@ -339,16 +406,18 @@ test('a fatal scheduler shutdown preserves earlier durable pages and clears cons
 
 test('an asynchronous checkpoint save failure stops acquisition and produces a failed report without an uncaught timer error', async t => {
   const metadata = new MemoryMetadata(), save = metadata.saveHistoryDownload.bind(metadata)
+  let clock = base + 2 * hour
   let saves = 0
   metadata.saveHistoryDownload = report => {
     if (++saves > 1) throw new Error('Metadata disk is full.')
     save(report)
   }
-  const f = fixture(t, { metadata, concurrency: 1, fetchGap: request => new Promise((_resolve, reject) => {
+  const f = fixture(t, { metadata, now: () => clock, concurrency: 1, fetchGap: request => new Promise((_resolve, reject) => {
     request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true })
   }) })
   const started = f.download.start([instrument])
   await waitFor(() => f.calls.length === 1)
+  clock += 1000
   await waitFor(() => f.download.snapshot().finishedAt !== null)
   await f.sync.whenIdle()
   const failed = f.download.snapshot()

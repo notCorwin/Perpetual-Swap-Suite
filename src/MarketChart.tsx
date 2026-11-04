@@ -285,30 +285,30 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
 
 type PlotSize = { width: number; height: number }
 
-const ChartSurface = memo(function ChartSurface({ surface, size, selected, visible, inspected, inspectedBar, wheelFraction }: {
-  surface: ReadyChartWindow; size: PlotSize; selected: boolean; visible: boolean; inspected: number | null
+const ChartSurface = memo(function ChartSurface({ instId, timeframe, hasCompletedBars, priceState, indicatorState, oiState, takerState, oiStatus, takerStatus,
+  liveBar, plot, size, selected, visible, inspected, inspectedBar, wheelFraction }: {
+  instId: string; timeframe: RadarTimeframe; hasCompletedBars: boolean; priceState?: PreparedChartState; indicatorState: PreparedChartState
+  oiState: PreparedChartState; takerState: PreparedChartState; oiStatus?: ChartSourceStatus; takerStatus?: ChartSourceStatus
+  liveBar?: Bar; plot: NonNullable<ReturnType<typeof chartPlot>>; size: PlotSize; selected: boolean; visible: boolean; inspected: number | null
   inspectedBar?: Bar; wheelFraction: number
 }) {
-  const overscan = chartOverscan(surface)
-  const plot = chartPlot(surface, size, overscan)
-  const ready = Boolean(surface.bars.length && (surface.priceState === 'ready' || surface.priceState === 'stale')
-    && (surface.indicatorState === 'ready' || surface.indicatorState === 'unavailable')
-    && surface.oiState !== 'loading' && surface.takerState !== 'loading' && plot)
-  if (!plot) return null
+  const ready = Boolean(hasCompletedBars && (priceState === 'ready' || priceState === 'stale')
+    && (indicatorState === 'ready' || indicatorState === 'unavailable')
+    && oiState !== 'loading' && takerState !== 'loading')
   const { bars, geometry } = plot
   const contentOffset = chartWheelContentOffset(wheelFraction, geometry.barPitch, Boolean(plot.before), Boolean(plot.after))
   return <PlotVisible value={visible}>
-    <svg strokeWidth="var(--chart-line-width)" data-prepared-chart-inst={surface.instId} data-prepared-chart-timeframe={surface.timeframe}
-      data-prepared-chart-ready={ready} data-prepared-indicator-state={surface.indicatorState} data-prepared-oi-state={surface.oiState} data-prepared-taker-state={surface.takerState}
-      data-rendered-inst={selected ? surface.instId : undefined} data-rendered-timeframe={selected ? surface.timeframe : undefined}
+    <svg strokeWidth="var(--chart-line-width)" data-prepared-chart-inst={instId} data-prepared-chart-timeframe={timeframe}
+      data-prepared-chart-ready={ready} data-prepared-indicator-state={indicatorState} data-prepared-oi-state={oiState} data-prepared-taker-state={takerState}
+      data-rendered-inst={selected ? instId : undefined} data-rendered-timeframe={selected ? timeframe : undefined}
       data-rendered-start={bars[0]!.hour} data-rendered-end={bars.at(-1)!.hour}
       viewBox={`0 0 ${size.width} ${size.height}`} aria-hidden={!selected}
       style={{ visibility: selected ? 'visible' : 'hidden' }}
       className={cn('absolute inset-0 h-full w-full font-mono text-[length:var(--chart-text-size)] select-none outline-none', !selected && 'pointer-events-none')}
       role="img" tabIndex={selected ? 0 : -1}
-      aria-label={`${surface.instId} ${bars.length}-candle ${timeframeLabel(surface.timeframe)} chart. Hold the primary mouse button to inspect a candle, drag to inspect others, and release to return to the window end. Hover RSI crossing triangles to inspect their candle and time. Alt+Left and Alt+Right inspect RSI crossings; Escape clears inspection. Scroll to review history. Arrow keys navigate markets.`}>
-      <Plot bars={bars} geometry={geometry} liveBar={surface.liveBar ?? bars.at(-1)!} liveOverlay={!!surface.liveBar} contentOffset={contentOffset}
-        inspected={selected ? inspected : null} inspectedBar={selected ? inspectedBar : undefined} oiState={surface.oiState} takerState={surface.takerState} oiStatus={surface.oiStatus} takerStatus={surface.takerStatus} />
+      aria-label={`${instId} ${bars.length}-candle ${timeframeLabel(timeframe)} chart. Hold the primary mouse button to inspect a candle, drag to inspect others, and release to return to the window end. Hover RSI crossing triangles to inspect their candle and time. Alt+Left and Alt+Right inspect RSI crossings; Escape clears inspection. Scroll to review history. Arrow keys navigate markets.`}>
+      <Plot bars={bars} geometry={geometry} liveBar={liveBar ?? bars.at(-1)!} liveOverlay={!!liveBar} contentOffset={contentOffset}
+        inspected={selected ? inspected : null} inspectedBar={selected ? inspectedBar : undefined} oiState={oiState} takerState={takerState} oiStatus={oiStatus} takerStatus={takerStatus} />
     </svg>
   </PlotVisible>
 })
@@ -644,7 +644,10 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
         const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : -event.deltaY
         queueWheel(delta * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 240 : 1))
       }}>
-        {surface && <ChartSurface surface={surface} size={plotSize} selected={matchesSelection} visible={matchesSelection && isActive && windowVisible} inspected={inspected} inspectedBar={inspectedBar} wheelFraction={activeWheelFraction} />}
+        {surface && preparedPlot && <ChartSurface instId={surface.instId} timeframe={surface.timeframe} hasCompletedBars={surface.bars.length > 0}
+          priceState={surface.priceState} indicatorState={surface.indicatorState} oiState={surface.oiState} takerState={surface.takerState}
+          oiStatus={surface.oiStatus} takerStatus={surface.takerStatus} liveBar={surface.liveBar} plot={preparedPlot} size={plotSize}
+          selected={matchesSelection} visible={matchesSelection && isActive && windowVisible} inspected={inspected} inspectedBar={inspectedBar} wheelFraction={activeWheelFraction} />}
       </div>
       {captureStatus === 'flashing' && <div aria-hidden="true" className="pointer-events-none absolute inset-0 z-10 bg-[var(--chart-capture-flash)] motion-safe:animate-[chart-capture-flash_550ms_ease-out_both] motion-reduce:hidden" />}
     </section>
