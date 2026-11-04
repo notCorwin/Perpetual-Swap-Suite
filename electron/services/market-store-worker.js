@@ -1,8 +1,11 @@
+import { closeOperationRecording } from './operation-runtime.js'
 import { onOperationMessage } from './worker-operations.js'
 import { databaseOperation, openRecordedDatabase } from './recorded-database.js'
 import { parentPort, workerData } from 'node:worker_threads'
 import { DatabaseSync } from 'node:sqlite'
 import { performance } from 'node:perf_hooks'
+import { existsSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { CANDLE_INTERVALS, validateCandle, validateQuery } from './market-records.js'
 import { statisticsMask, validTakerVolumes } from './statistics-state.js'
 import { statisticsAbsenceExpiryAt } from './statistics-coverage.js'
@@ -12,6 +15,22 @@ const database = openRecordedDatabase(DatabaseSync, workerData.path, { readOnly:
 database.exec('PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA cache_size=-8192;')
 if (workerData.reader) database.exec('PRAGMA query_only=ON;')
 else {
+  const previousVersion = database.prepare('PRAGMA user_version').get().user_version
+  if (previousVersion < 4) {
+    const hasTable = name => database.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?").get(name)
+    const hasManifest = hasTable('migration_partitions')
+    const failed = hasManifest && database.prepare("SELECT 1 FROM migration_partitions WHERE status='failed' LIMIT 1").get()
+      || hasTable('import_issues') && database.prepare('SELECT 1 FROM import_issues LIMIT 1').get()
+    const complete = hasManifest && database.prepare("SELECT 1 FROM migration_partitions WHERE path='__complete__' AND status='completed'").get()
+    const incomplete = existsSync(join(dirname(workerData.path), 'candles')) && !complete
+    if (failed || incomplete) {
+      database.close()
+      await closeOperationRecording()
+      throw new Error(failed
+        ? 'Legacy archive migration has unresolved failures. Resolve failed partitions using the previous app version before upgrading. Recovery details remain in market.sqlite and original archive files are unchanged.'
+        : 'Legacy archive migration is incomplete. Finish the SQLite migration using the previous app version before upgrading, or use a new data directory to download history again. Original archive files are unchanged.')
+    }
+  }
   database.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=2000;
     CREATE TABLE IF NOT EXISTS series (
       id INTEGER PRIMARY KEY, instrument TEXT NOT NULL, timeframe TEXT NOT NULL,
@@ -28,18 +47,9 @@ else {
       value1 REAL, value2 REAL, expires_at INTEGER, written_at INTEGER NOT NULL,
       origin INTEGER NOT NULL, import_version INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY(series_id,source,timestamp)) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS replacements (
-      series_id INTEGER NOT NULL, from_ts INTEGER NOT NULL, through_ts INTEGER NOT NULL,
-      PRIMARY KEY(series_id,from_ts,through_ts)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS indicator_checkpoints (
       series_id INTEGER NOT NULL, formula TEXT NOT NULL, timestamp INTEGER NOT NULL, value TEXT NOT NULL,
-      PRIMARY KEY(series_id,formula,timestamp)) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS migration_partitions (
-      path TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, status TEXT NOT NULL, value TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS import_issues (
-      path TEXT PRIMARY KEY, instrument TEXT NOT NULL, timeframe TEXT NOT NULL, from_ts INTEGER NOT NULL,
-      through_ts INTEGER NOT NULL, reason TEXT NOT NULL, detail TEXT NOT NULL);
-    CREATE INDEX IF NOT EXISTS import_issues_range ON import_issues(instrument,timeframe,from_ts);`)
+      PRIMARY KEY(series_id,formula,timestamp)) WITHOUT ROWID;`)
   const version = database.prepare('PRAGMA user_version').get().user_version
   if (version < 2) {
     database.exec('BEGIN IMMEDIATE')
@@ -56,6 +66,16 @@ else {
     database.exec('BEGIN IMMEDIATE')
     try {
       database.exec('ALTER TABLE statistics ADD COLUMN observed_volume REAL; PRAGMA user_version=3; COMMIT;')
+    } catch (error) { database.exec('ROLLBACK'); throw error }
+  }
+  // Keep inert legacy columns to avoid rewriting every historical row on upgrade.
+  if (version < 4) {
+    database.exec('BEGIN IMMEDIATE')
+    try {
+      database.exec(`DROP TABLE IF EXISTS migration_partitions;
+        DROP TABLE IF EXISTS import_issues;
+        DROP TABLE IF EXISTS replacements;
+        PRAGMA user_version=4; COMMIT;`)
     } catch (error) { database.exec('ROLLBACK'); throw error }
   }
 }
@@ -89,13 +109,12 @@ const transaction = (operation, validate) => {
   database.exec('BEGIN IMMEDIATE')
   try { const value = operation(); validate?.(); database.exec('COMMIT'); return value } catch (error) { database.exec('ROLLBACK'); throw error }
 }
-const finishMutations = (changes, imported = false) => {
+const finishMutations = (changes) => {
   for (const [id, change] of changes) {
     run('UPDATE series SET revision=revision+1, price_revision=price_revision+? WHERE id=?', change.priceFrom === null ? 0 : 1, id)
     if (change.priceFrom !== null) run('DELETE FROM indicator_checkpoints WHERE series_id=? AND timestamp>=?', id, change.priceFrom)
     const value = get('SELECT revision,price_revision FROM series WHERE id=?', id)
     change.revision = value.revision; change.priceRevision = value.price_revision
-    change.imported = imported
   }
   return [...changes.values()]
 }
@@ -105,9 +124,8 @@ const refreshBounds = id => {
 }
 
 function writeStatistic(series, source, timestamp, first, second, expiresAt, changes,
-  { importing = false, importVersion = 0, preserveExistingSource = false, observedAt = importing ? importVersion : Date.now(), observeAbsence = false, observedVolume = null } = {}) {
+  { preserveExistingSource = false, observedAt = Date.now(), observeAbsence = false, observedVolume = null } = {}) {
   const previous = get('SELECT * FROM statistics WHERE series_id=? AND source=? AND timestamp=?', series.id, source, timestamp)
-  if (importing && previous && (previous.origin === 1 || previous.import_version > importVersion)) return false
   const needsPrice = source === 2 && (observedVolume !== null || previous?.observed_volume != null
     || first === 0 && second === 0 || previous?.value1 === 0 && previous.value2 === 0)
   const price = needsPrice ? get('SELECT volume,quote_volume FROM candles WHERE series_id=? AND timestamp=?', series.id, timestamp) : null
@@ -123,7 +141,7 @@ function writeStatistic(series, source, timestamp, first, second, expiresAt, cha
     && (observedVolume === null || previous.observed_volume == null)) return false
   // Absence is a bounded source observation, never a correction to a numeric fact.
   if (absent && previousNumeric && !staleDerived) return false
-  if (!importing && previous && observedAt < previous.written_at && (absent || previousNumeric && !staleDerived)) return false
+  if (previous && observedAt < previous.written_at && (absent || previousNumeric && !staleDerived)) return false
   if (first === null && previous?.value1 === 0 && previous.value2 === 0 && traded && !staleDerived) {
     // A fresh empty response can renew a contradicted zero placeholder's
     // unavailable proof. Merely receiving its price never renews that proof.
@@ -136,19 +154,18 @@ function writeStatistic(series, source, timestamp, first, second, expiresAt, cha
   if (previous && Object.is(previous.value1, first) && Object.is(previous.value2, second) && Object.is(previous.expires_at, expiresAt)
     && Object.is(previous.observed_volume, observedVolume) && previous.absence_attempts === absenceAttempts
     && (!observeAbsence || !absent || previous.written_at === observedAt)) {
-    if (!importing && previous.origin === 0) run('UPDATE statistics SET origin=1,import_version=0 WHERE series_id=? AND source=? AND timestamp=?', series.id, source, timestamp)
     return false
   }
-  run(`INSERT INTO statistics(series_id,source,timestamp,value1,value2,expires_at,written_at,origin,import_version,absence_attempts,observed_volume)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(series_id,source,timestamp) DO UPDATE SET value1=excluded.value1,value2=excluded.value2,
-    expires_at=excluded.expires_at,written_at=excluded.written_at,origin=excluded.origin,import_version=excluded.import_version,
+  run(`INSERT INTO statistics(series_id,source,timestamp,value1,value2,expires_at,written_at,origin,absence_attempts,observed_volume)
+    VALUES(?,?,?,?,?,?,?,1,?,?) ON CONFLICT(series_id,source,timestamp) DO UPDATE SET value1=excluded.value1,value2=excluded.value2,
+    expires_at=excluded.expires_at,written_at=excluded.written_at,
     absence_attempts=excluded.absence_attempts,observed_volume=excluded.observed_volume`,
-  series.id, source, timestamp, first, second, expiresAt, observedAt, importing ? 0 : 1, importVersion, absenceAttempts, observedVolume)
+  series.id, source, timestamp, first, second, expiresAt, observedAt, absenceAttempts, observedVolume)
   mutate(changes, series, timestamp, false, source === 1 ? 'oi' : 'taker')
   return true
 }
 
-function append(rows, { importing = false, replacement, partition, lifetime } = {}) {
+function append(rows, { replacement, lifetime } = {}) {
   if (!Array.isArray(rows)) throw new TypeError('Candles must be an array.')
   rows.forEach(validateCandle)
   const changes = new Map(), seriesCache = new Map(), bounds = new Set(), additions = new Map()
@@ -164,8 +181,6 @@ function append(rows, { importing = false, replacement, partition, lifetime } = 
     if (replacement) {
       const series = ensureSeries(replacement)
       run('DELETE FROM candles WHERE series_id=? AND timestamp>=? AND timestamp<?', series.id, replacement.from, replacement.through + CANDLE_INTERVALS[replacement.timeframe])
-      run('INSERT OR IGNORE INTO replacements(series_id,from_ts,through_ts) VALUES(?,?,?)', series.id, replacement.from, replacement.through)
-      run('DELETE FROM import_issues WHERE instrument=? AND timeframe=? AND from_ts>=? AND through_ts<=?', replacement.instrument, replacement.timeframe, replacement.from, replacement.through)
       mutate(changes, series, replacement.from, true); changes.get(series.id).through = replacement.through; changes.get(series.id).priceThrough = replacement.through; bounds.add(series.id)
     }
     for (const row of unique.values()) {
@@ -173,16 +188,13 @@ function append(rows, { importing = false, replacement, partition, lifetime } = 
       let series = seriesCache.get(key)
       if (!series) { series = ensureSeries(row); seriesCache.set(key, series) }
       const previous = get('SELECT * FROM candles WHERE series_id=? AND timestamp=?', series.id, row.timestamp)
-      const importVersion = Number(row.writtenAt ?? 0)
-      const protectedPrice = importing && (get('SELECT 1 FROM replacements WHERE series_id=? AND from_ts<=? AND through_ts>=? LIMIT 1', series.id, row.timestamp, row.timestamp)
-        || previous && (previous.origin !== 0 || previous.import_version > importVersion))
       const oldPrice = toPrice(previous), changed = !oldPrice || priceFields.some(field => !Object.is(oldPrice[field], row[field] ?? null))
-      if (changed && !protectedPrice) {
-        run(`INSERT INTO candles(series_id,timestamp,open,high,low,close,volume,base_volume,quote_volume,written_at,origin,import_version)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(series_id,timestamp) DO UPDATE SET open=excluded.open,high=excluded.high,low=excluded.low,
+      if (changed) {
+        run(`INSERT INTO candles(series_id,timestamp,open,high,low,close,volume,base_volume,quote_volume,written_at,origin)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(series_id,timestamp) DO UPDATE SET open=excluded.open,high=excluded.high,low=excluded.low,
           close=excluded.close,volume=excluded.volume,base_volume=excluded.base_volume,quote_volume=excluded.quote_volume,
-          written_at=excluded.written_at,origin=excluded.origin,import_version=excluded.import_version`, series.id, row.timestamp,
-        row.open, row.high, row.low, row.close, row.volume, row.baseVolume ?? null, row.quoteVolume ?? null, importing ? importVersion : Date.now(), importing ? 0 : 1, importVersion)
+          written_at=excluded.written_at,origin=excluded.origin`, series.id, row.timestamp,
+        row.open, row.high, row.low, row.close, row.volume, row.baseVolume ?? null, row.quoteVolume ?? null, Date.now(), 1)
         mutate(changes, series, row.timestamp, true)
         if (!previous) {
           const added = additions.get(series.id)
@@ -192,16 +204,16 @@ function append(rows, { importing = false, replacement, partition, lifetime } = 
             added.last = Math.max(added.last, row.timestamp)
           } else additions.set(series.id, { count: 1, first: row.timestamp, last: row.timestamp })
         }
-      } else if (!importing && (previous?.origin === 0 || previous?.origin === DERIVED_CANDLE_ORIGIN)) {
-        run('UPDATE candles SET origin=1,import_version=0 WHERE series_id=? AND timestamp=?', series.id, row.timestamp)
+      } else if (previous?.origin !== 1) {
+        run('UPDATE candles SET origin=1 WHERE series_id=? AND timestamp=?', series.id, row.timestamp)
       }
       const mask = statisticsMask(row)
-      if (mask & 1 || !importing && Number.isFinite(row.oi)) writeStatistic(series, 1, row.timestamp, row.oi ?? null, null, row.statisticsOIExpiresAt ?? null, changes,
-        { importing, importVersion, observedAt: row.statisticsOIObservedAt ?? (importing ? importVersion : row.writtenAt ?? (row.oi == null ? 0 : Date.now())) })
-      if (mask & 2 || !importing && validTakerVolumes(row)) {
+      if (mask & 1 || Number.isFinite(row.oi)) writeStatistic(series, 1, row.timestamp, row.oi ?? null, null, row.statisticsOIExpiresAt ?? null, changes,
+        { observedAt: row.statisticsOIObservedAt ?? (row.writtenAt ?? (row.oi == null ? 0 : Date.now())) })
+      if (mask & 2 || validTakerVolumes(row)) {
         const volumes = validTakerVolumes(row)
         writeStatistic(series, 2, row.timestamp, volumes?.sell ?? null, volumes?.buy ?? null, row.statisticsTakerExpiresAt ?? null, changes,
-          { importing, importVersion, observedAt: row.statisticsTakerObservedAt ?? (importing ? importVersion : row.writtenAt ?? (volumes ? Date.now() : 0)) })
+          { observedAt: row.statisticsTakerObservedAt ?? (row.writtenAt ?? (volumes ? Date.now() : 0)) })
       }
     }
     for (const [id, added] of additions) if (!bounds.has(id)) {
@@ -209,16 +221,7 @@ function append(rows, { importing = false, replacement, partition, lifetime } = 
         added.count, added.first, added.first, added.last, added.last, id)
     }
     for (const id of bounds) refreshBounds(id)
-    if (partition) {
-      const previousIssue = get('SELECT * FROM import_issues WHERE path=?', partition.path)
-      if (previousIssue) {
-        const series = ensureSeries({ instrument: previousIssue.instrument, timeframe: previousIssue.timeframe })
-        mutate(changes, series, previousIssue.from_ts, true); mutate(changes, series, previousIssue.through_ts, true)
-      }
-      run('INSERT OR REPLACE INTO migration_partitions(path,fingerprint,status,value) VALUES(?,?,?,?)', partition.path, partition.fingerprint, 'completed', JSON.stringify({ rows: rows.length }))
-      run('DELETE FROM import_issues WHERE path=?', partition.path)
-    }
-    return { result: unique.size, mutations: finishMutations(changes, importing) }
+    return { result: unique.size, mutations: finishMutations(changes) }
   }, currentLifetime)
   } finally { if (fence) { Atomics.store(fence, 1, 0); Atomics.notify(fence, 1) } }
 }
@@ -278,12 +281,12 @@ function aggregateCandles(input) {
         const oldPrice = toPrice(previous)
         const priceChanged = !oldPrice || priceFields.some(field => !Object.is(oldPrice[field], aggregate[field] ?? null))
         if (!priceChanged) continue
-        run(`INSERT INTO candles(series_id,timestamp,open,high,low,close,volume,base_volume,quote_volume,written_at,origin,import_version)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(series_id,timestamp) DO UPDATE SET open=excluded.open,high=excluded.high,low=excluded.low,
+        run(`INSERT INTO candles(series_id,timestamp,open,high,low,close,volume,base_volume,quote_volume,written_at,origin)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(series_id,timestamp) DO UPDATE SET open=excluded.open,high=excluded.high,low=excluded.low,
           close=excluded.close,volume=excluded.volume,base_volume=excluded.base_volume,quote_volume=excluded.quote_volume,
-          written_at=excluded.written_at,origin=excluded.origin,import_version=excluded.import_version`,
+          written_at=excluded.written_at,origin=excluded.origin`,
         series.id, timestamp, aggregate.open, aggregate.high, aggregate.low, aggregate.close, aggregate.volume, aggregate.baseVolume,
-        aggregate.quoteVolume, Date.now(), DERIVED_CANDLE_ORIGIN, 0)
+        aggregate.quoteVolume, Date.now(), DERIVED_CANDLE_ORIGIN)
         if (!previous) {
           added += 1
           firstAdded = Math.min(firstAdded ?? timestamp, timestamp)
@@ -515,25 +518,6 @@ const commands = {
     run('INSERT OR REPLACE INTO indicator_checkpoints(series_id,formula,timestamp,value) VALUES(?,?,?,?)', series.id, query.formulaVersion, query.timestamp, encoded)
     return { result: true }
   },
-  migrationState: path => ({ result: get('SELECT * FROM migration_partitions WHERE path=?', path) ?? null }),
-  migrationReport: () => ({ result: { complete: Boolean(get("SELECT 1 FROM migration_partitions WHERE path='__complete__'")),
-    completedPartitions: get("SELECT COUNT(*) AS count FROM migration_partitions WHERE path!='__complete__' AND status='completed'").count,
-    failedPartitions: get("SELECT COUNT(*) AS count FROM migration_partitions WHERE status='failed'").count,
-    importedRows: get("SELECT COALESCE(SUM(json_extract(value,'$.rows')),0) AS count FROM migration_partitions WHERE status='completed' AND path!='__complete__'").count,
-    issues: all('SELECT path,instrument,timeframe,from_ts AS "from",through_ts AS through,reason,detail FROM import_issues') } }),
-  migrationComplete: () => { run("INSERT OR REPLACE INTO migration_partitions(path,fingerprint,status,value) VALUES('__complete__','','completed','{}')"); return { result: undefined } },
-  migrationFailure: value => transaction(() => {
-    const changes = new Map(), series = ensureSeries(value)
-    const previous = get('SELECT * FROM import_issues WHERE path=?', value.path)
-    if (previous) {
-      const prior = ensureSeries({ instrument: previous.instrument, timeframe: previous.timeframe })
-      mutate(changes, prior, previous.from_ts, true); mutate(changes, prior, previous.through_ts, true)
-    }
-    run('INSERT OR REPLACE INTO migration_partitions(path,fingerprint,status,value) VALUES(?,?,?,?)', value.path, value.fingerprint, 'failed', JSON.stringify({ error: value.detail }))
-    run('INSERT OR REPLACE INTO import_issues(path,instrument,timeframe,from_ts,through_ts,reason,detail) VALUES(?,?,?,?,?,?,?)', value.path, value.instrument, value.timeframe, value.from, value.through, value.reason ?? 'corrupt-file', value.detail)
-    mutate(changes, series, value.from, true); mutate(changes, series, value.through, true)
-    return { result: undefined, mutations: finishMutations(changes, true) }
-  }),
   inspect: query => {
     const valid = validateQuery(query), series = identity(valid), gaps = missingRanges(valid, 'candles', true), issues = []
     let checkedRows = 0
@@ -551,24 +535,8 @@ const commands = {
         || row.high < Math.max(row.open,row.close,row.low) || row.low > Math.min(row.open,row.close,row.high)) issue('invalid-ohlc')
       if (['volume','baseVolume','quoteVolume'].some(field => row[field] !== null && (!Number.isFinite(row[field]) || row[field] < 0))) issue('negative-volume')
     }
-    const failures = all('SELECT * FROM import_issues WHERE instrument=? AND timeframe=? AND from_ts<=? AND through_ts>=? ORDER BY rowid', query.instrument, query.timeframe, query.through, query.from)
-    for (const row of failures) issues.push({ instrument: row.instrument, timeframe: row.timeframe, source: 'candles', from: row.from_ts, through: row.through_ts, reason: row.reason, repairable: true, file: row.path, detail: row.detail })
-    const orderedFailures = failures.toSorted((left, right) => left.from_ts - right.from_ts)
-    const furthest = []
-    for (const row of orderedFailures) furthest.push(Math.max(furthest.at(-1) ?? -Infinity, row.through_ts))
-    const uncoveredGaps = []
-    for (const gap of gaps) {
-      let left = 0, right = orderedFailures.length
-      while (left < right) {
-        const middle = Math.floor((left + right) / 2)
-        if (orderedFailures[middle].from_ts <= gap.from) left = middle + 1
-        else right = middle
-      }
-      if (left && furthest[left - 1] >= gap.through) continue
-      uncoveredGaps.push(gap)
-      issues.push({ instrument: query.instrument, timeframe: query.timeframe, source: 'candles', ...gap, reason: 'gap', repairable: true })
-    }
-    return { result: { issues, checkedRows, files: 1, missingRanges: uncoveredGaps } }
+    for (const gap of gaps) issues.push({ instrument: query.instrument, timeframe: query.timeframe, source: 'candles', ...gap, reason: 'gap', repairable: true })
+    return { result: { issues, checkedRows, files: 1, missingRanges: gaps } }
   },
   integrity: () => ({ result: all('PRAGMA quick_check').map(row => row.quick_check) }),
   close: () => { if (!workerData.reader) database.exec('PRAGMA wal_checkpoint(PASSIVE)'); database.close(); return { result: undefined } },

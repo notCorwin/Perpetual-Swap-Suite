@@ -75,7 +75,7 @@ export class MarketStore {
   root: string
   path: string
   workerThreadIds: { writer: number; readers: number[] }
-  subscribe(listener: (change: { instrument: string; timeframe: string; from: number; through: number; priceFrom: number | null; priceThrough: number | null; revision: number; priceRevision: number; imported: boolean }) => void): () => void
+  subscribe(listener: (change: { instrument: string; timeframe: string; from: number; through: number; priceFrom: number | null; priceThrough: number | null; revision: number; priceRevision: number }) => void): () => void
   appendCandles(candles: CandleRecord[], priority?: StorePriority, options?: { canWrite?: (row: CandleRecord) => boolean }): Promise<number>
   appendStatistics(page: StatisticsPage, priority?: StorePriority): Promise<number>
   statistics(query: CandleQuery & { source?: 'oi' | 'taker' }, priority?: StorePriority): Promise<StatisticsRecord[]>
@@ -88,7 +88,7 @@ export class MarketStore {
   aggregateCandles(query: AggregateCandleQuery, priority?: StorePriority): Promise<AggregateCandleResult>
   inspectCandles(query: CandleQuery & CandleRange, priority?: StorePriority): Promise<CandleInspection>
   getWriteMetrics(): { partitions: number; rowsSubmitted: number; bytesRead: number; bytesWritten: number; durationMS: number }
-  getDiagnostics(): { workerThreadIds: { writer: number; readers: number[] }; reads: Record<string, number>; writes: Record<string, number>; candleCache: { entries: number; estimatedBytes: number; pending: number; pendingKeyBytes: number }; migrationComplete: boolean; migrationProcessId: number | null }
+  getDiagnostics(): { workerThreadIds: { writer: number; readers: number[] }; reads: Record<string, number>; writes: Record<string, number>; candleCache: { entries: number; estimatedBytes: number; pending: number; pendingKeyBytes: number } }
   candleRevision(instrument: string, timeframe: string): number
   withCandleCommitFence<T>(callback: () => T): Promise<T>
   candlePriceRevision(instrument: string, timeframe: string): number
@@ -102,7 +102,6 @@ export class MarketStore {
   readIndicatorCheckpoint(query: CandleQuery & { before: number; formulaVersion: string }, priority?: StorePriority): Promise<IndicatorCheckpoint | null>
   writeIndicatorCheckpoint(query: CandleQuery & IndicatorCheckpoint, priority?: StorePriority): Promise<boolean>
   integrityCheck(): Promise<string[]>
-  migrationStatus(): Promise<{ complete: boolean; completedPartitions: number; failedPartitions: number; importedRows: number; issues: Array<{ path: string; instrument: string; timeframe: string; from: number; through: number; reason: string; detail: string }>; error: string }>
   coverage(instrument: string, timeframe: string, priority?: StorePriority): Promise<{ count: number; first: number | null; last: number | null }>
   missingCandleRanges(query: { instrument: string; timeframe?: string; from: number; through: number; intervalMS?: number }, priority?: StorePriority): Promise<Array<{ from: number; through: number }>>
   /** Price gaps include rows whose base or quote volume is missing or invalid. */

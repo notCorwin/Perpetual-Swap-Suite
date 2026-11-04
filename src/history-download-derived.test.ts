@@ -165,28 +165,7 @@ test('each completed fine page advances held parent progress through bounded loc
   } finally { await f.close() }
 })
 
-test('imported parent prices wake held coverage while statistics-only imports do not invalidate it', async () => {
-  const f = await fixture({ block: 'BTC-USDT-SWAP' })
-  try {
-    f.service.historyDownload.chunkSlots = 100
-    const instrument = f.instruments[0], timestamp = Math.ceil(f.listing / step['15m']) * step['15m']
-    const row = { instrument, timeframe: '15m', timestamp, ...expectedPrice(timestamp, step['15m']), confirmed: true, writtenAt: 100 }
-    const sync = f.service.history.sync, invalidate = sync.invalidate.bind(sync), changes: { from: number; through: number; source: string }[] = []
-    sync.invalidate = (query: { from: number; through: number; source: string }) => { changes.push(query); invalidate(query) }
-    f.start(); await f.entered.promise
-    await waitFor(() => [...f.service.historyDownload.held.values()].some((item: any) => item.task.timeframe === '15m'))
-    await (f.store as any).writer.request('append', [[row], { importing: true }])
-    await waitFor(() => [...f.service.historyDownload.held.values()].some((item: any) => item.task.timeframe === '15m' && item.task.coveredRecords === 1))
-    assert.deepEqual(changes.filter(value => value.source === 'candles').map(({ from, through }) => ({ from, through })), [{ from: timestamp, through: timestamp }])
-    await (f.store as any).writer.request('append', [[{ ...row, writtenAt: 101, oi: 50, statisticsVersion: 9 }], { importing: true }])
-    await setImmediate()
-    assert.equal(changes.filter(value => value.source === 'candles').length, 1, 'Statistics-only imports cannot invalidate price coverage.')
-    assert.equal(f.calls.filter(call => call.source === 'candles' && call.timeframe !== '5m').length, 0)
-    await f.service.historyDownload.cancel()
-  } finally { await f.close() }
-})
-
-for (const upgrade of ['release', 'interactive', 'inflight'] as const) test(`held dirty progress skips repeated derivation and ${upgrade} derives imported children`, async () => {
+for (const upgrade of ['release', 'interactive', 'inflight'] as const) test(`held dirty progress skips repeated derivation and ${upgrade} derives persisted children`, async () => {
   const f = await fixture()
   try {
     const instrument = f.instruments[0], timestamp = Math.ceil(f.listing / step['15m']) * step['15m']
@@ -208,8 +187,8 @@ for (const upgrade of ['release', 'interactive', 'inflight'] as const) test(`hel
     const initialDerivations = derivations
     const children = Array.from({ length: 3 }, (_, index) => ({ instrument, timeframe: '5m', timestamp: timestamp + index * step['5m'],
       ...fine(timestamp + index * step['5m']), confirmed: true }))
-    await (f.store as any).writer.request('append', [children, { importing: true }])
-    // A separate parent mutation or repair can wake the hold after child import.
+    await f.store.appendCandles(children)
+    // A separate parent mutation or repair can wake the hold after child write.
     sync.invalidate(query)
     if (upgrade === 'inflight') {
       await entered.promise
@@ -229,28 +208,10 @@ for (const upgrade of ['release', 'interactive', 'inflight'] as const) test(`hel
     }
     sync.release(held.id)
     assert.equal((await sync.waitFor(held.id)).status, 'completed')
-    assert.ok(derivations > initialDerivations, 'Release must derive the imported children before completion.')
+    assert.ok(derivations > initialDerivations, 'Release must derive the persisted children before completion.')
     assert.equal((await f.store.candles(query)).length, 1)
     assert.equal(f.calls.filter(call => call.source === 'candles').length, 0)
   } finally { await f.close() }
-})
-
-test('import notifications during initialization and after shutdown do not call an unavailable history owner', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-import-lifecycle-')), store = await MarketStore.open(root)
-  const preferences = structuredClone(DEFAULT_PREFERENCES)
-  const service = new MarketService(store, () => preferences, async () => { throw new Error('No network expected.') }, false)
-  const change = { instrument: 'BTC-USDT-SWAP', timeframe: '15m', from: 0, through: 0, priceFrom: 0, priceThrough: 0, imported: true }
-  try {
-    ;(store as any).committed([change])
-    await service.ready
-    let invalidations = 0
-    const invalidate = service.history.sync.invalidate.bind(service.history.sync)
-    service.history.sync.invalidate = (query: unknown) => { invalidations++; return invalidate(query) }
-    const closing = service.dispose()
-    ;(store as any).committed([change])
-    await closing
-    assert.equal(invalidations, 0)
-  } finally { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
 test('a deleted derived parent is rechecked after fine failure while a native parent survives', async () => {

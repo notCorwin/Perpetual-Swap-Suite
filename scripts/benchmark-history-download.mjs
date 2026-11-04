@@ -38,7 +38,7 @@ if (!Number.isSafeInteger(interval) || interval < 0 || interval > 2000) throw ne
 const revision = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim()
 const baselineRevision = execFileSync('git', ['rev-parse', `${values['baseline-ref']}^{commit}`], { cwd: root, encoding: 'utf8' }).trim()
 const worktreeDirty = Boolean(execFileSync('git', ['status', '--porcelain'], { cwd: root, encoding: 'utf8' }).trim())
-const sharedServices = ['market-store-migration.js', 'market-records.js', 'data-audit.js',
+const sharedServices = ['market-records.js', 'data-audit.js',
   'statistics-state.js', 'statistics-coverage.js', 'candle-aggregation.js', 'worker-operations.js', 'recorded-database.js', 'operations.js']
 const changedServices = ['market-service.js', 'history-download.js', 'history-sync.js', 'market-history.js', 'market-store.js', 'market-store-worker.js']
 const serviceChanges = execFileSync('git', ['diff', '--name-only', baselineRevision, '--', 'electron/services'], { cwd: root, encoding: 'utf8' })
@@ -83,9 +83,9 @@ try {
     const storeSource = baselineSources['market-store.js']
     if (!storeSource.includes("new URL('./market-store-worker.js', import.meta.url)")) throw new Error('The baseline worker URL no longer resolves through the temporary MarketStore source.')
     await writeFile(join(code, 'package.json'), '{"type":"module"}\n')
-    await writeFile(join(code, 'market-store.js'), relocate(storeSource, ['worker-operations.js', 'market-records.js', 'operations.js', 'market-store-migration.js']))
+    await writeFile(join(code, 'market-store.js'), relocate(storeSource, ['worker-operations.js', 'market-records.js', 'operations.js']))
     await writeFile(join(code, 'market-store-worker.js'), relocate(baselineSources['market-store-worker.js'],
-      ['worker-operations.js', 'recorded-database.js', 'market-records.js', 'statistics-state.js', 'statistics-coverage.js', 'candle-aggregation.js']))
+      ['operation-runtime.js', 'worker-operations.js', 'recorded-database.js', 'market-records.js', 'statistics-state.js', 'statistics-coverage.js', 'candle-aggregation.js']))
     await writeFile(join(code, 'history-sync.js'), relocate(baselineSources['history-sync.js'], ['operations.js']))
     await writeFile(join(code, 'history-download.js'), baselineSources['history-download.js'])
     await writeFile(join(code, 'market-history.js'), relocate(baselineSources['market-history.js'], ['data-audit.js', 'market-records.js', 'statistics-state.js']))

@@ -21,7 +21,7 @@ const node = args => [process.execPath, '--import', launchRegistration, '--impor
 const npm = args => [process.platform === 'win32' ? 'npm.cmd' : 'npm', ...args]
 const coreCoverage = {
   requireCategories: ['cpu', 'network', 'database', 'io', 'ipc'],
-  requireRoles: ['node', 'market-backend', 'market-reader', 'market-writer', 'market-migration', 'prepared-chart', 'stream-liquidity'],
+  requireRoles: ['node', 'market-backend', 'market-reader', 'market-writer', 'prepared-chart', 'stream-liquidity'],
   requireOperations: ['indicators.build', 'liquidity.evaluate', 'market.append', 'worker.execute', 'chart.geometry', 'websocket.receive',
     ...['dns.lookup', 'dns.Resolver.resolve4', 'dns.promises.Resolver.resolve4', 'udp.send', 'udp.receive', 'http2.request'].map(name => ({ name, source: 'native' }))],
 }

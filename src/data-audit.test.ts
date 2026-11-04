@@ -115,7 +115,7 @@ test('audit runs on the background lane, reports exact defect ranges, and return
   const metadata = new MemoryMetadata()
   const calls: AuditTarget[] = []
   const reasons = ['invalid-grid', 'invalid-ohlc', 'negative-volume', 'unconfirmed', 'duplicate', 'corrupt-file', 'missing-base-volume']
-  const issues = reasons.map((reason, index) => ({ ...finding(reason, index === 0 ? 1 : index * interval, undefined, reason !== 'missing-base-volume'), file: 'part.parquet' }))
+  const issues = reasons.map((reason, index) => ({ ...finding(reason, index === 0 ? 1 : index * interval, undefined, reason !== 'missing-base-volume'), file: 'market.sqlite' }))
   const audit = new DataAudit({
     metadata,
     store: { inspectCandles: async (query, priority) => { assert.equal(priority, 'background'); calls.push(query); return inspected(issues, 8) } },
@@ -470,7 +470,7 @@ test('an inspector I/O failure is a resumable failure, not a gap or a clean repo
   const metadata = new MemoryMetadata()
   let broken = true
   const audit = new DataAudit({ metadata, inspect: async () => {
-    if (broken) throw new Error('EACCES: Parquet file cannot be read')
+    if (broken) throw new Error('EACCES: SQLite database cannot be read')
     return inspected()
   } })
   try {

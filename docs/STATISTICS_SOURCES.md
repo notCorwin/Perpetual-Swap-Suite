@@ -46,4 +46,4 @@ The script uses an isolated temporary data directory and real `MarketService`/`M
 
 Source facts and their unavailable evidence are independent of transient HTTP tasks. The scheduler persists desired native ranges, reconstructs gaps from committed observations, and merges adjacent/overlapping requests rather than restoring old viewport or reconnect execution queues. A price correction invalidates price indicators, while an OI/Taker correction updates only the relevant source projection.
 
-Existing Parquet observations are imported read-only with their original source masks, units, and expiry evidence. Import does not invent numeric fields or refresh an old null lease. After the once-only cutover, SQLite is the sole fact source and retained original files are recovery artifacts.
+SQLite persists numeric observations and their original unavailable-source evidence across restarts. Removing archive-import bookkeeping does not refresh expiry evidence or remove committed facts. Legacy Parquet archives are no longer read; missing history uses the normal source acquisition path.

@@ -209,7 +209,7 @@ function verificationRanges(repaired, issues) {
   return ranges
 }
 
-/** A durable background audit of Parquet facts; SQLite stores only this report. */
+/** A durable background audit of SQLite market facts. */
 export class DataAudit {
   constructor({ store, metadata, inspect, repair, onCheckpoint, now = Date.now, chunkMilliseconds = DAY }) {
     if (!metadata || typeof metadata.saveAudit !== 'function' || typeof metadata.listAudits !== 'function') throw new TypeError('DataAudit needs a metadata store.')

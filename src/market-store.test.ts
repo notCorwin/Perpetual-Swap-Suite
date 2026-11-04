@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
-import { mkdtemp, readdir, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -65,8 +65,8 @@ test('complete price gaps ignore off-grid legacy rows and retain inclusive grid 
     await f.store.appendCandles([candle(0), candle(2), candle(4)])
     const database = new DatabaseSync(f.store.path)
     try {
-      const insert = database.prepare(`INSERT INTO candles(series_id,timestamp,open,high,low,close,volume,base_volume,quote_volume,written_at,origin,import_version)
-        SELECT series_id,?,open,high,low,close,volume,base_volume,quote_volume,written_at,origin,import_version FROM candles WHERE timestamp=?`)
+      const insert = database.prepare(`INSERT INTO candles(series_id,timestamp,open,high,low,close,volume,base_volume,quote_volume,written_at,origin)
+        SELECT series_id,?,open,high,low,close,volume,base_volume,quote_volume,written_at,origin FROM candles WHERE timestamp=?`)
       insert.run(base + step + 1, base)
       insert.run(base + 3 * step + 0.5, base)
     } finally { database.close() }
@@ -78,7 +78,7 @@ test('complete price gaps ignore off-grid legacy rows and retain inclusive grid 
   } finally { await f.close() }
 })
 
-test('coverage remains exact across mixed-series batches, repairs, and protected imports', async () => {
+test('coverage remains exact across mixed-series batches, repairs, and subsequent writes', async () => {
   const f = await fixture(), eth = 'ETH-USDT-SWAP'
   const ethCandle = (index: number) => ({ ...candle(index), instrument: eth })
   try {
@@ -92,9 +92,7 @@ test('coverage remains exact across mixed-series batches, repairs, and protected
 
     await f.store.replaceCandles({ ...query, from: base, through: base + step }, [candle(1)])
     assert.deepEqual(await f.store.coverage(query.instrument, query.timeframe), { count: 3, first: base + step, last: base + 4 * step })
-    // Importing cannot resurrect the repaired range or replace a newer native price.
-    await (f.store as any).writer.request('append', [[{ ...candle(0), writtenAt: 100 }, { ...candle(3, 120), writtenAt: 100 },
-      { ...candle(5), writtenAt: 100 }, { ...ethCandle(3), writtenAt: 100 }], { importing: true }])
+    await f.store.appendCandles([candle(5), ethCandle(3)])
     assert.deepEqual(await f.store.coverage(query.instrument, query.timeframe), { count: 4, first: base + step, last: base + 5 * step })
     assert.deepEqual(await f.store.coverage(eth, query.timeframe), { count: 4, first: base, last: base + 3 * step })
     assert.deepEqual((await f.store.candles(query)).map(row => [row.timestamp, row.close]), [
@@ -180,8 +178,8 @@ test('compact statistics coverage preserves malformed legacy observations for va
       update.run('bad', null, expiresAt, null, series.id, 1, base + step)
       update.run(Infinity, null, expiresAt, null, series.id, 1, base + 2 * step)
       update.run(null, null, expiresAt, null, series.id, 1, base + 3 * step)
-      database.prepare(`INSERT INTO statistics(series_id,source,timestamp,value1,value2,expires_at,written_at,origin,import_version,absence_attempts,observed_volume)
-        VALUES(?,1,?,NULL,NULL,?,0,1,0,1,NULL)`).run(series.id, base + 3 * step + 1, expiresAt)
+      database.prepare(`INSERT INTO statistics(series_id,source,timestamp,value1,value2,expires_at,written_at,origin,absence_attempts,observed_volume)
+        VALUES(?,1,?,NULL,NULL,?,0,1,1,NULL)`).run(series.id, base + 3 * step + 1, expiresAt)
       update.run(1, null, expiresAt, null, series.id, 2, base)
       update.run(-1, 1, expiresAt, null, series.id, 2, base + step)
       update.run(0, 0, expiresAt, null, series.id, 2, base + 2 * step)
@@ -201,7 +199,7 @@ test('compact statistics coverage preserves malformed legacy observations for va
   } finally { await f.close() }
 })
 
-test('coverage follows continuous series bounds through gaps, replacement and imported facts', async () => {
+test('coverage follows continuous series bounds through gaps, replacement and subsequent writes', async () => {
   const f = await fixture(), range = { ...query, through: base + 4 * step }
   try {
     assert.deepEqual(await f.store.missingCandleRanges(range), [{ from: base, through: range.through }])
@@ -213,9 +211,6 @@ test('coverage follows continuous series bounds through gaps, replacement and im
     assert.deepEqual(await f.store.missingCandleRanges({ ...range, through: base + 5 * step }), [{ from: base + 5 * step, through: base + 5 * step }])
 
     await f.store.replaceCandles({ ...range, from: base + 2 * step, through: base + 2 * step }, [])
-    assert.deepEqual(await f.store.missingCandleRanges(range), [{ from: base + 2 * step, through: base + 2 * step }])
-    // Imported rows cannot resurrect a replaced range; native repairs can.
-    await (f.store as any).writer.request('append', [[{ ...candle(2), writtenAt: 100 }], { importing: true }])
     assert.deepEqual(await f.store.missingCandleRanges(range), [{ from: base + 2 * step, through: base + 2 * step }])
     await f.store.appendCandles([candle(2)])
     assert.deepEqual(await f.store.missingCandleRanges(range), [])
@@ -240,24 +235,20 @@ test('integrity inspection detects gaps even if series metadata was corrupted', 
   } finally { await f.close() }
 })
 
-test('inspection preserves issue order, query limits, and covered gaps', async () => {
+test('inspection preserves row order, query limits, and SQLite gaps', async () => {
   const f = await fixture()
   try {
     await f.store.appendCandles([2, 4, 6].map(index => ({ ...candle(index), baseVolume: null })))
-    const database = new DatabaseSync(f.store.path)
-    try {
-      const insert = database.prepare('INSERT INTO import_issues(path,instrument,timeframe,from_ts,through_ts,reason,detail) VALUES(?,?,?,?,?,?,?)')
-      insert.run('z', query.instrument, query.timeframe, base + 5 * step, base + 5 * step, 'corrupt-file', 'first')
-      insert.run('a', query.instrument, query.timeframe, base, base + step, 'corrupt-file', 'second')
-    } finally { database.close() }
     const report = await f.store.inspectCandles({ ...query, order: 'desc', limit: 2 })
     assert.equal(report.checkedRows, 2)
-    assert.deepEqual(report.issues.map(issue => [issue.reason, issue.from, issue.file]), [
-      ['missing-base-volume', base + 6 * step, undefined], ['missing-base-volume', base + 4 * step, undefined],
-      ['corrupt-file', base + 5 * step, 'z'], ['corrupt-file', base, 'a'],
-      ['gap', base + 3 * step, undefined], ['gap', base + 7 * step, undefined],
+    assert.deepEqual(report.issues.map(issue => [issue.reason, issue.from]), [
+      ['missing-base-volume', base + 6 * step], ['missing-base-volume', base + 4 * step],
+      ['gap', base], ['gap', base + 3 * step], ['gap', base + 5 * step], ['gap', base + 7 * step],
     ])
-    assert.deepEqual(report.missingRanges, [{ from: base + 3 * step, through: base + 3 * step }, { from: base + 7 * step, through: base + 9 * step }])
+    assert.deepEqual(report.missingRanges, [
+      { from: base, through: base + step }, { from: base + 3 * step, through: base + 3 * step },
+      { from: base + 5 * step, through: base + 5 * step }, { from: base + 7 * step, through: base + 9 * step },
+    ])
   } finally { await f.close() }
 })
 
@@ -388,10 +379,10 @@ test('statistics coverage versions isolate sources and retain price-dependent ta
     assert.deepEqual(changes('taker', 0), { revision: 2, ranges: [{ from: base + step, through: base + step }] })
     await f.store.appendStatistics({ ...query, from: base + 2 * step, through: base + 2 * step, source: 'oi', values: [], expiresAt: Date.now() + 60_000 })
     assert.deepEqual([version('oi'), version('taker')], [2, 2], 'An empty OI lease changes only OI coverage.')
-    await (f.store as any).writer.request('append', [[{ ...candle(3), oi: 77, statisticsVersion: 9, writtenAt: 100 }], { importing: true }])
-    assert.deepEqual([version('oi'), version('taker')], [3, 3], 'Import records both its OI and its price effects.')
+    await (f.store as any).writer.request('append', [[{ ...candle(3), oi: 77, statisticsVersion: 9, writtenAt: 100 }]])
+    assert.deepEqual([version('oi'), version('taker')], [3, 3], 'A write records both its OI and its price effects.')
     assert.deepEqual(changes('oi', 2), { revision: 3, ranges: [{ from: base + 3 * step, through: base + 3 * step }] })
-    await (f.store as any).writer.request('append', [[{ ...candle(1), oi: 55, statisticsVersion: 9, writtenAt: 101 }], { importing: true }])
+    await (f.store as any).writer.request('append', [[{ ...candle(1), oi: 55, statisticsVersion: 9, writtenAt: 101 }]])
     assert.deepEqual([version('oi'), version('taker')], [4, 3], 'An OI-only import cannot invalidate Taker.')
     const oiBeforeUnknown = version('oi'), takerBeforeUnknown = version('taker')
     ;(f.store as any).committed([{ instrument: query.instrument, timeframe: query.timeframe, from: base + 4 * step,
@@ -433,4 +424,86 @@ test('close joins accepted transactions and rejects subsequent requests', async 
     try { assert.equal((await restarted.coverage(query.instrument, query.timeframe)).count, 1_000) }
     finally { await restarted.close() }
   } finally { await f.close() }
+})
+
+test('removing archive bookkeeping preserves committed SQLite history across restart', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-sqlite-cutover-'))
+  let store = await MarketStore.open(root)
+  try {
+    await store.appendCandles([candle(0)])
+    await store.appendStatistics({ ...query, from: base, through: base, source: 'oi', values: [[base, 1234]] })
+    const saved = await store.candles(query)
+    await store.close()
+    const database = new DatabaseSync(join(root, 'market.sqlite'))
+    try {
+      database.exec(`CREATE TABLE migration_partitions(path TEXT PRIMARY KEY, status TEXT);
+        CREATE TABLE import_issues(path TEXT PRIMARY KEY);
+        CREATE TABLE replacements(series_id INTEGER);
+        PRAGMA user_version=3;`)
+    } finally { database.close() }
+    store = await MarketStore.open(root)
+    assert.deepEqual(await store.candles(query), saved)
+    assert.deepEqual(await store.integrityCheck(), ['ok'])
+    await store.close()
+    const migrated = new DatabaseSync(join(root, 'market.sqlite'), { readOnly: true })
+    try {
+      assert.equal(migrated.prepare('PRAGMA user_version').get()!.user_version, 4)
+      const tables = migrated.prepare("SELECT name FROM sqlite_schema WHERE type='table'").all().map(row => row.name)
+      for (const name of ['migration_partitions', 'import_issues', 'replacements']) assert.ok(!tables.includes(name))
+      assert.ok(migrated.prepare('PRAGMA table_info(candles)').all().some(row => row.name === 'import_version'), 'Upgrade must avoid rewriting history merely to remove an inert column.')
+    } finally { migrated.close() }
+    store = await MarketStore.open(root)
+    assert.deepEqual(await store.candles(query), saved)
+  } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+for (const completed of [false, true]) test(`legacy archives ${completed ? 'with durable cutover keep SQLite available' : 'without cutover reject with recovery guidance'}`, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-archive-upgrade-'))
+  let store: MarketStore | undefined
+  try {
+    store = await MarketStore.open(root)
+    await store.appendCandles([candle(0)])
+    await store.close()
+    await mkdir(join(root, 'candles'))
+    const db = new DatabaseSync(join(root, 'market.sqlite'))
+    try {
+      db.exec(`CREATE TABLE migration_partitions(path TEXT PRIMARY KEY, status TEXT);
+        PRAGMA user_version=3;`)
+      if (completed) db.exec("INSERT INTO migration_partitions VALUES('__complete__','completed')")
+    } finally { db.close() }
+    if (completed) {
+      store = await MarketStore.open(root)
+      assert.equal((await store.candles(query))[0].close, 100)
+      await store.close()
+      store = await MarketStore.open(root)
+      assert.equal((await store.candles(query))[0].close, 100)
+    } else await assert.rejects(MarketStore.open(root), /Finish the SQLite migration using the previous app version/)
+    assert.ok((await readdir(root)).includes('candles'), 'Original archives must remain untouched.')
+  } finally { await store?.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+for (const failure of ['manifest', 'issue'] as const) test(`cutover preserves unresolved ${failure} recovery information despite a completion marker`, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-failed-archive-upgrade-'))
+  const store = await MarketStore.open(root)
+  try {
+    await store.appendCandles([candle(0)])
+    await store.close()
+    const db = new DatabaseSync(join(root, 'market.sqlite'))
+    try {
+      db.exec(`CREATE TABLE migration_partitions(path TEXT PRIMARY KEY, status TEXT, value TEXT);
+        CREATE TABLE import_issues(path TEXT PRIMARY KEY, detail TEXT);
+        INSERT INTO migration_partitions VALUES('__complete__','completed','{}');
+        PRAGMA user_version=3;`)
+      if (failure === 'manifest') db.prepare('INSERT INTO migration_partitions VALUES(?,?,?)').run('failed-partition', 'failed', 'invalid-schema')
+      else db.prepare('INSERT INTO import_issues VALUES(?,?)').run('failed-partition', 'original failure detail')
+    } finally { db.close() }
+    await assert.rejects(MarketStore.open(root), /Resolve failed partitions using the previous app version/)
+    const retained = new DatabaseSync(join(root, 'market.sqlite'), { readOnly: true })
+    try {
+      assert.equal(retained.prepare('PRAGMA user_version').get()!.user_version, 3)
+      assert.equal(retained.prepare('SELECT COUNT(*) AS count FROM candles').get()!.count, 1)
+      if (failure === 'manifest') assert.deepEqual({ ...retained.prepare('SELECT status,value FROM migration_partitions WHERE path=?').get('failed-partition') }, { status: 'failed', value: 'invalid-schema' })
+      else assert.equal(retained.prepare('SELECT detail FROM import_issues WHERE path=?').get('failed-partition')!.detail, 'original failure detail')
+    } finally { retained.close() }
+  } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
 })

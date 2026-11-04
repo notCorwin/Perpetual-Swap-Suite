@@ -422,17 +422,6 @@ export class MarketService {
         return this.track(this.setLive(instId, timeframe, row, context))
       } })
     this.ready = this.initialize()
-    this.unsubscribeStore = this.store.subscribe?.(change => {
-      if (!change.imported || this.closing) return
-      this.markChartDataChanged(change.instrument)
-      if (change.priceFrom !== null) {
-        this.history?.sync.invalidate({ instrument: change.instrument, timeframe: change.timeframe, source: 'candles', from: change.priceFrom, through: change.priceThrough })
-        this.preparedCharts.invalidate(change.instrument, change.timeframe)
-        this.invalidateLiquidityHistory(change.instrument, null, change.timeframe)
-        this.scheduleQualification(change.instrument, change.timeframe)
-        if (change.timeframe === '5m') { this.invalidateRanking(change.instrument); this.track(this.updateRanking(change.instrument)) }
-      } else this.track(this.preparedCharts.observeStatistics(change.instrument, change.timeframe, change.from, change.through))
-    })
   }
 
   prefs() { return validatePreferences(this.preferences()) }
@@ -3361,7 +3350,6 @@ export class MarketService {
     this.candleWaitImmediate = null
     for (const wait of this.candleWaits.values()) this.finishCandleWait(wait, false, new DOMException('Market service is closed.', 'AbortError'))
     for (const recovery of this.sourceRecoveries.values()) this.cancelRequiredRecovery(recovery.key)
-    this.unsubscribeStore?.()
     for (const instId of this.tickerRecoveries.keys()) this.cancelTickerRecovery(instId)
     this.tickerSubscriptions.clear()
     if (this.instrumentRetryTimer) clearTimeout(this.instrumentRetryTimer)

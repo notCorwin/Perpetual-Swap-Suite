@@ -69,7 +69,7 @@ test('a latest request from a removed listing cannot write confirmed candles or 
   }
 })
 
-for (const intervening of ['import', 'removal'] as const) test(`${intervening} during the pre-write read fences the old history response`, { timeout: 10_000 }, async () => {
+for (const intervening of ['write', 'removal'] as const) test(`${intervening} during the pre-write read fences the old history response`, { timeout: 10_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'perp-history-write-fence-')), store = await MarketStore.open(root)
   const sourceHeld = deferred(), requested = deferred(), readHeld = deferred(), reading = deferred()
   const timestamp = Math.floor(Date.now() / step) * step - 2 * step
@@ -94,27 +94,26 @@ for (const intervening of ['import', 'removal'] as const) test(`${intervening} d
       return result
     }
     sourceHeld.resolve(); await reading.promise
-    if (intervening === 'import') {
-      await (store as any).writer.request('append', [[{ ...candle(timestamp, 200), writtenAt: 1 }], { importing: true }], 'foreground')
+    if (intervening === 'write') {
+      await (store as any).writer.request('append', [[{ ...candle(timestamp, 200), writtenAt: 1 }]], 'foreground')
     } else service.installInstruments(new Map())
     readHeld.resolve()
     await pending?.catch(() => {})
     const rows = await candles({ instrument: instId, timeframe: '5m', from: timestamp, through: timestamp })
-    assert.equal(rows[0]?.close, intervening === 'import' ? 200 : undefined)
+    assert.equal(rows[0]?.close, intervening === 'write' ? 200 : undefined)
   } finally {
     sourceHeld.resolve(); readHeld.resolve(); await pending?.catch(() => {})
     await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true })
   }
 })
 
-for (const mode of ['append', 'replace'] as const) test(`a queued ${mode} rechecks its source revision after an independent import`, { timeout: 10_000 }, async () => {
+for (const mode of ['append', 'replace'] as const) test(`a queued ${mode} rechecks its source revision after an independent write`, { timeout: 10_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'perp-history-queue-fence-')), store = await MarketStore.open(root)
   const timestamp = Math.floor(Date.now() / step) * step - 2 * step
   const writer = (store as any).writer, revision = store.candlePriceRevision(instId, '5m')
   try {
-    await (store as any).migrationReady
     writer.fencing = true
-    const imported = writer.request('append', [[{ ...candle(timestamp, 200), writtenAt: 1 }], { importing: true }], 'foreground')
+    const written = writer.request('append', [[{ ...candle(timestamp, 200), writtenAt: 1 }]], 'foreground')
     const canWrite = () => store.candlePriceRevision(instId, '5m') === revision
     const stale = mode === 'append'
       ? store.appendCandles([candle(timestamp, 100)], 'background', { canWrite })
@@ -122,7 +121,7 @@ for (const mode of ['append', 'replace'] as const) test(`a queued ${mode} rechec
     const settled = stale.catch(error => error)
     await Promise.resolve()
     writer.fencing = false; writer.drain()
-    await imported
+    await written
     const result = await settled
     if (mode === 'replace') assert.match(String(result), /changed during repair/)
     assert.equal((await store.candles({ instrument: instId, timeframe: '5m', from: timestamp, through: timestamp }))[0]?.close, 200)
@@ -137,7 +136,7 @@ test('removal completes only after a price transaction admitted by the retired l
   const service = new MarketService(store, () => DEFAULT_PREFERENCES, async () => { throw new Error('Unexpected network request.') }, false)
   let database: DatabaseSync | undefined
   try {
-    await service.ready; await (store as any).migrationReady
+    await service.ready
     const history = service.history as any, timestamp = Math.floor(Date.now() / step) * step - 2 * step, row = candle(timestamp, 100)
     history.priceOrigins.set(row, { epoch: 0, revision: store.candlePriceRevision(instId, '5m') })
     const canWrite = history.priceGuard(instId, [row]), fence = new Int32Array(canWrite.lifetime.buffer)
@@ -147,7 +146,7 @@ test('removal completes only after a price transaction admitted by the retired l
     let retired = false
     const removal = history.removeTargets([instId]).then(() => { retired = true })
     await new Promise<void>(resolve => setImmediate(resolve))
-    assert.equal(retired, false, 'An in-flight transaction must settle before removal completes.')
+    assert.equal(retired && Atomics.load(fence, 1) === 1, false, 'Removal cannot complete while its retired price transaction remains active.')
     database.exec('ROLLBACK')
     assert.match(String(await writing), /lifetime was removed/)
     await removal
@@ -197,7 +196,7 @@ test('production relisting and its new requests wait for the old confirmed trans
     return new Response(JSON.stringify({ code: '0', data: [raw(timestamp, 210)] }))
   }, false)
   try {
-    await service.ready; await (store as any).migrationReady
+    await service.ready
     service.installInstruments(new Map([[instId, instrument], [other.instId, other]]))
     database = new DatabaseSync(join(root, 'market.sqlite')); database.exec('BEGIN IMMEDIATE')
     const history = service.history as any

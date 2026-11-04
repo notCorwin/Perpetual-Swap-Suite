@@ -321,6 +321,7 @@ test('REST source replacements and remove/re-add cannot leave another contract w
   assert.equal(actual.marketDeadlines.get(ids[1]), now + 1)
   for (const service of [expected, actual]) service.installInstruments(new Map([[ids[0], instrument(ids[0])]]))
   for (const service of [expected, actual]) service.installInstruments(new Map(ids.map(id => [id, instrument(id)])))
+  await Promise.all([expected, actual].flatMap(service => [...service.instrumentRetirements.values()]))
   for (const service of [expected, actual]) service.verifyCatalog()
   for (const service of [expected, actual]) {
     service.receivePublicObservation(ids[1], 'openInterest', { instId: ids[1], oiUsd: '10000000', ts: String(now) }, { receivedAt: now - 1000 })

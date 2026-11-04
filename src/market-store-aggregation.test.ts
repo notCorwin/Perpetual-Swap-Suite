@@ -235,24 +235,6 @@ test('aggregation requires complete parent bucket boundaries', async () => {
   } finally { await f.close() }
 })
 
-test('late archive imports preserve derived prices and their invalidation provenance', async () => {
-  const f = await fixture(), range = { instrument, timeframe: '15m', from: base, through: base }
-  try {
-    await f.store.appendCandles([child(0), child(1), child(2)])
-    await f.store.aggregateCandles({ ...range, timeframe: '15m' })
-    const [derived] = await f.store.candles(range)
-    // Exercise the same writer protocol used by the asynchronous archive importer.
-    const writer = (f.store as any).writer
-    await writer.request('append', [[{ ...derived, writtenAt: Date.now() + 1_000 }], { importing: true }])
-    await writer.request('append', [[parent('15m', base, { oi: 123, statisticsVersion: 9, writtenAt: Date.now() + 2_000 })], { importing: true }])
-    const [retained] = await f.store.candles(range)
-    assert.deepEqual([retained.close, retained.volume, retained.oi], [derived.close, derived.volume, 123])
-    await f.store.replaceCandles({ instrument, timeframe: '5m', from: base + childStep, through: base + childStep }, [])
-    assert.equal((await f.store.aggregateCandles({ ...range, timeframe: '15m', invalidateIncomplete: true })).invalidated, 1)
-    assert.deepEqual(await f.store.candles(range), [])
-    assert.equal((await f.store.statistics(range))[0].oi, 123)
-  } finally { await f.close() }
-})
 
 test('late Taker results are skipped and price-volume mismatches become missing without hiding OI', async () => {
   const f = await fixture()
@@ -356,7 +338,7 @@ test('observed candle volume migrates from v2 and survives reopening', async () 
     assert.deepEqual(rows.map(row => [row.sell, row.buy]), [[3, 7], [0.5, 1.5]])
     const migrated = new DatabaseSync(join(root, 'market.sqlite'))
     try {
-      assert.equal(migrated.prepare('PRAGMA user_version').get()!.user_version, 3)
+      assert.equal(migrated.prepare('PRAGMA user_version').get()!.user_version, 4)
       assert.equal(migrated.prepare('SELECT observed_volume FROM statistics WHERE series_id=1 AND source=2 AND timestamp=?').get(base)!.observed_volume, null)
       assert.equal(migrated.prepare('SELECT observed_volume FROM statistics WHERE series_id=1 AND source=2 AND timestamp=?').get(base + childStep)!.observed_volume, 2)
     } finally { migrated.close() }

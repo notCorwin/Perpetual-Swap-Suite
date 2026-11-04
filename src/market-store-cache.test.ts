@@ -13,7 +13,6 @@ const candle = (index: number, close = 100, instrument = query.instrument) => ({
   open: 100, high: Math.max(101, close), low: 99, close, volume: 1, baseVolume: 1, quoteVolume: 100, confirmed: true })
 const fixture = async () => {
   const root = await mkdtemp(join(tmpdir(), 'perp-candle-reuse-')), store = await MarketStore.open(root)
-  await (store as any).migrationReady
   return { root, store, close: async () => { await store.close(); await rm(root, { recursive: true, force: true }) } }
 }
 const requests = (store: MarketStore) => store.getDiagnostics().reads.requests
@@ -125,8 +124,8 @@ test('cached gap computation ignores off-grid records and does not enumerate an 
     await f.store.appendCandles([candle(0), candle(2)])
     const database = new DatabaseSync(f.store.path)
     try {
-      database.prepare(`INSERT INTO candles(series_id,timestamp,open,high,low,close,volume,base_volume,quote_volume,written_at,origin,import_version)
-        SELECT series_id,?,open,high,low,close,volume,base_volume,quote_volume,written_at,origin,import_version FROM candles WHERE timestamp=?`).run(base + step + 0.5, base)
+      database.prepare(`INSERT INTO candles(series_id,timestamp,open,high,low,close,volume,base_volume,quote_volume,written_at,origin)
+        SELECT series_id,?,open,high,low,close,volume,base_volume,quote_volume,written_at,origin FROM candles WHERE timestamp=?`).run(base + step + 0.5, base)
     } finally { database.close() }
     const range = { ...query, through: base + 2 * step }
     await f.store.candles(range)
@@ -223,9 +222,7 @@ test('all-source revisions invalidate related writes while unrelated commits pre
     assert.equal(renewed.statisticsOIExpiresAt, 503); assert.equal(renewed.statisticsOIAbsenceAttempts, 2)
     await f.store.replaceCandles({ ...query, through: base + step }, [])
     assert.deepEqual(await f.store.candles(query), [])
-    // Migration writes go directly through the same writer protocol, without a
-    // public append operation around them.
-    await (f.store as any).writer.request('append', [[{ ...candle(2), writtenAt: 100 }], { importing: true }])
+    await f.store.appendCandles([candle(2)])
     assert.deepEqual((await f.store.candles(query)).map(row => row.timestamp), [base + 2 * step])
     const parent = { instrument: query.instrument, timeframe: '15m', from: base, through: base }
     assert.deepEqual(await f.store.candles(parent), [])

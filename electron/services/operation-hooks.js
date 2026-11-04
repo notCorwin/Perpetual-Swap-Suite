@@ -47,7 +47,7 @@ const emitterHooks = new WeakSet()
 const eventTargetHooks = new WeakSet()
 const tcpSockets = new WeakMap()
 const hookMarker = Symbol('operation-hook')
-const knownExtensions = new Set(['.sqlite', '.db', '.parquet', '.json', '.jsonl', '.js', '.cjs', '.mjs', '.ts', '.html', '.css', '.png', '.pdf', '.txt', '.log'])
+const knownExtensions = new Set(['.sqlite', '.db', '.json', '.jsonl', '.js', '.cjs', '.mjs', '.ts', '.html', '.css', '.png', '.pdf', '.txt', '.log'])
 
 export { withOperationHookSuppressed, isOperationHookSuppressed }
 

@@ -19,7 +19,7 @@ const serviceDir = join(root, 'electron/services'), workerPath = join(serviceDir
 const currentWorker = await readFile(workerPath, 'utf8')
 const oldWorker = execFileSync('git', ['show', 'HEAD:electron/services/market-store-worker.js'], { cwd: root, encoding: 'utf8' })
 const facade = await readFile(join(serviceDir, 'market-store.js'), 'utf8')
-const helperNames = ['worker-operations.js', 'recorded-database.js', 'market-records.js', 'statistics-state.js', 'statistics-coverage.js', 'candle-aggregation.js', 'operations.js', 'market-store-migration.js']
+const helperNames = ['operation-runtime.js', 'worker-operations.js', 'recorded-database.js', 'market-records.js', 'statistics-state.js', 'statistics-coverage.js', 'candle-aggregation.js', 'operations.js']
 const inputNames = ['scripts/benchmark-aggregate-worker.mjs', 'electron/services/market-store.js', 'electron/services/market-store-worker.js', ...helperNames.map(name => `electron/services/${name}`)]
 const digest = value => createHash('sha256').update(value).digest('hex')
 const fingerprint = async () => {

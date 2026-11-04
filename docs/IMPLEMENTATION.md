@@ -71,20 +71,16 @@ The 2026-10-25 local paired run compared revision `8b0a8cd` with this repair, us
 
 Forming revisions project from a copy of confirmed recursive state and never change the durable confirmed seed. Price corrections invalidate descendants; statistics updates affect their own observations. Formula, seed, gap, and boundary rules remain defined in the [indicator contract](INDICATORS.md).
 
-## Existing-data migration
+## Existing SQLite data
 
-Parquet is a read-only import source, not a second active fact store. Migration runs in a separate Node child process and checkpoints each partition durably. The native DuckDB addon belongs to that process, so stopping an import cannot tear down native callbacks inside the app's worker-thread isolate. In packaged Electron, the child uses the same executable with `ELECTRON_RUN_AS_NODE=1` and loads its script from the app archive. Bounded foreground queries prioritize the required series/range; recent-tail queries import recent partitions first. Opening the store does not await the entire archive import.
-
-The importer honors the newest base generation and only later deltas, so superseded files cannot resurrect repaired or deleted rows. It resolves logical revisions by `writtenAt`, validates native grids, schema, confirmation, quantities, and partition identity, and preserves original units and source expiry evidence. Newly collected SQLite facts take precedence over older imported values, independently for price and each statistics source. Imported failures remain explicit audit findings.
-
-A completed import records a durable cutover marker before acknowledging completion, closes its connections, and exits normally. Shutdown cancels pending archive reads, drains already accepted SQLite transactions, and stops the child at a partition boundary; a hung native child can be killed without terminating the app or discarding acknowledged facts. An unexpected exit before cutover rejects pending legacy reads and leaves durable progress available on restart. An exit after durable cutover cannot invalidate committed SQLite facts. Subsequent launches skip the importer entirely, and queries do not reread the retained Parquet files. Original files remain unchanged for recovery. Imported rows, migration progress, and source versions commit atomically per partition; an interrupted import resumes rather than restarting or requiring permanent dual writes.
+SQLite is the only active history store. Schema version 4 removes obsolete archive-import bookkeeping while preserving committed candles, statistics, source observation times, and indicator checkpoints. Inert legacy columns remain to avoid rewriting the entire history during startup. Legacy Parquet files are neither read nor deleted. An unfinished archive migration or unresolved import failure blocks upgrade with recovery guidance and preserves its recovery records; complete it using the previous app version before upgrading. Missing SQLite history is acquired through the normal source scheduler.
 
 ## Verification and delivery
 
 Use the locked Node/npm versions and `npm ci`. Reproduction commands are listed in the [README](../README.md):
 
 - `npm run typecheck`, `npm run lint`, and `npm run check:desktop` check the source and desktop boundary.
-- `npm run test:core` checks native source handling, independent statistics, transactional persistence, import/cutover, correction invalidation, exact checkpoint replay, scheduling, and core UI contracts.
+- `npm run test:core` checks native source handling, independent statistics, transactional persistence, schema upgrades, correction invalidation, exact checkpoint replay, scheduling, and core UI contracts.
 - `npm run test:e2e` exercises the actual Electron bridge, navigation, partial readiness, chart interactions, and isolation with temporary data.
 - `npm run benchmark`, `npm run benchmark:chart:foreground`, and `npm run benchmark:instruments` measure the current implementation. Earlier Parquet timings do not describe the SQLite backend. Commands ending in `:foreground` deliberately show and focus Electron; ordinary tests keep their windows hidden.
 - `npm run benchmark:market:foreground` builds and seeds 287 × 3 native series into real SQLite, injects synthetic native updates while statistics are held and archive writes continue, and records receipt-to-SVG-commit/next-paint opportunities, switches, local scrolling, source correctness, worker diagnostics, and Electron process working sets. External WebSocket transport and network latency are excluded; `.build/resource-benchmark.json` records the outcome, including failures.
