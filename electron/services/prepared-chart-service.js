@@ -91,17 +91,70 @@ const bar = (row, calculated, oiFresh = sourceFresh(row, 1), takerFresh = source
   takerUnavailableReason: takerFresh && (!numeric(row.buy) || !numeric(row.sell)) ? 'not-published' : undefined,
 })
 
-const appendConfirmed = (state, candle) => {
+// A confirmed seed is shared by the latest tail and a resident history view.
+// Only appending a new confirmed candle creates a successor; projections and
+// promotions must never mutate the admitted prefix behind another owner.
+const sharedIndicatorState = state => {
+  if (!state || Object.isFrozen(state)) return state
+  for (const value of state.volumes) Object.freeze(value)
+  for (const value of state.rsi) Object.freeze(value)
+  for (const field of ['closes', 'volumes', 'rocs', 'rsi']) Object.freeze(state[field])
+  if (state.bollExpansion) Object.freeze(state.bollExpansion)
+  return Object.freeze(state)
+}
+const appendConfirmed = (previous, candle) => {
+  const state = { ...previous, closes: [...previous.closes], volumes: [...previous.volumes], rocs: [...previous.rocs],
+    rsi: previous.rsi.map(value => ({ ...value })) }
   const previousHour = state.lastTimestamp, previousWidth = state.previousBandWidth ?? null
   const value = appendIndicatorCandle(state, candle)
-  if (!value) return null
+  if (!value) return { state: previous, value: null }
   const width = value.bbw
   state.bollExpansion = width === null ? null : previousWidth === null || previousHour + state.intervalMS !== candle.timestamp
     ? { hours: 0, complete: false } : width <= previousWidth ? { hours: 0, complete: true }
       : { hours: (state.bollExpansion?.hours ?? 0) + 1, complete: state.bollExpansion?.complete ?? false }
   state.previousBandWidth = width
-  return value
+  return { state: sharedIndicatorState(state), value: immutableRecord({ ...value, indicatorsObserved: true }) }
 }
+
+// Source work and failures are owned by a series/source pair. Keep that index
+// at the mutation boundary, so a status query never scans unrelated contracts.
+// Its identity/version also fences cached task coverage on add/remove/replace.
+class SourceRegistry extends Map {
+  groups = new Map()
+
+  group(series, source) { return this.groups.get(`${series}:${source}`) }
+
+  change(key, value, adding) {
+    const identity = `${value.seriesKey}:${value.source}`
+    let group = this.groups.get(identity)
+    if (!group) { group = { entries: new Map(), version: 0, sorted: null }; this.groups.set(identity, group) }
+    if (adding) group.entries.set(key, value)
+    else group.entries.delete(key)
+    group.version += 1; group.sorted = null
+    if (!group.entries.size) this.groups.delete(identity)
+  }
+
+  set(key, value) {
+    const previous = this.get(key)
+    if (previous === value) return this
+    if (previous) this.change(key, previous, false)
+    super.set(key, value); this.change(key, value, true)
+    return this
+  }
+
+  delete(key) {
+    const previous = this.get(key)
+    if (!super.delete(key)) return false
+    this.change(key, previous, false)
+    return true
+  }
+
+  clear() { super.clear(); this.groups.clear() }
+}
+
+const sameStatus = (left, right) => left === right || Boolean(left && right
+  && Object.keys(left).every(key => Object.is(left[key], right[key]))
+  && Object.keys(right).every(key => Object.is(left[key], right[key])))
 
 /** Price publication, statistic observations and exact indicator work have independent lifetimes. */
 export class PreparedChartPipeline {
@@ -121,7 +174,7 @@ export class PreparedChartPipeline {
     this.candidateLimit = Math.min(4, this.workerLimit)
     this.candidateQueue = []; this.candidateTasks = new Map(); this.candidateTimer = null; this.candidateTimerAt = Infinity
     this.warmSourceQueue = []; this.warmSourceActive = new Map()
-    this.sourceAttempts = new Map(); this.sourceTasks = new Map()
+    this.sourceAttempts = new SourceRegistry(); this.sourceTasks = new SourceRegistry()
     this.sourceEpoch = 0
     this.focus = null; this.explicitFocus = false
     this.focusReads = new Set(); this.pendingFocusRead = null
@@ -152,7 +205,7 @@ export class PreparedChartPipeline {
         indicatorFailures: new Map(live?.indicatorFailures ?? []),
         barCaches: new Map(live?.barCaches ?? []),
         projectedBars: new Map(live?.projectedBars ?? []),
-        indicatorState: live?.indicatorState ? structuredClone(live.indicatorState) : null, live: live?.live ?? null, observedAt: live?.observedAt ?? null,
+        indicatorState: sharedIndicatorState(live?.indicatorState) ?? null, live: live?.live ?? null, observedAt: live?.observedAt ?? null,
         indicatorVersion: live?.indicatorVersion ?? 0,
         floor: live?.floor ?? null, active: 0, latestHour: live?.latestHour ?? null, historyEnd: null, loaded: live?.loaded ?? false, calculation: null }
     }
@@ -231,7 +284,7 @@ export class PreparedChartPipeline {
       if (projected <= this.maxProjectionBytes) break
       if (key === this.focusKey || this.universe.has(key) || state.active || this.series.get(key)?.active) continue
       projected -= state.byteSize ?? 0
-      state.rows.clear(); state.indicators.clear(); state.barCaches?.clear(); state.projectedBars?.clear(); state.historyBarsCache = null; state.liveProjection = null; state.byteSize = 0
+      state.rows.clear(); this.sourceRowsChanged(state); state.indicators.clear(); state.barCaches?.clear(); state.projectedBars?.clear(); state.historyBarsCache = null; state.liveProjection = null; state.byteSize = 0
       state.indicatorFailures?.clear()
       // Quotes and fixed-size recursive checkpoints remain available on ticks.
     }
@@ -573,10 +626,13 @@ export class PreparedChartPipeline {
   sourceStatus(state, source, from, through, availability) {
     let status = { state: availability, from, through }
     if (!['ready', 'unavailable'].includes(availability)) {
-      const pending = this.pendingSourceRanges(state, source, from, through)
-      const failure = [...this.sourceAttempts.values()].filter(attempt => attempt.seriesKey === state.key && attempt.source === source
-        && pending.some(range => attempt.from <= range.through && attempt.through >= range.from))
-        .sort((left, right) => right.failedAt - left.failedAt)[0]
+      const attempts = this.sourceAttempts.group(state.key, source)
+      let failure
+      if (attempts) {
+        const pending = this.pendingSourceRanges(state, source, from, through)
+        for (const attempt of attempts.entries.values()) if ((!failure || attempt.failedAt > failure.failedAt)
+          && pending.some(range => attempt.from <= range.through && attempt.through >= range.from)) failure = attempt
+      }
       if (failure) status = { ...status, state: 'error', error: failure.error, retryAt: failure.retryAt }
       else if (source !== 'candles' && typeof this.history.ensureStatistics !== 'function') status = { ...status, state: 'unavailable', reason: 'unsupported' }
     } else if (availability === 'unavailable' && source !== 'candles') status.reason = 'not-published'
@@ -587,7 +643,7 @@ export class PreparedChartPipeline {
     state.statusCache ??= new Map()
     const { through } = status
     const key = `${source}:${through}`, previous = state.statusCache.get(key)
-    if (previous && (previous === status || JSON.stringify(previous) === JSON.stringify(status))) status = previous
+    if (sameStatus(previous, status)) status = previous
     state.statusCache.delete(key); state.statusCache.set(key, status)
     while (state.statusCache.size > 12) state.statusCache.delete(state.statusCache.keys().next().value)
     return status
@@ -797,6 +853,7 @@ export class PreparedChartPipeline {
       if (changedSource(previous, value, 1)) oiChanged = true
       if (changedSource(previous, value, 2)) takerChanged = true
       state.rows.set(row.timestamp, immutableRecord(unchanged ? previous : value))
+      if (!unchanged) this.sourceRowsChanged(state, row.timestamp)
     }
     if (pricesChanged) state.priceVersion += 1
     if (observationsChanged) state.sourceVersion += 1
@@ -869,6 +926,7 @@ export class PreparedChartPipeline {
     let evicted = false
     for (const hour of state.rows.keys()) if (hour < first || hour > last) {
       state.rows.delete(hour); state.indicators.delete(hour); state.projectedBars?.delete(hour)
+      this.sourceRowsChanged(state, hour)
       evicted = true
     }
     // A cursor may leave and return while coverage is pending. Matching final
@@ -927,6 +985,7 @@ export class PreparedChartPipeline {
     for (const [hour, row] of state.rows) if (hour >= state.latestHour - (TAIL - 1) * state.intervalMS) {
       const previous = live.rows.get(hour)
       if (previous && !samePrice(previous, row)) live.indicators.delete(hour)
+      if (previous !== row) this.sourceRowsChanged(live, hour)
       live.rows.set(hour, row)
       if (state.indicators.has(hour)) live.indicators.set(hour, state.indicators.get(hour))
       const failure = state.indicatorFailures?.get(hour)
@@ -934,9 +993,10 @@ export class PreparedChartPipeline {
     }
     for (const hour of live.rows.keys()) if (hour < state.latestHour - (TAIL - 1) * state.intervalMS) {
       live.rows.delete(hour); live.indicators.delete(hour); live.projectedBars?.delete(hour)
+      this.sourceRowsChanged(live, hour)
     }
     for (const hour of live.indicatorFailures?.keys() ?? []) if (!live.rows.has(hour)) live.indicatorFailures.delete(hour)
-    if (state.indicatorState && (!live.indicatorState || state.indicatorState.lastTimestamp > live.indicatorState.lastTimestamp)) live.indicatorState = structuredClone(state.indicatorState)
+    if (state.indicatorState && (!live.indicatorState || state.indicatorState.lastTimestamp > live.indicatorState.lastTimestamp)) live.indicatorState = sharedIndicatorState(state.indicatorState)
     live.latestHour = state.latestHour; live.floor = state.floor; live.generation = state.generation
     live.loaded ||= state.loaded
     for (const field of ['sourceVersion', 'priceVersion', 'oiVersion', 'takerVersion', 'indicatorVersion']) live[field] = Math.max(live[field] ?? 0, state[field] ?? 0)
@@ -957,11 +1017,14 @@ export class PreparedChartPipeline {
       // facts also admit the selected chart without another disk query.
       const live = this.liveStates.get(key)
       if (live !== state && live?.loaded && (!state.loaded || !state.rows.has(state.latestHour))) {
-        for (const [hour, row] of live.rows) { state.rows.set(hour, row); if (live.indicators.has(hour)) state.indicators.set(hour, live.indicators.get(hour)) }
+        for (const [hour, row] of live.rows) {
+          if (state.rows.get(hour) !== row) this.sourceRowsChanged(state, hour)
+          state.rows.set(hour, row); if (live.indicators.has(hour)) state.indicators.set(hour, live.indicators.get(hour))
+        }
         for (const field of ['latestHour', 'floor', 'generation', 'sourceVersion', 'priceVersion', 'oiVersion', 'takerVersion', 'indicatorVersion', 'loaded']) state[field] = live[field]
         state.barCaches = new Map(live.barCaches ?? [])
         state.projectedBars = new Map(live.projectedBars ?? [])
-        if (live.indicatorState) state.indicatorState = structuredClone(live.indicatorState)
+        if (live.indicatorState) state.indicatorState = sharedIndicatorState(live.indicatorState)
         this.updateMemory(state)
       }
     }
@@ -1374,7 +1437,7 @@ export class PreparedChartPipeline {
     for (const [source, bit] of [['oi', 1], ['taker', 2]]) {
       // Skipping an active range also means sharing its lifetime. Otherwise a
       // focus change can cancel the edge repair a candidate just reused.
-      for (const job of this.sourceTasks.values()) if (job.seriesKey === state.key && job.source === source && job.from <= through && job.through >= from) {
+      for (const job of this.sourceTasks.group(state.key, source)?.entries.values() ?? []) if (job.from <= through && job.through >= from) {
         if (demand) job.demands.add(demand)
         job.reserve ??= reserve
         this.promoteSourceJob(job, priority)
@@ -1468,11 +1531,11 @@ export class PreparedChartPipeline {
   }
 
   sourceRetryAt(state, source, from, through) {
-    if (!this.sourceAttempts.size) return 0
+    const attempts = this.sourceAttempts.group(state.key, source)
+    if (!attempts) return 0
     const pending = this.pendingSourceRanges(state, source, from, through)
     let retryAt = 0
-    for (const attempt of this.sourceAttempts.values()) if (attempt.seriesKey === state.key && attempt.source === source
-      && pending.some(range => attempt.from <= range.through && attempt.through >= range.from)
+    for (const attempt of attempts.entries.values()) if (pending.some(range => attempt.from <= range.through && attempt.through >= range.from)
       && numeric(attempt.retryAt)) retryAt = Math.max(retryAt, attempt.retryAt)
     return retryAt > Date.now() ? retryAt : 0
   }
@@ -1480,30 +1543,63 @@ export class PreparedChartPipeline {
   sourceInputVersion(state, source) { return source === 'candles' ? state.priceVersion : source === 'oi' ? state.oiVersion : state.takerVersion }
 
   sourceBlocked(state, source, from, through) {
-    if (this.sourceRetryAt(state, source, from, through)) return true
+    const attempts = this.sourceAttempts.group(state.key, source)
+    if (!attempts) return false
     const pending = this.pendingSourceRanges(state, source, from, through)
-    return [...this.sourceAttempts.values()].some(attempt => attempt.seriesKey === state.key && attempt.source === source
-      && attempt.retryAt === undefined && (attempt.demands ? attempt.demands.some(demand => this.currentDemand(demand)) : attempt.focus === this.focus) && attempt.sourceEpoch === this.sourceEpoch
-      && attempt.inputVersion === this.sourceInputVersion(state, source)
-      && pending.some(range => attempt.from <= range.through && attempt.through >= range.from))
+    const now = Date.now()
+    for (const attempt of attempts.entries.values()) if (pending.some(range => attempt.from <= range.through && attempt.through >= range.from)
+      && (numeric(attempt.retryAt) && attempt.retryAt > now
+        || attempt.retryAt === undefined && (attempt.demands ? attempt.demands.some(demand => this.currentDemand(demand)) : attempt.focus === this.focus)
+          && attempt.sourceEpoch === this.sourceEpoch && attempt.inputVersion === this.sourceInputVersion(state, source))) return true
+    return false
+  }
+
+  sourceRowsChanged(state, from, through = from, source) {
+    const cache = state.pendingRangeCache
+    if (!cache) return
+    if (from === undefined) { cache.clear(); return }
+    for (const [key, value] of cache) if ((!source || value.source === source)
+      && value.from <= through && value.through >= from) cache.delete(key)
   }
 
   pendingSourceRanges(state, source, from, through) {
-    const jobs = [...this.sourceTasks.values()].filter(job => job.seriesKey === state.key && job.source === source && job.from <= through && job.through >= from)
-      .sort((left, right) => left.from - right.from)
+    const group = this.sourceTasks.group(state.key, source), version = group?.version ?? 0
+    const key = `${source}:${from}:${through}`, now = Date.now()
+    const cache = state.pendingRangeCache ??= new Map(), cached = cache.get(key)
+    if (cached && cached.rows === state.rows && cached.group === group && cached.version === version
+      && now >= cached.computedAt && now < cached.validUntil) return cached.ranges
+    // Sort active coverage once per membership revision, independently of the
+    // requested window. Resident mutations clear this bounded cache; expiring
+    // unpublished statistics invalidate at their earliest relevant deadline.
+    const jobs = group ? group.sorted ??= [...group.entries.values()].sort((left, right) => left.from - right.from) : []
     const ranges = []
-    let index = 0, coveredThrough = -Infinity
+    let index = 0, coveredThrough = -Infinity, validUntil = Infinity
     for (let hour = from; hour <= through; hour += state.intervalMS) {
       while (index < jobs.length && jobs[index].from <= hour) {
         const job = jobs[index++]
         if (job.through >= hour) coveredThrough = Math.max(coveredThrough, job.through)
       }
       const row = state.rows.get(hour)
+      if (row && source !== 'candles') {
+        const missing = source === 'oi' ? !numeric(row.oi) : !numeric(row.buy) || !numeric(row.sell)
+        const expiry = Number(row[source === 'oi' ? 'statisticsOIExpiresAt' : 'statisticsTakerExpiresAt'])
+        if (missing && expiry > now) validUntil = Math.min(validUntil, expiry)
+      }
       if ((source === 'candles' ? completePriceCandle(row) : sourceFresh(row, source === 'oi' ? 1 : 2))
         || coveredThrough >= hour) continue
       const previous = ranges.at(-1)
       if (previous?.through + state.intervalMS === hour) previous.through = hour
       else ranges.push({ from: hour, through: hour })
+    }
+    // Callers consume ranges as immutable plans; no caller may edit a cached
+    // plan and thereby change another consumer's acquisition boundaries.
+    for (const range of ranges) Object.freeze(range)
+    Object.freeze(ranges)
+    cache.delete(key); cache.set(key, { rows: state.rows, source, from, through, group, version, computedAt: now, validUntil, ranges })
+    let spans = [...cache.values()].reduce((sum, entry) => sum + entry.ranges.length, 0)
+    while (cache.size > 12 || spans > 256) {
+      const oldest = cache.keys().next().value
+      spans -= cache.get(oldest).ranges.length; cache.delete(oldest)
     }
     return ranges
   }
@@ -1522,7 +1618,8 @@ export class PreparedChartPipeline {
   }
 
   sourceJob(key, operation, { state, source, from, through, reserve, priority = 'interactive', demand = this.focus }) {
-    const existing = this.sourceTasks.get(key) ?? [...this.sourceTasks.values()].find(job => job.seriesKey === state.key && job.source === source && job.from <= from && job.through >= through)
+    const existing = this.sourceTasks.get(key) ?? [...this.sourceTasks.group(state.key, source)?.entries.values() ?? []]
+      .find(job => job.from <= from && job.through >= through)
     if (existing) { existing.reserve ??= reserve; if (demand) existing.demands.add(demand); this.promoteSourceJob(existing, priority); return existing.task }
     if (this.sourceBlocked(state, source, from, through)) return null
     const controller = new AbortController(), signal = controller.signal
@@ -1610,8 +1707,8 @@ export class PreparedChartPipeline {
     }
     const indicators = this.indicatorDemand(state, focus)
     if (indicators) {
-      const active = [...this.sourceTasks.values()].some(job => job.seriesKey === state.key && job.source === 'candles'
-        && job.from <= indicators.from && job.through >= indicators.through)
+      const active = [...this.sourceTasks.group(state.key, 'candles')?.entries.values() ?? []]
+        .some(job => job.from <= indicators.from && job.through >= indicators.through)
       if (!active) repair('candles', indicators.from, indicators.through)
     }
     this.repairDeadlines = repairDeadlines
@@ -1636,6 +1733,7 @@ export class PreparedChartPipeline {
         const previous = current.rows.get(row.timestamp), value = this.normalize(row)
         if (!previous || samePrice(previous, value)) continue
         current.rows.set(row.timestamp, immutableRecord(mergeStatistics(previous, value)))
+        this.sourceRowsChanged(current, row.timestamp)
         changedFrom = Math.min(changedFrom, row.timestamp); changed = true
       }
       if (changed) { current.priceVersion += 1; current.sourceVersion += 1 }
@@ -1764,7 +1862,7 @@ export class PreparedChartPipeline {
             current.indicators.set(value.hour, immutableRecord(value)); changed = true; progressed = true
           }
           for (const current of residents()) if (!current.indicatorState || calculated.lastTimestamp > current.indicatorState.lastTimestamp) {
-            current.indicatorState = structuredClone(calculated); current.bollExpansion = calculated.bollExpansion
+            current.indicatorState = sharedIndicatorState(calculated); current.bollExpansion = calculated.bollExpansion
           }
           if (changed) {
             const version = Math.max(...residents().map(current => current.indicatorVersion ?? 0)) + 1
@@ -1824,6 +1922,7 @@ export class PreparedChartPipeline {
       const consumers = [state, live].filter(Boolean)
       if (!consumers.length) continue
       const ordered = batch.length > 1 ? batch.toSorted((a, b) => a.timestamp - b.timestamp) : batch
+      const confirmedAppends = new WeakMap()
       let changedFrom = Infinity
       for (const current of consumers) {
         for (const row of ordered) {
@@ -1832,15 +1931,22 @@ export class PreparedChartPipeline {
             current.priceVersion += 1
             if (row.timestamp <= (current.latestHour ?? -Infinity)) changedFrom = Math.min(changedFrom, row.timestamp)
             else if (current.indicatorState) {
-              const value = appendConfirmed(current.indicatorState, row)
+              const previous = current.indicatorState
+              let appended = confirmedAppends.get(previous)
+              if (!appended || appended.row !== row) {
+                appended = { ...appendConfirmed(previous, row), row }
+                confirmedAppends.set(previous, appended)
+              }
+              const { state: successor, value } = appended
+              current.indicatorState = successor
               current.bollExpansion = current.indicatorState.bollExpansion
-              if (value) current.indicators.set(value.hour, immutableRecord({ ...value, indicatorsObserved: true }))
+              if (value) current.indicators.set(value.hour, value)
             }
           }
           if (changedSource(previous.get(row.timestamp), row, 1)) current.oiVersion = (current.oiVersion ?? 0) + 1
           if (changedSource(previous.get(row.timestamp), row, 2)) current.takerVersion = (current.takerVersion ?? 0) + 1
           const prior = current.rows.get(row.timestamp), value = mergeStatistics(prior, this.normalize(row))
-          if (!sameRecord(prior, value)) { current.rows.set(row.timestamp, immutableRecord(value)); current.sourceVersion += 1 }
+          if (!sameRecord(prior, value)) { current.rows.set(row.timestamp, immutableRecord(value)); current.sourceVersion += 1; this.sourceRowsChanged(current, row.timestamp) }
           current.latestHour = Math.max(current.latestHour ?? -Infinity, row.timestamp)
           if (current.live?.timestamp <= row.timestamp) current.live = null
         }
@@ -1885,7 +1991,7 @@ export class PreparedChartPipeline {
         const value = mergeStatistics(previous, { ...previous, ...Object.fromEntries(statisticsFields.map(field => [field, normalized[field]])) }, allowed)
         if (changedSource(previous, value, 1)) current.oiVersion = (current.oiVersion ?? 0) + 1
         if (changedSource(previous, value, 2)) current.takerVersion = (current.takerVersion ?? 0) + 1
-        if (!sameRecord(previous, value)) { current.rows.set(row.timestamp, immutableRecord(value)); observationsChanged = true }
+        if (!sameRecord(previous, value)) { current.rows.set(row.timestamp, immutableRecord(value)); observationsChanged = true; this.sourceRowsChanged(current, row.timestamp, row.timestamp, source) }
       }
       if (observationsChanged) { current.sourceVersion += 1; changed = true; this.updateMemory(current) }
     }
@@ -1899,6 +2005,7 @@ export class PreparedChartPipeline {
     const generation = ++this.nextGeneration
     for (const current of new Set([state, live].filter(Boolean))) {
       current.priceVersion += 1; current.generation = generation; current.indicatorState = null; current.indicators.clear(); current.loaded = false; current.historyRange = null; current.rows.clear(); current.latestHour = null
+      this.sourceRowsChanged(current)
       current.indicatorFailures?.clear()
       current.barCaches?.clear(); current.projectedBars?.clear(); current.historyBarsCache = null; current.liveProjection = null
       current.publishedHistoryFrame = null

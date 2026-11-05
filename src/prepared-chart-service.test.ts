@@ -1142,6 +1142,32 @@ test('full-universe forming intake retains raw prices without publishing charts 
   } finally { unsubscribe(); await pipeline.dispose() }
 })
 
+test('confirmed appends preserve admitted prefixes and checkpoint ownership across resident views', async () => {
+  const rows = source(400), { pipeline, store } = fixture(rows)
+  try {
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
+    const state = pipeline.state(instId, '15m'), live = pipeline.liveStates.get(state.key)
+    const prefix = state.indicatorState, saved = structuredClone(prefix)
+    const next = [candle(rows.at(-1)!.timestamp + interval, 400), candle(rows.at(-1)!.timestamp + 2 * interval, 401)]
+    // The worker receives its own request checkpoint, even when the sender's
+    // admitted prefix is immutable and shared by several resident views.
+    const replay = await pipeline.calculate(next, interval, 'foreground', prefix)
+    assert.deepEqual(prefix, saved)
+    for (const row of next) store.change(row)
+    pipeline.observe(next, new Map())
+    await finishSeed(pipeline)
+    assert.deepEqual(prefix, saved, 'Admitting a successor cannot mutate an earlier recursive prefix.')
+    const oracle = buildIndicatorSeries([...rows, ...next], interval).bars.at(-1) as any
+    for (const current of [state, live]) {
+      assert.equal(current.indicatorState.lastTimestamp, next.at(-1)!.timestamp)
+      for (const key of indicatorFields) assert.equal(current.indicators.get(next.at(-1)!.timestamp)[key], oracle[key])
+    }
+    for (const key of indicatorFields) assert.equal(replay.bars.at(-1)[key], oracle[key])
+    assert.deepEqual(store.checkpoints.find(checkpoint => checkpoint.timestamp === saved.lastTimestamp)?.state, saved,
+      'A resident append cannot alter a previously durable checkpoint.')
+  } finally { await pipeline.dispose() }
+})
+
 test('exact recursive work reads bounded chunks and durable checkpoints reproduce full-history math', async () => {
   const rows = source(3500), { pipeline, store } = fixture(rows)
   let restarted: any
@@ -1668,17 +1694,18 @@ test('a delayed statistics query cannot roll back canonical price fields or a ne
   } finally { hold.resolve(); await pipeline.dispose() }
 })
 
-test('restored latest cores do not share mutable recursive state and volume corrections invalidate derived values', async () => {
+test('restored latest prefixes remain unchanged during appends and volume corrections invalidate derived values', async () => {
   const rows = source(500), { pipeline, store } = fixture(rows)
   try {
     await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     pipeline.series.delete(`${instId}:15m`)
     await focusLatest(pipeline, instId, '15m')
     const state = pipeline.series.get(`${instId}:15m`), live = pipeline.liveStates.get(`${instId}:15m`)
-    assert.notEqual(state.indicatorState, live.indicatorState)
+    const prefix = state.indicatorState, saved = structuredClone(prefix)
     const next = candle(end() + interval, 500)
     const prior = store.change(next)
     pipeline.observe([next], prior)
+    assert.deepEqual(prefix, saved, 'Restoring a resident must preserve the previously admitted prefix when either owner advances.')
     assert.equal(state.indicatorState.lastTimestamp, next.timestamp)
     assert.equal(live.indicatorState.lastTimestamp, next.timestamp)
     const generation = state.generation, corrected = { ...rows[490], baseVolume: 10_000 }

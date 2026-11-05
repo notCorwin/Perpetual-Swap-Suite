@@ -42,8 +42,9 @@ test('metadata schema migration drops obsolete sync demand once and preserves du
   } finally { store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
-test('preference schema has exact defaults, validates nested rules, and returns detached values', () => {
-  const preferences = validatePreferences(DEFAULT_PREFERENCES)
+test('preference schema owns immutable snapshots, reuses proven values and validates changed inputs', () => {
+  const input = structuredClone(DEFAULT_PREFERENCES)
+  const preferences = validatePreferences(input)
   assert.deepEqual(preferences, {
     chartTimeframe: '15m', rankingLookback: 15, historyDays: 30,
     liquidity: {
@@ -52,7 +53,14 @@ test('preference schema has exact defaults, validates nested rules, and returns 
       openInterest: { enabled: true, minUSDT: 5_000_000 }, volumeStability: { enabled: false, maxRatio: 2 },
     },
   })
-  preferences.liquidity.spread.maxPercent = 1
+  assert.equal(Reflect.set(preferences.liquidity.spread, 'maxPercent', 1), false)
+  assert.equal(validatePreferences(preferences), preferences)
+  input.liquidity.spread.maxPercent = 1
+  assert.equal(preferences.liquidity.spread.maxPercent, 0.05)
+  assert.equal(validatePreferences(input).liquidity.spread.maxPercent, 1)
+  let reads = 0
+  const changing = { ...input, get chartTimeframe() { return ++reads === 1 ? '15m' : 'invalid' } }
+  assert.throws(() => validatePreferences(changing), /chartTimeframe/, 'A changing accessor cannot admit an unvalidated immutable snapshot.')
   assert.equal(DEFAULT_PREFERENCES.liquidity.spread.maxPercent, 0.05)
   assert.equal(Object.isFrozen(DEFAULT_PREFERENCES.liquidity.slippage), true)
   assert.equal(validatePreferences({ ...DEFAULT_PREFERENCES, historyDays: 3650 }).historyDays, 3650)

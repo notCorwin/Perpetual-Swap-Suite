@@ -1,5 +1,6 @@
 // Shared preference schema: no Electron, native modules, or credentials.
 const TIMEFRAMES = new Set(['5m', '15m', '1H'])
+const validated = new WeakSet()
 
 function freeze(value) {
   if (value && typeof value === 'object') { Object.values(value).forEach(freeze); Object.freeze(value) }
@@ -19,6 +20,7 @@ export const DEFAULT_PREFERENCES = freeze({
     volumeStability: { enabled: false, maxRatio: 2 },
   },
 })
+validated.add(DEFAULT_PREFERENCES)
 
 function object(value, label) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) throw new TypeError(`${label} must be a plain object.`)
@@ -70,9 +72,18 @@ export function validatePreferenceFields(value, partial = false) {
   }
 }
 
-/** Validate a complete preference value and return an independent plain copy. */
+/** Own one immutable snapshot per validated input. Mutable or foreign inputs
+ * must be validated and copied; only our deeply frozen snapshots are reusable.
+ * A settings update creates a new snapshot, so no time-based expiry is needed. */
 export function validatePreferences(value) {
+  if (validated.has(value)) return value
   validatePreferenceFields(value)
-  return structuredClone(value)
+  const snapshot = structuredClone(value)
+  // Accessors can change between the caller validation and the ownership
+  // transfer. Only stable, validated owned data may enter the reuse set.
+  validatePreferenceFields(snapshot)
+  freeze(snapshot)
+  validated.add(snapshot)
+  return snapshot
 }
 

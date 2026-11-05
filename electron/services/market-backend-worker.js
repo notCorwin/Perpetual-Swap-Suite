@@ -11,6 +11,29 @@ import { backgroundArchiveRows, seedMarketResources, startBackgroundArchive } fr
 
 let metadata, store, service, preferences, sourceProbe
 let resourceFixture, acquisitionFixture, coldBoundaryFixture
+const notificationSubscriptions = new Map()
+function subscribeNotifications(names) {
+  if (!Array.isArray(names) || names.some(name => !['chart', 'market', 'audit', 'history-download'].includes(name))) {
+    throw new TypeError('Backend notification subscriptions must contain supported event names.')
+  }
+  const wanted = new Set(names)
+  for (const [name, unsubscribe] of notificationSubscriptions) if (!wanted.has(name)) {
+    unsubscribe(); notificationSubscriptions.delete(name)
+  }
+  for (const name of wanted) if (!notificationSubscriptions.has(name)) {
+    let unsubscribe
+    if (name === 'chart') {
+      // A new consumer has no compact-update basis. Its first publication
+      // must carry the complete frame even when the source bars are reused.
+      const notifications = new ChartNotificationEncoder()
+      unsubscribe = service.subscribePreparedCharts(frame => emit('chart', notifications.encode(frame)))
+    } else if (name === 'market') unsubscribe = service.subscribeMarket(() => emit('market'))
+    else if (name === 'audit') unsubscribe = service.subscribeAudit(report => emit('audit', report))
+    else unsubscribe = service.subscribeHistoryDownload(report => emit('history-download', report))
+    notificationSubscriptions.set(name, unsubscribe)
+  }
+  return { ok: true }
+}
 let coldBoundaryOperation = Promise.resolve()
 const coldBoundaryLifecycle = operation => {
   const result = coldBoundaryOperation.then(operation)
@@ -65,11 +88,6 @@ const initialize = runWorkerInitialization('market-backend', async () => {
   service = new MarketService(store, () => preferences, exchange?.fetcher ?? (workerData.testMode ? offline : fetch),
     !workerData.testMode || Boolean(exchange), { metadata, ...(exchange ? { webSocketFactory: exchange.webSocketFactory } : {}) })
   await service.ready
-  const notifications = new ChartNotificationEncoder()
-  service.subscribePreparedCharts(frame => emit('chart', notifications.encode(frame)))
-  service.subscribeMarket(() => emit('market'))
-  service.subscribeAudit(report => emit('audit', report))
-  service.subscribeHistoryDownload(report => emit('history-download', report))
   if (workerData.e2eLiveRefresh) void service.refresh().catch(error => console.error(error))
   parentPort.postMessage({ type: 'ready' })
 })
@@ -389,9 +407,11 @@ onOperationMessage(parentPort, 'market-backend', async ({ id, method, value }) =
     await initialize
     let result
     if (method === 'request') result = await request(value)
+    else if (method === 'subscriptions') result = subscribeNotifications(value)
     else if (method === 'credentials') result = metadata.getAnalysisSettings().apiKey ?? ''
     else if (method === 'probe') result = await probe(value)
     else if (method === 'dispose') {
+      subscribeNotifications([])
       sourceProbe?.release()
       const failures = []
       for (const close of [() => coldBoundaryLifecycle(async () => { await coldBoundaryFixture?.remove(); coldBoundaryFixture = null }),

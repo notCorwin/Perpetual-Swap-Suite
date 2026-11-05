@@ -21,6 +21,11 @@ import { DeadlineIndex } from './deadline-index.js'
 const OKX_ORIGIN = 'https://www.okx.com/api/v5'
 const FIVE_MINUTES = 300_000
 const CHART_TIMEFRAMES = ['5m', '15m', '1H']
+// Only prefs() admits configurations owned and deeply frozen by validation.
+// Replacements receive a new identity; mutable/foreign inputs are encoded anew.
+// Weak keys release obsolete settings without a time-based validity policy.
+const liquidityConfigKeys = new WeakMap()
+const liquidityConfigKey = config => liquidityConfigKeys.get(config) ?? JSON.stringify(config)
 const LIQUIDITY_SOURCE_CRITERIA = {
   ticker: ['spread'], book: ['depth', 'slippage'], openInterest: ['openInterest'],
   turnover: ['volume24h'], hourly: ['volumeStability'],
@@ -424,8 +429,13 @@ export class MarketService {
     this.ready = this.initialize()
   }
 
-  prefs() { return validatePreferences(this.preferences()) }
-  catalogCriteriaKey() { return JSON.stringify(this.prefs().liquidity) }
+  prefs() {
+    const preferences = validatePreferences(this.preferences())
+    const config = preferences.liquidity
+    if (!liquidityConfigKeys.has(config)) liquidityConfigKeys.set(config, JSON.stringify(config))
+    return preferences
+  }
+  catalogCriteriaKey() { return liquidityConfigKey(this.prefs().liquidity) }
   catalogEntry(instId) { return this.catalog.get(instId) }
   touchList() {
     this.canonicalList = null
@@ -1605,7 +1615,7 @@ export class MarketService {
       // Keep collecting the observation and publishing trade prices. Reuse an
       // assessment when this source is absent from its enabled dependencies.
       const config = this.preferences().liquidity, record = this.catalogChecks.get(instId)
-      if (record && record.instrument === this.instruments.get(instId) && record.configKey === JSON.stringify(config)
+      if (record && record.instrument === this.instruments.get(instId) && record.configKey === liquidityConfigKey(config)
         && LIQUIDITY_SOURCE_CRITERIA[source].every(key => config[key].enabled === false)) return
     }
     this.streamQualifications.add(instId)
@@ -1619,7 +1629,7 @@ export class MarketService {
     this.streamQualificationTimer = null
     const ids = [...this.streamQualifications]; this.streamQualifications.clear()
     if (this.closing || this.disposed) return
-    const config = this.prefs().liquidity, configKey = JSON.stringify(config), now = Date.now()
+    const config = this.prefs().liquidity, configKey = liquidityConfigKey(config), now = Date.now()
     const records = []
     for (const instId of ids) {
       const instrument = this.instruments.get(instId)
@@ -1757,7 +1767,7 @@ export class MarketService {
   }
 
   sampleBook(instId, sample) {
-    const instrument = this.instruments.get(instId), config = this.prefs().liquidity, configKey = JSON.stringify(config)
+    const instrument = this.instruments.get(instId), config = this.prefs().liquidity, configKey = liquidityConfigKey(config)
     if (!instrument || !this.candidateIDs?.has(instId) || sample.configKey !== configKey) {
       this.bookSamples.delete(instId); this.scheduleSubscriptions(); return
     }
@@ -1805,7 +1815,7 @@ export class MarketService {
       this.preparedCharts.setRealtimeSubscriptions(derivedSubscriptions)
     }
     if (collectorChanged) this.realtime.setSubscriptions([...subscriptions.values()])
-    const config = this.prefs().liquidity, configKey = JSON.stringify(config), now = Date.now()
+    const config = this.prefs().liquidity, configKey = liquidityConfigKey(config), now = Date.now()
     const books = new Set(), trades = new Set(), openInterest = new Set(), proofDeadlines = []
     const prerequisites = Object.entries(LIQUIDITY_SOURCE_CRITERIA).filter(([source]) => source !== 'book')
       .flatMap(([source, criteria]) => criteria.filter(key => config[key].enabled).map(key => ({ key, source })))
@@ -1863,7 +1873,7 @@ export class MarketService {
   }
 
   updateDirtySubscriptions() {
-    const now = Date.now(), config = this.prefs().liquidity, configKey = JSON.stringify(config), state = this.subscriptionState
+    const now = Date.now(), config = this.prefs().liquidity, configKey = liquidityConfigKey(config), state = this.subscriptionState
     if ([...this.subscriptionDirty].some(id => this.bookSamples.has(id) || this.bookSampleInterval(this.catalogChecks.get(id), config) !== null)) return this.updateSubscriptions()
     const current = this.subscriptionSignature(now, configKey)
     if (!state || !this.candidateIDs || !this.publicSubscriptionDemand || !this.publicRealtime
@@ -2138,7 +2148,7 @@ export class MarketService {
     this.qualificationImmediate = setImmediate(() => {
       this.qualificationImmediate = null
       const ids = [...this.qualificationQueue]; this.qualificationQueue.clear()
-      const config = this.prefs().liquidity, key = JSON.stringify(config)
+      const config = this.prefs().liquidity, key = liquidityConfigKey(config)
       this.track(Promise.allSettled(ids.map(id => {
         const instrument = this.instruments.get(id)
         return instrument && this.checkCandidate(instrument, config, key, this.shutdownController.signal, 'foreground', { localOnly: true })
@@ -2185,7 +2195,7 @@ export class MarketService {
     if (this.marketDeadlineTimer && this.marketDeadlineAt <= now) return
     const previous = this.marketDeadlineState
     if (!previous || !previous.indexUsable || !this.marketDeadlineTimer || now < previous.now) return this.scheduleMarketDeadline()
-    const config = this.prefs().liquidity, configKey = JSON.stringify(config)
+    const config = this.prefs().liquidity, configKey = liquidityConfigKey(config)
     const continuousMetadata = this.instrumentStream?.synchronized && !this.instrumentStream.signal.aborted
     const realtime = this.realtime, connection = realtime?.connection
     if (previous.configKey !== configKey || previous.boundary !== closedBoundary('5m', now)
@@ -2240,7 +2250,7 @@ export class MarketService {
     // arrives before the timer gets its event-loop turn.
     if (this.marketDeadlineTimer && this.marketDeadlineAt <= now) return
     const dirty = new Map(this.marketDeadlineDirty)
-    const config = this.prefs().liquidity, configKey = JSON.stringify(config), required = requiredLiquiditySources(config)
+    const config = this.prefs().liquidity, configKey = liquidityConfigKey(config), required = requiredLiquiditySources(config)
     const ids = new Set([...this.catalogChecks.keys(), ...this.catalog.keys()]), deadlines = new Map()
     const indexedRemovals = []
     const continuousMetadata = this.instrumentStream?.synchronized && !this.instrumentStream.signal.aborted
@@ -2475,7 +2485,7 @@ export class MarketService {
   }
 
   liquidityInput(instrument, config, observations, now = Date.now()) {
-    const configKey = JSON.stringify(config)
+    const configKey = liquidityConfigKey(config)
     const fresh = key => this.qualificationObservation(observations, key, instrument.instId, configKey, now)
     const turnover = fresh('turnover')?.value, hourly = fresh('hourly')?.value
     // The hourly validator must use the actual retained window's boundary.
@@ -2532,7 +2542,7 @@ export class MarketService {
   // Qualification is a local calculation. Source acquisition can be pending
   // without making a threshold edit wait for the exchange or a history job.
   verifyCatalog() {
-    const config = this.prefs().liquidity, configKey = JSON.stringify(config), now = Date.now(), verified = []
+    const config = this.prefs().liquidity, configKey = liquidityConfigKey(config), now = Date.now(), verified = []
     for (const instrument of this.instruments.values()) {
       if (this.candidateIDs && !this.candidateIDs.has(instrument.instId)) continue
       const observations = { ...(this.observations.get(instrument.instId) ?? {}) }
@@ -3081,7 +3091,7 @@ export class MarketService {
     await this.ready
     if (this.closing || this.disposed) return
     if (this.renewing) return this.renewing
-    const controller = new AbortController(), config = this.prefs().liquidity, configKey = JSON.stringify(config)
+    const controller = new AbortController(), config = this.prefs().liquidity, configKey = liquidityConfigKey(config)
     this.renewalController = controller
     this.catalogControllers.add(controller)
     this.renewalStartedAt = Date.now()
@@ -3120,7 +3130,7 @@ export class MarketService {
     await this.ready
     if (this.closing || this.disposed) return
     if (this.refreshing) return this.refreshing
-    const controller = new AbortController(), config = this.prefs().liquidity, configKey = JSON.stringify(config)
+    const controller = new AbortController(), config = this.prefs().liquidity, configKey = liquidityConfigKey(config)
     this.refreshController = controller
     this.catalogControllers.add(controller)
     // Cached checks are already scheduled for the full refresh, even while
@@ -3168,7 +3178,7 @@ export class MarketService {
   async reconfigure(previousPreferences) {
     await this.ready
     const current = this.prefs(), previous = validatePreferences(previousPreferences)
-    const liquidityChanged = JSON.stringify(previous.liquidity) !== JSON.stringify(current.liquidity)
+    const liquidityChanged = liquidityConfigKey(previous.liquidity) !== liquidityConfigKey(current.liquidity)
     if (previous.chartTimeframe !== current.chartTimeframe) this.preparedCharts.sourceStateChanged()
     if (!liquidityChanged && previous.rankingLookback === current.rankingLookback) return
     if (liquidityChanged) {
@@ -3182,7 +3192,7 @@ export class MarketService {
       this.updateSubscriptions()
       this.scheduleMarketDeadline()
       this.lastRefreshAt = 0
-      const configKey = JSON.stringify(current.liquidity)
+      const configKey = liquidityConfigKey(current.liquidity)
       if (this.autoRefresh) this.track(Promise.allSettled([this.refreshing, this.renewing].filter(Boolean)).then(() => {
         if (!this.closing && !this.disposed && this.catalogCriteriaKey() === configKey) return this.refresh({ reuse: true })
       }))

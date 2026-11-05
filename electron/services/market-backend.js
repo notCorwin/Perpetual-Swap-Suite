@@ -1,6 +1,8 @@
 import { createOperationWorker, createWorkerRequest } from './worker-operations.js'
 import { EventEmitter } from 'node:events'
 
+const notificationEvents = new Set(['chart', 'market', 'audit', 'history-download'])
+
 /** Electron owns windows; this worker owns market coordination and metadata. */
 export class MarketBackend extends EventEmitter {
   constructor(options) {
@@ -25,6 +27,33 @@ export class MarketBackend extends EventEmitter {
     this.worker.on('exit', code => {
       if (!this.closed) this.fail(new Error(`Market backend exited (${code}).`))
     })
+    // Worker notification ownership follows actual consumers. A worker still
+    // collects and prepares all requested data when no renderer is connected.
+    this.notificationEvents = new Set()
+    const interestChanged = (name, count) => {
+      if (!notificationEvents.has(name) || this.disposal || this.closed) return
+      const interested = count > 0
+      if (this.notificationEvents.has(name) === interested) return
+      if (interested) this.notificationEvents.add(name)
+      else this.notificationEvents.delete(name)
+      void this.call('subscriptions', [...this.notificationEvents]).catch(error => {
+        if (!this.closed) this.fail(error)
+      })
+    }
+    this.notificationListenerAdded = name => interestChanged(name, this.listenerCount(name) + 1)
+    this.notificationListenerRemoved = name => interestChanged(name, this.listenerCount(name))
+    this.on('newListener', this.notificationListenerAdded)
+    this.on('removeListener', this.notificationListenerRemoved)
+  }
+
+  removeAllListeners(...args) {
+    super.removeAllListeners(...args)
+    // These are transport bookkeeping, not domain subscriptions. Preserve them
+    // when a caller detaches every consumer so a later owner can subscribe.
+    for (const [name, listener] of [['newListener', this.notificationListenerAdded], ['removeListener', this.notificationListenerRemoved]]) {
+      if (listener && !this.listeners(name).includes(listener)) super.on(name, listener)
+    }
+    return this
   }
 
   fail(error) {

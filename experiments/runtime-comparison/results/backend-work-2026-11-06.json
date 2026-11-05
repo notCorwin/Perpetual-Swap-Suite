@@ -1,0 +1,173 @@
+{
+  "schemaVersion": 1,
+  "scope": "Separate diagnostic, never energy evidence. live counters start with first forming intake and end at dispose entry. Wall times are nested/inclusive observer-perturbed observations, not CPU costs.",
+  "probeModuleSHA256": "ffe64bbdaf259f27144f8448c4a2c1180cdf2d707bf820e6434188bf2e73d895",
+  "before": {
+    "file": "artifacts/backend-optimization/probe-before-final/40969-1.json",
+    "sha256": "f98219e73de31b2d4aec43cb46edb3d11f82667446899cae5c2d6945a9777b80",
+    "report": "artifacts/backend-optimization/diagnostic-before-final/report.json",
+    "reportSHA256": "fac64dc20b6490203f6642b1c68f0bfa1fc5b6d4a97fb66dfa40429e88af95bd",
+    "counts": {
+      "startup.structuredClone": 3502,
+      "startup.syncLive": {
+        "calls": 1723,
+        "wallMS": 2.0948580000167567,
+        "rowLookups": 0
+      },
+      "startup.publishFrame": {
+        "calls": 4020,
+        "wallMS": 1230.9894399999991,
+        "rowLookups": 0
+      },
+      "startup.frame": {
+        "calls": 4020,
+        "wallMS": 578.360402999986,
+        "rowLookups": 0
+      },
+      "startup.sourceStatus": {
+        "calls": 12060,
+        "wallMS": 99.66219499999534,
+        "rowLookups": 0
+      },
+      "startup.cachedStatus": {
+        "calls": 16080,
+        "wallMS": 15.835323000007747,
+        "rowLookups": 0
+      },
+      "startup.pendingSourceRanges": {
+        "calls": 10584,
+        "wallMS": 91.88713599995981,
+        "rowLookups": 1016064
+      },
+      "startup.state": {
+        "calls": 4,
+        "wallMS": 0.12591599999996106,
+        "rowLookups": 0
+      },
+      "live.setLive": {
+        "calls": 51660,
+        "wallMS": 335.8264680003358,
+        "rowLookups": 0
+      },
+      "live.publishFrame": {
+        "calls": 51668,
+        "wallMS": 5812.573637000227,
+        "rowLookups": 0
+      },
+      "live.frame": {
+        "calls": 51668,
+        "wallMS": 5104.619204999894,
+        "rowLookups": 0
+      },
+      "live.sourceStatus": {
+        "calls": 155004,
+        "wallMS": 1582.580684999024,
+        "rowLookups": 0
+      },
+      "live.cachedStatus": {
+        "calls": 206672,
+        "wallMS": 240.455783000667,
+        "rowLookups": 0
+      },
+      "live.pendingSourceRanges": {
+        "calls": 103456,
+        "wallMS": 1297.0421110005627,
+        "rowLookups": 9931776
+      },
+      "live.structuredClone": 70256
+    }
+  },
+  "after": {
+    "file": "artifacts/backend-optimization/diagnostic-after-final/1-native-full-electron/backend-work/60453-1.json",
+    "sha256": "b672453f05da17002a47aeb79d54021b01e8e84cc7a41baf980667dbc5807a98",
+    "report": "artifacts/backend-optimization/diagnostic-after-final/report.json",
+    "reportSHA256": "eb2668f6f7ff16b9d1749ea6d5bff1fd8ec7a1d5ae8c1834597a55de9e3a475e",
+    "counts": {
+      "startup.structuredClone": 40,
+      "startup.syncLive": {
+        "calls": 1723,
+        "wallMS": 1.879887999988341,
+        "rowLookups": 0
+      },
+      "startup.publishFrame": {
+        "calls": 4020,
+        "wallMS": 1058.106443999996,
+        "rowLookups": 0
+      },
+      "startup.frame": {
+        "calls": 4020,
+        "wallMS": 454.14225500001726,
+        "rowLookups": 0
+      },
+      "startup.sourceStatus": {
+        "calls": 12060,
+        "wallMS": 14.164167999947495,
+        "rowLookups": 0
+      },
+      "startup.cachedStatus": {
+        "calls": 16080,
+        "wallMS": 11.923987000003763,
+        "rowLookups": 0
+      },
+      "startup.pendingSourceRanges": {
+        "calls": 1722,
+        "wallMS": 9.438825000005863,
+        "rowLookups": 55296
+      },
+      "startup.state": {
+        "calls": 4,
+        "wallMS": 0.09258399999998801,
+        "rowLookups": 0
+      },
+      "live.setLive": {
+        "calls": 51660,
+        "wallMS": 339.07951800000865,
+        "rowLookups": 0
+      },
+      "live.publishFrame": {
+        "calls": 51668,
+        "wallMS": 4034.561847000263,
+        "rowLookups": 0
+      },
+      "live.frame": {
+        "calls": 51668,
+        "wallMS": 3281.0234280003833,
+        "rowLookups": 0
+      },
+      "live.sourceStatus": {
+        "calls": 155004,
+        "wallMS": 215.51055799991173,
+        "rowLookups": 0
+      },
+      "live.cachedStatus": {
+        "calls": 206672,
+        "wallMS": 197.2700630002082,
+        "rowLookups": 0
+      },
+      "live.pendingSourceRanges": {
+        "calls": 132,
+        "wallMS": 1.2912510000087423,
+        "rowLookups": 0
+      },
+      "live.structuredClone": 39
+    }
+  },
+  "changes": {
+    "live.pendingSourceRanges": {
+      "before": 103456,
+      "after": 132,
+      "rowLookups": {
+        "before": 9931776,
+        "after": 0
+      }
+    },
+    "live.structuredClone": {
+      "before": 70256,
+      "after": 39
+    },
+    "startup.structuredClone": {
+      "before": 3502,
+      "after": 40
+    }
+  }
+}

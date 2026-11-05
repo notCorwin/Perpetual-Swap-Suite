@@ -12,7 +12,8 @@ onOperationMessage(parentPort, 'prepared-chart', ({ type, id, candles, intervalM
   try {
     const { state, bars } = measureOperation({ category: 'cpu', name: 'indicators.replay', resource: candles[0]?.instrument,
       attributes: { candles: candles.length, intervalMS, checkpoint: Boolean(checkpoint), execution: 'worker' } }, () => {
-    const state = checkpoint ? structuredClone(checkpoint) : createIndicatorState(intervalMS)
+    // postMessage already gave this request an owned copy of the checkpoint.
+    const state = checkpoint ?? createIndicatorState(intervalMS)
     const bars = []
     for (const candle of candles) {
       const previousHour = state.lastTimestamp, previousWidth = state.previousBandWidth ?? null

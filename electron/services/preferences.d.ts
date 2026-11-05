@@ -20,5 +20,7 @@ export type PreferencesPatch = {
   liquidity?: { [Rule in keyof Preferences['liquidity']]?: Partial<Preferences['liquidity'][Rule]> }
 }
 export const DEFAULT_PREFERENCES: Readonly<Preferences>
-export function validatePreferences(value: unknown): Preferences
+type Immutable<T> = T extends object ? { readonly [K in keyof T]: Immutable<T[K]> } : T
+export type PreferenceSnapshot = Immutable<Preferences>
+export function validatePreferences(value: unknown): PreferenceSnapshot
 export function validatePreferenceFields(value: unknown, partial?: boolean): void
