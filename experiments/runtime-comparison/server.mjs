@@ -6,19 +6,30 @@ import { randomUUID } from 'node:crypto'
 import { initializeOperationRecording, closeOperationRecording, closeExternalOperationSource } from '../../electron/services/operation-runtime.js'
 import { createRendererOperationReceiver } from '../../electron/services/renderer-operations.js'
 import { encodeChartWire } from '../../electron/chart-wire.js'
+import { createNativeBroker } from './native-broker.mjs'
 
 const root = fileURLToPath(new URL('../..', import.meta.url))
 const profile = process.env.RADAR_COMPARE_PROFILE
-if (!profile || !process.env.PERPETUAL_SWAP_OPERATION_DIR) throw new Error('An isolated profile and operation recording directory are required.')
+const telemetry = process.env.RADAR_COMPARE_TELEMETRY ?? 'full', transport = process.env.RADAR_COMPARE_TRANSPORT ?? 'http'
+const assets = resolve(process.env.RADAR_COMPARE_ASSETS ?? join(root, 'dist'))
+if (!profile || telemetry !== 'off' && !process.env.PERPETUAL_SWAP_OPERATION_DIR) throw new Error('An isolated profile and explicit recording policy are required.')
 await mkdir(profile, { recursive: true })
 initializeOperationRecording({ label: 'comparison-backend' })
 const { MarketBackend } = await import('../../electron/services/market-backend.js')
 const backend = new MarketBackend({ userData: profile, testMode: true, e2eLiveRefresh: false })
 const receiver = createRendererOperationReceiver(), owner = 'comparison-page', token = randomUUID()
-let stream, nextCommand = 0, closing = false
+let stream, native, nextCommand = 0, closing = false, metrics
+const resetMetrics = () => { metrics = { requests: {}, requestBytes: {}, responseBytes: {}, events: {}, eventBytes: {} } }
+resetMetrics()
 const commands = new Map()
 const bridge = await readFile(new URL('./browser.js', import.meta.url), 'utf8')
-const send = value => stream?.write(`data: ${JSON.stringify(value)}\n\n`)
+const probes = process.env.RADAR_COMPARE_DIAGNOSTICS === '1' ? await readFile(new URL('./timing-probes.js', import.meta.url), 'utf8') : ''
+const send = value => {
+  if (!stream && !native?.connected) return
+  const key = value.channel ?? (value.command ? 'controller' : 'fatal'), encoded = JSON.stringify(value)
+  metrics.events[key] = (metrics.events[key] ?? 0) + 1; metrics.eventBytes[key] = (metrics.eventBytes[key] ?? 0) + Buffer.byteLength(encoded)
+  if (native?.connected) native.send(encoded); else stream.write(`data: ${encoded}\n\n`)
+}
 for (const [name, channel] of [['chart', 'radar:chart-prepared'], ['market', 'radar:market-changed'], ['audit', 'radar:audit-changed'], ['history-download', 'radar:history-download-changed']]) {
   backend.on(name, detail => send({ channel, detail: name === 'chart' ? encodeChartWire(detail) : detail }))
 }
@@ -27,16 +38,42 @@ const json = (response, status, value) => { response.writeHead(status, { 'Conten
 async function body(request) {
   const chunks = []; let bytes = 0
   for await (const chunk of request) { bytes += chunk.length; if (bytes > 16 * 1024 * 1024) throw new Error('Comparison request exceeds 16 MiB.'); chunks.push(chunk) }
-  return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+  return { value: JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'), bytes }
 }
 async function command(value) {
-  if (!stream) throw new Error('Comparison page is not connected.')
+  if (!stream && !native?.connected) throw new Error('Comparison page is not connected.')
   const id = ++nextCommand
   return new Promise((resolveCommand, reject) => {
     const timeout = setTimeout(() => { commands.delete(id); reject(new Error(`Browser command ${value.action} timed out.`)) }, Math.max(60_000, (value.durationMS ?? 0) + 60_000))
     commands.set(id, { resolve: value => { clearTimeout(timeout); resolveCommand(value) }, reject: error => { clearTimeout(timeout); reject(error) } })
     send({ command: { id, ...value } })
   })
+}
+async function rpc(path, value, bytes = 0) {
+  if (!['metrics', 'status', 'control'].includes(path)) {
+    metrics.requests[path] = (metrics.requests[path] ?? 0) + 1
+    metrics.requestBytes[path] = (metrics.requestBytes[path] ?? 0) + bytes
+  }
+  let result
+  if (path === 'connect') result = { ok: true }
+  else if (path === 'status') result = { connected: Boolean(stream) || native?.connected === true, pid: process.pid, fixture, epochMS: performance.timeOrigin + performance.now() }
+  else if (path === 'metrics') result = structuredClone(metrics)
+  else if (path === 'control') { if (value.action === 'run') resetMetrics(); result = await command(value) }
+  else if (path === 'result') {
+    const pending = commands.get(value.id); commands.delete(value.id)
+    if (value.error) pending?.reject(new Error(value.error)); else pending?.resolve(value.result)
+    result = { ok: true }
+  } else if (path === 'request') {
+    result = await backend.request(value)
+    if (['chartWindow', 'chartLocal', 'chartHistory', 'chartUniverse'].some(key => key in value)) result = encodeChartWire(result)
+  } else if (path === 'probe') result = await backend.probe(value)
+  else if (path === 'operations/init') result = receiver.initialize(owner, value.nonce)
+  else if (path === 'operations/batch') result = await receiver.receive(owner, value)
+  else if (path === 'operations/failure') { receiver.fail(owner, value); result = { ok: true } }
+  else throw new Error(`Unknown comparison RPC: ${path}`)
+  const encoded = JSON.stringify(result)
+  if (!['metrics', 'status', 'control'].includes(path)) metrics.responseBytes[path] = (metrics.responseBytes[path] ?? 0) + Buffer.byteLength(encoded)
+  return encoded
 }
 const server = createServer(async (request, response) => {
   try {
@@ -51,26 +88,14 @@ const server = createServer(async (request, response) => {
       request.on('close', () => { if (stream === response) stream = undefined }); return
     }
     if (request.method === 'POST') {
-      const value = await body(request)
-      if (path === 'control') return json(response, 200, await command(value))
-      if (path === 'result') {
-        const pending = commands.get(value.id); commands.delete(value.id)
-        if (value.error) pending?.reject(new Error(value.error)); else pending?.resolve(value.result)
-        return json(response, 200, { ok: true })
-      }
-      if (path === 'request') {
-        const result = await backend.request(value)
-        return json(response, 200, ['chartWindow', 'chartLocal', 'chartHistory', 'chartUniverse'].some(key => key in value) ? encodeChartWire(result) : result)
-      }
-      if (path === 'probe') return json(response, 200, await backend.probe(value))
-      if (path === 'operations/init') return json(response, 200, receiver.initialize(owner, value.nonce))
-      if (path === 'operations/batch') return json(response, 200, await receiver.receive(owner, value))
-      if (path === 'operations/failure') { receiver.fail(owner, value); return json(response, 200, { ok: true }) }
+      const { value, bytes } = await body(request)
+      const result = await rpc(path, value, bytes)
+      response.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); response.end(result); return
     }
-    if (path === 'status') return json(response, 200, { connected: Boolean(stream), pid: process.pid, fixture, epochMS: performance.timeOrigin + performance.now() })
-    if (path === 'browser.js') { response.setHeader('Content-Type', 'text/javascript'); response.end(`globalThis.__radarComparisonClockOffsetMS=${Number(process.env.RADAR_COMPARE_CLOCK_OFFSET_MS ?? 0)};\n${bridge}`); return }
-    const relative = path || 'index.html', file = resolve(root, 'dist', relative)
-    if (!file.startsWith(join(root, 'dist') + '/')) return json(response, 403, { error: 'Invalid asset path.' })
+    if (path === 'status') { response.setHeader('Content-Type', 'application/json'); response.end(await rpc(path)); return }
+    if (path === 'browser.js') { response.setHeader('Content-Type', 'text/javascript'); response.end(`globalThis.__radarComparisonClockOffsetMS=${Number(process.env.RADAR_COMPARE_CLOCK_OFFSET_MS ?? 0)};globalThis.__radarComparisonOptions=${JSON.stringify({ telemetry, transport, engineProfile: process.env.RADAR_COMPARE_ENGINE_PROFILE === '1' })};\n${probes};\n${bridge}`); return }
+    const relative = path || 'index.html', file = resolve(assets, relative)
+    if (!file.startsWith(assets + '/')) return json(response, 403, { error: 'Invalid asset path.' })
     let contents = await readFile(file)
     if (relative === 'index.html') contents = Buffer.from(contents.toString().replace('<head>', `<head><script src="/${token}/browser.js"></script>`))
     response.setHeader('Content-Type', ({ '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.woff2': 'font/woff2', '.svg': 'image/svg+xml' })[extname(file)] ?? 'application/octet-stream')
@@ -79,9 +104,10 @@ const server = createServer(async (request, response) => {
 })
 await backend.ready
 const fixture = await backend.probe({ action: 'scaleSeed', count: Number(process.env.RADAR_COMPARE_COUNT ?? 287), periods: 384 })
+if (transport === 'native') native = await createNativeBroker({ token, dispatch: rpc })
 await new Promise(resolveListen => server.listen(0, '127.0.0.1', resolveListen))
 const origin = `http://127.0.0.1:${server.address().port}`
-console.log(JSON.stringify({ ready: true, pid: process.pid, url: `${origin}/${token}/`, fixture }))
+console.log(JSON.stringify({ ready: true, pid: process.pid, url: `${origin}/${token}/`, fixture, socketPath: native?.path, nativeToken: token }))
 async function close() {
   if (closing) return; closing = true
   try {
@@ -89,6 +115,7 @@ async function close() {
     commands.clear()
     if (stream) { try { await command({ action: 'drain' }) } catch (error) { console.error(error.message) } }
     stream?.end(); server.closeAllConnections(); await new Promise(done => server.close(done))
+    await native?.close()
     await backend.dispose()
     for (const source of receiver.sourcesFor(owner)) await closeExternalOperationSource(source)
     await closeOperationRecording()

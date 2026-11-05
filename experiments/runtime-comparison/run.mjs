@@ -16,6 +16,18 @@ const root = fileURLToPath(new URL('../..', import.meta.url)), execute = promisi
 const args = process.argv.slice(2), option = (name, fallback) => args.includes(name) ? args[args.indexOf(name) + 1] : fallback
 const smoke = args.includes('--smoke'), runtimeOption = option('--runtime', 'all'), rounds = Number(option('--rounds', smoke ? 1 : 3))
 const count = Number(option('--count', smoke ? 8 : 287)), durationMS = Number(option('--duration-ms', smoke ? 1500 : 20000))
+const scenarios = option('--scenarios', 'idle,realtime,history,download').split(',')
+const variants = option('--variants', `${option('--transport', 'http')}:${option('--telemetry', 'full')}`).split(',').map(value => {
+  const [transport, telemetry] = value.split(':')
+  if (!['http', 'native'].includes(transport) || !['full', 'off'].includes(telemetry)) throw new Error('Invalid transport/telemetry variant.')
+  return { transport, telemetry }
+})
+if (scenarios.some(value => !['idle', 'realtime', 'history', 'download'].includes(value)) || !scenarios.length) throw new Error('Invalid comparison scenarios.')
+const diagnostics = args.includes('--diagnostics')
+const sampleStacks = args.includes('--sample-stacks'), v8Profile = args.includes('--v8-profile')
+const engineProfile = args.includes('--engine-profile')
+const marketEpochMS = Number(option('--market-epoch-ms', Math.floor(Date.now() / 900000) * 900000 + 1000))
+if (!Number.isSafeInteger(marketEpochMS) || Math.abs(marketEpochMS - Date.now()) > 86400000) throw new Error('Market epoch must be an integer within one day.')
 if (!['electron', 'tauri', 'all'].includes(runtimeOption) || !Number.isSafeInteger(rounds) || rounds < 1 || rounds > 5
   || !Number.isSafeInteger(count) || count < 1 || count > 1000 || !Number.isSafeInteger(durationMS) || durationMS < 500) throw new Error('Invalid comparison options.')
 const directory = resolve(root, option('--output', `artifacts/runtime-comparison/${new Date().toISOString().replaceAll(':', '-')}`))
@@ -33,6 +45,7 @@ async function fingerprint() {
     }
   }
   for (const path of ['dist/assets', 'electron', 'experiments/runtime-comparison']) await visit(path)
+  if (variants.some(value => value.telemetry === 'off')) await visit('artifacts/runtime-comparison/frontend-off')
   for (const file of ['dist/index.html', 'package.json', 'package-lock.json']) files[file] = createHash('sha256').update(await readFile(join(root, file))).digest('hex')
   return { files, sha256: createHash('sha256').update(JSON.stringify(files)).digest('hex') }
 }
@@ -127,17 +140,17 @@ const revision = (await execute('git', ['rev-parse', 'HEAD'], { cwd: root })).st
 const sourceFingerprint = await fingerprint()
 const report = { schemaVersion: 1, revision, dirty: Boolean((await execute('git', ['status', '--porcelain'], { cwd: root })).stdout.trim()),
   sourceFingerprint,
-  marketEpochMS: Math.floor(Date.now() / 900000) * 900000 + 1000,
+  marketEpochMS,
   startedAt: new Date().toISOString(), machine: { platform: process.platform, arch: process.arch, node: process.version,
     hardware: (await execute('sysctl', ['-n', 'hw.model'])).stdout.trim(), macOS: (await execute('sw_vers', ['-productVersion'])).stdout.trim(),
     powerAtStart: (await execute('pmset', ['-g', 'batt'])).stdout.trim(), thermalAtStart: (await execute('pmset', ['-g', 'therm'])).stdout.trim(),
     otherActivity: 'The user continues normal desktop work; ambient load, thermal conditions and CPU frequency are not controlled.' },
-  scope: 'Identical production frontend, common loopback HTTP/SSE bridge, identical existing Node worker backend and deterministic native-intake fixtures. Rust business-logic rewrite is not measured.',
+  scope: 'Identical production rendering/data sources, HTTP/SSE or native IPC around the same Node worker backend. Off variants replace only telemetry initialization. Rust business-logic rewrite is not measured.',
   measurement: { nativePresentation: false, realNetworkOrWebSocketTransport: false, frameLatency: 'DOM correctness at a subsequent RAF opportunity; not native compositor or photon latency.',
     requestedCadenceMS: 500, syntheticInteractionCadenceMS: 200, count, periods: 384, nonFocusableWindowsBehindUser: true,
     activePageSimulated: true, downloadAuditExcluded: true, clock: 'Constant offset aligns market candle boundaries; real timers, performance.now and native OS counters are not slowed or accelerated.',
     energy: { totalAppAvailable: false, reason: 'Total app/device energy and GPU energy cannot be attributed. Privileged powermetrics is unavailable; per-task CPU energy is measured separately with the supported kernel nanojoule counter.' } },
-  smoke, rounds, runs: [], outcome: 'running' }
+  smoke, rounds, variants, scenarios, diagnostics, sampleStacks, v8Profile, engineProfile, runs: [], outcome: 'running' }
 let reportWrites = Promise.resolve()
 function saveReport() {
   const contents = JSON.stringify(report, null, 2)
@@ -157,11 +170,21 @@ installInterruptionCleanup(async (signal, cleanup) => {
 })
 let measurement
 if (!smoke || args.includes('--measure')) measurement = await import('./measurement/index.mjs')
-const template = join(directory, 'seed-template')
+let template = join(directory, 'seed-template')
 try {
   // Clone only a closed, pristine seed. Copying a previous measured trial
   // would silently reuse its completed download in the next runtime.
   const clockImport = ['--import', join(root, 'experiments/runtime-comparison/clock.mjs'), '--import', join(root, 'experiments/runtime-comparison/fixture-policy.mjs')]
+  const seedReport = option('--seed-report', '')
+  if (seedReport) {
+    const source = resolve(seedReport), bytes = await readFile(source), previous = JSON.parse(bytes)
+    if (previous.marketEpochMS !== marketEpochMS || previous.measurement?.count !== count || previous.measurement?.periods !== 384
+      || !previous.runs?.some(run => run.outcome === 'passed' && run.final?.actualRows === count * 384 * 3)) throw new Error('Reusable seed report does not validate this exact market epoch and fixture size.')
+    template = previous.reusedSeed?.directory ?? join(dirname(source), 'seed-template')
+    await access(template)
+    report.reusedSeed = { report: source, sha256: createHash('sha256').update(bytes).digest('hex'), directory: template,
+      validity: 'Exact fixture size and virtual market epoch; each trial reseeds and validates the oracle, source cardinality and final live values.' }
+  } else {
   const seeder = launch(process.execPath, [...clockImport, join(root, 'experiments/runtime-comparison/server.mjs')], {
     RADAR_COMPARE_CLOCK_OFFSET_MS: String(report.marketEpochMS - Date.now()),
     RADAR_COMPARE_DOWNLOAD_ONLY: '1',
@@ -172,20 +195,29 @@ try {
     const stopped = await stop(seeder)
     if (stopped.forced || stopped.code !== 0) throw new Error(`Pristine seed did not close successfully: ${JSON.stringify(stopped)}`)
   }
+  }
   for (let round = 0; round < rounds; round++) {
+    const rotated = variants.map((_, index) => variants[(index + round) % variants.length])
+    for (const variant of rotated) {
     const order = runtimeOption === 'all' ? (round % 2 ? ['tauri', 'electron'] : ['electron', 'tauri']) : [runtimeOption]
     for (const runtime of order) {
-      const trial = join(directory, `${round + 1}-${runtime}`); await mkdir(trial, { recursive: true })
+      const trial = join(directory, `${round + 1}-${variant.transport}-${variant.telemetry}-${runtime}`); await mkdir(trial, { recursive: true })
       const profile = join(trial, 'data')
       await cp(template, profile, { recursive: true, mode: constants.COPYFILE_FICLONE })
       let backend, app
-      const result = { runtime, round: round + 1, phases: [], outcome: 'running' }; report.runs.push(result)
+      const result = { runtime, ...variant, round: round + 1, phases: [], outcome: 'running' }; report.runs.push(result)
       try {
-        log(`Preparing ${runtime}, round ${round + 1}, ${count} contracts`)
-        backend = launch(process.execPath, [...clockImport, join(root, 'experiments/runtime-comparison/server.mjs')], {
+        log(`Preparing ${runtime} ${variant.transport}/${variant.telemetry}, round ${round + 1}, ${count} contracts`)
+        const assets = variant.telemetry === 'off' ? join(root, 'artifacts/runtime-comparison/frontend-off') : join(root, 'dist')
+        if (v8Profile) await mkdir(join(trial, 'v8-profiles'), { recursive: true })
+        if (engineProfile && runtime === 'electron') await mkdir(join(trial, 'engine-profiles'), { recursive: true })
+        backend = launch(process.execPath, [...(v8Profile ? ['--cpu-prof', `--cpu-prof-dir=${join(trial, 'v8-profiles')}`] : []), ...clockImport, join(root, 'experiments/runtime-comparison/server.mjs')], {
           RADAR_COMPARE_CLOCK_OFFSET_MS: String(report.marketEpochMS - Date.now()),
           RADAR_COMPARE_DOWNLOAD_ONLY: '1',
-          RADAR_COMPARE_PROFILE: profile, RADAR_COMPARE_COUNT: String(count), PERPETUAL_SWAP_OPERATION_DIR: join(trial, 'operations'),
+          RADAR_COMPARE_PROFILE: profile, RADAR_COMPARE_COUNT: String(count), PERPETUAL_SWAP_OPERATION_DIR: variant.telemetry === 'off' ? undefined : join(trial, 'operations'),
+          RADAR_COMPARE_TELEMETRY: variant.telemetry, RADAR_COMPARE_TRANSPORT: variant.transport, RADAR_COMPARE_ASSETS: assets,
+          RADAR_COMPARE_DIAGNOSTICS: diagnostics ? '1' : '0',
+          RADAR_COMPARE_ENGINE_PROFILE: engineProfile ? '1' : '0',
           PERPETUAL_SWAP_OPERATION_SESSION: `runtime-comparison-${round}-${runtime}`, PERPETUAL_SWAP_ALLOW_NETWORK: '0', PERPETUAL_SWAP_SANDBOX: '1',
         }, 'common backend')
         const service = await backend.ready, configured = await shell(runtime)
@@ -193,6 +225,8 @@ try {
         result.executableSHA256 = createHash('sha256').update(await readFile(configured.executable)).digest('hex')
         const env = { RADAR_COMPARE_URL: new URL('/', service.url).href, RADAR_COMPARE_WIDTH: '1200', RADAR_COMPARE_HEIGHT: '760',
           RADAR_COMPARE_ELECTRON_PROFILE: join(trial, 'electron-profile'), ELECTRON_RUN_AS_NODE: undefined,
+          RADAR_COMPARE_TRANSPORT: variant.transport, RADAR_COMPARE_SOCKET: service.socketPath, RADAR_COMPARE_NATIVE_TOKEN: service.nativeToken,
+          RADAR_COMPARE_ENGINE_PROFILE_DIR: engineProfile && runtime === 'electron' ? join(trial, 'engine-profiles') : undefined,
           PERPETUAL_SWAP_SANDBOX: undefined, PERPETUAL_SWAP_OPERATION_DIR: undefined }
         app = runtime === 'tauri' ? await launchTauri(configured, env, trial) : launch(configured.executable, configured.args, env, runtime)
         if (app.bundlePath) result.bundlePath = app.bundlePath
@@ -207,6 +241,10 @@ try {
           const sequence = index + 1, seed = resourceCandle(0, '15m', service.fixture.periods, service.fixture.periods, service.fixture.asOf), close = seed.close + sequence * .001
           return projectIndicatorCandle(expected.state, { ...seed, close, high: Math.max(seed.high, close), volume: 100 + sequence, baseVolume: 100 + sequence, quoteVolume: close * (100 + sequence), confirmed: false })
         })
+        const oracle = JSON.stringify({ bars: expected.bars, live: expectedLive })
+        const oracleSHA256 = createHash('sha256').update(oracle).digest('hex')
+        if (!report.oracleSHA256) { report.oracleSHA256 = oracleSHA256; await writeFile(join(directory, 'oracle.json'), oracle) }
+        else if (report.oracleSHA256 !== oracleSHA256) throw new Error('The full correctness oracle differs across variants.')
         result.prepared = await post(service.url, 'control', { action: 'prepare', fixture: service.fixture, expectedBars: expected.bars })
         let quiet = 0
         for (let tries = 0; tries < 720 && quiet < 3; tries++) {
@@ -216,6 +254,7 @@ try {
         }
         if (quiet < 3) throw new Error('Initial chart preparation did not settle before measurement.')
         result.prepared = await post(service.url, 'control', { action: 'prepare', fixture: service.fixture })
+        result.startupMetrics = await post(service.url, 'metrics', {})
         result.canonicalDataHash = createHash('sha256').update(JSON.stringify({ ...result.prepared.chart, svgPaths: undefined })).digest('hex')
         report.canonicalDataHash ??= result.canonicalDataHash
         if (result.canonicalDataHash !== report.canonicalDataHash) throw new Error('Runtime input bars or canonical indicators differ; refusing an unequal comparison.')
@@ -223,7 +262,7 @@ try {
         result.pathComparison = comparePaths(report.referencePaths, result.prepared.chart.svgPaths)
         if (!result.pathComparison.compatible) throw new Error(`Indicator SVG evidence differs: ${JSON.stringify(result.pathComparison)}`)
         if (result.prepared.visibility !== 'visible' || result.prepared.errors.length) throw new Error(`Invalid ${runtime} presentation or page errors: ${JSON.stringify(result.prepared)}`)
-        for (const scenario of ['idle', 'realtime', 'history', 'download']) {
+        for (const scenario of scenarios) {
           log(`Measuring ${runtime} ${scenario}, round ${round + 1}`)
           const samples = [], roots = [app.runtimePid, backend.child.pid]
           let sampler
@@ -234,10 +273,30 @@ try {
             } })
           let phase
           try {
-            phase = await post(service.url, 'control', { action: 'run', scenario, fixture: service.fixture,
+            const running = post(service.url, 'control', { action: 'run', scenario, fixture: service.fixture,
               durationMS: scenario === 'realtime' ? (smoke ? 1000 : 30500) : durationMS, ticks, expectedLive })
+            if (sampleStacks) {
+              await pause(smoke ? 100 : 5000)
+              const { snapshotProcessTree } = await import('./measurement/index.mjs')
+              const { capture } = await import('./profiling/index.mjs')
+              const snapshot = await snapshotProcessTree({ rootPids: [app.runtimePid], extraPids: [backend.child.pid] })
+              result.stackProfiles ??= []
+              result.stackProfiles.push(await capture({ snapshot, pids: snapshot.processes.filter(p => p.counters).map(p => p.pid),
+                durationSeconds: smoke ? 1 : 5, intervalMS: 10, outputDirectory: join(trial, `stacks-${scenario}`) }))
+            }
+            phase = await running
           } finally { if (sampler) phase = { ...phase, resources: await sampler.stop() } }
           result.phases.push(phase)
+          phase.transportMetrics = await post(service.url, 'metrics', {})
+          if (!sampleStacks && scenario !== 'idle' && phase.rafCount / (phase.durationMS / 1000) < 50) throw new Error('Native refresh cadence fell below 50 RAF/s; discard this unequal active-page run.')
+          if (engineProfile && runtime === 'electron') {
+            let completed = false
+            for (let attempt = 0; attempt < 100; attempt++) {
+              try { completed = JSON.parse(await readFile(join(trial, 'engine-profiles', `${scenario}.complete.json`), 'utf8')).complete; if (completed) break } catch (error) { if (error.code !== 'ENOENT') throw error }
+              await pause(100)
+            }
+            if (!completed) throw new Error('Engine profile did not finish without opening DevTools.')
+          }
           if (phase.errors?.length || phase.failures?.length || phase.pendingInputs || phase.inputs?.some(input => input.error || input.status === 'committed' && !input.correct)
             || phase.inputCounts.planned !== phase.inputCounts.dispatched
             || phase.visibility?.some(state => state !== 'visible')
@@ -248,7 +307,7 @@ try {
         }
         result.final = await post(service.url, 'probe', { action: 'scaleStop' })
         if (result.final.liveMismatches.length) throw new Error('The replay lost updates on one or more contracts.')
-        if (result.final.ticks !== ticks || result.final.nativeUpdates !== ticks * count * service.fixture.timeframes.length) throw new Error('The replay did not deliver the identical complete native-intake workload.')
+        if (scenarios.includes('realtime') && (result.final.ticks !== ticks || result.final.nativeUpdates !== ticks * count * service.fixture.timeframes.length)) throw new Error('The replay did not deliver the identical complete native-intake workload.')
         if (result.final.actualRows !== service.fixture.rowsSeeded) throw new Error('The source dataset cardinality changed across the measured trial.')
         await post(service.url, 'control', { action: 'drain' })
         result.outcome = 'passed'
@@ -260,13 +319,17 @@ try {
         result.logs = { runtime: app?.logs(), backend: backend?.logs() }
         await saveReport()
         if (result.teardown.runtime.forced || result.teardown.backend.forced || result.teardown.backend.code !== 0) throw new Error(`Unclean comparison teardown: ${JSON.stringify(result.teardown)}`)
+        if (variant.telemetry === 'off') result.recording = { disabledByControl: true, correctnessChecksRetained: true }
+        else {
         const operations = await summarizeOperations(join(trial, 'operations'), {
-          requireRoles: ['market-backend', 'market-reader', 'market-writer', 'prepared-chart', 'renderer'],
+          requireRoles: ['market-backend', 'market-reader', 'market-writer', 'prepared-chart', ...(variant.telemetry === 'full' ? ['renderer'] : [])],
           requireCategories: ['cpu', 'database', 'io', 'ipc', 'network'],
         })
         result.recording = { diagnostics: operations.diagnostics, coverage: operations.coverage }
         if (operationReportHasFailures(operations)) throw new Error(`Incomplete operation recording: ${JSON.stringify(operations.diagnostics)}`)
+        }
       }
+    }
     }
   }
   const endFingerprint = await fingerprint()

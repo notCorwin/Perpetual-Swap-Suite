@@ -1,2 +1,4 @@
 /tauri/gen/
 /measurement/.build/
+/profiling/.build/
+/diagnostics/.build/

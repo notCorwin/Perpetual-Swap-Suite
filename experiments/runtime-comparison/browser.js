@@ -11,13 +11,20 @@
     Object.defineProperty(performance, 'timeOrigin', { value: performance.timeOrigin + clockOffsetMS, configurable: true })
   }
   const base = new URL('./', document.currentScript.src)
+  const options = globalThis.__radarComparisonOptions ?? { transport: 'http', telemetry: 'full' }
+  const native = options.transport === 'native' ? window.__comparisonNative : undefined
+  if (options.transport === 'native' && !native) throw new Error('Native comparison bridge is unavailable.')
+  let transportReady = Promise.resolve()
   const post = async (path, value) => {
+    await transportReady
+    if (native) return JSON.parse(await native.request(path, JSON.stringify(value)))
     const response = await fetch(new URL(path, base), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) })
     const result = await response.json()
     if (!response.ok) throw new Error(result.error || `Comparison request failed (${response.status}).`)
     return result
   }
-  const pending = [], events = new EventSource(new URL('events', base)), errors = []
+  const pending = [], events = native ? { close() {} } : new EventSource(new URL('events', base)), errors = []
+  if (native) transportReady = native.subscribe(payload => void handleMessage({ data: payload })).then(() => native.request('connect', '{}'))
   let hooks, connected = false, phase, clockCalibration, oracle
   const checkedFields = ['open', 'high', 'low', 'close', 'ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
   const equalValue = (left, right) => Object.is(left, right) || typeof left === 'number' && typeof right === 'number' && Math.abs(left - right) <= 1e-10 * Math.max(1, Math.abs(right))
@@ -46,7 +53,8 @@
     accept({ nativeWindowControls: false, request: value => post('request', value),
       initializeOperations: async value => {
         hooks = value
-        const source = await post('operations/init', { nonce: crypto.randomUUID() })
+        const source = options.telemetry === 'full' ? await post('operations/init', { nonce: crypto.randomUUID() })
+          : { sessionId: 'comparison-local', executionId: 'comparison-renderer-local' }
         for (const item of pending.splice(0)) hooks.receive(item.channel, item.detail)
         return source
       }, recordOperations: value => post('operations/batch', value), operationSourceFailure: value => post('operations/failure', value) })
@@ -55,7 +63,7 @@
     if (expectedBars) oracle = new Map(expectedBars.map(bar => [bar.hour, bar]))
     const clocks = []
     for (let index = 0; index < 5; index++) {
-      const before = epoch(), result = await fetch(new URL('status', base)).then(value => value.json()), after = epoch()
+      const before = epoch(), result = await post('status', {}), after = epoch()
       clocks.push({ offsetMS: result.epochMS - (before + after) / 2, uncertaintyMS: (after - before) / 2 })
     }
     clockCalibration = clocks.toSorted((a, b) => a.uncertaintyMS - b.uncertaintyMS)[0]
@@ -69,9 +77,15 @@
         && ['ready', 'unavailable'].includes(snapshot.indicatorState) && svg && svg.querySelector('[data-chart-indicator="ema"]')
     }, 'Canonical 96-candle chart', 90000)
     await pause(1500)
+    const rafProbe = await new Promise((resolve, reject) => {
+      let frames = 0, handle
+      const start = performance.now(), timer = setTimeout(() => { cancelAnimationFrame(handle); reject(new Error('Native RAF is suspended under occlusion; refusing an unequal refresh workload.')) }, 1500)
+      const next = () => { if (++frames === 8) { clearTimeout(timer); resolve({ frames, elapsedMS: performance.now() - start }) } else handle = requestAnimationFrame(next) }
+      handle = requestAnimationFrame(next)
+    })
     return { userAgent: navigator.userAgent, visibility: document.visibilityState, nativeVisibility: nativeVisibility(), activePageSimulated: true, focused: document.hasFocus(),
       devicePixelRatio, innerWidth, innerHeight, selected: view().snapshot.instId, timeframe: view().snapshot.timeframe,
-      bars: view().snapshot.bars.length, clockCalibration, clockOffsetMS, chart: canonicalChart(), errors: [...errors] }
+      bars: view().snapshot.bars.length, clockCalibration, clockOffsetMS, rafProbe, chart: canonicalChart(), errors: [...errors] }
   }
   function canonicalChart() {
     const { snapshot, svg } = view()
@@ -88,6 +102,8 @@
     if (phase) throw new Error('Comparison phase is already running.')
     const state = phase = { name: options.scenario, startedAt: epoch(), frameGaps: [], inputs: [], live: [], checks: 0, failures: [], rafCount: 0,
       errorsAtStart: errors.length, active: true, pendingInputs: new Set(), visibility: new Set(), nativeVisibility: new Set(), seenQuotes: new Set() }
+    window.__comparisonCosts?.reset()
+    if (globalThis.__radarComparisonOptions?.engineProfile) console.debug(`RADAR_COMPARE_PROFILE_START:${options.scenario}`)
     const visibility = () => { state.visibility.add(document.visibilityState); state.nativeVisibility.add(nativeVisibility()) }
     document.addEventListener('visibilitychange', visibility)
     let lastFrame, frameHandle, inputTimer, iteration = 0, load
@@ -122,6 +138,7 @@
         element.dispatchEvent(new Event('input', { bubbles: true }))
       }
       const expected = term === undefined ? null : options.fixture.instIds.filter(id => id.toLowerCase().includes(term)).length
+      if (term !== undefined) { record.term = term; record.expectedCount = expected }
       void (async () => {
         const deadline = performance.now() + 3000
         while (state.active && record.status === 'pending' && performance.now() < deadline) {
@@ -207,6 +224,7 @@
       state.checks++; if (!checkView()) state.failures.push('Final chart is incomplete or inconsistent.')
       state.stoppedAt = epoch(); state.active = false
       cancelAnimationFrame(frameHandle); window.removeEventListener('radar-chart-prepared', live)
+      if (globalThis.__radarComparisonOptions?.engineProfile) console.debug('RADAR_COMPARE_PROFILE_STOP')
       return { scenario: options.scenario, startedAt: state.startedAt, stoppedAt: state.stoppedAt, durationMS: state.stoppedAt - state.startedAt,
         visibility: [...state.visibility], nativeVisibility: [...state.nativeVisibility], activePageSimulated: true, userAgent: navigator.userAgent, viewport: { innerWidth, innerHeight, devicePixelRatio },
         rafOpportunityGapsMS: summarize(state.frameGaps), rafCount: state.rafCount,
@@ -215,12 +233,12 @@
         liveReceiveToRAFMS: summarize(state.live.filter(item => item.status === 'committed').map(item => item.receiveToRAFMS)), liveSourceToRAFMS: summarize(state.live.filter(item => item.status === 'committed').map(item => item.sourceToRAFMS)),
         live: state.live, deliveries: state.deliveries, load, expectedClose: state.expectedClose, pendingInputs: state.pendingInputs.size,
         downloadStart: state.downloadStart, downloadEnd: state.downloadEnd,
-        errors: errors.slice(state.errorsAtStart), failures: state.failures, finalChart: canonicalChart() }
+        errors: errors.slice(state.errorsAtStart), failures: state.failures, finalChart: canonicalChart(), diagnostics: window.__comparisonCosts?.snapshot() }
     } finally {
       state.active = false; clearTimeout(inputTimer); cancelAnimationFrame(frameHandle); window.removeEventListener('radar-chart-prepared', live); document.removeEventListener('visibilitychange', visibility); phase = undefined
     }
   }
-  events.onmessage = async event => {
+  async function handleMessage(event) {
     const item = JSON.parse(event.data)
     if (item.fatal) { errors.push(item.fatal); return }
     if (item.channel) { if (hooks) hooks.receive(item.channel, item.detail); else pending.push(item); return }
@@ -232,4 +250,5 @@
       await post('result', { id, result })
     } catch (error) { await post('result', { id, error: `${error.message}\n${error.stack || ''}` }) }
   }
+  if (!native) events.onmessage = handleMessage
 })()
