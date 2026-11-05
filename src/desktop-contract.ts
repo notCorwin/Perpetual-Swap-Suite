@@ -18,7 +18,7 @@ export type ChartCaptureBounds = { x: number; y: number; width: number; height: 
 export type ChartImage = { imageDataURL: string; width: number; height: number }
 
 export type RankedMarketRow = {
-  instId: string; lastPrice: number | null; turnover24hUSDT: number | null
+  instId: string; tickSz: string | null; lastPrice: number | null; turnover24hUSDT: number | null
   rankingChange: number | null; rankingAsOf: number | null
 }
 export type CatalogProgress = { total: number; completed: number; verified: number; failed: number; unknown: number; pending: number }

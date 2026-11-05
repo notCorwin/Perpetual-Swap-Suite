@@ -25,7 +25,7 @@ before(async () => {
       openInterest: { enabled: true, minUSDT: 5_000_000 }, volumeStability: { enabled: false, maxRatio: 2 },
     } }
     const rows = [['BETA', -3], ['ZETA', 3], ['ALPHA', 1], ['NULL', null]].map(([symbol, rankingChange]) => ({
-      instId: `${symbol}-USDT-SWAP`, price: 100, lastPrice: 100, rankingChange, rankingAsOf: 1_800_000_000_000,
+      instId: `${symbol}-USDT-SWAP`, tickSz: null, price: 100, lastPrice: 100, rankingChange, rankingAsOf: 1_800_000_000_000,
       turnover24hUSDT: 50_000_000,
     }))
     const state = globalThis.__workspaceFixture = { preferences, analysisSettings: { model: 'fixture/vision', hasAPIKey: false }, rows, initialRows: rows, requests: [], coldTimeframes: [], revision: 1, loading: false, error: '', realtimeState: 'live', updatedAt: 1_800_000_000_000, catalogSource: 'live', catalogProgress: undefined, failNextSave: false, failSnapshots: 0, staleNextSnapshot: false, staleReplies: 0, chartGeneration: 1, bollMode: 'standard', holdNextSnapshot: false, releaseSnapshot: null, snapshotActive: 0, snapshotMaximum: 0,
@@ -530,6 +530,80 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
   assert.match(await chart.locator('svg[data-rendered-inst] [data-chart-price-label-value]').textContent(), /^135 /)
   assert.equal(await page.evaluate(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]').__chartSnapshot.bars === globalThis.__completedSubscriptionBars), true)
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), reads, 'Live-only subscriptions must reuse the completed frame without a follow-up read.')
+})
+
+test('contract precision updates pad current quotes while preserving historical and indicator digits', async () => {
+  await page.locator('[aria-label="View BETA-USDT-SWAP chart"]').click()
+  await selectTimeframe(page, '15m')
+  const chart = page.locator('[data-chart-inst="BETA-USDT-SWAP"]')
+  const close = chart.locator('[data-chart-ohlc="close"] span[title]')
+  const waitForLabel = expected => page.waitForFunction(expected => document.querySelector('[data-chart-price-label-value]')?.textContent === expected, expected)
+  try {
+    const frame = await electron.evaluate(async () => {
+      const state = globalThis.__workspaceFixture
+      state.precisionRows = state.rows
+      state.rows = state.rows.map(row => row.instId === 'BETA-USDT-SWAP' ? { ...row, tickSz: '0.0001000', lastPrice: 100.12 } : row)
+      state.revision += 1; state.notify()
+      state.chartGeneration += 1
+      const frame = await state.request(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
+      Object.assign(frame.bars.at(-1), { open: 100.1, high: 101, low: 99, close: 100.123456789 })
+      frame.liveBar = { ...frame.bars.at(-1), hour: frame.endHour + frame.intervalMS, open: 100.1, high: 101, low: 99, close: 100.12,
+        ema: 100.123456789, confirmed: false }
+      state.sendChart(frame)
+      return frame
+    })
+    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '100.1200')
+    await waitForLabel('100.1200 ↑')
+    assert.equal(await close.textContent(), '100.1200')
+    assert.equal(await chart.locator('[data-chart-legend="EMA(200)"]').locator('..').locator('text').nth(1).textContent(), '100.12346', 'Indicators retain their independent significant-digit display.')
+    const baseline = await page.evaluate(() => {
+      const chart = document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')
+      globalThis.__precisionBars = chart.__chartSnapshot.bars
+      globalThis.__precisionLive = chart.__chartSnapshot.liveBar
+      return chart.querySelector('[data-chart-price-label-background]').getBoundingClientRect().width
+    })
+    const reads = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length)
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      state.rows = state.rows.map(row => row.instId === 'BETA-USDT-SWAP' ? { ...row, tickSz: '1e-8' } : row)
+      state.revision += 1; state.notify()
+    })
+    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '100.12000000')
+    await waitForLabel('100.12000000 ↑')
+    assert.equal(await close.textContent(), '100.12000000')
+    const layout = await chart.evaluate(chart => {
+      const label = chart.querySelector('[data-chart-price-label-value]').getBoundingClientRect()
+      const background = chart.querySelector('[data-chart-price-label-background]').getBoundingClientRect()
+      return { fits: label.right <= background.right + 1, width: background.width,
+        sameInputs: chart.__chartSnapshot.bars === globalThis.__precisionBars && chart.__chartSnapshot.liveBar === globalThis.__precisionLive,
+        historicalClose: chart.__chartSnapshot.bars.at(-1).close, ema: chart.__chartSnapshot.liveBar.ema }
+    })
+    assert.ok(layout.fits && layout.width > baseline, 'The chart gutter must reserve the newly padded quote width.')
+    assert.equal(layout.sameInputs, true, 'A precision-only update must reuse source bars and calculated values.')
+    assert.equal(layout.historicalClose, 100.123456789)
+    assert.equal(layout.ema, 100.123456789)
+    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), reads, 'Precision updates must not request chart data again.')
+    const target = await emaCandleTarget(94, frame)
+    await page.mouse.move(target.x, target.y)
+    await page.mouse.down()
+    await page.waitForFunction(() => document.querySelector('[data-chart-ohlc="close"] span[title]')?.textContent === '100.123456789')
+    await page.mouse.up()
+    await waitForLabel('100.12000000 ↑')
+  } finally {
+    await page.mouse.up()
+    const generation = await electron.evaluate(async () => {
+      const state = globalThis.__workspaceFixture
+      state.rows = state.precisionRows ?? state.rows
+      delete state.precisionRows
+      state.revision += 1; state.notify()
+      state.chartGeneration += 1
+      const frame = await state.request(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
+      state.sendChart(frame)
+      return frame.generation
+    })
+    await page.waitForFunction(generation => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.generation === generation, generation)
+    await page.evaluate(() => { delete globalThis.__precisionBars; delete globalThis.__precisionLive })
+  }
 })
 
 test('chart source updates stay outside the plot without resizing its viewport at scaled and design widths', async () => {

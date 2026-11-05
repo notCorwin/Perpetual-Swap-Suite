@@ -699,8 +699,12 @@ export class MarketService {
     const projected = entries.map(entry => {
       const instId = entry.instrument.instId, ranking = this.rankings.get(instId)
       const current = ranking?.lookback === lookback && ranking.rankingAsOf === asOf
-      const ticker = this.observations.get(instId)?.ticker?.value ?? entry.ticker
-      return { instId, lastPrice: number(ticker.last), turnover24hUSDT: number(this.catalogChecks.get(instId)?.result.turnover ?? entry.result.turnover),
+      // A metadata reassessment may have no ticker dependency. Quote display
+      // still owns the last shared market observation, independently of filters.
+      const ticker = this.observations.get(instId)?.ticker?.value ?? this.tickerCache?.values.get(instId)?.value ?? entry.ticker
+      const instrument = this.instruments.get(instId) ?? entry.instrument
+      return { instId, tickSz: typeof instrument.tickSz === 'string' ? instrument.tickSz : null,
+        lastPrice: number(ticker.last), turnover24hUSDT: number(this.catalogChecks.get(instId)?.result.turnover ?? entry.result.turnover),
         rankingChange: current ? ranking.rankingChange : null, rankingAsOf: current ? ranking.rankingAsOf : null }
     })
     const previousOrder = this.canonicalOrdering, byId = new Map(projected.map(row => [row.instId, row]))

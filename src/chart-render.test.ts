@@ -56,3 +56,21 @@ test('fractional overscan paths retain the exact 96-bar presentation window', ()
   assert.ok(emaPoints.at(-1)! > extended.geometry.layout.right)
   assert.equal(cache(frame, size, { before, after }), extended, 'Repeating an unchanged overscan frame reuses its geometry.')
 })
+
+test('current-price precision reserves label width and reuses unchanged chart inputs', () => {
+  const labels: string[] = []
+  const cache = createChartPlotCache(text => { labels.push(text); return text.length * 6 })
+  const size = { width: 1280, height: 700 }, frame = window()
+  const live = { ...frame, liveBar: { ...frame.bars.at(-1)!, confirmed: false, hour: 96 * step } }
+  const unpadded = cache(live, size)!
+  const padded = cache(live, size, {}, '1e-20')!
+  const quote = '102.00000000000000000000 ↑'
+  assert.ok(labels.includes(quote), 'The gutter must measure the same padded current price as the visible tag.')
+  assert.ok(padded.geometry.gutter >= quote.length * 6 + 16)
+  assert.ok(padded.geometry.gutter > unpadded.geometry.gutter)
+  assert.equal(padded.bars, unpadded.bars, 'A precision update reuses market data and calculated indicators.')
+  labels.length = 0
+  assert.equal(cache(live, size, {}, '1e-20'), padded)
+  assert.equal(labels.length, 0, 'Unchanged precision must reuse geometry without measuring or rebuilding paths.')
+  assert.equal(cache(live, size), unpadded, 'Historical formatting keeps its independent cached geometry.')
+})

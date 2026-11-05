@@ -17,9 +17,8 @@ import type { MarketSnapshot, RankedMarketRow, UnchangedSnapshot } from '@/deskt
 import type { PreparedChartNotification } from '@/chart-data'
 import type { RadarTimeframe } from '@/timeframe'
 import { cn } from '@/lib/utils'
+import { formatCurrentPrice } from '@/price-format'
 
-const priceFormatter = new Intl.NumberFormat('en-US', { maximumSignificantDigits: 8 })
-const formatPrice = (value: number | null | undefined) => value == null ? '—' : priceFormatter.format(value)
 const qualificationPending = (progress: MarketSnapshot['catalogProgress']) => !progress || progress.total === 0 || progress.completed < progress.total || progress.pending > 0
 const collectorStatus = (snapshot: MarketSnapshot | UnchangedSnapshot) => {
   const catalog = snapshot.catalogProgress
@@ -39,7 +38,7 @@ const MarketRowView = memo(function MarketRowView({ row, index, selected, lookba
     if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelect(row.instId) }
   }} className="cursor-pointer focus-visible:outline-2 focus-visible:outline-ring focus-visible:-outline-offset-2">
     <TableCell className="font-medium" title={row.instId}><span className="block truncate">{row.instId.replace(/-USDT-SWAP$/, '')}</span></TableCell>
-    <TableCell className="text-right">{formatPrice(row.lastPrice)}</TableCell>
+    <TableCell className="text-right">{formatCurrentPrice(row.lastPrice, row.tickSz)}</TableCell>
     <TableCell className="text-right" title={row.rankingAsOf ? `${lookback}-minute signed relative change · completed candle as of ${new Date(row.rankingAsOf).toLocaleString('en-US')}` : 'Completed candle ranking is not available'}>
       <span className="inline-flex items-center justify-end gap-1"><span aria-hidden="true" className={cn(change === null ? 'text-muted-foreground' : change > 0 ? 'text-positive' : change < 0 ? 'text-negative' : 'text-muted-foreground')}>{change === null ? '' : change > 0 ? '↑' : change < 0 ? '↓' : '→'}</span><span>{change === null ? '—' : `${change > 0 ? '+' : ''}${change.toFixed(2)}%`}</span></span>
     </TableCell>
@@ -218,7 +217,7 @@ function App() {
       </section>
     </aside>
     <section data-chart-panel className="h-full min-w-0 flex-1" aria-label="Market chart workspace">
-      {selectedID ? <MarketChart active={settingsSection === null} instId={selectedID} timeframe={timeframe} candidateIds={candidateIds} onTimeframeChange={changeTimeframe} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} /> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}
+      {selectedID ? <MarketChart active={settingsSection === null} instId={selectedID} tickSz={selectedRow?.tickSz} timeframe={timeframe} candidateIds={candidateIds} onTimeframeChange={changeTimeframe} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} /> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}
     </section>
     </div>
     {settingsSection && <WorkspaceSettings section={settingsSection} preferences={preferences} loaded={preferencesLoaded} loadError={preferencesError} onSave={savePreferences} onNavigationStateChange={updateSettingsGuard} />}

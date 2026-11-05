@@ -11,7 +11,8 @@ import { chartAnalysis } from '@/analysis-service'
 import { analysisSessionKey, type AnalysisDirection } from '@/chart-analysis'
 import { captureStableChart, chartCaptureBounds } from '@/chart-capture'
 import { CHART_PANELS, chartContentClip, chartPanelClip, chartPriceLabelLayout, type ChartPanel as Panel } from "@/chart-layout"
-import { chartCompact as compact, chartPrice as price, chartPercent, type ChartGeometry } from "@/chart-geometry"
+import { chartCompact as compact, chartPercent, type ChartGeometry } from "@/chart-geometry"
+import { formatCurrentPrice, formatHistoricalPrice, formatIndicatorPrice } from '@/price-format'
 import { chartRsiNavigationTarget, chartWheelContentOffset, createChartWheelBatch, createChartWheelScheduler } from '@/chart-navigation'
 import { chartStatisticsSamples } from '@/chart-legend'
 import { RSI_FIELDS, type RsiField } from '@/rsi-crossings'
@@ -122,7 +123,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
   const tag = { price: liveBar.close, rising: liveBar.close >= liveBar.open, inViewport: liveBar.hour <= endHour + (liveOverlay ? intervalMS : 0) }
   const latestY = priceY(tag.price)
   const latestColor = tag.rising ? "var(--positive)" : "var(--negative)"
-  const latestPrice = `${price(tag.price)} ${tag.rising ? '↑' : '↓'}`
+  const latestPrice = `${formatCurrentPrice(tag.price, geometry.currentPriceTickSz)} ${tag.rising ? '↑' : '↓'}`
   const priceLabel = chartPriceLabelLayout(latestY, panels.price, chartTokens.textSize, chartTokens.priceLabelPaddingY, liveOverlay)
   const tickHalfHeight = chartTokens.textSize / 2
   const inspectionX = x[0] + (active.hour - bars[0].hour) / intervalMS * geometry.barPitch
@@ -247,7 +248,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     {inspecting && panelKeys.map(key => <line key={key} x1={inspectionX} x2={inspectionX} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--foreground)" strokeDasharray="3 5" opacity="0.3" />)}
     <g clipPath={`url(#${areaClipId}-price)`}>
     {([[highIndex, candleHigh, "high"], [lowIndex, candleLow, "low"]] as const).map(([index, value, kind]) => {
-      const markerX = x[index], label = price(value)
+      const markerX = x[index], label = formatHistoricalPrice(value)
       const labelWidth = label.length * 6.5 + 8
       const start = index < n / 2 ? markerX + 10 : markerX - labelWidth - 10
       return <g key={kind}>
@@ -263,7 +264,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
       <text data-chart-price-label-value x={axisStarts.price} y={latestY} dominantBaseline="middle" fill="var(--foreground)">{latestPrice}</text>
       {priceLabel.countdownY !== null && <PriceCountdown hour={liveBar.hour} intervalMS={intervalMS} x={axisStarts.price} y={priceLabel.countdownY} />}
     </g>}
-    {legend("price", [["VWAP(14)", price(active.vwap), "var(--chart-2)", "2 3"], ["EMA(200)", price(active.ema), "var(--chart-3)", "7 4"], ["BOLL(20,2)", `U ${price(active.bollUpper)}\u00a0·\u00a0M ${price(active.bollMiddle)}\u00a0·\u00a0L ${price(active.bollLower)}`, "var(--chart-1)"]])}
+    {legend("price", [["VWAP(14)", formatIndicatorPrice(active.vwap), "var(--chart-2)", "2 3"], ["EMA(200)", formatIndicatorPrice(active.ema), "var(--chart-3)", "7 4"], ["BOLL(20,2)", `U ${formatIndicatorPrice(active.bollUpper)}\u00a0·\u00a0M ${formatIndicatorPrice(active.bollMiddle)}\u00a0·\u00a0L ${formatIndicatorPrice(active.bollLower)}`, "var(--chart-1)"]])}
     {legend("roc", [["ROC(9)", formatPercent(active.roc), "var(--chart-1)"], ["MAROC(9)", formatPercent(active.maroc), "var(--chart-2)", "7 4"]])}
     {legend("rsi", [["RSI(6)", rsiValue('rsi6'), "var(--chart-1)"], ["RSI(12)", rsiValue('rsi12'), "var(--chart-2)", "7 4"], ["RSI(24)", rsiValue('rsi24'), "var(--chart-3)", "3 4"]])}
     {legend("atr", [["ATR%(14)", chartPercent(active.atrPercent), "var(--chart-3)"], ["BBW(20,2)", chartPercent(active.bbw), "var(--chart-1)", "7 4"]])}
@@ -313,7 +314,7 @@ const ChartSurface = memo(function ChartSurface({ instId, timeframe, hasComplete
   </PlotVisible>
 })
 
-export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, turnoverOrder, onSelect }: { instId: string; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; candidateIds?: string[]; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
+export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, turnoverOrder, onSelect }: { instId: string; tickSz?: string | null; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; candidateIds?: string[]; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
   const windowVisible = useSyncExternalStore(subscribeVisibility, documentVisible)
   const controlsHelp = useRef<HTMLDialogElement>(null)
   const view = useSyncExternalStore(chartController.subscribe, chartController.getSnapshot)
@@ -332,11 +333,14 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
   const error = view.requested?.instId === instId && view.requested.timeframe === timeframe ? view.error : ''
   const requestedEnd = view.requested?.end ?? view.latestEnd
   const historical = surface ? surface.endHour !== chartController.store.latestEnd(surface.instId, surface.timeframe) : false
+  // Only the selected contract's forming quote uses today's trading precision.
+  // Completed candles and a retained previous contract keep their source digits.
+  const currentPriceTickSz = matchesSelection && !historical && surface?.liveBar ? tickSz : undefined
   const chartRef = useRef<HTMLElement>(null)
   const plotRef = useRef<HTMLDivElement>(null)
   const [plotSize, setPlotSize] = useState({ width: 0, height: 0 })
   const overscan = chartOverscan(surface)
-  const preparedPlot = chartPlot(surface, plotSize, overscan)
+  const preparedPlot = chartPlot(surface, plotSize, overscan, currentPriceTickSz)
   const bars = preparedPlot?.bars ?? surface?.bars ?? EMPTY_BARS
   const plotGeometry = preparedPlot?.geometry ?? null
   const [inspection, setInspection] = useState<{ instId: string; timeframe: RadarTimeframe; hour: number } | null>(null)
@@ -609,7 +613,10 @@ export const MarketChart = memo(function MarketChart({ instId, timeframe = '15m'
       </div>
       {active && <div className="flex shrink-0 flex-wrap items-center gap-x-6 gap-y-1 border-b px-4 py-1.5 text-[length:var(--chart-text-size)]" aria-live="off">
         <p className="min-w-0 truncate" data-chart-inspected-hour={inspectedBar?.hour}><span className="text-muted-foreground">{inspectedBar === undefined ? historical ? 'Window end' : 'Latest' : 'Selected'}</span> {time(active.hour)}</p>
-        {([['Open', active.open], ['High', active.high], ['Low', active.low], ['Close', active.close]] as const).map(([label, value]) => <div key={label} data-chart-ohlc={label.toLowerCase()} className="min-w-0"><span className="text-muted-foreground">{label} </span><span title={price(value)}>{price(value)}</span></div>)}
+        {([['Open', active.open], ['High', active.high], ['Low', active.low], ['Close', active.close]] as const).map(([label, value]) => {
+          const text = label === 'Close' && active === surface?.liveBar ? formatCurrentPrice(value, currentPriceTickSz) : formatHistoricalPrice(value)
+          return <div key={label} data-chart-ohlc={label.toLowerCase()} className="min-w-0"><span className="text-muted-foreground">{label} </span><span title={text}>{text}</span></div>
+        })}
         <span data-chart-price-scale={priceScale} className="ml-auto text-muted-foreground" title={priceScale === 'linear' ? 'Linear scale · BOLL includes zero or negative values' : 'Logarithmic price scale'}>{priceScale === 'linear' ? 'Linear' : 'Log'}</span>
       </div>}
       <div ref={plotRef} data-chart-plot tabIndex={-1} className="relative min-h-0 flex-1 overflow-hidden outline-none" onKeyDown={event => {

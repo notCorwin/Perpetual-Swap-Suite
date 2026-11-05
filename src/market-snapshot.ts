@@ -11,7 +11,7 @@ export function reconcileMarketRows(previous: RankedMarketRow[], incoming: Ranke
   const byID = new Map(previous.map(row => [row.instId, row]))
   const next = incoming.map(row => {
     const old = byID.get(row.instId)
-    return old && old.lastPrice === row.lastPrice && old.turnover24hUSDT === row.turnover24hUSDT
+    return old && old.tickSz === row.tickSz && old.lastPrice === row.lastPrice && old.turnover24hUSDT === row.turnover24hUSDT
       && old.rankingChange === row.rankingChange && old.rankingAsOf === row.rankingAsOf ? old : row
   })
   return previous.length === next.length && next.every((row, index) => row === previous[index]) ? previous : next

@@ -13,6 +13,7 @@ const btc = 'BTC-USDT-SWAP', eth = 'ETH-USDT-SWAP', sol = 'SOL-USDT-SWAP'
 const instrument = (instId = btc) => ({
   instId, instType: 'SWAP', instCategory: '1', settleCcy: 'USDT', ctType: 'linear', state: 'live',
   ctVal: '0.01', ctMult: '1', ctValCcy: instId.split('-')[0], ruleType: 'normal',
+  tickSz: '0.01',
 })
 const response = (data: unknown) => new Response(JSON.stringify({ code: '0', data }), { headers: { 'Content-Type': 'application/json' } })
 const deferred = <T = void>() => {
@@ -112,6 +113,7 @@ test('reconnect snapshot preserves fields omitted from buffered partial instrume
     const current = f.service.instruments.get(btc)
     assert.equal(current.ctVal, '0.02', 'A buffered patch cannot restore a field from the previous socket session.')
     assert.equal(current.tickSz, '0.1')
+    assert.equal(f.service.listRowsFor().find(row => row.instId === btc)?.tickSz, '0.1', 'The published quote uses the reconciled precision, not the older REST definition.')
     assert.equal(current.lotSz, '1')
   } finally { held.resolve([]); await reconciling; await f.close() }
 })
@@ -121,6 +123,13 @@ test('live metadata additions and delistings update list membership and subscrip
   try {
     const { context } = await synchronized(f.service)
     const requests = f.requests.length
+    const before = f.service.listRowsFor().find(row => row.instId === btc)!
+    assert.equal(before.tickSz, '0.01')
+    f.service.receiveInstruments([{ instId: btc, tickSz: '0.0001' }], context)
+    await settle(f.service)
+    const after = f.service.listRowsFor().find(row => row.instId === btc)!
+    assert.equal(after.tickSz, '0.0001', 'A precision-only subscription update changes the displayed precision immediately.')
+    assert.equal(after.lastPrice, before.lastPrice)
     f.service.receiveInstruments([instrument(eth)], context)
     await settle(f.service)
     assert.deepEqual(ids(f.service), [btc, eth])

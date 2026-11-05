@@ -4,12 +4,11 @@ import type { Bar } from './chart-data.ts'
 import { finitePercentage, formatPercent } from './market-percent.ts'
 import { measureOperation } from '../electron/services/operations.js'
 import { chartRsiCrossings } from './rsi-crossings.ts'
+import { formatCurrentPrice } from './price-format.ts'
 
 const compactFormatter = new Intl.NumberFormat('en-US', { maximumSignificantDigits: 5, notation: 'compact' })
-const priceFormatter = new Intl.NumberFormat('en-US', { maximumSignificantDigits: 8 })
 const axisFormatters = new Map<number, Intl.NumberFormat>()
 export const chartCompact = (value: number | null) => value === null ? '—' : compactFormatter.format(value)
-export const chartPrice = (value: number | null) => value === null ? '—' : priceFormatter.format(value)
 export const chartPercent = (value: number | null, decimals = 2) => value === null ? '—' : `${value.toFixed(decimals)}%`
 const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value)
 const priceFields = ['low', 'high', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower'] as const
@@ -26,7 +25,7 @@ const axisFormatter = (decimals: number) => {
 }
 
 type Range = readonly [number, number]
-export type ChartGeometryOptions = Readonly<{ width: number; height: number; endHour: number; intervalMS: number; liveClose?: number }>
+export type ChartGeometryOptions = Readonly<{ width: number; height: number; endHour: number; intervalMS: number; liveClose?: number; currentPriceTickSz?: string | null }>
 export type ChartGeometryOverscan = Readonly<{ before?: Bar; after?: Bar }>
 const linearScale = (min: number, max: number, panel: Range) => {
   const span = max - min || 1, height = panel[1] - panel[0]
@@ -83,7 +82,7 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
     ...priceLabelsText,
     formatPercent(rocAxis.max, rocAxis.decimals), formatPercent(rocAxis.min, rocAxis.decimals), '100', '0',
     ...oiLabelsText, ...takerLabelsText,
-    `${chartPrice(liveClose ?? bars.at(-1)!.close)} ↑`, '00:00',
+    `${formatCurrentPrice(liveClose ?? bars.at(-1)!.close, options.currentPriceTickSz)} ↑`, '00:00',
   ]
   const gutter = Math.ceil(Math.max(...labels.map(measureText)) + 16)
   const layout = chartLayout(width, height, gutter), { left, right } = layout
@@ -209,6 +208,7 @@ export function createChartGeometryCache(measureText: (text: string) => number) 
     const liveClose = finite(options.liveClose) ? options.liveClose : undefined
     const index = variants.findIndex(({ value, before, after }) => value.width === options.width && value.height === options.height
       && value.endHour === options.endHour && value.intervalMS === options.intervalMS && value.liveClose === liveClose
+      && value.currentPriceTickSz === options.currentPriceTickSz
       && before === overscan.before && after === overscan.after)
     if (index >= 0) {
       const [variant] = variants.splice(index, 1)
