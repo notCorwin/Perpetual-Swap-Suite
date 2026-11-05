@@ -1,4 +1,4 @@
-import { beginOperation, readOperationCPUTime } from './operations.js'
+import { beginOperation, hasOperationRecording, readOperationCPUTime } from './operations.js'
 
 // A market command/transaction is one database operation. `calls` counts hooked
 // database/statement API calls; `queryCount` counts execution API batches
@@ -8,7 +8,8 @@ const databases = new WeakMap()
 const recordedConstructors = new WeakSet()
 const recordedPrototypes = new WeakSet()
 const recordedBackupFunctions = new WeakSet()
-export function databaseOperation(name, operation, attributes = {}, resource) {
+export function databaseOperation(name, operation, attributes, resource) {
+  if (!hasOperationRecording()) return operation()
   if (group) return operation()
   const span = beginOperation({ category: 'database', name, resource, attributes })
   const cpu = readOperationCPUTime()
@@ -19,10 +20,12 @@ export function databaseOperation(name, operation, attributes = {}, resource) {
 }
 
 export function recordedDatabase(database, resource) {
+  if (!hasOperationRecording()) return database
   const existing = databases.get(database)
   if (existing) { if (resource) existing.resource = resource; return existing.proxy }
   const state = { database, resource: resource ?? 'sqlite', statements: new WeakMap(), invocationDepth: 0 }
   const invoke = (name, method, args, identity) => {
+    if (!hasOperationRecording()) return method(...args)
     const execution = name.split('.').at(-1)
     const operation = () => {
       if (group) {
@@ -46,8 +49,10 @@ export function recordedDatabase(database, resource) {
     const proxy = new Proxy(statement, { get(statementTarget, method) {
       const value = Reflect.get(statementTarget, method, statementTarget)
       if (typeof value !== 'function' || method === 'constructor') return value
+      if (!hasOperationRecording()) return value.bind(statementTarget)
       const identity = table ? `${state.resource}:${table}` : state.resource
       if (method === 'iterate') return (...args) => {
+        if (!hasOperationRecording()) return Reflect.apply(value, statementTarget, args)
         const originGroup = group
         let span, iterator, finished = false
         const details = { calls: originGroup ? 0 : 1, queryCount: originGroup ? 0 : 1, rows: 0, changes: 0 }
@@ -61,6 +66,7 @@ export function recordedDatabase(database, resource) {
           if (typeof iteratorMethod !== 'function') return iteratorMethod
           if (!['next', 'return', 'throw'].includes(key)) return iteratorMethod.bind(iteratorTarget)
           return (...values) => {
+            if (!hasOperationRecording()) return Reflect.apply(iteratorMethod, iteratorTarget, values)
             // A lazy iterator may escape its synchronous group. Record that
             // later consumption separately rather than changing a closed event.
             const activeGroup = originGroup && group === originGroup ? originGroup : undefined
@@ -81,7 +87,12 @@ export function recordedDatabase(database, resource) {
     return proxy
   }
   const proxy = new Proxy(database, { get(target, key) {
+    if (!hasOperationRecording()) {
+      const value = Reflect.get(target, key, target)
+      return typeof value === 'function' && key !== 'constructor' ? value.bind(target) : value
+    }
     if (key === 'prepare') return sql => {
+      if (!hasOperationRecording()) return Reflect.apply(target.prepare, target, [sql])
       // Only identifiers from a fixed schema are recorded. SQL text and literals
       // may contain paths or secrets and must never enter the journal.
       const tables = ['settings', 'analysis_settings', 'migrations', 'audits', 'catalog', 'series', 'candles', 'statistics', 'indicator_checkpoints']
@@ -101,6 +112,7 @@ export function recordedDatabase(database, resource) {
 }
 
 export function openRecordedDatabase(Database, path, options, role) {
+  if (!hasOperationRecording()) return new Database(path, options ?? {})
   return recordedDatabase(databaseOperation('sqlite.open', () => {
     if (!recordedConstructors.has(Database)) group.calls++
     return new Database(path, options ?? {})
@@ -108,7 +120,8 @@ export function openRecordedDatabase(Database, path, options, role) {
 }
 
 /** Hook default/CommonJS constructors plus the shared prototype for named imports. */
-export function installRecordedSQLite(sqlite) {
+export function installRecordedSQLite(sqlite, recording = hasOperationRecording()) {
+  if (!recording) return false
   const Database = sqlite?.DatabaseSync
   if (typeof Database !== 'function') return false
   if (recordedConstructors.has(Database)) return true
@@ -120,6 +133,7 @@ export function installRecordedSQLite(sqlite) {
       const original = Database.prototype[method]
       if (typeof original !== 'function') continue
       Object.defineProperty(Database.prototype, method, { ...Object.getOwnPropertyDescriptor(Database.prototype, method), value: function (...args) {
+        if (!hasOperationRecording()) return Reflect.apply(original, this, args)
         const existing = databases.get(this)
         if (existing?.invocationDepth) return Reflect.apply(original, this, args)
         const proxy = recordedDatabase(this)
@@ -128,6 +142,7 @@ export function installRecordedSQLite(sqlite) {
     }
   }
   const HookedDatabase = new Proxy(Database, { construct(target, args, newTarget) {
+    if (!hasOperationRecording()) return Reflect.construct(target, args, newTarget === HookedDatabase ? target : newTarget)
     const database = databaseOperation('sqlite.open', () => { group.calls++; return Reflect.construct(target, args, newTarget === HookedDatabase ? target : newTarget) }, { role: 'sqlite' })
     return recordedDatabase(database)
   } })
@@ -136,6 +151,11 @@ export function installRecordedSQLite(sqlite) {
   const backup = sqlite.backup
   if (typeof backup === 'function' && !recordedBackupFunctions.has(backup)) {
     const recordedBackup = function (...args) {
+      if (!hasOperationRecording()) {
+        const state = databases.get(args[0])
+        if (state) args[0] = state.database
+        return Reflect.apply(backup, this, args)
+      }
       const span = beginOperation({ category: 'database', name: 'sqlite.backup' })
       const attributes = { calls: 1, queryCount: 0, rows: 0, changes: 0 }
       if (databases.has(args[0])) args[0] = databases.get(args[0]).database

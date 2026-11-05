@@ -4,8 +4,10 @@ import type { OperationContext } from '../electron/services/operations.js'
 
 type DesktopTransport = {
   readonly nativeWindowControls: boolean
+  readonly operationRecording: boolean
   request(value: unknown, context?: OperationContext): Promise<unknown>
-  initializeOperations(hooks: OperationBridgeHooks): Promise<OperationSourceIdentity>
+  subscribeNotifications(receiver: (channel: string, detail: unknown, context?: OperationContext) => void): void
+  initializeOperations(flush: () => Promise<void>): Promise<OperationSourceIdentity>
   recordOperations(batch: OperationBatch): Promise<OperationAcknowledgment>
   operationSourceFailure(value: { executionId: string; reason: string; omitted: number }): Promise<void>
 }
@@ -20,11 +22,13 @@ let operations: OperationBridgeHooks | undefined
 const chartRequest = (value: unknown) => value !== null && typeof value === 'object'
   && ['chartWindow', 'chartLocal', 'chartHistory', 'chartUniverse'].some(key => Object.hasOwn(value, key))
 
-const request = async (value: DesktopRequest) => {
+const decodeResponse = (value: DesktopRequest, result: unknown) => chartRequest(value) ? decodeChartWire(result) : result
+const plainRequest = async (value: DesktopRequest) => decodeResponse(value, await bridge.request(value))
+const recordedRequest = async (value: DesktopRequest) => {
   const operation = operations?.beginRequest(Object.keys(value ?? {})[0] ?? 'invalid')
   try {
     const result = await bridge.request(value, operation?.context)
-    const response = chartRequest(value) ? decodeChartWire(result) : result
+    const response = decodeResponse(value, result)
     if (operation) operations?.endRequest(operation.id, 'ok')
     return response
   } catch (error) {
@@ -33,14 +37,27 @@ const request = async (value: DesktopRequest) => {
   }
 }
 
+const deliverNotification = (channel: string, detail: unknown) => {
+  window.dispatchEvent(new CustomEvent(channel.replace(':', '-'), {
+    detail: channel === 'radar:chart-prepared' ? decodeChartWire(detail) : detail,
+  }))
+}
+bridge.subscribeNotifications(bridge.operationRecording
+  ? (channel, detail, context) => {
+    if (operations) operations.receive(channel, context, () => deliverNotification(channel, detail))
+    else deliverNotification(channel, detail)
+  }
+  : deliverNotification)
+
 const desktop: RadarDesktop = {
   nativeWindowControls: bridge.nativeWindowControls,
-  request: request as RadarDesktop['request'],
+  operationRecording: bridge.operationRecording,
+  request: (bridge.operationRecording ? recordedRequest : plainRequest) as RadarDesktop['request'],
   initializeOperations(hooks) {
+    if (!bridge.operationRecording) throw new Error('Operation recording is disabled for this renderer.')
+    if (operations) throw new Error('Renderer recording is already initialized.')
     operations = hooks
-    return bridge.initializeOperations({ ...hooks, receive: (channel, detail, context) => {
-      hooks.receive(channel, detail, context, channel === 'radar:chart-prepared' ? decodeChartWire : undefined)
-    } })
+    return bridge.initializeOperations(hooks.flush)
   },
   recordOperations: batch => bridge.recordOperations(batch),
   operationSourceFailure: value => bridge.operationSourceFailure(value),

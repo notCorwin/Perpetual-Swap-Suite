@@ -1,6 +1,6 @@
 import { Worker, workerData } from 'node:worker_threads'
 import { fork } from 'node:child_process'
-import { beginOperation, getOperationContext, recordOperation, runWithOperationContext } from './operations.js'
+import { beginOperation, getOperationContext, hasOperationRecording, recordOperation, runWithOperationContext } from './operations.js'
 import { registerOperationParticipant, closeOperationRecording } from './operation-runtime.js'
 
 const instrumented = new WeakSet()
@@ -11,6 +11,7 @@ const commandOf = message => String(message?.command ?? message?.method ?? messa
 
 /** Every message carries its causal context without changing its domain fields. */
 export function instrumentOperationEndpoint(endpoint, role) {
+  if (!hasOperationRecording()) return endpoint
   if (instrumented.has(endpoint)) return endpoint
   instrumented.add(endpoint)
   const sendMethod = typeof endpoint.postMessage === 'function' ? 'postMessage' : 'send'
@@ -40,50 +41,57 @@ export function instrumentOperationEndpoint(endpoint, role) {
 }
 
 export function createOperationWorker(url, options = {}, role = 'worker') {
-  const participant = registerOperationParticipant(role)
-  const startup = beginOperation({ category: 'ipc', name: 'worker.start', resource: role })
+  const recording = hasOperationRecording()
+  const participant = recording ? registerOperationParticipant(role) : undefined
+  const startup = recording ? beginOperation({ category: 'ipc', name: 'worker.start', resource: role }) : undefined
   let worker
   try {
-    worker = startup.run(() => new Worker(url, { ...options,
+    const create = () => new Worker(url, recording ? { ...options,
       env: { ...process.env, ...options.env, ...participant?.env },
       workerData: { ...options.workerData, operationContext: startup.context },
-    }))
-  } catch (error) { startup.end({ status: 'error', attributes: { errorName: error.name } }); throw error }
+    } : options)
+    worker = startup ? startup.run(create) : create()
+  } catch (error) { startup?.end({ status: 'error', attributes: { errorName: error.name } }); throw error }
   instrumentOperationEndpoint(worker, role)
-  const lifetime = beginOperation({ category: 'ipc', name: 'worker.lifetime', resource: role, attributes: { threadId: worker.threadId } })
-  worker.once('online', () => startup.end())
+  worker.operationRecording = recording
+  const lifetime = recording ? beginOperation({ category: 'ipc', name: 'worker.lifetime', resource: role, attributes: { threadId: worker.threadId } }) : undefined
+  if (startup) worker.once('online', () => startup.end())
   worker.on('error', error => {
-    startup.end({ status: 'error', attributes: { errorName: error.name } })
+    startup?.end({ status: 'error', attributes: { errorName: error.name } })
     for (const request of [...(requests.get(worker) ?? [])]) request.reject(error)
   })
   worker.once('exit', code => {
-    startup.end({ status: code === 0 ? 'cancelled' : 'error', attributes: { code } })
-    lifetime.end({ status: code === 0 || code === 1 && worker.operationTerminationRequested ? 'ok' : 'error', attributes: { code } })
+    startup?.end({ status: code === 0 ? 'cancelled' : 'error', attributes: { code } })
+    lifetime?.end({ status: code === 0 || code === 1 && worker.operationTerminationRequested ? 'ok' : 'error', attributes: { code } })
     for (const request of [...(requests.get(worker) ?? [])]) request.reject(Object.assign(new Error('Worker exited before responding.'), { name: 'WorkerExitError' }))
   })
-  const terminate = worker.terminate.bind(worker)
-  worker.terminate = (...args) => { worker.operationTerminationRequested = true; return terminate(...args) }
+  if (recording) {
+    const terminate = worker.terminate.bind(worker)
+    worker.terminate = (...args) => { worker.operationTerminationRequested = true; return terminate(...args) }
+  }
   return worker
 }
 
 export function createOperationProcess(entry, args = [], options = {}, role = 'process') {
-  const participant = registerOperationParticipant(role)
-  const startup = beginOperation({ category: 'ipc', name: 'worker.start', resource: role })
+  const recording = hasOperationRecording()
+  const participant = recording ? registerOperationParticipant(role) : undefined
+  const startup = recording ? beginOperation({ category: 'ipc', name: 'worker.start', resource: role }) : undefined
   let child
   try {
-    child = startup.run(() => fork(entry, args, { ...options, env: { ...process.env, ...options.env, ...participant?.env,
-      PERPETUAL_SWAP_PARENT_OPERATION_CONTEXT: JSON.stringify(startup.context) } }))
-  } catch (error) { startup.end({ status: 'error', attributes: { errorName: error.name } }); throw error }
+    const create = () => fork(entry, args, recording ? { ...options, env: { ...process.env, ...options.env, ...participant?.env,
+      PERPETUAL_SWAP_PARENT_OPERATION_CONTEXT: JSON.stringify(startup.context) } } : options)
+    child = startup ? startup.run(create) : create()
+  } catch (error) { startup?.end({ status: 'error', attributes: { errorName: error.name } }); throw error }
   instrumentOperationEndpoint(child, role)
-  const lifetime = beginOperation({ category: 'ipc', name: 'worker.lifetime', resource: role, attributes: { processId: child.pid } })
-  child.once('spawn', () => startup.end())
+  const lifetime = recording ? beginOperation({ category: 'ipc', name: 'worker.lifetime', resource: role, attributes: { processId: child.pid } }) : undefined
+  if (startup) child.once('spawn', () => startup.end())
   child.on('error', error => {
-    startup.end({ status: 'error', attributes: { errorName: error.name } })
+    startup?.end({ status: 'error', attributes: { errorName: error.name } })
     for (const request of [...(requests.get(child) ?? [])]) request.reject(error)
   })
   child.once('close', (code, signal) => {
-    startup.end({ status: 'error', attributes: { code } })
-    lifetime.end({ status: code === 0 && !signal ? 'ok' : 'error', attributes: { code } })
+    startup?.end({ status: 'error', attributes: { code } })
+    lifetime?.end({ status: code === 0 && !signal ? 'ok' : 'error', attributes: { code } })
     for (const request of [...(requests.get(child) ?? [])]) request.reject(Object.assign(new Error('Worker process exited before responding.'), { name: 'WorkerExitError' }))
   })
   return child
@@ -91,20 +99,20 @@ export function createOperationProcess(entry, args = [], options = {}, role = 'p
 
 /** Admission owns the queue wait; settlement always closes the whole request. */
 export function createWorkerRequest(role, command, resolve, reject, attributes = {}) {
-  const operation = beginOperation({ category: 'ipc', name: 'worker.request', resource: role, attributes: { ...attributes, command } })
-  const queuedAt = performance.now()
-  const queue = operation.run(() => beginOperation({ category: 'ipc', name: 'worker.queue', resource: role, attributes: { ...attributes, command } }))
+  const operation = hasOperationRecording() ? beginOperation({ category: 'ipc', name: 'worker.request', resource: role, attributes: { ...attributes, command } }) : undefined
+  const queuedAt = operation ? performance.now() : undefined
+  const queue = operation?.run(() => beginOperation({ category: 'ipc', name: 'worker.queue', resource: role, attributes: { ...attributes, command } }))
   let target, settled = false, queueMS
   const finish = (error, value) => {
     if (settled) return
     settled = true
-    queue.end({ status: error ? failureStatus(error) : 'ok' })
-    operation.end({ status: error ? failureStatus(error) : 'ok', attributes: { ...(queueMS === undefined ? {} : { queueMS }), ...(error ? { errorName: error.name } : {}) } })
+    queue?.end({ status: error ? failureStatus(error) : 'ok' })
+    operation?.end({ status: error ? failureStatus(error) : 'ok', attributes: { ...(queueMS === undefined ? {} : { queueMS }), ...(error ? { errorName: error.name } : {}) } })
     requests.get(target)?.delete(request)
     error ? reject(error) : resolve(value)
   }
   const request = {
-    context: operation.context,
+    context: operation?.context,
     resolve: value => finish(null, value),
     reject: error => finish(error),
     dispatch(endpoint, message, ...args) {
@@ -112,9 +120,11 @@ export function createWorkerRequest(role, command, resolve, reject, attributes =
       target = endpoint
       const pending = requests.get(endpoint) ?? new Set()
       requests.set(endpoint, pending); pending.add(request)
-      queueMS = performance.now() - queuedAt
-      queue.end({ attributes: { queueMS } })
-      try { return operation.run(() => endpoint[typeof endpoint.postMessage === 'function' ? 'postMessage' : 'send'](message, ...args)) }
+      if (queue) { queueMS = performance.now() - queuedAt; queue.end({ attributes: { queueMS } }) }
+      try {
+        const send = () => endpoint[typeof endpoint.postMessage === 'function' ? 'postMessage' : 'send'](message, ...args)
+        return operation ? operation.run(send) : send()
+      }
       catch (error) { request.reject(error); throw error }
     },
   }
@@ -123,6 +133,16 @@ export function createWorkerRequest(role, command, resolve, reject, attributes =
 
 /** Worker entrypoints share one async execution boundary and shutdown policy. */
 export function onOperationMessage(endpoint, role, handler, { closeWhen = () => false } = {}) {
+  if (!hasOperationRecording()) {
+    const listener = async message => {
+      try {
+        const response = await handler(message)
+        if (response !== undefined) endpoint[typeof endpoint.postMessage === 'function' ? 'postMessage' : 'send'](response)
+      } catch (error) { queueMicrotask(() => { throw error }) }
+    }
+    endpoint.on('message', listener)
+    return () => endpoint.off('message', listener)
+  }
   instrumentOperationEndpoint(endpoint, role)
   const listener = message => runWithOperationContext(message?.operationContext, async () => {
     const receivedAt = now()
@@ -145,6 +165,7 @@ export function onOperationMessage(endpoint, role, handler, { closeWhen = () => 
 }
 
 export function runWorkerInitialization(role, operation) {
+  if (!hasOperationRecording()) return operation()
   let initial = workerData?.operationContext
   if (!initial && process.env.PERPETUAL_SWAP_PARENT_OPERATION_CONTEXT) {
     try { initial = JSON.parse(process.env.PERPETUAL_SWAP_PARENT_OPERATION_CONTEXT) } catch { /* Invalid context cannot affect initialization. */ }

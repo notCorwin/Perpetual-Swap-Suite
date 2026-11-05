@@ -11,7 +11,7 @@ import { createNativeBroker } from './native-broker.mjs'
 const root = fileURLToPath(new URL('../..', import.meta.url))
 const profile = process.env.RADAR_COMPARE_PROFILE
 const telemetry = process.env.RADAR_COMPARE_TELEMETRY ?? 'full', transport = process.env.RADAR_COMPARE_TRANSPORT ?? 'http'
-const assets = resolve(process.env.RADAR_COMPARE_ASSETS ?? join(root, 'dist'))
+const assets = join(root, 'dist')
 if (!profile || telemetry !== 'off' && !process.env.PERPETUAL_SWAP_OPERATION_DIR) throw new Error('An isolated profile and explicit recording policy are required.')
 await mkdir(profile, { recursive: true })
 initializeOperationRecording({ label: 'comparison-backend' })

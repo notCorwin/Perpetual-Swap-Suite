@@ -7,7 +7,8 @@ import { graphicsCapabilities, graphicsSystemSnapshot, inspectGraphicsTrace, rea
 
 // An explicitly supplied operation directory identifies sandbox or diagnostic runs.
 export const graphicsRecordingRequested = (environment = process.env) =>
-  Boolean(environment.PERPETUAL_SWAP_OPERATION_DIR) || environment.PERPETUAL_SWAP_GPU_TRACE === '1'
+  environment.PERPETUAL_SWAP_OPERATION_TRACE !== '0'
+    && (Boolean(environment.PERPETUAL_SWAP_OPERATION_DIR) || environment.PERPETUAL_SWAP_GPU_TRACE === '1')
 
 // Process CPU/RSS samples, service-thread clocks, and hardware device clocks are
 // separate measurements. Native timestamps never become guessed epoch spans.

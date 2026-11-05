@@ -1,10 +1,14 @@
 // Browser-safe operation identity and lifecycle. Node installs async context
 // propagation; browser callbacks use the same API for synchronous scopes.
 const { performance } = globalThis
-const timeOrigin = performance.timeOrigin
+let timeOrigin
 const sinks = new Set(), journalSinks = new Set(), active = new Set(), imports = new Map()
 let operationSequence = 0, journalSequence = 0
-let identity = { sessionId: 'unattached', executionId: `renderer-${globalThis.crypto?.randomUUID?.() ?? performance.timeOrigin}` }
+const identity = { sessionId: 'unattached', executionId: undefined }
+function initializeIdentity() {
+  timeOrigin ??= performance.timeOrigin
+  identity.executionId ??= `renderer-${globalThis.crypto?.randomUUID?.() ?? timeOrigin}`
+}
 let cpuClock, synchronousContext = {}, propagation
 // Domain sets are module-owned, copy-on-write values. Public identity snapshots
 // and worker messages never expose this process-local execution state.
@@ -86,7 +90,7 @@ export function isOperationHookSuppressed(domain) {
   return context.suppressed === true || context[hookDomains]?.has(domain) === true
 }
 export function hasOperationRecording() { return sinks.size > 0 || journalSinks.size > 0 }
-export function readOperationCPUTime() { return cpuClock?.() }
+export function readOperationCPUTime() { return hasOperationRecording() ? cpuClock?.() : undefined }
 export function attachOperationSink(sink) { sinks.add(sink); return () => sinks.delete(sink) }
 export function attachOperationJournalSink(sink) { journalSinks.add(sink); return () => journalSinks.delete(sink) }
 function publish(event) {
@@ -132,6 +136,7 @@ export function recordOperation(value) {
   if (!hasOperationRecording() || isOperationSuppressed() || !categories.has(value.category)) return
   const { status, startedAt, durationMS, cpuTimeMS } = value
   if (!statuses.has(status) || !Number.isFinite(startedAt) || !Number.isFinite(durationMS) || durationMS < 0) return
+  initializeIdentity()
   // Completed observations own their terminal snapshot from admission. Keep the
   // same key order as localEvent; the independently copied start may be mutated.
   const context = current(), id = `${identity.executionId}:${++operationSequence}`
@@ -172,6 +177,7 @@ class LocalOperationSpan {
 }
 export function beginOperation(specification) {
   if (!hasOperationRecording() || isOperationSuppressed() || !categories.has(specification.category)) return noop
+  initializeIdentity()
   const started = performance.now(), span = new LocalOperationSpan(start(specification, timeOrigin + started), started)
   active.add(span); return span
 }
@@ -183,6 +189,7 @@ function failOperation(span, error) {
   span.end({ status: error?.name === 'AbortError' ? 'cancelled' : 'error', attributes: { errorName: error?.name ?? 'Error' } }); throw error
 }
 export function measureOperation(specification, operation) {
+  if (!hasOperationRecording() || isOperationSuppressed()) return operation()
   const span = beginOperation(specification), cpu = specification.cpuTime !== false && cpuClock && span !== noop ? cpuClock() : undefined
   try {
     const value = span.run(operation)
@@ -212,6 +219,7 @@ export function hookOperationMethods(target, specifications) {
       normalizedSpecifications.add(template)
     }
     const wrapped = function (...args) {
+      if (!hasOperationRecording() || isOperationSuppressed()) return Reflect.apply(method, this, args)
       const spec = template ?? Reflect.apply(specification, this, args)
       return measureOperation(spec, () => Reflect.apply(method, this, args))
     }

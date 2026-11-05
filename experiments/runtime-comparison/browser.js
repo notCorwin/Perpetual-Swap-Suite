@@ -25,7 +25,7 @@
   }
   const pending = [], events = native ? { close() {} } : new EventSource(new URL('events', base)), errors = []
   if (native) transportReady = native.subscribe(payload => void handleMessage({ data: payload })).then(() => native.request('connect', '{}'))
-  let hooks, connected = false, phase, clockCalibration, oracle
+  let notificationReceiver, flushOperations, connected = false, phase, clockCalibration, oracle
   const checkedFields = ['open', 'high', 'low', 'close', 'ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
   const equalValue = (left, right) => Object.is(left, right) || typeof left === 'number' && typeof right === 'number' && Math.abs(left - right) <= 1e-10 * Math.max(1, Math.abs(right))
   window.addEventListener('error', event => errors.push(`${event.message}\n${event.error?.stack || ''}`))
@@ -50,14 +50,22 @@
   window.radarDesktopBootstrap = { connect(accept) {
     if (connected) throw new Error('Comparison bridge is already connected.')
     connected = true
-    accept({ nativeWindowControls: false, request: value => post('request', value),
-      initializeOperations: async value => {
-        hooks = value
-        const source = options.telemetry === 'full' ? await post('operations/init', { nonce: crypto.randomUUID() })
-          : { sessionId: 'comparison-local', executionId: 'comparison-renderer-local' }
-        for (const item of pending.splice(0)) hooks.receive(item.channel, item.detail)
-        return source
-      }, recordOperations: value => post('operations/batch', value), operationSourceFailure: value => post('operations/failure', value) })
+    const operationRecording = options.telemetry === 'full'
+    const requireRecording = () => { if (!operationRecording) throw new Error('Operation recording is disabled for this renderer.') }
+    accept({ nativeWindowControls: false, operationRecording, request: value => post('request', value),
+      subscribeNotifications: receiver => {
+        if (notificationReceiver || typeof receiver !== 'function') throw new Error('The notification receiver is already subscribed or invalid.')
+        notificationReceiver = receiver
+        for (const item of pending.splice(0)) receiver(item.channel, item.detail, item.context)
+      },
+      initializeOperations: flush => {
+        requireRecording()
+        if (flushOperations || typeof flush !== 'function') throw new Error('Renderer recording is already initialized or its drain is invalid.')
+        flushOperations = flush
+        return post('operations/init', { nonce: crypto.randomUUID() })
+      },
+      recordOperations: value => { requireRecording(); return post('operations/batch', value) },
+      operationSourceFailure: value => { requireRecording(); return post('operations/failure', value) } })
   } }
   async function prepare({ fixture, expectedBars }) {
     if (expectedBars) oracle = new Map(expectedBars.map(bar => [bar.hour, bar]))
@@ -241,12 +249,12 @@
   async function handleMessage(event) {
     const item = JSON.parse(event.data)
     if (item.fatal) { errors.push(item.fatal); return }
-    if (item.channel) { if (hooks) hooks.receive(item.channel, item.detail); else pending.push(item); return }
+    if (item.channel) { if (notificationReceiver) notificationReceiver(item.channel, item.detail, item.context); else pending.push(item); return }
     if (!item.command) return
     const { id, ...options } = item.command
     try {
       const result = options.action === 'prepare' ? await prepare(options) : options.action === 'run' ? await run(options)
-        : options.action === 'drain' ? (await hooks?.flush(), events.close(), { ok: true }) : (() => { throw new Error('Unsupported browser comparison command.') })()
+        : options.action === 'drain' ? (await flushOperations?.(), events.close(), { ok: true }) : (() => { throw new Error('Unsupported browser comparison command.') })()
       await post('result', { id, result })
     } catch (error) { await post('result', { id, error: `${error.message}\n${error.stack || ''}` }) }
   }

@@ -604,7 +604,7 @@ export function installOperationHooks() {
   installFetch()
   installWebSocket()
   try {
-    const sqlite=require('node:sqlite'),enabled=installRecordedSQLite(sqlite)
+    const sqlite=require('node:sqlite'),enabled=installRecordedSQLite(sqlite, true)
     if(enabled)installed.add('sqlite')
     capability('node:sqlite.DatabaseSync',enabled,'default-module-constructor-and-recorded-opens-only',enabled?undefined:'native-constructor-not-writable',sqlite,'DatabaseSync',sqlite.DatabaseSync)
   } catch {capability('node:sqlite.DatabaseSync',false,'default-module-constructor-and-recorded-opens-only','runtime-api-unavailable')}

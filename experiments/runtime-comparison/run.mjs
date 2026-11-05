@@ -24,6 +24,7 @@ const variants = option('--variants', `${option('--transport', 'http')}:${option
 })
 if (scenarios.some(value => !['idle', 'realtime', 'history', 'download'].includes(value)) || !scenarios.length) throw new Error('Invalid comparison scenarios.')
 const diagnostics = args.includes('--diagnostics')
+const backendWorkProbe = args.includes('--backend-work-probe') || Boolean(process.env.RADAR_BACKEND_WORK_PROBE)
 const sampleStacks = args.includes('--sample-stacks'), v8Profile = args.includes('--v8-profile')
 const engineProfile = args.includes('--engine-profile')
 const marketEpochMS = Number(option('--market-epoch-ms', Math.floor(Date.now() / 900000) * 900000 + 1000))
@@ -45,7 +46,6 @@ async function fingerprint() {
     }
   }
   for (const path of ['dist/assets', 'electron', 'experiments/runtime-comparison']) await visit(path)
-  if (variants.some(value => value.telemetry === 'off')) await visit('artifacts/runtime-comparison/frontend-off')
   for (const file of ['dist/index.html', 'package.json', 'package-lock.json']) files[file] = createHash('sha256').update(await readFile(join(root, file))).digest('hex')
   return { files, sha256: createHash('sha256').update(JSON.stringify(files)).digest('hex') }
 }
@@ -139,13 +139,14 @@ const shell = async runtime => {
 const revision = (await execute('git', ['rev-parse', 'HEAD'], { cwd: root })).stdout.trim()
 const sourceFingerprint = await fingerprint()
 const report = { schemaVersion: 1, revision, dirty: Boolean((await execute('git', ['status', '--porcelain'], { cwd: root })).stdout.trim()),
+  backendWorkProbe,
   sourceFingerprint,
   marketEpochMS,
   startedAt: new Date().toISOString(), machine: { platform: process.platform, arch: process.arch, node: process.version,
     hardware: (await execute('sysctl', ['-n', 'hw.model'])).stdout.trim(), macOS: (await execute('sw_vers', ['-productVersion'])).stdout.trim(),
     powerAtStart: (await execute('pmset', ['-g', 'batt'])).stdout.trim(), thermalAtStart: (await execute('pmset', ['-g', 'therm'])).stdout.trim(),
     otherActivity: 'The user continues normal desktop work; ambient load, thermal conditions and CPU frequency are not controlled.' },
-  scope: 'Identical production rendering/data sources, HTTP/SSE or native IPC around the same Node worker backend. Off variants replace only telemetry initialization. Rust business-logic rewrite is not measured.',
+  scope: 'Identical production rendering/data sources, HTTP/SSE or native IPC around the same Node worker backend. Recording is selected at startup for each variant. Rust business-logic rewrite is not measured.',
   measurement: { nativePresentation: false, realNetworkOrWebSocketTransport: false, frameLatency: 'DOM correctness at a subsequent RAF opportunity; not native compositor or photon latency.',
     requestedCadenceMS: 500, syntheticInteractionCadenceMS: 200, count, periods: 384, nonFocusableWindowsBehindUser: true,
     activePageSimulated: true, downloadAuditExcluded: true, clock: 'Constant offset aligns market candle boundaries; real timers, performance.now and native OS counters are not slowed or accelerated.',
@@ -175,6 +176,7 @@ try {
   // Clone only a closed, pristine seed. Copying a previous measured trial
   // would silently reuse its completed download in the next runtime.
   const clockImport = ['--import', join(root, 'experiments/runtime-comparison/clock.mjs'), '--import', join(root, 'experiments/runtime-comparison/fixture-policy.mjs')]
+  if (backendWorkProbe) clockImport.push('--import', join(root, 'experiments/runtime-comparison/backend-work-probe.mjs'))
   const seedReport = option('--seed-report', '')
   if (seedReport) {
     const source = resolve(seedReport), bytes = await readFile(source), previous = JSON.parse(bytes)
@@ -189,6 +191,7 @@ try {
     RADAR_COMPARE_CLOCK_OFFSET_MS: String(report.marketEpochMS - Date.now()),
     RADAR_COMPARE_DOWNLOAD_ONLY: '1',
     RADAR_COMPARE_PROFILE: template, RADAR_COMPARE_COUNT: String(count), PERPETUAL_SWAP_OPERATION_DIR: join(directory, 'seed-operations'),
+    PERPETUAL_SWAP_OPERATION_TRACE: '1',
     PERPETUAL_SWAP_OPERATION_SESSION: 'comparison-seed', PERPETUAL_SWAP_ALLOW_NETWORK: '0', PERPETUAL_SWAP_SANDBOX: '1',
   }, 'fixture seeder')
   try { await seeder.ready } finally {
@@ -208,15 +211,16 @@ try {
       const result = { runtime, ...variant, round: round + 1, phases: [], outcome: 'running' }; report.runs.push(result)
       try {
         log(`Preparing ${runtime} ${variant.transport}/${variant.telemetry}, round ${round + 1}, ${count} contracts`)
-        const assets = variant.telemetry === 'off' ? join(root, 'artifacts/runtime-comparison/frontend-off') : join(root, 'dist')
         if (v8Profile) await mkdir(join(trial, 'v8-profiles'), { recursive: true })
         if (engineProfile && runtime === 'electron') await mkdir(join(trial, 'engine-profiles'), { recursive: true })
         backend = launch(process.execPath, [...(v8Profile ? ['--cpu-prof', `--cpu-prof-dir=${join(trial, 'v8-profiles')}`] : []), ...clockImport, join(root, 'experiments/runtime-comparison/server.mjs')], {
           RADAR_COMPARE_CLOCK_OFFSET_MS: String(report.marketEpochMS - Date.now()),
           RADAR_COMPARE_DOWNLOAD_ONLY: '1',
           RADAR_COMPARE_PROFILE: profile, RADAR_COMPARE_COUNT: String(count), PERPETUAL_SWAP_OPERATION_DIR: variant.telemetry === 'off' ? undefined : join(trial, 'operations'),
-          RADAR_COMPARE_TELEMETRY: variant.telemetry, RADAR_COMPARE_TRANSPORT: variant.transport, RADAR_COMPARE_ASSETS: assets,
+          PERPETUAL_SWAP_OPERATION_TRACE: variant.telemetry === 'off' ? '0' : '1',
+          RADAR_COMPARE_TELEMETRY: variant.telemetry, RADAR_COMPARE_TRANSPORT: variant.transport,
           RADAR_COMPARE_DIAGNOSTICS: diagnostics ? '1' : '0',
+          RADAR_BACKEND_WORK_PROBE: backendWorkProbe ? join(trial, 'backend-work') : undefined,
           RADAR_COMPARE_ENGINE_PROFILE: engineProfile ? '1' : '0',
           PERPETUAL_SWAP_OPERATION_SESSION: `runtime-comparison-${round}-${runtime}`, PERPETUAL_SWAP_ALLOW_NETWORK: '0', PERPETUAL_SWAP_SANDBOX: '1',
         }, 'common backend')

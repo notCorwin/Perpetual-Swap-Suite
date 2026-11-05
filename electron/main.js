@@ -14,6 +14,7 @@ import { graphicsRecordingRequested, startGraphicsRecording } from './services/o
 import { beginOperation, measureOperation, recordOperation, runWithOperationContext, withOperationSuppressed } from './services/operations.js'
 import { createRendererOperationReceiver } from './services/renderer-operations.js'
 import { createOperationSession, enforceOperationRetention } from './services/operation-retention.js'
+import { operationRecordingRequested } from './services/operation-policy.js'
 import { installElectronOperationHooks } from './services/operation-hooks.js'
 import { MarketBackend } from './services/market-backend.js'
 import { windowToolbarLayout } from './window-layout.js'
@@ -35,7 +36,7 @@ if (process.env.PERPETUAL_SWAP_USER_DATA) {
 }
 const recordGraphics = graphicsRecordingRequested()
 const operationSessionRoot = join(app.getPath('userData'), 'Operations')
-const operationSession = !process.env.PERPETUAL_SWAP_OPERATION_DIR
+const operationSession = operationRecordingRequested() && !process.env.PERPETUAL_SWAP_OPERATION_DIR
   ? await withOperationSuppressed(() => createOperationSession({ root: operationSessionRoot })) : undefined
 if (operationSession) process.env.PERPETUAL_SWAP_OPERATION_DIR = operationSession.directory
 let retentionTask = Promise.resolve()
@@ -51,7 +52,7 @@ await maintainOperationRetention()
 const operationRecording = initializeOperationRecording({ label: 'electron-main' })
 const retentionTimer = operationSession ? setInterval(maintainOperationRetention, 60_000) : undefined
 retentionTimer?.unref()
-const rendererOperations = createRendererOperationReceiver()
+const rendererOperations = operationRecording ? createRendererOperationReceiver() : undefined
 let stopGraphicsRecording
 const security = createDesktopSecurity({ rendererURL, rendererFile: join(root, 'dist', 'index.html') })
 const e2eLiveRefresh = testMode && process.env.PERPETUAL_SWAP_E2E_LIVE_REFRESH === '1'
@@ -71,6 +72,7 @@ function sendGateway(event, detail) {
 }
 
 function sendNotification(sender, channel, detail) {
+  if (!operationRecording) return sender.send(channel, channel === 'radar:chart-prepared' ? encodeChartWire(detail) : detail)
   const operation = beginOperation({ category: 'ipc', name: 'desktop.notification.send', resource: channel })
   try { operation.run(() => sender.send(channel, channel === 'radar:chart-prepared' ? encodeChartWire(detail) : detail, operation.context)) }
   finally { operation.end() }
@@ -79,7 +81,7 @@ function sendNotification(sender, channel, detail) {
 function drainRendererOperations(target) {
   if (!target || target.isDestroyed() || target.webContents.isDestroyed()) return Promise.resolve()
   const sender = target.webContents
-  if (!rendererOperations.sourcesFor(sender.id).length) return Promise.resolve()
+  if (!rendererOperations?.sourcesFor(sender.id).length) return Promise.resolve()
   return new Promise((resolve, reject) => {
     const id = randomUUID()
     const finish = error => {
@@ -119,7 +121,7 @@ async function gatewayFetch(event, { id, body }) {
     const apiKey = await backend.credentials()
     controller.signal.throwIfAborted()
     if (!apiKey) throw new Error('Save an AI Gateway API key in Configure analysis before starting analysis.')
-    operation = beginOperation({ category: 'ipc', name: 'gateway.stream', resource: 'https://ai-gateway.vercel.sh/v1/chat/completions', attributes: { method: 'POST', sentBytes: Buffer.byteLength(body) } })
+    if (operationRecording) operation = beginOperation({ category: 'ipc', name: 'gateway.stream', resource: 'https://ai-gateway.vercel.sh/v1/chat/completions', attributes: { method: 'POST', sentBytes: Buffer.byteLength(body) } })
     const response = await fetch('https://ai-gateway.vercel.sh/v1/chat/completions', {
       method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` }, body, signal: controller.signal,
     })
@@ -134,14 +136,14 @@ async function gatewayFetch(event, { id, body }) {
             receivedBytes += value.byteLength
             sendGateway(event, { id, type: 'data', base64: Buffer.from(value).toString('base64') })
           }
-          operation.end({ status: response.ok ? 'ok' : 'error', attributes: { receivedBytes, httpStatus } })
+          operation?.end({ status: response.ok ? 'ok' : 'error', attributes: { receivedBytes, httpStatus } })
           sendGateway(event, { id, type: 'end' })
         } catch (error) {
-          operation.end({ status: controller.signal.aborted ? 'cancelled' : 'error', attributes: { receivedBytes, httpStatus, errorName: error.name } })
+          operation?.end({ status: controller.signal.aborted ? 'cancelled' : 'error', attributes: { receivedBytes, httpStatus, errorName: error.name } })
           if (!controller.signal.aborted) sendGateway(event, { id, type: 'error', message: error instanceof Error ? error.message : 'Gateway stream interrupted.' })
         } finally { reader.releaseLock(); release() }
       })()
-    } else { operation.end({ status: response.ok ? 'ok' : 'error', attributes: { receivedBytes, httpStatus } }); release() }
+    } else { operation?.end({ status: response.ok ? 'ok' : 'error', attributes: { receivedBytes, httpStatus } }); release() }
     return { status: response.status, headers: Object.fromEntries(response.headers.entries()) }
   } catch (error) { operation?.end({ status: controller.signal.aborted ? 'cancelled' : 'error', attributes: { receivedBytes, errorName: error.name } }); release(); throw error }
 }
@@ -150,7 +152,7 @@ async function handleRequest(event, payload, context) {
   security.assertTrustedSender(event, window)
   const request = parseDesktopRequest(payload, { allowE2E: testMode })
   if (shuttingDown) throw new Error('The application is closing.')
-  const task = runWithOperationContext(context, () => measureOperation({ category: 'ipc', name: 'desktop.request.execute', resource: Object.keys(request)[0] }, async () => {
+  const execute = async () => {
   if (request.gatewayFetch) return gatewayFetch(event, request.gatewayFetch)
   if (request.cancelGatewayFetch) { gatewayRequests.get(request.cancelGatewayFetch)?.controller.abort(); return { ok: true } }
   if ('copyText' in request) { clipboard.writeText(request.copyText); return { ok: true } }
@@ -172,7 +174,10 @@ async function handleRequest(event, payload, context) {
     return { ...response, revision: build?.revision ?? null }
   }
   return request.chartWindow || request.chartLocal || request.chartHistory || request.chartUniverse ? encodeChartWire(response) : response
-  }))
+  }
+  const task = operationRecording
+    ? runWithOperationContext(context, () => measureOperation({ category: 'ipc', name: 'desktop.request.execute', resource: Object.keys(request)[0] }, execute))
+    : execute()
   desktopRequests.add(task)
   task.then(() => desktopRequests.delete(task), () => desktopRequests.delete(task))
   return task
@@ -187,8 +192,10 @@ async function createWindow() {
     width: 1600, height: 1000, minWidth: 1200, minHeight: 640,
     title: 'Perpetual Swap Suite', backgroundColor: '#101114', show: !testMode && !backgroundTests,
     webPreferences: { ...testWindowOptions(backgroundTests).webPreferences,
+      additionalArguments: operationRecording ? ['--perpetual-swap-operation-recording'] : [],
       preload: join(root, 'electron', 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true },
   })
+  subscribeWindowNotifications(window)
   if (process.platform === 'darwin') {
     const target = window
     const positionButtons = () => {
@@ -204,8 +211,9 @@ async function createWindow() {
   window.webContents.on('will-redirect', event => { if (!security.isAllowedNavigation(event.url)) event.preventDefault() })
   window.webContents.on('will-frame-navigate', event => { if (!security.isAllowedNavigation(event.url)) event.preventDefault() })
   window.webContents.on('render-process-gone', (_event, details) => {
-    rendererOperations.markIncomplete(window.webContents.id, `renderer-${details.reason}`)
-    recordOperation({ category: 'cpu', name: 'renderer.interrupted', startedAt: Date.now(), durationMS: 0, status: 'error',
+    console.error('Renderer process exited:', details.reason)
+    rendererOperations?.markIncomplete(window.webContents.id, `renderer-${details.reason}`)
+    if (operationRecording) recordOperation({ category: 'cpu', name: 'renderer.interrupted', startedAt: Date.now(), durationMS: 0, status: 'error',
       attributes: { incomplete: true, execution: 'renderer', reason: details.reason } })
   })
   let allowClose = false, closing = false
@@ -216,7 +224,7 @@ async function createWindow() {
     if (closing) return
     closing = true
     void drainRendererOperations(target).catch(error => console.error('Renderer operation shutdown failed:', error)).then(async () => {
-      for (const executionId of rendererOperations.sourcesFor(target.webContents.id)) await closeExternalOperationSource(executionId)
+      for (const executionId of rendererOperations?.sourcesFor(target.webContents.id) ?? []) await closeExternalOperationSource(executionId)
     }).catch(error => console.error('Renderer operation source close failed:', error)).finally(() => { allowClose = true; if (!target.isDestroyed()) target.close() })
   })
   window.webContents.setWindowOpenHandler(({ url }) => {
@@ -227,6 +235,31 @@ async function createWindow() {
   else await window.loadFile(join(root, 'dist', 'index.html'))
 }
 
+function subscribeWindowNotifications(target) {
+  const listeners = [
+    ['chart', 'radar:chart-prepared'], ['market', 'radar:market-changed'],
+    ['audit', 'radar:audit-changed'], ['history-download', 'radar:history-download-changed'],
+  ].map(([name, channel]) => [name, value => {
+    if (!shuttingDown && !target.isDestroyed() && !target.webContents.isDestroyed()) sendNotification(target.webContents, channel, value)
+  }])
+  let attached = false
+  const attach = () => {
+    if (attached || shuttingDown || target.isDestroyed() || target.webContents.isDestroyed()) return
+    attached = true
+    for (const [name, listener] of listeners) backend.on(name, listener)
+  }
+  const detach = () => {
+    if (!attached) return
+    attached = false
+    for (const [name, listener] of listeners) backend.off(name, listener)
+  }
+  target.once('closed', detach)
+  target.webContents.once('destroyed', detach)
+  target.webContents.on('render-process-gone', detach)
+  target.webContents.on('did-start-loading', attach)
+  attach()
+}
+
 async function startDesktop() {
   if (recordGraphics) stopGraphicsRecording = await startGraphicsRecording(app, contentTracing, operationRecording.directory)
   backend = new MarketBackend({ userData: app.getPath('userData'), testMode, e2eLiveRefresh })
@@ -234,12 +267,9 @@ async function startDesktop() {
   const send = (channel, value) => {
     if (!shuttingDown && window && !window.isDestroyed() && !window.webContents.isDestroyed()) sendNotification(window.webContents, channel, value)
   }
-  backend.on('chart', frame => send('radar:chart-prepared', frame))
-  backend.on('market', () => send('radar:market-changed'))
-  backend.on('audit', report => send('radar:audit-changed', report))
-  backend.on('history-download', report => send('radar:history-download-changed', report))
   backend.on('failure', error => { console.error('Market backend failed:', error); send('radar:market-changed') })
   ipcMain.handle('radar:request', handleRequest)
+  if (rendererOperations) {
   ipcMain.handle('radar:operations-initialize', (event, value) => {
     security.assertTrustedSender(event, window)
     return rendererOperations.initialize(event.sender.id, value?.nonce)
@@ -252,6 +282,7 @@ async function startDesktop() {
     security.assertTrustedSender(event, window)
     rendererOperations.fail(event.sender.id, value)
   })
+  }
   // Windows and input become available while data restores in its own worker.
   await createWindow()
 }

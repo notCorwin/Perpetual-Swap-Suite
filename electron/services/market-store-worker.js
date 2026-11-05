@@ -1,6 +1,7 @@
 import { closeOperationRecording } from './operation-runtime.js'
 import { onOperationMessage } from './worker-operations.js'
 import { databaseOperation, openRecordedDatabase } from './recorded-database.js'
+import { hasOperationRecording } from './operations.js'
 import { parentPort, workerData } from 'node:worker_threads'
 import { DatabaseSync } from 'node:sqlite'
 import { performance } from 'node:perf_hooks'
@@ -543,11 +544,13 @@ const commands = {
 }
 
 onOperationMessage(parentPort, workerData.reader ? 'market-reader' : 'market-writer', ({ id, command, args }) => {
-  const started = performance.now()
+  const recording = hasOperationRecording(), started = recording ? performance.now() : undefined
   try {
     if (!commands[command]) throw new Error(`Unknown market store operation: ${command}`)
-    const response = databaseOperation(`market.${command}`, () => commands[command](...args), { role: workerData.reader ? 'reader' : 'writer' })
-    return { id, ...response, durationMS: performance.now() - started }
+    const response = recording
+      ? databaseOperation(`market.${command}`, () => commands[command](...args), { role: workerData.reader ? 'reader' : 'writer' })
+      : commands[command](...args)
+    return { id, ...response, ...(recording ? { durationMS: performance.now() - started } : {}) }
   } catch (error) { return { id, error: { message: error.message, name: error.name, code: error.code } } }
 }, { closeWhen: message => message.command === 'close' })
 parentPort.postMessage({ ready: true })

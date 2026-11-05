@@ -114,7 +114,10 @@ test('notification decoding belongs to receive lineage and failed decoding remai
   const detach = attachOperationSink(event => events.push(event))
   try {
     const context = { traceId: 'wire:trace', parentId: 'wire:send' }
-    harness.hooks().receive('radar:chart-prepared', 'encoded', context, () => measureOperation({ category: 'cpu', name: 'fixture.decode' }, () => ({ revision: 7 })))
+    harness.hooks().receive('radar:chart-prepared', context, () => {
+      const detail = measureOperation({ category: 'cpu', name: 'fixture.decode' }, () => ({ revision: 7 }))
+      window.dispatchEvent(new CustomEvent('radar-chart-prepared', { detail }))
+    })
     assert.deepEqual(delivered.map(event => event.detail), [{ revision: 7 }])
     const received = events.find(event => event.name === 'desktop.notification.receive')!
     const decoded = events.find(event => event.name === 'fixture.decode')!
@@ -122,7 +125,7 @@ test('notification decoding belongs to receive lineage and failed decoding remai
     assert.equal(received.traceId, context.traceId)
     assert.equal(decoded.parentId, received.id)
     assert.equal(decoded.traceId, received.traceId)
-    assert.throws(() => harness.hooks().receive('radar:chart-prepared', 'malformed', context, () => { throw new SyntaxError('Invalid wire') }), SyntaxError)
+    assert.throws(() => harness.hooks().receive('radar:chart-prepared', context, () => { throw new SyntaxError('Invalid wire') }), SyntaxError)
     assert.equal(delivered.length, 1, 'Malformed data cannot dispatch a business notification.')
     assert.deepEqual(events.filter(event => event.name === 'desktop.notification.receive').map(event => event.status), ['ok', 'error'])
     assert.equal(events.at(-1)!.attributes!.errorName, 'SyntaxError')
@@ -244,7 +247,7 @@ test('leaving a renderer submits cancelled requests before an earlier durable AC
     assert.equal(persisted.size, 0)
     assert.equal(acknowledged, false)
     assert.throws(() => harness.hooks().beginRequest('snapshot'), { name: 'AbortError' })
-    assert.doesNotThrow(() => harness.hooks().receive('radar:chart-prepared', {}, undefined), 'A detached document must not dispatch more business work.')
+    assert.doesNotThrow(() => harness.hooks().receive('radar:chart-prepared', undefined, () => { throw new Error('dispatched after detach') }), 'A detached document must not dispatch more business work.')
     harness.hooks().endRequest(history.id, 'ok')
     harness.hooks().endRequest(universe.id, 'error')
     release!()

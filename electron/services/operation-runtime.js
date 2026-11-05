@@ -12,12 +12,16 @@ import { createRecorderSelfTiming } from './recorder-self-timing.js'
 import { attachOperationJournalSink, configureOperationContext, configureOperationPropagation, finishActiveOperations,
   registerOperationImportSource, withOperationSuppressed } from './operations.js'
 
-const scopes = new AsyncLocalStorage()
-configureOperationPropagation({ get: () => scopes.getStore(), run: (context, operation) => scopes.run(context, operation) })
-const startupContext = workerData?.operationContext ?? (process.env.PERPETUAL_SWAP_PARENT_OPERATION_CONTEXT
-  ? JSON.parse(process.env.PERPETUAL_SWAP_PARENT_OPERATION_CONTEXT) : {})
-scopes.enterWith(Object.fromEntries(['traceId', 'parentId', 'scenarioId'].filter(key => typeof startupContext[key] === 'string'
-  && /^[\w.:/-]{1,256}$/.test(startupContext[key])).map(key => [key, startupContext[key]])))
+let scopes
+function initializePropagation() {
+  if (scopes) return
+  scopes = new AsyncLocalStorage()
+  configureOperationPropagation({ get: () => scopes.getStore(), run: (context, operation) => scopes.run(context, operation) })
+  const startupContext = workerData?.operationContext ?? (process.env.PERPETUAL_SWAP_PARENT_OPERATION_CONTEXT
+    ? JSON.parse(process.env.PERPETUAL_SWAP_PARENT_OPERATION_CONTEXT) : {})
+  scopes.enterWith(Object.fromEntries(['traceId', 'parentId', 'scenarioId'].filter(key => typeof startupContext[key] === 'string'
+    && /^[\w.:/-]{1,256}$/.test(startupContext[key])).map(key => [key, startupContext[key]])))
+}
 installSandboxNetworkBoundary()
 let current
 const suppress = withOperationSuppressed
@@ -472,7 +476,8 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
 }
 
 export function initializeOperationRecording({ directory = process.env.PERPETUAL_SWAP_OPERATION_DIR, label, role = process.env.PERPETUAL_SWAP_OPERATION_ROLE } = {}) {
-  if (current || !directory) return current
+  if (current || !directory || process.env.PERPETUAL_SWAP_OPERATION_TRACE === '0') return current
+  initializePropagation()
   suppress(() => mkdirSync(directory, { recursive: true, mode: 0o700 }))
   const executionId = `${process.pid}-${threadId}-${randomUUID()}`
   const sessionId = process.env.PERPETUAL_SWAP_OPERATION_SESSION ?? (basename(directory) === 'operations' ? basename(dirname(directory)) : basename(directory))

@@ -10,7 +10,7 @@ export type OperationAcknowledgment = { batchId: string; lastSequence: number }
 export type OperationBridgeHooks = {
   beginRequest(command: string): { id: string; context: OperationContext }
   endRequest(id: string, status: 'ok' | 'error'): void
-  receive(channel: string, detail: unknown, context?: OperationContext, decode?: (detail: unknown) => unknown): void
+  receive(channel: string, context: OperationContext | undefined, deliver: () => void): void
   flush(): Promise<void>
 }
 
@@ -71,6 +71,7 @@ export type DesktopResponse<Request extends DesktopRequest> = Request extends { 
   ? ChartImage : { [K in keyof DesktopCommands]: Request extends Record<K, unknown> ? DesktopCommands[K]['output'] : never }[keyof DesktopCommands]
 export interface RadarDesktop {
   readonly nativeWindowControls: boolean
+  readonly operationRecording: boolean
   initializeOperations(hooks: OperationBridgeHooks): Promise<OperationSourceIdentity>
   recordOperations(batch: OperationBatch): Promise<OperationAcknowledgment>
   operationSourceFailure(value: { executionId: string; reason: string; omitted: number }): Promise<void>

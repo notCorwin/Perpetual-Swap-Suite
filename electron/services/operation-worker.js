@@ -2,6 +2,7 @@ import { beginOperation } from './operations.js'
 
 /** Stop a worker only after its operation journal has acknowledged shutdown. */
 export async function stopOperationWorker(worker, resource, timeoutMS = 2_000) {
+  if (worker.operationRecording === false) { await worker.terminate(); return }
   const span = beginOperation({ category: 'ipc', name: 'diagnostics.worker.flush', resource,
     attributes: { measurement: 'shutdown-wait', threadId: worker.threadId } })
   const outcome = await new Promise(resolve => {

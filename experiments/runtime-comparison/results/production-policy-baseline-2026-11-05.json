@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-11-05",
+  "purpose": "Reinterpret existing measurements for a production policy with operation tracing disabled by default; no new measurement.",
+  "policy": "Operation performance tracing is restricted to sandbox/tests or explicit diagnostics and is off by default in production.",
+  "reusedEvidence": {
+    "factorialReport": "artifacts/runtime-comparison/attribution-factorial-2026-11-05-v2/report.json",
+    "factorialReportSHA256": "3f922fbeae7953387d1d55d718e785460aa6ce61e5c9860189a0c6c4678b9e0c",
+    "factorialSummary": "artifacts/runtime-comparison/attribution-factorial-2026-11-05-v2/attribution-summary.json",
+    "factorialSummarySHA256": "06dd3ff508766d61b5e649b3bae7573874ee605f6117365117d74c23d2bca683",
+    "committedAttribution": "experiments/runtime-comparison/results/attribution-2026-11-05.json",
+    "committedAttributionSHA256": "ee356b82de2e52a4584a5af30393f0cf9119298bc8d5ac1b46ec2ec6ca2892b9",
+    "groupSelectors": [
+      "primary.grouped.electron.http.off",
+      "primary.grouped.tauri.http.off",
+      "primary.grouped.electron.native.off",
+      "primary.grouped.tauri.native.off"
+    ],
+    "nativeRuntimeContrastSelector": "primary.contrasts.crossRuntimeNativeOff",
+    "earlierFourScenarioEvidence": "experiments/runtime-comparison/results/2026-11-05.json",
+    "earlierFourScenarioRole": "Historical full-recording diagnostic, not the daily production baseline."
+  },
+  "scope": "Three pairs per runtime and transport in the synthetic realtime workload only; no replicated off energy baseline is established here for idle, history or download.",
+  "controlDifference": "Historical off replaced the renderer telemetry initializer in an isolated frontend build and disabled backend recording by omitting its recording directory. The updated production entry gates also skip residual trace context and worker wrappers. These are policy-aligned historical controls, not measurements of the updated installed binary.",
+  "limitations": "CPU-only energy excludes GPU, display, I/O and other device or shared-system energy. Synthetic intake, simulated active page and DOM-at-RAF acknowledgements do not measure actual network transport or physical presentation. Three pairs are descriptive; correctness, cadence and counter coverage are documented in the reused evidence.",
+  "verification": {
+    "targetedContracts": "65 unique tests covered default-off clocks/workers, off/on renderer bridge, native SQLite hooks, tracing lifecycle and acknowledged recording. First run: 64 passed; the 2 affected bridge tests passed after correcting the sandbox module-loader IO fixture.",
+    "comparisonChecks": "6 headless HTTP/native full/off transport and diagnostic probe tests passed.",
+    "staticChecks": "lint and desktop syntax passed; typecheck is part of the single unified renderer build.",
+    "deliveryEvidence": "artifacts/tracing-scope-delivery/report.json records unified E2E, packaged off smoke and signed installed identity; generated during delivery, separate from historical energy evidence."
+  }
+}

@@ -18,25 +18,27 @@ type TelemetryHost = {
 const FLUSH_THRESHOLD = 128, FLUSH_MS = 250, MAX_PENDING = 8_192
 
 /** Retain each lifecycle record until the main process acknowledges durable storage. */
-export async function initializeOperationTelemetry(host: TelemetryHost = {
-  initialize: hooks => window.radarDesktop.initializeOperations(hooks),
-  recordOperations: batch => window.radarDesktop.recordOperations(batch),
-  reportFailure: value => window.radarDesktop.operationSourceFailure(value),
-  timeOrigin: performance.timeOrigin,
-  Observer: globalThis.PerformanceObserver,
-  schedule: (callback, delay) => window.setTimeout(callback, delay),
-  cancel: handle => window.clearTimeout(handle),
-  onFlush: callback => {
-    const flush = () => { void callback().catch(() => {}) }
-    window.addEventListener('radar-operations-flush', flush)
-    return () => window.removeEventListener('radar-operations-flush', flush)
-  },
-  onStop: callback => {
-    const stop = () => { void callback().catch(() => {}) }
-    window.addEventListener('pagehide', stop)
-    return () => window.removeEventListener('pagehide', stop)
-  },
-}): Promise<() => Promise<void>> {
+export async function initializeOperationTelemetry(host?: TelemetryHost): Promise<() => Promise<void>> {
+  if (!host && !window.radarDesktop.operationRecording) return async () => {}
+  host ??= {
+    initialize: hooks => window.radarDesktop.initializeOperations(hooks),
+    recordOperations: batch => window.radarDesktop.recordOperations(batch),
+    reportFailure: value => window.radarDesktop.operationSourceFailure(value),
+    timeOrigin: performance.timeOrigin,
+    Observer: globalThis.PerformanceObserver,
+    schedule: (callback, delay) => window.setTimeout(callback, delay),
+    cancel: handle => window.clearTimeout(handle),
+    onFlush: callback => {
+      const flush = () => { void callback().catch(() => {}) }
+      window.addEventListener('radar-operations-flush', flush)
+      return () => window.removeEventListener('radar-operations-flush', flush)
+    },
+    onStop: callback => {
+      const stop = () => { void callback().catch(() => {}) }
+      window.addEventListener('pagehide', stop)
+      return () => window.removeEventListener('pagehide', stop)
+    },
+  }
   const pending: OperationJournalEvent[] = [], observers: PerformanceObserver[] = []
   const requests = new Map<string, OperationSpan>()
   let timer: number | undefined, flushing: Promise<void> | undefined, batch: OperationBatch | undefined
@@ -147,12 +149,12 @@ export async function initializeOperationTelemetry(host: TelemetryHost = {
       return { id, context: operation.context }
     },
     endRequest(id, status) { requests.get(id)?.end({ status }); requests.delete(id) },
-    receive(channel, detail, context, decode) {
+    receive(channel, context, deliver) {
       if (stopped) return
       runWithOperationContext(context, () => {
         const operation = beginOperation({ category: 'ipc', name: 'desktop.notification.receive', resource: channel })
         try {
-          operation.run(() => window.dispatchEvent(new CustomEvent(channel.replace(':', '-'), { detail: decode ? decode(detail) : detail })))
+          operation.run(deliver)
           operation.end()
         } catch (error) {
           operation.end({ status: 'error', attributes: { errorName: error instanceof Error ? error.name : 'Error' } })

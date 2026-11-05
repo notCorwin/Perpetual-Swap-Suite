@@ -2,33 +2,72 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 import vm from 'node:vm'
-import { initializeOperationTelemetry } from '../telemetry-off.ts'
 
 const source = await readFile(new URL('../timing-probes.js', import.meta.url), 'utf8')
+const comparisonBridge = await readFile(new URL('../browser.js', import.meta.url), 'utf8')
 
-test('telemetry-off retains notification decoding without recording or timers', async () => {
-  const originalWindow = globalThis.window, originalCustomEvent = globalThis.CustomEvent
-  const events = []; let hooks, initializations = 0
-  globalThis.window = { radarDesktop: { async initializeOperations(value) { initializations++; hooks = value; return {} } },
-    dispatchEvent(event) { events.push(event); return true } }
-  globalThis.CustomEvent = class { constructor(type, options) { this.type = type; this.detail = options.detail } }
-  try {
-    const cleanup = await initializeOperationTelemetry()
-    assert.equal(initializations, 1)
-    const first = hooks.beginRequest('snapshot'), second = hooks.beginRequest('chartWindow')
-    assert.notEqual(first.id, second.id)
-    assert.deepEqual(first.context, {})
-    hooks.endRequest(first.id, 'ok')
-    hooks.receive('radar:chart-prepared', 'wire', undefined, value => ({ decoded: value }))
-    hooks.receive('radar:market-changed', 7)
-    assert.equal(events[0].type, 'radar-chart-prepared')
-    assert.deepEqual(events[0].detail, { decoded: 'wire' })
-    assert.equal(events[1].type, 'radar-market-changed')
-    assert.equal(events[1].detail, 7)
-    assert.throws(() => hooks.receive('radar:chart-prepared', 'bad', undefined, () => { throw new Error('bad wire') }), /bad wire/)
-    await hooks.flush(); await cleanup()
-  } finally { globalThis.window = originalWindow; globalThis.CustomEvent = originalCustomEvent }
-})
+for (const transport of ['http', 'native']) for (const telemetry of ['off', 'full']) {
+  test(`comparison ${transport}/${telemetry} selects recording independently of notification delivery`, async () => {
+    const requests = [], notifications = []
+    let stream, subscriber, nonceCalls = 0, flushed = 0
+    class Document { get visibilityState() { return 'hidden' } }
+    const document = new Document()
+    document.currentScript = { src: 'http://127.0.0.1/session/browser.js' }
+    const respond = (path, body) => {
+      requests.push([path, body])
+      if (path === 'operations/init') return { sessionId: 'comparison', executionId: 'renderer' }
+      return { ok: true }
+    }
+    class EventSource {
+      constructor() { stream = this }
+      close() {}
+    }
+    const context = vm.createContext({ Document, document, URL, EventSource,
+      performance: { timeOrigin: 1, now: () => 1 },
+      crypto: { randomUUID: () => { if (telemetry === 'off') throw new Error('Unexpected recording nonce'); nonceCalls++; return 'nonce' } },
+      fetch: async (url, init) => ({ ok: true, json: async () => respond(url.pathname.split('/').slice(2).join('/'), JSON.parse(init.body)) }),
+      __radarComparisonOptions: { transport, telemetry }, addEventListener() {},
+    })
+    context.window = context
+    if (transport === 'native') context.__comparisonNative = {
+      subscribe: async callback => { subscriber = callback },
+      request: async (path, payload) => JSON.stringify(respond(path, JSON.parse(payload))),
+    }
+    vm.runInContext(comparisonBridge, context)
+    await Promise.resolve()
+    const emit = item => {
+      const payload = JSON.stringify(item)
+      if (transport === 'native') subscriber(payload); else stream.onmessage({ data: payload })
+    }
+    emit({ channel: 'radar:chart-prepared', detail: 'encoded-chart' })
+    let bridge
+    context.radarDesktopBootstrap.connect(value => { bridge = value })
+    assert.equal(bridge.operationRecording, telemetry === 'full')
+    bridge.subscribeNotifications((...values) => notifications.push(values))
+    assert.equal(notifications[0][0], 'radar:chart-prepared')
+    assert.equal(notifications[0][1], 'encoded-chart')
+    emit({ channel: 'radar:market-changed', detail: 7 })
+    assert.equal(notifications[1][1], 7)
+    await bridge.request({ snapshot: {} })
+    if (telemetry === 'full') {
+      const identity = await bridge.initializeOperations(async () => { flushed++ })
+      assert.equal(identity.executionId, 'renderer')
+      await bridge.recordOperations({ batchId: 'test' })
+      emit({ command: { id: 'drain', action: 'drain' } })
+      await new Promise(resolve => setImmediate(resolve))
+      assert.equal(flushed, 1)
+      assert.ok(requests.some(([path]) => path === 'result'))
+      assert.equal(nonceCalls, 1)
+      assert.ok(requests.some(([path]) => path === 'operations/init'))
+      assert.ok(requests.some(([path]) => path === 'operations/batch'))
+    } else {
+      assert.throws(() => bridge.initializeOperations(() => {}), /disabled/)
+      assert.throws(() => bridge.recordOperations({}), /disabled/)
+      assert.equal(nonceCalls, 0)
+      assert.ok(requests.every(([path]) => !path.startsWith('operations/')))
+    }
+  })
+}
 
 function browser({ observerTypes = ['longtask'] } = {}) {
   let clock = 0

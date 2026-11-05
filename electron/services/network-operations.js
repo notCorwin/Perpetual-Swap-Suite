@@ -1,8 +1,8 @@
-import { beginOperation, captureOperationContext, recordOperation } from './operations.js'
+import { beginOperation, captureOperationContext, hasOperationRecording, recordOperation } from './operations.js'
 import { Buffer } from 'node:buffer'
 import { performance } from 'node:perf_hooks'
 
-const timeOrigin = performance.timeOrigin
+let timeOrigin
 let nextConnection = 0
 const recordedSockets = new WeakMap()
 const recordedConstructionErrors = new WeakSet()
@@ -27,7 +27,9 @@ export const networkByteLength = value => {
  * Explicit forwarding preserves native WebSocket and injected socket receivers.
  */
 export function recordedWebSocketFactory(factory, stream) {
+  if (!hasOperationRecording()) return url => factory(url)
   return url => {
+    if (!hasOperationRecording()) return factory(url)
     let socket
     try { socket = factory(url) }
     catch (error) {
@@ -44,7 +46,8 @@ export function recordedWebSocketFactory(factory, stream) {
 }
 
 /** Native constructors and injected transports share one receiver-safe recorder. */
-export function constructRecordedWebSocket(construct, url, attributes = {}) {
+export function constructRecordedWebSocket(construct, url, attributes) {
+  if (!hasOperationRecording()) return construct()
   const connect = beginOperation({ category: 'network', name: 'websocket.connect', resource: networkResource(url),
     attributes: { transport: 'websocket', ...attributes } })
   try { return recordWebSocket(construct(), url, attributes, connect) }
@@ -56,6 +59,7 @@ export function constructRecordedWebSocket(construct, url, attributes = {}) {
 }
 
 function recordWebSocket(socket, url, suppliedAttributes, pendingConnect) {
+    timeOrigin ??= performance.timeOrigin
     const resource = networkResource(url)
     const attributes = { transport: 'websocket', ...suppliedAttributes, connection: ++nextConnection }
     const connect = pendingConnect ?? beginOperation({ category: 'network', name: 'websocket.connect', resource, attributes })
@@ -72,17 +76,24 @@ function recordWebSocket(socket, url, suppliedAttributes, pendingConnect) {
     // Native observers retain connection IDs without restoring application hook
     // scopes. Suppression belongs to the execution delivering each event.
     const resumeObserver = captureOperationContext()
-    const observe = listener => event => resumeObserver(() => listener(event))
+    const observe = listener => event => {
+      if (hasOperationRecording()) resumeObserver(() => listener(event))
+    }
+    const removeObservers = () => {
+      for (const [type, listener] of Object.entries(listeners)) socket.removeEventListener(type, listener)
+    }
     const listeners = {
       open: observe(() => { connected = true; finishConnect('ok') }),
       message: observe(event => record('websocket.receive', { bytes: networkByteLength(event.data) })),
       error: observe(() => { finishConnect('error'); record('websocket.error', {}, 'error') }),
-      close: observe(event => {
-        finishConnect(connected ? 'ok' : 'error')
-        const clean = event.wasClean === true || event.code === 1000 || event.code === 1001
-        record('websocket.closed', { code: Number.isInteger(event.code) ? event.code : null, clean }, clean ? 'ok' : 'error')
-        for (const [type, listener] of Object.entries(listeners)) socket.removeEventListener(type, listener)
-      }),
+      close: event => {
+        if (hasOperationRecording()) resumeObserver(() => {
+          finishConnect(connected ? 'ok' : 'error')
+          const clean = event.wasClean === true || event.code === 1000 || event.code === 1001
+          record('websocket.closed', { code: Number.isInteger(event.code) ? event.code : null, clean }, clean ? 'ok' : 'error')
+        })
+        removeObservers()
+      },
     }
     for (const [type, listener] of Object.entries(listeners)) socket.addEventListener(type, listener)
     if (socket.readyState === 1) listeners.open()
@@ -92,11 +103,13 @@ function recordWebSocket(socket, url, suppliedAttributes, pendingConnect) {
     let recorded = socket
     const methods = {
       send(...args) {
+        if (!hasOperationRecording()) return Reflect.apply(nativeSend, this === recorded ? socket : this, args)
         const operation = beginOperation({ category: 'network', name: 'websocket.send', resource, attributes: { ...attributes, bytes: networkByteLength(args[0]) } })
         try { const result = Reflect.apply(nativeSend, this === recorded ? socket : this, args); operation.end(); return result }
         catch (error) { operation.end({ status: 'error' }); throw error }
       },
       close(...args) {
+        if (!hasOperationRecording()) return Reflect.apply(nativeClose, this === recorded ? socket : this, args)
         // Abandoning a connecting socket is terminal even if an injected or
         // failed transport never delivers its close handshake event.
         if (!connected) finishConnect('cancelled')
