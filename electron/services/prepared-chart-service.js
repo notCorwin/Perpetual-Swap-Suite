@@ -2,7 +2,7 @@ import { createOperationWorker, createWorkerRequest } from './worker-operations.
 import { availableParallelism } from 'node:os'
 import { statisticsMask, statisticsVersionFor } from './statistics-state.js'
 import { appendIndicatorCandle, projectIndicatorCandle } from './indicators.js'
-import { captureOperationContext, hookOperationMethods, measureOperation, recordOperation } from './operations.js'
+import { captureOperationContext, hasOperationRecording, hookOperationMethods, measureOperation, recordOperation } from './operations.js'
 import { stopOperationWorker } from './operation-worker.js'
 import { completePriceCandle } from './market-records.js'
 
@@ -1045,6 +1045,7 @@ export class PreparedChartPipeline {
   }
 
   recordFocusCancellation(entry, reason, name) {
+    if (!hasOperationRecording()) return
     recordOperation({ category: 'cpu', name, resource: entry.state.instId, status: 'cancelled',
       startedAt: Date.now(), durationMS: 0, attributes: { reason } })
   }
@@ -1072,7 +1073,7 @@ export class PreparedChartPipeline {
   cancelFocusWaits(reason) {
     for (const group of this.focusWaits.values()) {
       for (const waiter of group.waiters.values()) {
-        recordOperation({ category: 'cpu', name: 'chart.focus.consumer', resource: group.instId,
+        if (hasOperationRecording()) recordOperation({ category: 'cpu', name: 'chart.focus.consumer', resource: group.instId,
           status: 'cancelled', startedAt: Date.now(), durationMS: 0, attributes: { reason } })
         waiter.resolve(false)
       }
