@@ -122,6 +122,36 @@ test('history stays stable through live updates and returning to latest shows th
   } finally { close() }
 })
 
+test('idle fences in-flight reads and resumes with a complete snapshot at the retained historical cursor', async () => {
+  const gate = deferred<PreparedChartResponse | null>()
+  let reads = 0, changes = 0
+  const controller = new ChartController(transport({ history: () => ++reads === 1 ? gate.promise : Promise.resolve(null) }), cached())
+  const close = controller.open(btc, '1H')
+  try {
+    await settled()
+    controller.scroll(-20)
+    const cursor = controller.getSnapshot().requested!.end
+    assert.equal(reads, 1)
+    controller.subscribe(() => { changes++ })
+    const frozen = controller.getSnapshot()
+    controller.setPresentationActive(false)
+    controller.scroll(-10)
+    controller.prefetchAdjacent(-1)
+    assert.equal(reads, 1)
+    assert.equal(controller.getSnapshot(), frozen)
+    const fresh = prepared(btc, 1199, { generation: 2, revision: 2, bars: bars(1000, 200) })
+    controller.setPresentationActive(true, [fresh])
+    assert.equal(controller.getSnapshot().requested?.end, cursor)
+    assert.equal(controller.getSnapshot().presented?.generation, 2)
+    assert.equal(controller.getSnapshot().presented?.endHour, cursor)
+    const resumed = controller.getSnapshot()
+    gate.resolve(prepared(btc, 1179, { generation: 9, revision: 99, latestEnd: 1199 * hour }))
+    await settled()
+    assert.equal(controller.getSnapshot().presented?.generation, resumed.presented?.generation)
+    assert.ok(changes > 0)
+  } finally { close() }
+})
+
 test('fractional navigation admits local neighbours once without moving the requested cursor or backend demand', async () => {
   const tail = prepared(btc, 1199), bulk = prepared(btc, 1199, { bars: bars(1000, 200), revision: 2 })
   const gate = deferred<PreparedChartResponse | null>(), demands: Array<ChartTarget | null> = []

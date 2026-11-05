@@ -1,5 +1,5 @@
 import { decodeChartWire } from '../electron/chart-wire.js'
-import type { DesktopRequest, OperationBridgeHooks, OperationSourceIdentity, OperationBatch, OperationAcknowledgment, RadarDesktop } from './desktop-contract.ts'
+import type { DesktopRequest, OperationBridgeHooks, OperationSourceIdentity, OperationBatch, OperationAcknowledgment, PresentationUpdate, RadarDesktop } from './desktop-contract.ts'
 import type { OperationContext } from '../electron/services/operations.js'
 
 type DesktopTransport = {
@@ -7,6 +7,7 @@ type DesktopTransport = {
   readonly operationRecording: boolean
   request(value: unknown, context?: OperationContext): Promise<unknown>
   subscribeNotifications(receiver: (channel: string, detail: unknown, context?: OperationContext) => void): void
+  subscribePresentation(receiver: (update: Omit<PresentationUpdate, 'snapshot'> & { snapshot?: unknown }) => void): void
   initializeOperations(flush: () => Promise<void>): Promise<OperationSourceIdentity>
   recordOperations(batch: OperationBatch): Promise<OperationAcknowledgment>
   operationSourceFailure(value: { executionId: string; reason: string; omitted: number }): Promise<void>
@@ -42,6 +43,16 @@ const deliverNotification = (channel: string, detail: unknown) => {
     detail: channel === 'radar:chart-prepared' ? decodeChartWire(detail) : detail,
   }))
 }
+let presentation: PresentationUpdate = { epoch: 0, active: true, startedAt: 0 }
+const presentationListeners = new Set<(update: PresentationUpdate) => void>()
+bridge.subscribePresentation(update => {
+  if (update.epoch < presentation.epoch) return
+  presentation = { ...update, snapshot: update.snapshot === undefined ? undefined : decodeChartWire(update.snapshot) as PresentationUpdate['snapshot'] }
+  if (presentationListeners.size) {
+    try { for (const listener of presentationListeners) listener(presentation) }
+    finally { const { snapshot: _snapshot, ...state } = presentation; presentation = state }
+  }
+})
 bridge.subscribeNotifications(bridge.operationRecording
   ? (channel, detail, context) => {
     if (operations) operations.receive(channel, context, () => deliverNotification(channel, detail))
@@ -52,6 +63,12 @@ bridge.subscribeNotifications(bridge.operationRecording
 const desktop: RadarDesktop = {
   nativeWindowControls: bridge.nativeWindowControls,
   operationRecording: bridge.operationRecording,
+  subscribePresentation(receiver) {
+    presentationListeners.add(receiver)
+    try { receiver(presentation) }
+    finally { const { snapshot: _snapshot, ...state } = presentation; presentation = state }
+    return () => { presentationListeners.delete(receiver) }
+  },
   request: (bridge.operationRecording ? recordedRequest : plainRequest) as RadarDesktop['request'],
   initializeOperations(hooks) {
     if (!bridge.operationRecording) throw new Error('Operation recording is disabled for this renderer.')

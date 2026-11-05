@@ -28,6 +28,10 @@ export class PreparedChartPipeline {
   })
   /** Declare viewport demand and immediately own its hydration, repair, priority and bounded reserve. */
   setFocus(target: { instId: string; timeframe: HistoryTimeframe; endHour?: number } | null, id?: string): void
+  /** Pauses chart-owned preparation and publication without changing live inputs or demand. */
+  setPresentationActive(active: boolean): void
+  /** Rehydrates invalidated cached and focused states locally before capturing a resume snapshot. */
+  preparePresentationResume(): Promise<void>
   prepare(instId: string, timeframe: HistoryTimeframe, targetEnd?: number, historyBars?: number, options?: { focusId?: string }): Promise<PreparedChartResponse | null>
   /** Pure latest durable read; never starts calculation, changes focus, or schedules source work. */
   local(instId: string, timeframe: HistoryTimeframe, options?: { priority?: HistoryPriority }): Promise<PreparedChartResponse | null>

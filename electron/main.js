@@ -18,6 +18,7 @@ import { operationRecordingRequested } from './services/operation-policy.js'
 import { installElectronOperationHooks } from './services/operation-hooks.js'
 import { MarketBackend } from './services/market-backend.js'
 import { windowToolbarLayout } from './window-layout.js'
+import { PresentationLifecycle } from './services/presentation-lifecycle.js'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const rendererURL = process.env.ELECTRON_RENDERER_URL || undefined
@@ -65,16 +66,54 @@ let shutdownComplete = false
 let startupTask = Promise.resolve()
 let stopTestOwner = () => {}
 let testOwnerExitTimer
+let presentation
+const windowNotifications = new Set()
+const deferredGateway = new Map()
+
+function publishPresentation(update) {
+  if (!window || window.isDestroyed() || window.webContents.isDestroyed()) return
+  let value = update
+  const deliveredGateway = []
+  if (update.snapshot) {
+    const gateway = []
+    for (const [id, pending] of deferredGateway) {
+      if (pending.owner !== window.webContents) continue
+      if (pending.chunks.length) gateway.push({ id, type: 'data', base64: Buffer.concat(pending.chunks).toString('base64') })
+      if (pending.terminal) gateway.push(pending.terminal)
+      deliveredGateway.push(id)
+    }
+    value = { ...update, snapshot: encodeChartWire({ ...update.snapshot, gateway }) }
+  }
+  window.webContents.send('radar:presentation', value)
+  // A failed encode/send leaves raw response ownership available for retry.
+  for (const id of deliveredGateway) deferredGateway.delete(id)
+}
 
 
 function sendGateway(event, detail) {
-  if (!shuttingDown && !event.sender.isDestroyed()) sendNotification(event.sender, 'radar:gateway-stream', detail)
+  if (shuttingDown || event.sender.isDestroyed()) return
+  if (presentation?.getState().active) sendNotification(event.sender, 'radar:gateway-stream', detail)
+  else {
+    const pending = deferredGateway.get(detail.id) ?? { owner: event.sender, chunks: [] }
+    pending.terminal = detail; deferredGateway.set(detail.id, pending)
+  }
+}
+function sendGatewayChunk(event, id, bytes) {
+  if (shuttingDown || event.sender.isDestroyed()) return
+  if (presentation?.getState().active) sendNotification(event.sender, 'radar:gateway-stream', { id, type: 'data', base64: Buffer.from(bytes).toString('base64') })
+  else {
+    const pending = deferredGateway.get(id) ?? { owner: event.sender, chunks: [] }
+    // This is response body ownership, not a replay queue of UI events.
+    pending.chunks.push(Buffer.from(bytes)); deferredGateway.set(id, pending)
+  }
 }
 
 function sendNotification(sender, channel, detail) {
-  if (!operationRecording) return sender.send(channel, channel === 'radar:chart-prepared' ? encodeChartWire(detail) : detail)
+  if (!presentation?.getState().active) return
+  const epoch = presentation.getState().epoch
+  if (!operationRecording) return sender.send(channel, channel === 'radar:chart-prepared' ? encodeChartWire(detail) : detail, undefined, epoch)
   const operation = beginOperation({ category: 'ipc', name: 'desktop.notification.send', resource: channel })
-  try { operation.run(() => sender.send(channel, channel === 'radar:chart-prepared' ? encodeChartWire(detail) : detail, operation.context)) }
+  try { operation.run(() => sender.send(channel, channel === 'radar:chart-prepared' ? encodeChartWire(detail) : detail, operation.context, epoch)) }
   finally { operation.end() }
 }
 
@@ -107,12 +146,13 @@ async function gatewayFetch(event, { id, body }) {
   const finished = new Promise(resolve => { finish = resolve })
   const owner = event.sender
   const abort = () => controller.abort()
+  const forget = () => { deferredGateway.delete(id); abort() }
   const navigation = details => { if (details.isMainFrame && !details.isSameDocument) abort() }
-  owner.once('destroyed', abort)
+  owner.once('destroyed', forget)
   owner.on('did-start-navigation', navigation)
   gatewayRequests.set(id, { controller, finished })
   const release = () => {
-    owner.removeListener('destroyed', abort)
+    owner.removeListener('destroyed', forget)
     owner.removeListener('did-start-navigation', navigation)
     gatewayRequests.delete(id)
     finish()
@@ -134,7 +174,7 @@ async function gatewayFetch(event, { id, body }) {
             const { done, value } = await reader.read()
             if (done) break
             receivedBytes += value.byteLength
-            sendGateway(event, { id, type: 'data', base64: Buffer.from(value).toString('base64') })
+            sendGatewayChunk(event, id, value)
           }
           operation?.end({ status: response.ok ? 'ok' : 'error', attributes: { receivedBytes, httpStatus } })
           sendGateway(event, { id, type: 'end' })
@@ -152,9 +192,17 @@ async function handleRequest(event, payload, context) {
   security.assertTrustedSender(event, window)
   const request = parseDesktopRequest(payload, { allowE2E: testMode })
   if (shuttingDown) throw new Error('The application is closing.')
+  const displayRead = Boolean(request.snapshot || request.chartWindow || request.chartLocal || request.chartHistory || request.chartUniverse)
+  const epoch = presentation.getState().epoch
+  const assertPresentation = () => {
+    if (displayRead && (!presentation.getState().active || epoch !== presentation.getState().epoch)) {
+      throw Object.assign(new Error('The interface became idle or changed while its view was being read.'), { name: 'AbortError' })
+    }
+  }
+  assertPresentation()
   const execute = async () => {
   if (request.gatewayFetch) return gatewayFetch(event, request.gatewayFetch)
-  if (request.cancelGatewayFetch) { gatewayRequests.get(request.cancelGatewayFetch)?.controller.abort(); return { ok: true } }
+  if (request.cancelGatewayFetch) { gatewayRequests.get(request.cancelGatewayFetch)?.controller.abort(); deferredGateway.delete(request.cancelGatewayFetch); return { ok: true } }
   if ('copyText' in request) { clipboard.writeText(request.copyText); return { ok: true } }
   if ('copyImage' in request) {
     const image = nativeImage.createFromDataURL(request.copyImage)
@@ -169,6 +217,7 @@ async function handleRequest(event, payload, context) {
     return { ok: true }
   }
   const response = await backend.request(request)
+  assertPresentation()
   if (request.e2e?.action === 'smokeStatus') {
     const build = await readFile(join(process.resourcesPath, 'build-revision.json'), 'utf8').then(JSON.parse).catch(() => null)
     return { ...response, revision: build?.revision ?? null }
@@ -192,7 +241,8 @@ async function createWindow() {
     width: 1600, height: 1000, minWidth: 1200, minHeight: 640,
     title: 'Perpetual Swap Suite', backgroundColor: '#101114', show: !testMode && !backgroundTests,
     webPreferences: { ...testWindowOptions(backgroundTests).webPreferences,
-      additionalArguments: operationRecording ? ['--perpetual-swap-operation-recording'] : [],
+      additionalArguments: [...(operationRecording ? ['--perpetual-swap-operation-recording'] : []),
+        ...(!presentation.getState().active ? ['--perpetual-swap-presentation-idle'] : [])],
       preload: join(root, 'electron', 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true },
   })
   subscribeWindowNotifications(window)
@@ -244,7 +294,7 @@ function subscribeWindowNotifications(target) {
   }])
   let attached = false
   const attach = () => {
-    if (attached || shuttingDown || target.isDestroyed() || target.webContents.isDestroyed()) return
+    if (attached || !presentation.desiredActive || shuttingDown || target.isDestroyed() || target.webContents.isDestroyed()) return
     attached = true
     for (const [name, listener] of listeners) backend.on(name, listener)
   }
@@ -253,22 +303,56 @@ function subscribeWindowNotifications(target) {
     attached = false
     for (const [name, listener] of listeners) backend.off(name, listener)
   }
-  target.once('closed', detach)
-  target.webContents.once('destroyed', detach)
+  const entry = { attach, detach }
+  windowNotifications.add(entry)
+  target.once('closed', () => { detach(); windowNotifications.delete(entry) })
+  const owner = target.webContents
+  target.webContents.once('destroyed', () => {
+    detach()
+    for (const [id, pending] of deferredGateway) if (pending.owner === owner) deferredGateway.delete(id)
+  })
   target.webContents.on('render-process-gone', detach)
-  target.webContents.on('did-start-loading', attach)
+  target.webContents.on('did-start-loading', () => {
+    if (presentation.desiredActive) void presentation.setActive(true, { refresh: true })
+  })
   attach()
 }
 
 async function startDesktop() {
   if (recordGraphics) stopGraphicsRecording = await startGraphicsRecording(app, contentTracing, operationRecording.directory)
   backend = new MarketBackend({ userData: app.getPath('userData'), testMode, e2eLiveRefresh })
+  presentation = new PresentationLifecycle({ active: backgroundTests || app.isActive(),
+    pause: epoch => { for (const entry of windowNotifications) entry.detach(); return backend.presentation(false, epoch) },
+    resume: async epoch => {
+      for (const entry of windowNotifications) entry.attach()
+      const snapshot = await backend.presentation(true, epoch)
+      if (!snapshot) throw new Error('The presentation snapshot was superseded by a newer activation.')
+      return snapshot
+    }, publish: publishPresentation })
+  // Background test bundles are never natively active. Their explicit test
+  // entry exercises this same lifecycle without letting launch-time native
+  // deactivation race the simulated active workload or take desktop focus.
+  if (!backgroundTests) {
+    app.on('did-become-active', () => { void presentation.setActive(true) })
+    app.on('did-resign-active', () => { void presentation.setActive(false) })
+  }
+  // Dispatch initial idle without holding window creation behind data restore.
+  // App listeners are already installed, so activation during restore gets a
+  // newer epoch; reconcile once ready in case native startup changed state.
+  if (!presentation.desiredActive) void backend.presentation(false, 0).catch(error => console.error('Could not initialize interface idle:', error))
+  void backend.ready.then(() => {
+    if (!backgroundTests && !shuttingDown) return presentation.setActive(app.isActive())
+  }).catch(error => console.error('Could not reconcile application activation:', error))
+  if (testMode) globalThis.__presentationTest = {
+    setActive: active => presentation.setActive(active), getState: () => presentation.getState(),
+  }
   if (testMode) globalThis.__marketBackend = backend
   const send = (channel, value) => {
     if (!shuttingDown && window && !window.isDestroyed() && !window.webContents.isDestroyed()) sendNotification(window.webContents, channel, value)
   }
   backend.on('failure', error => { console.error('Market backend failed:', error); send('radar:market-changed') })
   ipcMain.handle('radar:request', handleRequest)
+  ipcMain.handle('radar:presentation-state', event => { security.assertTrustedSender(event, window); return presentation.getState() })
   if (rendererOperations) {
   ipcMain.handle('radar:operations-initialize', (event, value) => {
     security.assertTrustedSender(event, window)

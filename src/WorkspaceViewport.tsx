@@ -1,16 +1,21 @@
 import { useLayoutEffect, useState, type ReactNode } from 'react'
 import { WORKSPACE_DESIGN_WIDTH, windowToolbarLayout } from '../electron/window-layout.js'
+import { getPresentation, usePresentation } from '@/presentation-store'
 
 // Zoom the common ancestor of the workspace and all body-mounted portals.
 // DOM rectangles remain screen CSS pixels, which capture and SVG pointers use.
 export function WorkspaceViewport({ children }: { children: ReactNode }) {
   const [viewport, setViewport] = useState(() => ({ width: window.innerWidth, height: window.innerHeight }))
+  const presentation = usePresentation()
   const { scale, height: toolbarHeight, controlsInset } = windowToolbarLayout(viewport.width, window.radarDesktop.nativeWindowControls)
   useLayoutEffect(() => {
-    const resize = () => setViewport({ width: window.innerWidth, height: window.innerHeight })
+    const resize = () => { if (getPresentation().active) setViewport({ width: window.innerWidth, height: window.innerHeight }) }
     window.addEventListener('resize', resize)
     return () => window.removeEventListener('resize', resize)
   }, [])
+  useLayoutEffect(() => {
+    if (presentation.active) setViewport(current => current.width === window.innerWidth && current.height === window.innerHeight ? current : { width: window.innerWidth, height: window.innerHeight })
+  }, [presentation.active])
   useLayoutEffect(() => {
     document.body.style.zoom = String(scale)
     document.body.style.setProperty("--workspace-height", `${viewport.height / scale}px`)

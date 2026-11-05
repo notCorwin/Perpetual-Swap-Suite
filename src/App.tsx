@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { Settings2 } from 'lucide-react'
 import { buttonVariants } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -18,6 +18,7 @@ import type { PreparedChartNotification } from '@/chart-data'
 import type { RadarTimeframe } from '@/timeframe'
 import { cn } from '@/lib/utils'
 import { formatCurrentPrice } from '@/price-format'
+import { getPresentation, subscribePresentationTransition, usePresentation, waitForPresentation } from '@/presentation-store'
 
 const qualificationPending = (progress: MarketSnapshot['catalogProgress']) => !progress || progress.total === 0 || progress.completed < progress.total || progress.pending > 0
 const collectorStatus = (snapshot: MarketSnapshot | UnchangedSnapshot) => {
@@ -28,7 +29,7 @@ const collectorStatus = (snapshot: MarketSnapshot | UnchangedSnapshot) => {
   }
   if (snapshot.error || catalog && catalog.unknown > 0) return snapshot.catalogSource === 'none' ? 'Unavailable' : 'Incomplete'
   if (snapshot.loading) return 'Refreshing'
-  return snapshot.catalogSource === 'cache' ? 'Cached' : snapshot.catalogSource === 'none' ? 'Waiting' : 'Live'
+  return snapshot.catalogSource === 'cache' ? 'Cached' : snapshot.catalogSource === 'live' ? 'Live' : 'Waiting'
 }
 const message = (cause: unknown) => cause instanceof Error ? cause.message : 'The desktop data service could not complete this request.'
 
@@ -70,10 +71,53 @@ function App() {
   const [error, setError] = useState('')
   const [updatedAt, setUpdatedAt] = useState<number | null>(null)
   const order = useRef(new SnapshotOrder())
+  const retainSelection = useRef(false)
   const preferenceWrite = useRef(0)
   const committedPreferences = useRef<Preferences>(DEFAULT_PREFERENCES)
   const preferenceQueue = useRef<Promise<void>>(Promise.resolve())
   const timeframe = preferences.chartTimeframe
+  const presentation = usePresentation()
+
+  const applyMarket = useCallback((snapshot: MarketSnapshot | UnchangedSnapshot, preserveSelection = false) => {
+    if (!order.current.accept(snapshot)) return
+    if (!('unchanged' in snapshot)) {
+      const unverified = snapshot.loading && qualificationPending(snapshot.catalogProgress) || snapshot.error || snapshot.catalogSource === 'none' || (snapshot.catalogProgress?.unknown ?? 0) > 0
+      setRows(current => reconcileMarketRows(current, snapshot.rows))
+      setCandidateIds(current => reconcileMarketOrder(current, snapshot.rows.map(row => row.instId)))
+      setTurnoverOrder(current => reconcileMarketOrder(current, snapshot.turnoverOrder))
+      setSelected(current => (preserveSelection || retainSelection.current) && current || snapshot.rows.some(row => row.instId === current) || (!snapshot.rows.length && unverified) ? current : snapshot.rows[0]?.instId ?? null)
+      setReady(true)
+    }
+    setError(snapshot.error)
+    setCatalog(current => ({
+      loading: snapshot.loading ?? ('unchanged' in snapshot ? current.loading : false),
+      catalogSource: snapshot.catalogSource ?? current.catalogSource,
+      catalogProgress: snapshot.catalogProgress ?? ('unchanged' in snapshot ? current.catalogProgress : undefined),
+    }))
+    if (!('unchanged' in snapshot) || snapshot.catalogSource !== undefined || snapshot.catalogProgress !== undefined || snapshot.loading !== undefined) setStatus(collectorStatus(snapshot))
+    if (snapshot.updatedAt !== undefined) setUpdatedAt(snapshot.updatedAt)
+    if (snapshot.realtimeState) setRealtime(snapshot.realtimeState)
+    else if (!('unchanged' in snapshot)) setRealtime('Unavailable')
+  }, [])
+  useLayoutEffect(() => subscribePresentationTransition(update => {
+    if (!update.active) { retainSelection.current = true; chartController.setPresentationActive(false); return }
+    if (update.snapshot) {
+      chartController.setPresentationActive(true, update.snapshot.frames)
+      applyMarket(update.snapshot.market, true)
+      committedPreferences.current = update.snapshot.preferences
+      setPreferences(update.snapshot.preferences); setPreferencesError(''); setPreferencesLoaded(true)
+    } else chartController.setPresentationActive(true)
+  }), [applyMarket])
+  useLayoutEffect(() => {
+    if (!presentation.active) return
+    const epoch = presentation.epoch
+    const frame = requestAnimationFrame(() => {
+      if (!getPresentation().active || getPresentation().epoch !== epoch) return
+      document.documentElement.setAttribute('data-presentation-epoch', String(epoch))
+      window.dispatchEvent(new CustomEvent('radar-presentation-ready', { detail: { epoch } }))
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [presentation])
 
   useEffect(() => {
     const receive = (event: Event) => chartController.ingestPrepared((event as CustomEvent<PreparedChartNotification>).detail)
@@ -83,9 +127,10 @@ function App() {
   useEffect(() => {
     let stopped = false
     const write = preferenceWrite.current
+    const epoch = getPresentation().epoch
     window.radarDesktop.request({ preferences: { action: 'read' } }).then(value => {
-      if (!stopped && write === preferenceWrite.current) { committedPreferences.current = value; setPreferences(value); setPreferencesError('') }
-    }).catch(cause => { if (!stopped) setPreferencesError(message(cause)) }).finally(() => { if (!stopped) setPreferencesLoaded(true) })
+      if (!stopped && getPresentation().active && epoch === getPresentation().epoch && write === preferenceWrite.current) { committedPreferences.current = value; setPreferences(value); setPreferencesError('') }
+    }).catch(cause => { if (!stopped && getPresentation().active && epoch === getPresentation().epoch) setPreferencesError(message(cause)) }).finally(() => { if (!stopped && getPresentation().active && epoch === getPresentation().epoch) setPreferencesLoaded(true) })
     return () => { stopped = true }
   }, [])
   useEffect(() => {
@@ -93,38 +138,20 @@ function App() {
     let stopped = false
     let working = false
     let queued = false
-    const visible = () => document.visibilityState !== 'hidden'
+    const visible = () => document.visibilityState !== 'hidden' && getPresentation().active
     const load = async () => {
       if (stopped) return
       if (working) { queued = true; return }
       if (!visible()) { queued = true; return }
       working = true
       queued = false
+      const epoch = getPresentation().epoch
       try {
         const snapshot = await window.radarDesktop.request({ snapshot: { sinceRevision: order.current.revision, serviceSession: order.current.serviceSession } })
-        if (stopped) return
-        if (order.current.accept(snapshot)) {
-          if (!('unchanged' in snapshot)) {
-            const unverified = snapshot.loading && qualificationPending(snapshot.catalogProgress) || snapshot.error || snapshot.catalogSource === 'none' || (snapshot.catalogProgress?.unknown ?? 0) > 0
-            // Membership and order come from the backend, independently of charts.
-            setRows(current => reconcileMarketRows(current, snapshot.rows))
-            setCandidateIds(current => reconcileMarketOrder(current, snapshot.rows.map(row => row.instId)))
-            setTurnoverOrder(current => reconcileMarketOrder(current, snapshot.turnoverOrder))
-            setSelected(current => snapshot.rows.some(row => row.instId === current) || (!snapshot.rows.length && unverified) ? current : snapshot.rows[0]?.instId ?? null)
-            setReady(true)
-          }
-          setError(snapshot.error)
-          setCatalog(current => ({
-            loading: snapshot.loading ?? ('unchanged' in snapshot ? current.loading : false),
-            catalogSource: snapshot.catalogSource ?? current.catalogSource,
-            catalogProgress: snapshot.catalogProgress ?? ('unchanged' in snapshot ? current.catalogProgress : undefined),
-          }))
-          if (!('unchanged' in snapshot) || snapshot.catalogSource !== undefined || snapshot.catalogProgress !== undefined || snapshot.loading !== undefined) setStatus(collectorStatus(snapshot))
-          if (snapshot.updatedAt !== undefined) setUpdatedAt(snapshot.updatedAt)
-          if (snapshot.realtimeState) setRealtime(snapshot.realtimeState)
-        }
+        if (stopped || !visible() || epoch !== getPresentation().epoch) return
+        applyMarket(snapshot)
       } catch (cause) {
-        if (stopped) return
+        if (stopped || !visible() || epoch !== getPresentation().epoch) return
         setError(message(cause)); setStatus('Unavailable'); setRealtime('Disconnected')
         setCatalog(current => ({ ...current, loading: false }))
       } finally {
@@ -142,7 +169,7 @@ function App() {
       window.removeEventListener('radar-market-changed', changed)
       document.removeEventListener('visibilitychange', shown)
     }
-  }, [preferencesLoaded])
+  }, [preferencesLoaded, applyMarket])
 
   const visible = useMemo(() => rows.filter(row => row.instId.toLowerCase().includes(query.trim().toLowerCase())), [rows, query])
   const visibleIds = useMemo(() => candidateIds.filter(id => id.toLowerCase().includes(query.trim().toLowerCase())), [candidateIds, query])
@@ -154,32 +181,48 @@ function App() {
     ? awaitingObservations ? 'Waiting for fresh observations. Market data collection continues in the background.' : catalog.catalogProgress?.total ? `Checking enabled conditions: ${catalog.catalogProgress.completed} / ${catalog.catalogProgress.total} contracts completed.` : 'The data service is preparing and verifying the market list.'
     : verificationUnavailable ? 'Market data could not verify the enabled conditions. Waiting for updated observations from the data service.' : 'Adjust the enabled liquidity conditions in Settings.'
   const noSearchMatch = Boolean(query.trim()) && rows.length > 0
-  // Keep the selected chart available while the backend reports a verification gap.
-  const selectedRow = rows.find(row => row.instId === selected) ?? rows[0]
-  const retainedChart = !rows.length && Boolean(selected) && (verifying || verificationUnavailable)
-  const selectedID = selectedRow?.instId ?? (retainedChart ? selected : null)
+  // A qualification change must not discard the user's chart or history cursor.
+  const selectedRow = rows.find(row => row.instId === selected)
+  const retainedChart = Boolean(selected && !selectedRow)
+  const selectedID = selected
   const connectionProblem = !['live', 'connected'].includes(realtime.toLowerCase())
   const connectionFailure = ['reconnecting', 'disconnected'].includes(realtime.toLowerCase())
   const marketProblem = preferencesError || error
   const marketStatus = marketProblem || (connectionProblem ? realtime : !rows.length && status !== 'Live' ? status : status === 'Cached' ? 'Cached' : '')
   const marketStatusDetail = [marketStatus, retainedChart ? 'Current chart remains available' : ''].filter(Boolean).join(' · ')
   const listOrder = candidateIds
-  useEffect(() => { if (ready) chartController.setUniverse(retainedChart && selectedID ? [selectedID] : candidateIds, timeframe) }, [ready, candidateIds, timeframe, retainedChart, selectedID])
+  useEffect(() => { if (ready) chartController.setUniverse(retainedChart && selectedID ? [...candidateIds, selectedID] : candidateIds, timeframe) }, [ready, candidateIds, timeframe, retainedChart, selectedID])
   const savePreferences = useCallback(async (values: Partial<Preferences>) => {
     const write = ++preferenceWrite.current
+    const epoch = getPresentation().epoch
     const task = preferenceQueue.current.then(() => window.radarDesktop.request({ preferences: { action: 'update', values } }))
     preferenceQueue.current = task.then(() => undefined, () => undefined)
     let saved: Preferences
-    try { saved = await task }
+    try {
+      saved = await task
+      await waitForPresentation()
+      if (epoch !== getPresentation().epoch) {
+        // A write can finish during the barrier; read the current committed
+        // preferences instead of letting its older response replace it.
+        const readEpoch = getPresentation().epoch
+        try {
+          const actual = await window.radarDesktop.request({ preferences: { action: 'read' } })
+          await waitForPresentation()
+          saved = readEpoch === getPresentation().epoch ? actual : committedPreferences.current
+        } catch { await waitForPresentation(); saved = committedPreferences.current }
+      }
+    }
     catch (cause) {
+      await waitForPresentation()
       if (write !== preferenceWrite.current) return
       // A failed response does not prove that the backend did not commit.
       try {
         const actual = await window.radarDesktop.request({ preferences: { action: 'read' } })
+        await waitForPresentation()
         if (write !== preferenceWrite.current) return
         committedPreferences.current = actual
         setPreferences(actual)
-      } catch { /* Keep the last confirmed value if reconciliation is unavailable. */ }
+      } catch { await waitForPresentation() /* Keep the last confirmed value if reconciliation is unavailable. */ }
       if (write !== preferenceWrite.current) return
       throw cause
     }
@@ -197,6 +240,7 @@ function App() {
   }, [savePreferences])
 
   return <WorkspaceViewport>
+    {presentation.error && <p role="alert" className="px-4 py-2 text-sm text-destructive">{presentation.error}</p>}
     <div hidden={settingsSection !== null} inert={settingsSection !== null} className={cn('h-full min-w-0 flex-1', settingsSection === null ? 'flex' : 'hidden')}>
     <aside data-market-list className="flex h-full w-[420px] shrink-0 flex-col border-r" aria-label="Contract list">
       <header className="flex flex-col">

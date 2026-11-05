@@ -6,7 +6,7 @@ import { parse } from '@babel/parser'
 import { reconcileMarketOrder, reconcileMarketRows } from './market-snapshot.ts'
 import { DEFAULT_PREFERENCES, type Preferences } from './renderer-preferences.ts'
 import { SnapshotOrder } from './snapshot-order.ts'
-import type { MarketSnapshot, RankedMarketRow } from './desktop-contract.ts'
+import type { MarketSnapshot, PresentationUpdate, RankedMarketRow } from './desktop-contract.ts'
 import type { RadarTimeframe } from './timeframe.ts'
 
 type View = {
@@ -45,6 +45,7 @@ function fixture(snapshotFailure = false) {
     rows: [{ instId: 'BTC-USDT-SWAP', tickSz: '0.1', lastPrice: 100, rankingChange: 2, rankingAsOf: 900_000, turnover24hUSDT: 100 }] as RankedMarketRow[],
     afterUpdate: undefined as undefined | (() => Promise<void>),
     beforeUpdate: undefined as undefined | (() => Promise<void>),
+    beforeSnapshot: undefined as undefined | (() => Promise<void>),
   }
   const window = Object.assign(new EventTarget(), {
     setTimeout(callback: () => void, delay: number) { const id = ++timers; pendingTimers.set(id, { callback, at: now + delay }); return id },
@@ -65,17 +66,27 @@ function fixture(snapshotFailure = false) {
       snapshotRequests.push(query)
       if (state.snapshotFailure) throw new Error('Worker unavailable')
       const metadata = { revision: state.revision, serviceSession: state.serviceSession, ...state.metadata }
-      return query.sinceRevision === state.revision && query.serviceSession === state.serviceSession ? { ...metadata, unchanged: true }
+      const result = query.sinceRevision === state.revision && query.serviceSession === state.serviceSession ? { ...metadata, unchanged: true }
         : { ...metadata, rows: structuredClone(state.rows), turnoverOrder: state.rows.map(row => row.instId).toReversed(), updatedAt: 1 }
+      await state.beforeSnapshot?.()
+      return result
     } },
   })
   const document = Object.assign(new EventTarget(), { visibilityState: 'visible' })
+  let presentation: PresentationUpdate = { epoch: 0, active: true, startedAt: 0 }
+  const transitions = new Set<(value: PresentationUpdate) => void>()
   function slot() { return slots[cursor++] ?? (slots[cursor - 1] = {}) }
   const changed = (previous: unknown[] | undefined, next: unknown[]) => !previous || previous.length !== next.length || next.some((value, index) => !Object.is(value, previous[index]))
   const environment = {
     window, document, DEFAULT_PREFERENCES, SnapshotOrder, reconcileMarketRows, reconcileMarketOrder,
     performance: { now: () => now },
-    chartController: { ingestPrepared() {}, getSnapshot: () => ({}), setUniverse: (...args: unknown[]) => { universeRequests.push(args) } },
+    chartController: { ingestPrepared() {}, setPresentationActive() {}, getSnapshot: () => ({}), setUniverse: (...args: unknown[]) => { universeRequests.push(args) } },
+    usePresentation: () => presentation,
+    getPresentation: () => presentation,
+    subscribePresentationTransition: (listener: (value: PresentationUpdate) => void) => { transitions.add(listener); listener(presentation); return () => { transitions.delete(listener) } },
+    waitForPresentation: () => Promise.resolve(),
+    requestAnimationFrame: () => 0,
+    cancelAnimationFrame: () => {},
     useSettingsSection: () => null,
     useRef<T>(initial: T) { const current = slot(); return current.value ??= { current: initial } },
     useState<T>(initial: T) {
@@ -103,6 +114,7 @@ function fixture(snapshotFailure = false) {
         effects.push(() => { if (current.cleanup) current.cleanup(); current.cleanup = setup() })
       }
     },
+    useLayoutEffect(setup: () => void | (() => void), dependencies: unknown[]) { environment.useEffect(setup, dependencies) },
   }
   const render = new Function(...Object.keys(environment), `${logic}\nreturn App`)(...Object.values(environment)) as () => View
   return {
@@ -119,6 +131,7 @@ function fixture(snapshotFailure = false) {
       pendingTimers.delete(id); timer.callback()
     },
     notify() { window.dispatchEvent(new Event('radar-market-changed')) },
+    present(update: PresentationUpdate) { presentation = update; for (const listener of transitions) listener(update); dirty = true },
     async flush() {
       for (let pass = 0; pass < 8; pass++) {
         if (dirty) {
@@ -168,6 +181,29 @@ test('a market notification arriving before the preference response stays author
   assert.equal(app.view.ready, true)
   assert.equal(app.snapshotRequests.length, 2)
   assert.equal(app.snapshotRequests[1].sinceRevision, 1)
+})
+
+test('an old market request cannot replace the resume snapshot or the retained selection', async context => {
+  const app = fixture(); context.after(() => app.close())
+  await app.flush()
+  let release!: () => void
+  app.state.rows = [{ ...app.state.rows[0], lastPrice: 101 }]
+  app.state.revision++
+  app.state.beforeSnapshot = () => new Promise<void>(resolve => { release = resolve })
+  app.notify(); await app.flush()
+  app.present({ epoch: 1, active: false, startedAt: 1 })
+  await app.flush()
+  assert.equal(app.view.rows[0].lastPrice, 100)
+  const snapshot = {
+    market: { ...app.state.metadata, revision: 3, serviceSession: app.state.serviceSession, rows: [{ ...app.state.rows[0], lastPrice: 102 }], turnoverOrder: ['BTC-USDT-SWAP'], updatedAt: 2 },
+    preferences: app.state.preferences, frames: [], audit: {}, download: {},
+  } as unknown as PresentationUpdate['snapshot']
+  app.present({ epoch: 2, active: true, startedAt: 2, snapshot })
+  await app.flush()
+  assert.equal(app.view.rows[0].lastPrice, 102)
+  assert.equal(app.view.selectedID, 'BTC-USDT-SWAP')
+  release(); await app.flush()
+  assert.equal(app.view.rows[0].lastPrice, 102)
 })
 
 test('all qualified rows are immediately visible without any chart render receipts', async context => {
@@ -266,6 +302,20 @@ test('backend exclusion is applied immediately without a renderer grace period',
   app.state.rows = []; app.state.revision++; app.notify(); await app.flush()
   assert.deepEqual(app.view.rows, [])
   assert.equal(app.view.selectedID, null)
+})
+
+test('a chart retained across idle survives later qualification updates without inventing list rows', async context => {
+  const app = fixture(); context.after(() => app.close())
+  await app.flush()
+  app.present({ epoch: 1, active: false, startedAt: 1 })
+  app.state.rows = [{ ...app.state.rows[0], instId: 'ETH-USDT-SWAP' }]
+  app.state.revision++
+  const market = { ...app.state.metadata, rows: app.state.rows, turnoverOrder: [], revision: app.state.revision, serviceSession: app.state.serviceSession, updatedAt: 1 }
+  app.present({ epoch: 2, active: true, startedAt: 2, snapshot: { market, frames: [], preferences: app.state.preferences } as unknown as NonNullable<PresentationUpdate['snapshot']> })
+  await app.flush()
+  app.state.revision++; app.notify(); await app.flush()
+  assert.equal(app.view.selectedID, 'BTC-USDT-SWAP')
+  assert.deepEqual(app.view.rows.map(row => row.instId), ['ETH-USDT-SWAP'])
 })
 
 test('an unverified empty snapshot retains only the current chart, never invented list rows', async context => {

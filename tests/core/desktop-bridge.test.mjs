@@ -11,7 +11,7 @@ const chart = { instId: 'BTC-USDT-SWAP', liveBar: { close: 101 }, optional: unde
 const wire = encodeChartWire(chart)
 const trap = name => () => { throw new Error(`Unexpected ${name}`) }
 
-function harness(enabled) {
+function harness(enabled, state = Promise.resolve({ epoch: 0, active: true, startedAt: 0 })) {
   const listeners = new Map(), windowListeners = new Map(), calls = [], delivered = [], batches = []
   let nonceCalls = 0, nextTimer = 0
   const timers = new Map()
@@ -27,6 +27,7 @@ function harness(enabled) {
     send(...args) { calls.push(['send', ...args]) },
     async invoke(...args) {
       calls.push(['invoke', ...args])
+      if (args[0] === 'radar:presentation-state') return state
       if (args[0] === 'radar:operations-initialize') return { sessionId: 'bridge-test', executionId: 'bridge-renderer' }
       if (args[0] === 'radar:operations') {
         const batch = args[1]; batches.push(batch)
@@ -45,7 +46,7 @@ function harness(enabled) {
     return { ipcRenderer, contextBridge: { exposeInMainWorld: (name, value) => { window[name] = value } } }
   }, process: { argv: enabled ? ['electron', '--perpetual-swap-operation-recording'] : ['electron'], platform: 'darwin' }, window, crypto, Uint8Array })
   return { window, listeners, windowListeners, calls, delivered, batches, timers, nonceCalls: () => nonceCalls,
-    notify: (channel, detail, context) => listeners.get(channel)({}, detail, context) }
+    notify: (channel, detail, context, epoch) => listeners.get(channel)({}, detail, context, epoch) }
 }
 
 async function connect(h, suffix) {
@@ -91,6 +92,7 @@ test('recording off skips telemetry while requests and buffered or live notifica
     assert.equal(h.listeners.has('radar:operations-drain'), false)
     assert.equal(h.windowListeners.has('pagehide'), false)
     assert.deepEqual(h.calls.map(call => [call[0], call[1], call.length]), [
+      ['invoke', 'radar:presentation-state', 2],
       ['invoke', 'radar:request', 3], ['invoke', 'radar:request', 3], ['invoke', 'radar:request', 3],
     ])
     assert.deepEqual(generated, [])
@@ -98,6 +100,39 @@ test('recording off skips telemetry while requests and buffered or live notifica
     detach()
     if (priorPerformance) Object.defineProperty(globalThis, 'performance', priorPerformance); else Reflect.deleteProperty(globalThis, 'performance')
     if (priorObserver) Object.defineProperty(globalThis, 'PerformanceObserver', priorObserver); else Reflect.deleteProperty(globalThis, 'PerformanceObserver')
+    if (priorWindow) Object.defineProperty(globalThis, 'window', priorWindow); else Reflect.deleteProperty(globalThis, 'window')
+  }
+})
+
+test('presentation fences old notifications and decodes the resume barrier before delivery', async () => {
+  const priorWindow = Object.getOwnPropertyDescriptor(globalThis, 'window')
+  let resolveState
+  const initial = new Promise(resolve => { resolveState = resolve })
+  const h = harness(false, initial), updates = []
+  try {
+    const desktop = await connect(h, 'presentation')
+    const stop = desktop.subscribePresentation(value => updates.push(value))
+    assert.equal(updates.at(-1).active, true)
+    h.notify('radar:presentation', { epoch: 1, active: false, startedAt: 100 })
+    h.notify('radar:market-changed', { revision: 1 }, undefined, 0)
+    h.notify('radar:market-changed', { revision: 2 }, undefined, 1)
+    resolveState({ epoch: 0, active: true, startedAt: 0 })
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(updates.at(-1).active, false)
+    const snapshot = { market: { rows: [] }, frames: [chart], preferences: {}, audit: {}, download: {}, gateway: [] }
+    h.notify('radar:presentation', { epoch: 2, active: false, startedAt: 200 })
+    h.notify('radar:presentation', { epoch: 2, active: true, startedAt: 200, snapshot: encodeChartWire(snapshot) })
+    assert.deepEqual(updates.at(-1).snapshot, snapshot)
+    h.notify('radar:market-changed', { revision: 3 }, undefined, 1)
+    h.notify('radar:chart-prepared', wire, undefined, 2)
+    assert.deepEqual(h.delivered.map(event => [event.type, event.detail]), [['radar-chart-prepared', chart]])
+    h.notify('radar:presentation', { epoch: 1, active: false, startedAt: 100 })
+    assert.equal(updates.at(-1).epoch, 2)
+    stop()
+    let retained
+    desktop.subscribePresentation(value => { retained = value })()
+    assert.equal(retained.snapshot, undefined, 'Late subscribers must not retain or replay the bulk resume payload.')
+  } finally {
     if (priorWindow) Object.defineProperty(globalThis, 'window', priorWindow); else Reflect.deleteProperty(globalThis, 'window')
   }
 })

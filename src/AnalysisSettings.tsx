@@ -6,6 +6,7 @@ import { Spinner } from '@/components/ui/spinner'
 import { Settings2 } from 'lucide-react'
 import { DEFAULT_ANALYSIS_MODEL } from '@/chart-analysis'
 import { requestAnalysisSettings } from '@/analysis-service'
+import { waitForPresentation } from '@/presentation-store'
 
 export function AnalysisSettingsButton() {
   return <a href="#/settings/analysis" aria-label="Configure analysis" className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}><Settings2 aria-hidden="true" /></a>
@@ -43,10 +44,12 @@ export function AnalysisSettings({ onDirtyChange, onBusyChange }: AnalysisSettin
     requestEpoch.current = epoch
     const pending = pendingRead.current ?? Promise.resolve().then(() => requestAnalysisSettings({ action: 'read' }))
     pendingRead.current = pending
-    return pending.then(value => {
+    return pending.then(async value => {
+      await waitForPresentation()
       if (epoch !== requestEpoch.current) return
       setModel(value.model); setSavedModel(value.model); setConfigured(value.hasAPIKey); setLoaded(true)
-    }).catch(cause => {
+    }).catch(async cause => {
+      await waitForPresentation()
       if (epoch === requestEpoch.current) setError(cause instanceof Error ? cause.message : 'Cannot read analysis settings.')
     }).finally(() => {
       if (pendingRead.current === pending) pendingRead.current = null
@@ -71,12 +74,14 @@ export function AnalysisSettings({ onDirtyChange, onBusyChange }: AnalysisSettin
     setOperation(remove ? 'removing' : 'saving'); setError(''); setSuccess('')
     try {
       const result = await requestAnalysisSettings(remove ? { action: 'removeKey' } : { action: 'save', model: model.trim(), apiKey: key })
+      await waitForPresentation()
       if (epoch !== requestEpoch.current) return
       setConfigured(result.hasAPIKey); setSavedModel(result.model); setKey('')
       if (remove) setModel(current => current === savedModel ? result.model : current)
       else { setModel(result.model); setModelInvalid(false) }
       setSuccess(remove ? 'Saved API key removed.' : 'Analysis settings saved.')
     } catch (cause) {
+      await waitForPresentation()
       if (epoch === requestEpoch.current) setError(cause instanceof Error ? cause.message : 'Cannot save analysis settings.')
     } finally {
       if (epoch === requestEpoch.current) { requestPending.current = false; setOperation(null) }

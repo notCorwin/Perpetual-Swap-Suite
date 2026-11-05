@@ -37,6 +37,8 @@ export class ChartController {
   private readonly identity = crypto.randomUUID()
   private focusId = ''
   private active = false
+  private presentationActive = true
+  private presentationVersion = 0
   private localTargets = new Set<string>()
   private localCheckedKey: string | null = null
   private historyTargets = new Set<string>()
@@ -59,12 +61,30 @@ export class ChartController {
   getSnapshot = () => this.view
   subscribe = (listener: () => void) => { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
 
+  setPresentationActive(active: boolean, frames: readonly PreparedChartResponse[] = []) {
+    if (!active) {
+      if (this.presentationActive) {
+        this.presentationVersion++; this.universeRequest++
+        this.localTargets = new Set(); this.historyTargets = new Set()
+      }
+      this.presentationActive = false
+      return
+    }
+    // Ingest the entire barrier while publishing and display prefetch are
+    // suspended. A historical target and its cursor remain untouched.
+    this.presentationActive = false
+    for (const frame of frames) this.ingestPrepared(frame)
+    this.presentationActive = true
+    if (this.active) { this.commit(); void this.pump() }
+  }
+
   setUniverse(instIds: readonly string[], timeframe: RadarTimeframe, focusInstId?: string) {
     const ids = [...new Set(instIds.filter(Boolean))]
     const key = JSON.stringify(ids.toSorted())
     this.universeIds = ids
     const focus = focusInstId ?? (this.view.requested?.timeframe === timeframe ? this.view.requested.instId : undefined)
     this.store.setUniverse(ids, timeframe, focus)
+    if (!this.presentationActive) return this.universeTask
     if (key === this.universeKey) return this.universeTask
     this.universeKey = key
     const request = ++this.universeRequest
@@ -75,7 +95,7 @@ export class ChartController {
         if ((this.notificationVersions.get(seriesKey(frame)) ?? 0) <= admittedAt) this.retainPriceSource(frame)
         if (this.admitDrawable(frame)) this.store.ingestLatest(this.preservePushedLive(frame, admittedAt))
       }
-      if (this.active) { this.commit(); void this.pump() }
+      if (this.active && this.presentationActive) { this.commit(); void this.pump() }
     }).catch(() => { if (request === this.universeRequest) this.universeKey = '' })
     return this.universeTask
   }
@@ -139,7 +159,7 @@ export class ChartController {
 
   private preparedChanged(response: Pick<PreparedChartResponse, 'instId' | 'timeframe'>, live = false) {
     const target = this.view.requested
-    if (this.active && target?.instId === response.instId && target.timeframe === response.timeframe) {
+    if (this.active && this.presentationActive && target?.instId === response.instId && target.timeframe === response.timeframe) {
       this.commit()
       if (!live) void this.pump()
     }
@@ -160,7 +180,7 @@ export class ChartController {
 
   scroll(steps: number) {
     const target = this.view.requested
-    if (!this.active || !target || !Number.isFinite(steps) || !Math.trunc(steps)) return
+    if (!this.active || !this.presentationActive || !target || !Number.isFinite(steps) || !Math.trunc(steps)) return
     const latest = this.view.latestEnd
     if (latest === null) return
     const interval = timeframeMilliseconds(target.timeframe)
@@ -173,7 +193,7 @@ export class ChartController {
   /** Admit cached neighbours for sub-candle movement without changing demand. */
   prefetchAdjacent(direction: number) {
     const { requested, presented, latestEnd, oldestHour, historyExhausted } = this.view
-    if (!this.active || !requested || !presented || !direction || !Number.isFinite(direction)
+    if (!this.active || !this.presentationActive || !requested || !presented || !direction || !Number.isFinite(direction)
       || !sameSeries(requested, presented) || !this.transport.history) return
     const edge = direction < 0 ? presented.bars[0] : presented.bars.at(-1)
     if (!edge) return
@@ -191,8 +211,9 @@ export class ChartController {
   private updateFocus(target: ChartTarget | null) {
     this.focusId = `${this.identity}:${++this.focusVersion}`
     const focusId = this.focusId
+    const presentationVersion = this.presentationVersion
     const failed = (cause: unknown) => {
-      if (this.active && focusId === this.focusId) this.publish({ ...this.view, error: cause instanceof Error ? cause.message : 'Could not declare chart demand.' })
+      if (this.active && this.presentationActive && presentationVersion === this.presentationVersion && focusId === this.focusId) this.publish({ ...this.view, error: cause instanceof Error ? cause.message : 'Could not declare chart demand.' })
     }
     try { void Promise.resolve(this.transport.focus(target, focusId)).catch(failed) } catch (cause) { queueMicrotask(() => failed(cause)) }
   }
@@ -262,7 +283,7 @@ export class ChartController {
   }
 
   private async pump() {
-    if (!this.active || !this.view.requested) return
+    if (!this.active || !this.presentationActive || !this.view.requested) return
     const target = this.view.requested
     const key = seriesKey(target)
     if (target.end === null) {
@@ -282,22 +303,25 @@ export class ChartController {
 
   private async hydrateLocal(target: ChartTarget) {
     const focusId = this.focusId
+    const presentationVersion = this.presentationVersion
     const key = seriesKey(target)
-    this.localTargets.add(key)
+    const targets = this.localTargets
+    targets.add(key)
     const admittedAt = this.notificationVersion
     try {
       const response = await this.transport.local(target.instId, target.timeframe)
+      if (presentationVersion !== this.presentationVersion || !this.presentationActive) return
       if (response) {
         const sourceChanged = (this.notificationVersions.get(seriesKey(response)) ?? 0) <= admittedAt && this.retainPriceSource(response, focusId)
         const accepted = this.admitDrawable(response) && Boolean(response.bars.length || response.liveBar) && this.store.ingestLatest(this.preservePushedLive(response, admittedAt))
         if (accepted || sourceChanged) this.preparedChanged(response, !accepted)
       }
     } catch (cause) {
-      if (this.active && focusId === this.focusId) this.publish({ ...this.view, error: cause instanceof Error ? cause.message : 'Could not read local chart data.' })
+      if (this.active && this.presentationActive && presentationVersion === this.presentationVersion && focusId === this.focusId) this.publish({ ...this.view, error: cause instanceof Error ? cause.message : 'Could not read local chart data.' })
     }
     finally {
-      this.localTargets.delete(key)
-      if (focusId === this.focusId) this.localCheckedKey = targetKey(target)
+      targets.delete(key)
+      if (presentationVersion === this.presentationVersion && focusId === this.focusId) this.localCheckedKey = targetKey(target)
       void this.pump()
     }
   }
@@ -309,12 +333,15 @@ export class ChartController {
 
   private async hydrateHistory(target: ChartTarget, checkedKey: string, watermark: string) {
     const focusId = this.focusId
+    const presentationVersion = this.presentationVersion
     const key = seriesKey(target)
     const requestKey = targetKey(target)
-    this.historyTargets.add(requestKey)
+    const targets = this.historyTargets
+    targets.add(requestKey)
     const admittedAt = this.notificationVersion
     try {
       const response = await this.transport.history!(target, focusId)
+      if (presentationVersion !== this.presentationVersion || !this.presentationActive) return
       if (response) {
         if ((this.notificationVersions.get(seriesKey(response)) ?? 0) <= admittedAt) this.retainPriceSource(response, focusId)
         const accepted = this.admitDrawable(response) && Boolean(response.bars.length || response.liveBar) && this.store.ingest(this.preservePushedLive(response, admittedAt))
@@ -324,13 +351,13 @@ export class ChartController {
         if (accepted && focusId === this.focusId) this.historyHydrated.set(key, `${response.generation}:${JSON.stringify(response.sourceVersions ?? response.revision)}:${meta?.latestEnd ?? -1}:${this.store.historyEpoch(target.instId, target.timeframe)}:${meta?.indicatorStatus?.inputVersion ?? ''}:${meta?.indicatorStatus?.state ?? ''}`)
         if (this.active) this.commit()
       } else if (focusId === this.focusId) this.historyHydrated.set(key, watermark)
-      if (focusId === this.focusId) this.historyAttempts.set(key, checkedKey)
+      if (presentationVersion === this.presentationVersion && focusId === this.focusId) this.historyAttempts.set(key, checkedKey)
     } catch {
       // Failed reads wait for changed input or a new viewport. Backend source
       // repair proceeds independently and publishes its own lifecycle.
-      if (focusId === this.focusId) this.historyAttempts.set(key, checkedKey)
+      if (presentationVersion === this.presentationVersion && focusId === this.focusId) this.historyAttempts.set(key, checkedKey)
     } finally {
-      this.historyTargets.delete(requestKey)
+      targets.delete(requestKey)
       void this.pump()
     }
   }

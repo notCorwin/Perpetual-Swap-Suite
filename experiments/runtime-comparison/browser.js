@@ -53,6 +53,7 @@
     const operationRecording = options.telemetry === 'full'
     const requireRecording = () => { if (!operationRecording) throw new Error('Operation recording is disabled for this renderer.') }
     accept({ nativeWindowControls: false, operationRecording, request: value => post('request', value),
+      subscribePresentation: receiver => receiver({ epoch: 0, active: true, startedAt: 0 }),
       subscribeNotifications: receiver => {
         if (notificationReceiver || typeof receiver !== 'function') throw new Error('The notification receiver is already subscribed or invalid.')
         notificationReceiver = receiver

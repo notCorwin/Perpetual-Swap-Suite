@@ -3,6 +3,7 @@ import type { PreparedChartResponse } from './chart-data.ts'
 import type { Preferences, PreferencesPatch } from '../electron/services/preferences.js'
 import type { RadarTimeframe } from './timeframe.ts'
 import type { OperationContext, OperationJournalEvent } from '../electron/services/operations.js'
+import type { GatewayEvent } from './gateway-fetch.ts'
 
 export type OperationSourceIdentity = { sessionId: string; executionId: string; scenarioId?: string }
 export type OperationBatch = { executionId: string; batchId: string; firstSequence: number; events: OperationJournalEvent[] }
@@ -49,6 +50,11 @@ export type HistoryDownload = {
   failures: { instrument: string; timeframe: string; source: string; from: number; through: number; error: string }[]
   error: string
 }
+export type PresentationSnapshot = {
+  market: MarketSnapshot; frames: PreparedChartResponse[]; preferences: Preferences
+  audit: DataAudit; download: HistoryDownload; gateway?: GatewayEvent[]
+}
+export type PresentationUpdate = { epoch: number; active: boolean; startedAt: number; snapshot?: PresentationSnapshot; error?: string }
 export type DesktopCommands = {
   preferences: { input: { action: 'read' } | { action: 'update'; values: PreferencesPatch }; output: Preferences }
   snapshot: { input: { sinceRevision?: number; serviceSession?: string }; output: MarketSnapshot | UnchangedSnapshot }
@@ -72,6 +78,7 @@ export type DesktopResponse<Request extends DesktopRequest> = Request extends { 
 export interface RadarDesktop {
   readonly nativeWindowControls: boolean
   readonly operationRecording: boolean
+  subscribePresentation(receiver: (update: PresentationUpdate) => void): () => void
   initializeOperations(hooks: OperationBridgeHooks): Promise<OperationSourceIdentity>
   recordOperations(batch: OperationBatch): Promise<OperationAcknowledgment>
   operationSourceFailure(value: { executionId: string; reason: string; omitted: number }): Promise<void>

@@ -1,4 +1,4 @@
-import { createContext, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react"
+import { createContext, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { flushSync } from "react-dom"
 import { Camera } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
@@ -25,6 +25,7 @@ import { chartController } from '@/chart-controller'
 import { createChartPlotCache } from '@/chart-render'
 import type { Bar, ChartSourceStatus, PreparedChartState, ReadyChartWindow } from '@/chart-data'
 import { measureOperation } from '../electron/services/operations.js'
+import { getPresentation, usePresentation, usePresentedStore, waitForPresentation } from '@/presentation-store'
 
 const EMPTY_BARS: readonly Bar[] = []
 const PriceStatus = memo(function PriceStatus({ observedAt, realtime, active }: { observedAt?: number | null; realtime?: 'live' | 'stale'; active: boolean }) {
@@ -35,7 +36,7 @@ const PriceStatus = memo(function PriceStatus({ observedAt, realtime, active }: 
     const remaining = observedAt + 30_000 - current
     if ((now - observedAt < 30_000) !== (remaining > 0)) setNow(current)
     if (remaining <= 0) return
-    const timer = window.setTimeout(() => setNow(Date.now()), remaining)
+    const timer = window.setTimeout(() => { if (getPresentation().active) setNow(Date.now()) }, remaining)
     return () => window.clearTimeout(timer)
   }, [active, observedAt, realtime, now])
   const fresh = realtime === 'live' && observedAt != null && now - observedAt < 30_000
@@ -81,7 +82,7 @@ const PriceCountdown = memo(function PriceCountdown({ hour, intervalMS, x, y }: 
   useEffect(() => {
     if (!visible) return
     setNow(Date.now())
-    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    const timer = window.setInterval(() => { if (getPresentation().active) setNow(Date.now()) }, 1000)
     return () => window.clearInterval(timer)
   }, [visible])
   const seconds = Math.max(0, Math.floor((hour + intervalMS - now) / 1000))
@@ -315,9 +316,10 @@ const ChartSurface = memo(function ChartSurface({ instId, timeframe, hasComplete
 })
 
 export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, turnoverOrder, onSelect }: { instId: string; tickSz?: string | null; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; candidateIds?: string[]; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
-  const windowVisible = useSyncExternalStore(subscribeVisibility, documentVisible)
+  const presentation = usePresentation()
+  const windowVisible = usePresentedStore(subscribeVisibility, documentVisible)
   const controlsHelp = useRef<HTMLDialogElement>(null)
-  const view = useSyncExternalStore(chartController.subscribe, chartController.getSnapshot)
+  const view = usePresentedStore(chartController.subscribe, chartController.getSnapshot)
   useLayoutEffect(() => {
     if (!isActive) return
     const target = chartController.getSnapshot().requested
@@ -354,9 +356,15 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     heldPointer.current = null
     if (held?.target.hasPointerCapture(held.pointerId)) held.target.releasePointerCapture(held.pointerId)
   }, [])
+  useLayoutEffect(() => {
+    if (!presentation.active || !plotRef.current) return
+    const { clientWidth: width, clientHeight: height } = plotRef.current
+    if (width > 0 && height > 0) setPlotSize(current => current.width === width && current.height === height ? current : { width, height })
+  }, [presentation.active])
   const endInspection = useCallback(() => { releaseInspection(); setInspection(null) }, [releaseInspection, setInspection])
   const sessionKey = analysisSessionKey(instId, timeframe)
-  const analysis = useSyncExternalStore(chartAnalysis.subscribe, () => chartAnalysis.get(sessionKey))
+  const getAnalysis = useCallback(() => chartAnalysis.get(sessionKey), [sessionKey])
+  const analysis = usePresentedStore(chartAnalysis.subscribe, getAnalysis)
   const [analysisOpen, setAnalysisOpen] = useState(() => chartAnalysis.get(sessionKey) !== null)
   const analysisBusy = analysis?.phase === 'capturing' || analysis?.phase === 'streaming'
   const [capture, setCapture] = useState<{ status: 'idle' | 'copying' | 'flashing' | 'failed'; error: string }>({ status: 'idle', error: '' })
@@ -414,7 +422,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     if (!element) return
     const measure = (width: number, height: number) => {
       // Keep the rendered chart intact while its workspace is hidden.
-      if (!(width > 0 && height > 0)) return
+      if (!getPresentation().active || !(width > 0 && height > 0)) return
       setPlotSize(current => current.width === width && current.height === height ? current : { width, height })
     }
     // Client dimensions stay in chart coordinates when the workspace is scaled.
@@ -426,16 +434,10 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     return () => { observer.disconnect(); element.removeEventListener('wheel', preventPageScroll) }
   }, [])
   useEffect(() => {
-    const hide = () => { if (document.hidden) endInspection() }
-    window.addEventListener('blur', endInspection)
-    document.addEventListener('visibilitychange', hide)
-    return () => { window.removeEventListener('blur', endInspection); document.removeEventListener('visibilitychange', hide) }
-  }, [endInspection])
-  useEffect(() => {
-    if (capture.status !== 'flashing') return
-    const timer = window.setTimeout(() => setCapture({ status: 'idle', error: '' }), 550)
+    if (!presentation.active || capture.status !== 'flashing') return
+    const timer = window.setTimeout(() => { if (getPresentation().active) setCapture({ status: 'idle', error: '' }) }, 550)
     return () => window.clearTimeout(timer)
-  }, [capture.status])
+  }, [capture.status, presentation.active])
   useLayoutEffect(() => {
     if (!isActive) return
     const navigate = (event: KeyboardEvent) => {
@@ -455,7 +457,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
       if (navigationTask.current === null) {
         const task = navigationTask.current = {}
         queueMicrotask(() => {
-          if (navigationTask.current !== task) return
+          if (navigationTask.current !== task || !getPresentation().active) { navigationTask.current = null; return }
           navigationTask.current = null
           flushSync(() => onSelect(navigationId.current))
         })
@@ -465,7 +467,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     return () => window.removeEventListener('keydown', navigate, true)
   }, [isActive, listOrder, turnoverOrder, onSelect])
   const queueWheel = (pixels: number) => {
-    if (!isActive || !surface || !matchesSelection || !Number.isFinite(pixels) || pixels === 0) return
+    if (!isActive || !getPresentation().active || !surface || !matchesSelection || !Number.isFinite(pixels) || pixels === 0) return
     const owner = { session: wheelSession, instId: surface.instId, timeframe: surface.timeframe, generation: surface.generation }
     const currentOwner = wheelOwnerRef.current
     if (!currentOwner || currentOwner.session !== owner.session) {
@@ -476,6 +478,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     }
     wheelBatch.current.add(pixels)
     wheelScheduler.schedule(() => {
+      if (!getPresentation().active) return
       const progress = wheelBatch.current.consume(wheelRemainder.current)
       wheelRemainder.current = progress.remainderPixels
       flushSync(() => {
@@ -539,8 +542,9 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
       if (captureOwner.current !== owner) return
       const result = await window.radarDesktop.request({ copyImage: image.imageDataURL })
       if (!result.ok) throw new Error('Could not copy chart.')
+      await waitForPresentation()
       if (captureOwner.current === owner) setCapture({ status: 'flashing', error: '' })
-    } catch (cause) { if (captureOwner.current === owner) setCapture({ status: 'failed', error: cause instanceof Error ? cause.message : 'Could not copy chart.' }) }
+    } catch (cause) { await waitForPresentation(); if (captureOwner.current === owner) setCapture({ status: 'failed', error: cause instanceof Error ? cause.message : 'Could not copy chart.' }) }
   }
   const analyzeChart = (direction: AnalysisDirection) => {
     if (pending || !surface || plotSize.width <= 0 || captureStatus === 'copying') return
@@ -585,7 +589,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
       <Button variant="ghost" size="sm" onClick={() => controlsHelp.current?.showModal()}>Chart controls</Button>
       <span role="status" className="sr-only">{captureStatus === 'flashing' ? 'Chart copied to clipboard' : ''}</span>
       {(historical || displayedFrame !== timeframe) && <Badge variant="secondary">{timeframeLabel(displayedFrame)}{historical ? ' history' : ' chart'}</Badge>}
-      {!historical && <PriceStatus observedAt={surface?.priceObservedAt} realtime={surface?.realtimeState} active={isActive && windowVisible} />}
+      {!historical && <PriceStatus observedAt={surface?.priceObservedAt} realtime={surface?.realtimeState} active={isActive && windowVisible && presentation.active} />}
     </header>
     <dialog ref={controlsHelp} aria-labelledby="chart-controls-title" className="m-auto w-[min(28rem,calc(100%-2rem))] rounded-lg border bg-popover p-6 text-popover-foreground backdrop:bg-background/80">
       <div className="flex flex-col gap-4">
@@ -636,7 +640,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
         target.setPointerCapture(event.pointerId)
         heldPointer.current = { pointerId: event.pointerId, target }
         inspectAt(target, event.clientX)
-      }} onPointerUp={endInspection} onPointerCancel={endInspection} onLostPointerCapture={endInspection} onPointerMove={event => {
+      }} onPointerUp={endInspection} onPointerCancel={releaseInspection} onLostPointerCapture={releaseInspection} onPointerMove={event => {
         const held = heldPointer.current
         if (!held) {
           const target = (event.target as Element).closest<SVGSVGElement>('svg[data-rendered-inst]')
@@ -654,7 +658,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
         {surface && preparedPlot && <ChartSurface instId={surface.instId} timeframe={surface.timeframe} hasCompletedBars={surface.bars.length > 0}
           priceState={surface.priceState} indicatorState={surface.indicatorState} oiState={surface.oiState} takerState={surface.takerState}
           oiStatus={surface.oiStatus} takerStatus={surface.takerStatus} liveBar={surface.liveBar} plot={preparedPlot} size={plotSize}
-          selected={matchesSelection} visible={matchesSelection && isActive && windowVisible} inspected={inspected} inspectedBar={inspectedBar} wheelFraction={activeWheelFraction} />}
+          selected={matchesSelection} visible={matchesSelection && isActive && windowVisible && presentation.active} inspected={inspected} inspectedBar={inspectedBar} wheelFraction={activeWheelFraction} />}
       </div>
       {captureStatus === 'flashing' && <div aria-hidden="true" className="pointer-events-none absolute inset-0 z-10 bg-[var(--chart-capture-flash)] motion-safe:animate-[chart-capture-flash_550ms_ease-out_both] motion-reduce:hidden" />}
     </section>

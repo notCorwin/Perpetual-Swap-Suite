@@ -129,6 +129,30 @@ test('backend collection, gap repair, and all-period preparation run independent
       }
     }
 
+    // Idle is a presentation policy: the real loopback WebSocket must still
+    // receive, persist and derive corrections without any display subscriber.
+    await backend.request({ chartFocus: { id: 'idle-selected', target: { instId: ids[1], timeframe: '5m' } } })
+    await backend.presentation(false, 1)
+    const delivery = []
+    const receive = () => delivery.push('increment')
+    backend.on('chart', receive)
+    const subscriptions = exchange.businessSubscriptions()
+    const idleChange = exchange.sendCandle(ids[1], '5m', { timestamp: changedAt, close: 552.5, volume: 110, confirmed: true })
+    await waitFor(async () => {
+      const rows = await backend.request({ e2e: { action: 'readCandles', instrument: ids[1], timeframe: '5m', from: changedAt, through: changedAt } })
+      return rows[0]?.close === idleChange.close
+    }, 'persist a confirmed native correction while idle')
+    assert.deepEqual(delivery, [], 'Idle must suppress chart encoding and publication while preserving native collection.')
+    assert.deepEqual(exchange.businessSubscriptions(), subscriptions)
+    const resumed = await backend.presentation(true, 2).then(snapshot => { delivery.push('snapshot'); return snapshot })
+    assert.equal(delivery[0], 'snapshot', 'No increment may overtake the resume snapshot response.')
+    const selected = resumed.frames.find(frame => frame.instId === ids[1] && frame.timeframe === '5m')
+    assert.equal(selected.bars.find(bar => bar.hour === changedAt)?.close, idleChange.close)
+    assert.equal(selected.indicatorState, 'ready')
+    exchange.sendCandle(ids[1], '5m', { close: 560.75, volume: 120 })
+    await waitFor(() => published.get(`${ids[1]}:5m`)?.liveBar?.close === 560.75, 'resume current native incremental chart delivery')
+    backend.off('chart', receive)
+
     // With sources settled, observational reads cannot manufacture new repair
     // work, focus ownership, or source demand for any period.
     await backend.probe({ action: 'sourceInstall', instId: ids[0] })

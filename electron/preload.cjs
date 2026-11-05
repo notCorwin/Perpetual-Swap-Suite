@@ -2,20 +2,37 @@ const { contextBridge, ipcRenderer } = require('electron')
 
 const operationRecording = process.argv.includes('--perpetual-swap-operation-recording')
 const pendingNotifications = []
-let notificationReceiver, flushOperations
-const receive = operationRecording
-  ? (channel, detail, context) => {
-    if (notificationReceiver) notificationReceiver(channel, detail, context)
-    else pendingNotifications.push([channel, detail, context])
+let notificationReceiver, presentationReceiver, flushOperations
+let presentation = { epoch: 0, active: !process.argv.includes('--perpetual-swap-presentation-idle'), startedAt: 0 }
+let presentationEvents = 0
+const updatePresentation = value => {
+  if (!value || !Number.isSafeInteger(value.epoch) || value.epoch < presentation.epoch || typeof value.active !== 'boolean') return
+  presentation = value
+  if (!value.active) pendingNotifications.length = 0
+  if (presentationReceiver) {
+    try { presentationReceiver(value) }
+    finally { const { snapshot: _snapshot, ...state } = value; presentation = state }
   }
-  : (channel, detail) => {
+}
+ipcRenderer.on('radar:presentation', (_event, value) => { presentationEvents++; updatePresentation(value) })
+// An IPC transition can overtake this response. In that case the event is the
+// newer authority, even when both describe different phases of the same epoch.
+ipcRenderer.invoke('radar:presentation-state').then(value => {
+  if (!presentationEvents) updatePresentation(value)
+}).catch(() => {})
+const receive = operationRecording
+  ? (channel, detail, context, epoch) => {
+    if (!presentation.active || typeof epoch === 'number' && epoch < presentation.epoch) return
+    if (notificationReceiver) notificationReceiver(channel, detail, context, epoch)
+    else pendingNotifications.push([channel, detail, context, epoch])
+  }
+  : (channel, detail, _context, epoch) => {
+    if (!presentation.active || typeof epoch === 'number' && epoch < presentation.epoch) return
     if (notificationReceiver) notificationReceiver(channel, detail)
-    else pendingNotifications.push([channel, detail])
+    else pendingNotifications.push([channel, detail, undefined, epoch])
   }
 for (const channel of ['radar:gateway-stream', 'radar:chart-prepared', 'radar:market-changed', 'radar:audit-changed', 'radar:history-download-changed']) {
-  ipcRenderer.on(channel, operationRecording
-    ? (_event, detail, context) => receive(channel, detail, context)
-    : (_event, detail) => receive(channel, detail))
+  ipcRenderer.on(channel, (_event, detail, context, epoch) => receive(channel, detail, context, epoch))
 }
 if (operationRecording) {
   ipcRenderer.on('radar:operations-drain', async (_event, { id }) => {
@@ -39,7 +56,15 @@ const transport = {
   subscribeNotifications: receiver => {
     if (notificationReceiver || typeof receiver !== 'function') throw new Error('The notification receiver is already subscribed or invalid.')
     notificationReceiver = receiver
-    for (const notification of pendingNotifications.splice(0)) receiver(...notification)
+    for (const notification of pendingNotifications.splice(0)) {
+      if (presentation.active && (typeof notification[3] !== 'number' || notification[3] >= presentation.epoch)) receiver(...notification)
+    }
+  },
+  subscribePresentation: receiver => {
+    if (presentationReceiver || typeof receiver !== 'function') throw new Error('The presentation receiver is already subscribed or invalid.')
+    presentationReceiver = receiver
+    try { receiver(presentation) }
+    finally { const { snapshot: _snapshot, ...state } = presentation; presentation = state }
   },
   initializeOperations: flush => {
     requireRecording()

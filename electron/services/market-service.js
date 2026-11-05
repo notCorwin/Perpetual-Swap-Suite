@@ -391,6 +391,7 @@ export class MarketService {
     this.abortControllers = new Set()
     this.shutdownController = new AbortController()
     this.revision = 0
+    this.presentationActive = true
     this.marketListeners = new Set()
     this.marketPublicationTimer = null
     this.serviceSession = randomUUID()
@@ -440,7 +441,7 @@ export class MarketService {
   touchList() {
     this.canonicalList = null
     this.revision += 1
-    if (!this.marketListeners.size || this.marketPublicationTimer || this.closing) return
+    if (!this.presentationActive || !this.marketListeners.size || this.marketPublicationTimer || this.closing) return
     // Coalesce a batch of market changes into one renderer wakeup.
     this.marketPublicationTimer = setTimeout(() => {
       this.marketPublicationTimer = null
@@ -453,6 +454,18 @@ export class MarketService {
     this.marketListeners.add(listener)
     return () => this.marketListeners.delete(listener)
   }
+
+  setPresentationActive(active) {
+    if (typeof active !== 'boolean') throw new TypeError('Presentation activity must be a boolean.')
+    if (this.presentationActive === active) return
+    this.presentationActive = active
+    if (!active && this.marketPublicationTimer !== null) {
+      clearTimeout(this.marketPublicationTimer); this.marketPublicationTimer = null
+    }
+    this.preparedCharts.setPresentationActive(active)
+  }
+
+  preparePresentationResume() { return this.preparedCharts.preparePresentationResume() }
 
   async initialize() {
     this.metadata ??= await MetadataStore.open(join(this.store.root, 'Metadata'))
@@ -3311,6 +3324,12 @@ export class MarketService {
 
   async snapshot({ sinceRevision, serviceSession } = {}) {
     await this.ready
+    return this.currentSnapshot({ sinceRevision, serviceSession })
+  }
+
+  // Caller must await ready. A resume barrier captures every component and
+  // posts its response in this same turn, before attaching live subscribers.
+  currentSnapshot({ sinceRevision, serviceSession } = {}) {
     const { rows, turnoverOrder, qualifiedCount, current: listCurrent } = this.canonicalMarketList()
     const configKey = this.catalogCriteriaKey()
     const pendingIDs = new Set([...this.pendingCandidates.values()].filter(value => value.configKey === configKey).map(value => value.instId))

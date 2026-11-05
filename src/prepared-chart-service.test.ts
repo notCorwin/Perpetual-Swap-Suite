@@ -68,7 +68,7 @@ const focusHistory = async (pipeline: any, id: string, timeframe: string, endHou
   return frame
 }
 const finishSeed = async (pipeline: any) => { while (pipeline.liveSeeds.size) await Promise.all([...pipeline.liveSeeds.values()]) }
-const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
+const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw'] as const
 const sqliteFixture = async (rows: any[]) => {
   const root = await mkdtemp(join(tmpdir(), 'perp-prefix-fence-')), store = await MarketStore.open(root)
   await store.appendCandles(rows)
@@ -3560,4 +3560,157 @@ test('statistics acquired while a new price row becomes resident cover the new r
     assert.equal(state.rows.get(second.timestamp).oi, second.oi)
     assert.equal(pipeline.sourceAttempts.size, 0)
   } finally { release.resolve(); pipeline.focus = null; await pipeline.dispose() }
+})
+
+test('idle retains the selected history cursor and live candle continuity without display work', async () => {
+  const rows = source(600), { pipeline, store } = fixture(rows), frames: any[] = [], operations: OperationEvent[] = []
+  const detach = attachOperationSink(event => { if (event.name === 'chart.frame' || event.name === 'chart.project') operations.push(event) })
+  try {
+    pipeline.setFocus({ instId, timeframe: '15m' }, 'latest')
+    await pipeline.focus.task; await finishSeed(pipeline)
+    const cursor = rows[300].timestamp
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: cursor }, 'history')
+    await pipeline.focus.task; await finishSeed(pipeline)
+    const original = pipeline.cached(`${instId}:15m`)
+    pipeline.subscribe((frame: any) => frames.push(frame))
+    pipeline.setPresentationActive(false)
+    const count = operations.length, reads = store.queries.length, calculations = pipeline.nextCalculation
+    for (let index = 0; index < 160; index++) {
+      const next = candle(rows.at(-1)!.timestamp + (index + 1) * interval, 600 + index)
+      const previous = store.change(next)
+      pipeline.observe([next], previous)
+      await pipeline.setLive(instId, '15m', { ...next, timestamp: next.timestamp + interval, confirmed: false, close: next.close + 0.25 })
+    }
+    pipeline.sourceStateChanged()
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(operations.length, count, 'Idle candle boundaries must not project or publish frames.')
+    assert.equal(store.queries.length, reads, 'Idle updates must not prefetch or replay history.')
+    assert.equal(pipeline.nextCalculation, calculations)
+    assert.equal(frames.length, 0)
+    assert.strictEqual(pipeline.cached(`${instId}:15m`), original)
+    assert.equal(pipeline.focus.end, cursor)
+    const expected = buildIndicatorSeries(store.rows, interval).bars.at(-1)!
+    const latest = pipeline.liveStates.get(`${instId}:15m`)
+    assert.equal(latest.live.close, store.rows.at(-1)!.close + 0.25)
+    for (const field of indicatorFields) assert.equal(latest.indicators.get(expected.hour)?.[field], expected[field], field)
+
+    pipeline.setPresentationActive(true)
+    await pipeline.preparePresentationResume()
+    const resumed = pipeline.cached(`${instId}:15m`)
+    assert.equal(resumed.latestEnd, store.rows.at(-1)!.timestamp)
+    assert.equal(resumed.liveBar.close, store.rows.at(-1)!.close + 0.25)
+    const history = await pipeline.localHistory(instId, '15m', cursor, { focusId: 'history' })
+    assert.equal(history.endHour, cursor)
+    assert.equal(history.bars.find((bar: any) => bar.hour === cursor).close, rows[300].close)
+    for (let index = 0; index < 3; index++) {
+      pipeline.setPresentationActive(false); pipeline.setPresentationActive(false)
+      const next = { ...latest.live, volume: latest.live.volume + 1, close: latest.live.close + 0.01 }
+      await pipeline.setLive(instId, '15m', next)
+      pipeline.setPresentationActive(true); pipeline.setPresentationActive(true)
+      await pipeline.preparePresentationResume()
+      assert.equal(pipeline.cached(`${instId}:15m`).liveBar.close, next.close)
+      assert.equal(pipeline.focus.end, cursor)
+    }
+  } finally { detach(); await pipeline.dispose() }
+})
+
+test('idle cancels chart-owned acquisitions and fences pending preparation until resume', async () => {
+  const signals: AbortSignal[] = [], frames: any[] = []
+  const fetch = async (_id: string, _timeframe: string, _from: number, _through: number, _priority: string, signal: AbortSignal) => {
+    signals.push(signal)
+    await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))
+  }
+  const { pipeline, store } = fixture([], { ensurePrices: fetch, ensureStatistics: fetch })
+  const waitFor = async (condition: () => boolean) => {
+    const deadline = Date.now() + 4000
+    while (!condition()) { assert.ok(Date.now() < deadline, 'Chart source did not start.'); await new Promise(resolve => setTimeout(resolve, 2)) }
+  }
+  try {
+    pipeline.subscribe((frame: any) => frames.push(frame))
+    pipeline.setUniverse([instId])
+    pipeline.setFocus({ instId, timeframe: '15m' }, 'selected')
+    await waitFor(() => signals.length > 0)
+    pipeline.setPresentationActive(false)
+    const started = signals.length, reads = store.queries.length, publications = frames.length
+    assert.ok(signals.every(signal => signal.aborted))
+    pipeline.sourceStateChanged()
+    pipeline.setUniverse([instId, 'ETH-USDT-SWAP'])
+    await new Promise(resolve => setTimeout(resolve, 30))
+    assert.equal(signals.length, started)
+    assert.equal(store.queries.length, reads)
+    assert.equal(frames.length, publications)
+    assert.equal(pipeline.focus.id, 'selected')
+    pipeline.setPresentationActive(true)
+    await pipeline.preparePresentationResume()
+    await waitFor(() => signals.length > started)
+    assert.ok(signals.slice(started).some(signal => !signal.aborted))
+  } finally { await pipeline.dispose() }
+})
+
+test('resume hydrates locally invalidated cached frames at the retained cursor', async () => {
+  const rows = source(500), { pipeline, store } = fixture(rows), cursor = rows[300].timestamp
+  try {
+    pipeline.setFocus({ instId, timeframe: '15m' }, 'initial')
+    await pipeline.focus.task; await finishSeed(pipeline)
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: cursor }, 'retained')
+    await pipeline.focus.task; await finishSeed(pipeline)
+    const before = pipeline.cached(`${instId}:15m`)
+    pipeline.setPresentationActive(false)
+    const latest = { ...rows.at(-1)!, close: rows.at(-1)!.close + 0.4 }
+    const historical = { ...rows[300], close: rows[300].close + 0.3 }
+    store.change(latest); store.change(historical)
+    pipeline.invalidate(instId, '15m')
+    assert.strictEqual(pipeline.cached(`${instId}:15m`), before)
+    assert.equal(pipeline.focus.id, 'retained'); assert.equal(pipeline.focus.end, cursor)
+    pipeline.setPresentationActive(true)
+    await pipeline.preparePresentationResume()
+    const resumed = pipeline.cached(`${instId}:15m`)
+    assert.equal(resumed.bars.at(-1).close, latest.close)
+    const selected = await pipeline.localHistory(instId, '15m', cursor, { focusId: 'retained' })
+    assert.equal(selected.bars.find((bar: any) => bar.hour === cursor).close, historical.close)
+    assert.equal(selected.endHour, cursor)
+  } finally { await pipeline.dispose() }
+})
+
+test('a pre-idle local read cannot restart obsolete chart preparation after a quick toggle', async () => {
+  const { pipeline, store } = fixture(source(400)), gate = deferred(), entered = deferred()
+  const read = store.candles.bind(store)
+  let hold = true
+  store.candles = async query => {
+    if (hold) { hold = false; entered.resolve(); await gate.promise }
+    return read(query)
+  }
+  try {
+    pipeline.setFocus({ instId, timeframe: '15m' }, 'retained')
+    const old = pipeline.focus.task
+    await entered.promise
+    pipeline.setPresentationActive(false)
+    pipeline.setPresentationActive(true)
+    gate.resolve()
+    assert.equal(await old, null)
+    await pipeline.focus.task
+    await pipeline.preparePresentationResume()
+    assert.equal(pipeline.focus.id, 'retained')
+    assert.ok(pipeline.cached(`${instId}:15m`)?.bars.length)
+  } finally { gate.resolve(); await pipeline.dispose() }
+})
+
+test('a correction during idle replays exact indicators from durable inputs after resume', async () => {
+  const rows = source(400), { pipeline, store } = fixture(rows)
+  try {
+    pipeline.setFocus({ instId, timeframe: '15m' }, 'selected')
+    await pipeline.focus.task; await finishSeed(pipeline)
+    pipeline.setPresentationActive(false)
+    const corrected = { ...rows[200], close: rows[200].close + 0.5 }
+    pipeline.observe([corrected], store.change(corrected))
+    for (let index = 0; index < 4; index++) {
+      const next = candle(rows.at(-1)!.timestamp + (index + 1) * interval, 400 + index)
+      pipeline.observe([next], store.change(next))
+    }
+    pipeline.setPresentationActive(true)
+    await pipeline.preparePresentationResume()
+    const expected = buildIndicatorSeries(store.rows, interval).bars.at(-1)!
+    const actual = pipeline.cached(`${instId}:15m`).bars.at(-1)
+    for (const field of indicatorFields) assert.equal(actual[field], expected[field], field)
+  } finally { await pipeline.dispose() }
 })

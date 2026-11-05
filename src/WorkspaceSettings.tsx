@@ -15,6 +15,7 @@ import { LIQUIDITY_FIELDS, preferencesDraft, validatePreferencesDraft, type Pref
 import type { DataAudit, HistoryDownload } from '@/desktop-contract'
 import { RADAR_TIMEFRAMES, type RadarTimeframe } from '@/timeframe'
 import { SnapshotOrder } from '@/snapshot-order'
+import { getPresentation, subscribePresentationTransition, waitForPresentation } from '@/presentation-store'
 
 const emptyAudit: DataAudit = { phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '', revision: 0, serviceSession: '' }
 const errorMessage = (cause: unknown) => cause instanceof Error ? cause.message : 'The desktop service could not complete this request.'
@@ -46,14 +47,17 @@ function HistoryDownloadSettings({ open }: { open: boolean }) {
     const currentLifecycle = lifecycle.current
     const currentSequence = ++sequence.current
     const before = accepted.current
+    const epoch = getPresentation().epoch
     setBusy(action); setRequestError(''); setStatusError('')
     try {
       const value = await window.radarDesktop.request({ historyDownload: { action } })
-      if (currentLifecycle === lifecycle.current && currentSequence === sequence.current) accept(value)
+      await waitForPresentation()
+      if (currentLifecycle === lifecycle.current && currentSequence === sequence.current && (action !== 'status' || epoch === getPresentation().epoch)) accept(value)
     } catch (cause) {
+      await waitForPresentation()
       if (currentLifecycle !== lifecycle.current || currentSequence !== sequence.current) return
       if (action === 'status') {
-        if (before === accepted.current) setStatusError(errorMessage(cause))
+        if (epoch === getPresentation().epoch && before === accepted.current) setStatusError(errorMessage(cause))
       } else setRequestError(errorMessage(cause))
     } finally {
       if (currentLifecycle === lifecycle.current && currentSequence === sequence.current) setBusy(null)
@@ -65,8 +69,9 @@ function HistoryDownloadSettings({ open }: { open: boolean }) {
     setReady(false)
     const published = (event: Event) => accept((event as CustomEvent<HistoryDownload>).detail)
     window.addEventListener('radar-history-download-changed', published)
-    void request('status')
-    return () => { window.removeEventListener('radar-history-download-changed', published); lifecycle.current++ }
+    const stop = subscribePresentationTransition(update => { if (update.active && update.snapshot) accept(update.snapshot.download) })
+    if (getPresentation().active) void request('status')
+    return () => { stop(); window.removeEventListener('radar-history-download-changed', published); lifecycle.current++ }
   }, [open, accept, request])
   const { progress, contracts, streams } = download
   const percent = progress.total ? Math.min(100, progress.checked / progress.total * 100) : 0
@@ -186,19 +191,21 @@ export function WorkspaceSettings({ section, preferences, loaded, loadError, onS
     if (!dataMounted) return
     const lifecycle = ++auditLifecycle.current
     const accepted = auditAccepted.current
+    const epoch = getPresentation().epoch
     setAuditBusy(false); setAuditError(''); setAuditStatusError('')
     const published = (event: Event) => acceptAudit((event as CustomEvent<DataAudit>).detail)
     window.addEventListener('radar-audit-changed', published)
+    const stop = subscribePresentationTransition(update => { if (update.active && update.snapshot) acceptAudit(update.snapshot.audit) })
     const status = async () => {
       try {
         const value = await window.radarDesktop.request({ dataAudit: { action: 'status' } })
-        if (lifecycle === auditLifecycle.current) acceptAudit(value)
+        if (lifecycle === auditLifecycle.current && getPresentation().active && epoch === getPresentation().epoch) acceptAudit(value)
       } catch (cause) {
-        if (lifecycle === auditLifecycle.current && accepted === auditAccepted.current) setAuditStatusError(errorMessage(cause))
+        if (lifecycle === auditLifecycle.current && getPresentation().active && epoch === getPresentation().epoch && accepted === auditAccepted.current) setAuditStatusError(errorMessage(cause))
       }
     }
-    void status()
-    return () => { window.removeEventListener('radar-audit-changed', published); auditLifecycle.current++ }
+    if (getPresentation().active) void status()
+    return () => { stop(); window.removeEventListener('radar-audit-changed', published); auditLifecycle.current++ }
   }, [dataMounted, acceptAudit])
   const auditAction = async (action: 'start' | 'cancel' | 'repair') => {
     const lifecycle = auditLifecycle.current
@@ -206,8 +213,9 @@ export function WorkspaceSettings({ section, preferences, loaded, loadError, onS
     setAuditBusy(true); setAuditError('')
     try {
       const value = await window.radarDesktop.request({ dataAudit: { action } })
+      await waitForPresentation()
       if (lifecycle === auditLifecycle.current && sequence === auditSequence.current) acceptAudit(value)
-    } catch (cause) { if (lifecycle === auditLifecycle.current && sequence === auditSequence.current) setAuditError(errorMessage(cause)) }
+    } catch (cause) { await waitForPresentation(); if (lifecycle === auditLifecycle.current && sequence === auditSequence.current) setAuditError(errorMessage(cause)) }
     finally { if (lifecycle === auditLifecycle.current && sequence === auditSequence.current) setAuditBusy(false) }
   }
   const changeNumber = (key: 'rankingLookback' | 'historyDays' | 'slippageNotional', value: string) => {

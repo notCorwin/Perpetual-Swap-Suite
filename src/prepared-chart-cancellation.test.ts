@@ -131,6 +131,29 @@ test('hiding a chart cancels only its consumers while overlapping history observ
   } finally { hold.resolve(); await Promise.allSettled([price, statistics]); await f.close() }
 })
 
+test('idle releases chart demand without cancelling shared continuity acquisition', async () => {
+  const hold = deferred(), f = await fixture({ acquire: () => hold.promise })
+  const through = end(), from = through - 95 * step
+  let price: ReturnType<MarketHistory['ensurePrices']> | undefined, statistics: ReturnType<MarketHistory['ensureStatistics']> | undefined
+  try {
+    price = f.history.ensurePrices(btc, '15m', from, through, 'continuity')
+    statistics = f.history.ensureStatistics(btc, '15m', from, through, 'continuity')
+    await waitFor(() => f.calls.length === 3)
+    f.pipeline.setFocus({ instId: btc, timeframe: '15m' }, 'selected')
+    await waitFor(() => f.history.sync.listTasks().length === 6)
+    const focus = f.pipeline.focus
+    f.pipeline.setPresentationActive(false)
+    await waitFor(() => f.history.sync.listTasks().filter(task => task.status === 'cancelled').length === 3)
+    assert.ok(f.calls.every(call => !call.signal.aborted))
+    assert.strictEqual(f.pipeline.focus, focus)
+    hold.resolve(); await Promise.all([price, statistics]); await f.history.sync.whenIdle()
+    const rows = await f.store.candles({ instrument: btc, timeframe: '15m', from, through })
+    assert.equal(rows.length, 96)
+    assert.ok(rows.every(row => row.oi === 500 && row.buy === 6 && row.sell === 4))
+    assert.equal(f.calls.length, 3)
+  } finally { hold.resolve(); await Promise.allSettled([price, statistics]); await f.close() }
+})
+
 test('chart cancellation preserves an already admitted durable write and never reports it as source backoff', async () => {
   const hold = deferred(), writing = deferred()
   const f = await fixture({ beforeWrite: async () => { writing.resolve(); await hold.promise } })

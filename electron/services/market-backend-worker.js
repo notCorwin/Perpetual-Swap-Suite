@@ -12,10 +12,15 @@ import { backgroundArchiveRows, seedMarketResources, startBackgroundArchive } fr
 let metadata, store, service, preferences, sourceProbe
 let resourceFixture, acquisitionFixture, coldBoundaryFixture
 const notificationSubscriptions = new Map()
+let presentationActive = true, presentationEpoch = 0, requestedSubscriptions = []
 function subscribeNotifications(names) {
   if (!Array.isArray(names) || names.some(name => !['chart', 'market', 'audit', 'history-download'].includes(name))) {
     throw new TypeError('Backend notification subscriptions must contain supported event names.')
   }
+  requestedSubscriptions = names
+  return applyNotificationSubscriptions(presentationActive ? names : [])
+}
+function applyNotificationSubscriptions(names) {
   const wanted = new Set(names)
   for (const [name, unsubscribe] of notificationSubscriptions) if (!wanted.has(name)) {
     unsubscribe(); notificationSubscriptions.delete(name)
@@ -33,6 +38,30 @@ function subscribeNotifications(names) {
     notificationSubscriptions.set(name, unsubscribe)
   }
   return { ok: true }
+}
+
+async function presentation({ active, epoch }, respond) {
+  if (typeof active !== 'boolean' || !Number.isSafeInteger(epoch) || epoch < 0) throw new TypeError('Invalid presentation activation epoch.')
+  if (epoch < presentationEpoch) { respond(null); return }
+  presentationEpoch = epoch; presentationActive = false
+  applyNotificationSubscriptions([])
+  service.setPresentationActive(active)
+  if (!active) { respond({ epoch }); return }
+  await service.preparePresentationResume()
+  if (epoch !== presentationEpoch) { respond(null); return }
+  const market = service.currentSnapshot()
+  const pipeline = service.preparedCharts
+  const frames = pipeline.residentFrames().frames
+  const focus = pipeline.focus, resident = focus && pipeline.series.get(focus.key)
+  if (resident && focus.end != null) frames.push(pipeline.frame(resident, focus.end, true))
+  const snapshot = { market, frames, preferences,
+    audit: structuredClone(service.auditReport), download: structuredClone(service.downloadReport) }
+  // Capture and post synchronously: no queued continuation can publish an
+  // increment before this barrier or mutate the market between capture and
+  // subscription. The main-process reply handler settles before the next
+  // MessagePort event is dispatched.
+  respond(snapshot)
+  presentationActive = true; applyNotificationSubscriptions(requestedSubscriptions)
 }
 let coldBoundaryOperation = Promise.resolve()
 const coldBoundaryLifecycle = operation => {
@@ -407,6 +436,10 @@ onOperationMessage(parentPort, 'market-backend', async ({ id, method, value }) =
     await initialize
     let result
     if (method === 'request') result = await request(value)
+    else if (method === 'presentation') {
+      await presentation(value, snapshot => parentPort.postMessage({ id, value: snapshot }))
+      return
+    }
     else if (method === 'subscriptions') result = subscribeNotifications(value)
     else if (method === 'credentials') result = metadata.getAnalysisSettings().apiKey ?? ''
     else if (method === 'probe') result = await probe(value)

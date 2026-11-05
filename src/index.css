@@ -224,3 +224,8 @@
     scroll-behavior: auto !important;
   }
 }
+
+/* Keep the last presented frame intact while the application is inactive. */
+html[data-presentation-idle] *, html[data-presentation-idle] *::before, html[data-presentation-idle] *::after {
+  animation-play-state: paused !important;
+}

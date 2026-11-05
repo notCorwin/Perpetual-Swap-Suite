@@ -81,6 +81,7 @@ export class MarketBackend extends EventEmitter {
   request(value) { return this.call('request', value) }
   credentials() { return this.call('credentials') }
   probe(value) { return this.call('probe', value) }
+  presentation(active, epoch) { return this.call('presentation', { active, epoch }) }
 
   async dispose() {
     if (this.disposal) return this.disposal

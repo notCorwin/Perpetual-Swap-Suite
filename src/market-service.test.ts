@@ -2624,3 +2624,42 @@ test('history download checkpoints and replies carry detached snapshots with mon
     unsubscribeMutation(); unsubscribe()
   } finally { await f.close() }
 })
+
+test('idle suppresses market notifications while preserving revisions', async () => {
+  const f = await fixture()
+  try {
+    let publications = 0
+    const unsubscribe = f.service.subscribeMarket(() => { publications++ })
+    const before = f.service.revision
+    f.service.touchList()
+    f.service.setPresentationActive(false)
+    f.service.touchList(); f.service.touchList()
+    await new Promise(resolve => setTimeout(resolve, 25))
+    assert.equal(publications, 0)
+    assert.equal(f.service.revision, before + 3)
+    f.service.setPresentationActive(true)
+    await f.service.preparePresentationResume()
+    f.service.touchList()
+    await new Promise(resolve => setTimeout(resolve, 25))
+    assert.equal(publications, 1)
+    unsubscribe()
+  } finally { await f.close() }
+})
+
+test('idle leaves durable candle writes and an explicitly requested audit available', async () => {
+  const f = await fixture()
+  try {
+    f.service.setPresentationActive(false)
+    const timestamp = Math.floor(Date.now() / fiveMinutes) * fiveMinutes - fiveMinutes
+    const bar = rawCandle(timestamp, 123)
+    await f.service.persistCandles(bar.instrument, [bar])
+    const stored = await f.store.candles({ instrument: bar.instrument, timeframe: '5m', from: timestamp, through: timestamp })
+    assert.equal(stored[0]?.close, 123)
+    const audits: DataAuditSnapshot[] = []
+    const unsubscribe = f.service.subscribeAudit(report => { audits.push(report) })
+    const result = await f.service.dataAuditRequest({ action: 'start' })
+    assert.equal(result.phase, 'completed')
+    assert.equal(audits.at(-1)?.phase, 'completed')
+    unsubscribe()
+  } finally { await f.close() }
+})
