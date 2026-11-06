@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, contentTracing, ipcMain, nativeImage, net, session, shell } from 'electron'
+import { app, BrowserWindow, clipboard, ClipboardItem, contentTracing, ipcMain, nativeImage, net, session, shell } from 'electron'
 import { mkdirSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -188,6 +188,12 @@ async function gatewayFetch(event, { id, body }) {
   } catch (error) { operation?.end({ status: controller.signal.aborted ? 'cancelled' : 'error', attributes: { receivedBytes, errorName: error.name } }); release(); throw error }
 }
 
+async function copyImage(image) {
+  if (image.isEmpty()) throw new Error('Invalid chart image.')
+  const png = measureOperation({ category: 'cpu', name: 'chart.encode-png' }, () => image.toPNG())
+  await clipboard.write([new ClipboardItem({ 'image/png': new Blob([png], { type: 'image/png' }) })])
+}
+
 async function handleRequest(event, payload, context) {
   security.assertTrustedSender(event, window)
   const request = parseDesktopRequest(payload, { allowE2E: testMode })
@@ -203,17 +209,16 @@ async function handleRequest(event, payload, context) {
   const execute = async () => {
   if (request.gatewayFetch) return gatewayFetch(event, request.gatewayFetch)
   if (request.cancelGatewayFetch) { gatewayRequests.get(request.cancelGatewayFetch)?.controller.abort(); deferredGateway.delete(request.cancelGatewayFetch); return { ok: true } }
-  if ('copyText' in request) { clipboard.writeText(request.copyText); return { ok: true } }
+  if ('copyText' in request) { await clipboard.writeText(request.copyText); return { ok: true } }
   if ('copyImage' in request) {
     const image = nativeImage.createFromDataURL(request.copyImage)
-    if (image.isEmpty()) throw new Error('Invalid chart image.')
-    clipboard.writeImage(image); return { ok: true }
+    await copyImage(image); return { ok: true }
   }
   if (request.captureChart) {
     const { x, y, width, height, output } = request.captureChart
     const image = await measureOperation({ category: 'gpu', name: 'chart.capture', attributes: { measurement: 'submission-wall', width, height } }, () => event.sender.capturePage({ x: Math.floor(x), y: Math.floor(y), width: Math.ceil(x + width) - Math.floor(x), height: Math.ceil(y + height) - Math.floor(y) }))
     if (output === 'png') return { imageDataURL: `data:image/png;base64,${measureOperation({ category: 'cpu', name: 'chart.encode-png' }, () => image.toPNG()).toString('base64')}`, ...image.getSize() }
-    clipboard.writeImage(image)
+    await copyImage(image)
     return { ok: true }
   }
   const response = await backend.request(request)

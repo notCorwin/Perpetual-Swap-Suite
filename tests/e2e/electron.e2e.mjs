@@ -228,11 +228,48 @@ test('completed candles round-trip through the Electron-owned SQLite store', asy
   assert.deepEqual(candles.map(candle => [candle.timestamp, candle.close, candle.confirmed]), [[timestamp, 108, true]])
 })
 
-test('clipboard, screenshot capture, analysis settings, and safe gateway cancellation work', async () => {
-  assert.deepEqual(await request({ copyText: 'Perpetual Swap Suite E2E' }), { ok: true })
-  const image = await request({ captureChart: { x: 0, y: 0, width: 80, height: 60, output: 'png' } })
-  assert.match(image.imageDataURL, /^data:image\/png;base64,/)
-  assert.ok(image.width > 0 && image.height > 0)
+test('clipboard requests commit text and PNG pixels before acknowledging success', async () => {
+  await electron.evaluate(async ({ clipboard, ClipboardItem }) => {
+    // Materialize the lazy OS clipboard payloads before replacing them.
+    globalThis.__savedClipboard = await Promise.all((await clipboard.read()).map(async item => new ClipboardItem(
+      Object.fromEntries(await Promise.all(item.types.map(async type => [type, await item.getType(type)]))),
+    )))
+  })
+  const readImage = () => electron.evaluate(async ({ clipboard, nativeImage }) => {
+    const item = (await clipboard.read()).find(item => item.types.includes('image/png'))
+    if (!item) return null
+    const image = nativeImage.createFromBuffer(Buffer.from(await (await item.getType('image/png')).arrayBuffer()))
+    return { ...image.getSize(), pixels: image.toBitmap().toString('base64') }
+  })
+  try {
+    assert.deepEqual(await request({ copyText: 'Perpetual Swap Suite E2E' }), { ok: true })
+    assert.equal(await electron.evaluate(({ clipboard }) => clipboard.readText()), 'Perpetual Swap Suite E2E')
+    const fixture = await electron.evaluate(({ nativeImage }) => {
+      const image = nativeImage.createFromBitmap(Buffer.from([0, 0, 255, 255, 0, 255, 0, 255]), { width: 2, height: 1 })
+      return { url: image.toDataURL(), width: 2, height: 1, pixels: image.toBitmap().toString('base64') }
+    })
+    assert.deepEqual(await request({ copyImage: fixture.url }), { ok: true })
+    assert.deepEqual(await readImage(), { width: fixture.width, height: fixture.height, pixels: fixture.pixels })
+    await assert.rejects(() => request({ copyImage: 'data:image/png;base64,aW52YWxpZA==' }), /Invalid chart image/)
+    assert.deepEqual(await readImage(), { width: fixture.width, height: fixture.height, pixels: fixture.pixels })
+    const rect = { x: 0, y: 0, width: 80, height: 60 }
+    const image = await request({ captureChart: { ...rect, output: 'png' } })
+    assert.match(image.imageDataURL, /^data:image\/png;base64,/)
+    assert.ok(image.width > 0 && image.height > 0)
+    assert.deepEqual(await request({ captureChart: rect }), { ok: true })
+    const captured = await readImage()
+    assert.ok(captured)
+    assert.deepEqual([captured.width, captured.height], [image.width, image.height])
+  } finally {
+    await electron.evaluate(async ({ clipboard }) => {
+      if (globalThis.__savedClipboard.length) await clipboard.write(globalThis.__savedClipboard)
+      else clipboard.clear()
+      delete globalThis.__savedClipboard
+    })
+  }
+})
+
+test('analysis settings and safe gateway cancellation work', async () => {
   assert.deepEqual(await request({ analysisSettings: { action: 'save', model: 'test-model', apiKey: 'test-key' } }), { model: 'test-model', hasAPIKey: true })
   assert.deepEqual(await request({ analysisSettings: { action: 'read' } }), { model: 'test-model', hasAPIKey: true })
   assert.equal('analysis' in await request({ snapshot: { sinceRevision: -1 } }), false)
