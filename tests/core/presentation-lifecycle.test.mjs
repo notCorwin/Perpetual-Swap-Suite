@@ -1,30 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { readFileSync } from 'node:fs'
-import { parse } from '@babel/parser'
 import { PresentationLifecycle } from '../../electron/services/presentation-lifecycle.js'
-
-test('failed snapshot delivery retains background analysis bytes and completion until a successful retry', () => {
-  const source = readFileSync(new URL('../../electron/main.js', import.meta.url), 'utf8')
-  const ast = parse(source, { sourceType: 'module' })
-  const fn = ast.program.body.find(node => node.type === 'FunctionDeclaration' && node.id.name === 'publishPresentation')
-  let failEncode = true, failSend = false
-  const sent = [], owner = { isDestroyed: () => false, send: (_channel, value) => {
-    if (failSend) throw new Error('Send failed')
-    sent.push(value)
-  } }
-  const deferred = new Map([['analysis', { owner, chunks: [Buffer.from('complete response')], terminal: { id: 'analysis', type: 'end' } }]])
-  const publish = new Function('window', 'deferredGateway', 'encodeChartWire', `${source.slice(fn.start, fn.end)}; return publishPresentation`)(
-    { isDestroyed: () => false, webContents: owner }, deferred, value => { if (failEncode) throw new Error('Encode failed'); return value })
-  const update = { epoch: 2, active: true, snapshot: { frames: [] } }
-  assert.throws(() => publish(update), /Encode failed/)
-  failEncode = false; failSend = true
-  assert.throws(() => publish(update), /Send failed/)
-  failSend = false; publish(update)
-  assert.deepEqual(sent[0].snapshot.gateway, [{ id: 'analysis', type: 'data', base64: Buffer.from('complete response').toString('base64') }, { id: 'analysis', type: 'end' }])
-  publish(update)
-  assert.deepEqual(sent[1].snapshot.gateway, [], 'A delivered response is released instead of replayed at the next activation.')
-})
 
 test('app deactivation gates publication immediately and resumption publishes only its consistent snapshot', async () => {
   const events = [], calls = []

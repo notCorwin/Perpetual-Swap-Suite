@@ -239,10 +239,14 @@ test('only owned projections are frozen or eligible for status reuse', async () 
     const row = { ...state.rows.get(state.latestHour) }
     const indicator = { ...state.indicators.get(state.latestHour) }
     state.rows.set(row.timestamp, row); state.indicators.set(row.timestamp, indicator)
+    const seed = state.indicatorState, seedBefore = structuredClone(seed)
+    const frozenBefore = Object.isFrozen(seed)
     const frame = pipeline.frame(state)
     assert.equal(Object.isFrozen(row), false)
     assert.equal(Object.isFrozen(indicator), false)
-    assert.equal(Object.isFrozen(state.indicatorState), false)
+    assert.equal(state.indicatorState, seed)
+    assert.deepEqual(seed, seedBefore, 'Projection must not mutate its shared indicator seed.')
+    assert.equal(Object.isFrozen(seed), frozenBefore)
     assert.ok(Object.isFrozen(frame.bars.at(-1)))
     const foreignBar = { ...frame.bars.at(-1) }, foreign = Object.freeze([foreignBar])
     const { from, through } = frame.indicatorStatus

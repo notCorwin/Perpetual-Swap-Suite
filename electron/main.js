@@ -19,6 +19,7 @@ import { installElectronOperationHooks } from './services/operation-hooks.js'
 import { MarketBackend } from './services/market-backend.js'
 import { windowToolbarLayout } from './window-layout.js'
 import { PresentationLifecycle } from './services/presentation-lifecycle.js'
+import { PresentationDelivery } from './services/presentation-delivery.js'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const rendererURL = process.env.ELECTRON_RENDERER_URL || undefined
@@ -68,44 +69,15 @@ let stopTestOwner = () => {}
 let testOwnerExitTimer
 let presentation
 const windowNotifications = new Set()
-const deferredGateway = new Map()
+const presentationDelivery = new PresentationDelivery({
+  getState: () => presentation?.getState(),
+  notify: sendNotification,
+  isClosing: () => shuttingDown,
+})
 
 function publishPresentation(update) {
-  if (!window || window.isDestroyed() || window.webContents.isDestroyed()) return
-  let value = update
-  const deliveredGateway = []
-  if (update.snapshot) {
-    const gateway = []
-    for (const [id, pending] of deferredGateway) {
-      if (pending.owner !== window.webContents) continue
-      if (pending.chunks.length) gateway.push({ id, type: 'data', base64: Buffer.concat(pending.chunks).toString('base64') })
-      if (pending.terminal) gateway.push(pending.terminal)
-      deliveredGateway.push(id)
-    }
-    value = { ...update, snapshot: encodeChartWire({ ...update.snapshot, gateway }) }
-  }
-  window.webContents.send('radar:presentation', value)
-  // A failed encode/send leaves raw response ownership available for retry.
-  for (const id of deliveredGateway) deferredGateway.delete(id)
-}
-
-
-function sendGateway(event, detail) {
-  if (shuttingDown || event.sender.isDestroyed()) return
-  if (presentation?.getState().active) sendNotification(event.sender, 'radar:gateway-stream', detail)
-  else {
-    const pending = deferredGateway.get(detail.id) ?? { owner: event.sender, chunks: [] }
-    pending.terminal = detail; deferredGateway.set(detail.id, pending)
-  }
-}
-function sendGatewayChunk(event, id, bytes) {
-  if (shuttingDown || event.sender.isDestroyed()) return
-  if (presentation?.getState().active) sendNotification(event.sender, 'radar:gateway-stream', { id, type: 'data', base64: Buffer.from(bytes).toString('base64') })
-  else {
-    const pending = deferredGateway.get(id) ?? { owner: event.sender, chunks: [] }
-    // This is response body ownership, not a replay queue of UI events.
-    pending.chunks.push(Buffer.from(bytes)); deferredGateway.set(id, pending)
-  }
+  if (!window || window.isDestroyed()) return
+  presentationDelivery.publish(window.webContents, update)
 }
 
 function sendNotification(sender, channel, detail) {
@@ -146,7 +118,7 @@ async function gatewayFetch(event, { id, body }) {
   const finished = new Promise(resolve => { finish = resolve })
   const owner = event.sender
   const abort = () => controller.abort()
-  const forget = () => { deferredGateway.delete(id); abort() }
+  const forget = () => { presentationDelivery.discard(id); abort() }
   const navigation = details => { if (details.isMainFrame && !details.isSameDocument) abort() }
   owner.once('destroyed', forget)
   owner.on('did-start-navigation', navigation)
@@ -174,13 +146,13 @@ async function gatewayFetch(event, { id, body }) {
             const { done, value } = await reader.read()
             if (done) break
             receivedBytes += value.byteLength
-            sendGatewayChunk(event, id, value)
+            presentationDelivery.chunk(owner, id, value)
           }
           operation?.end({ status: response.ok ? 'ok' : 'error', attributes: { receivedBytes, httpStatus } })
-          sendGateway(event, { id, type: 'end' })
+          presentationDelivery.terminal(owner, { id, type: 'end' })
         } catch (error) {
           operation?.end({ status: controller.signal.aborted ? 'cancelled' : 'error', attributes: { receivedBytes, httpStatus, errorName: error.name } })
-          if (!controller.signal.aborted) sendGateway(event, { id, type: 'error', message: error instanceof Error ? error.message : 'Gateway stream interrupted.' })
+          if (!controller.signal.aborted) presentationDelivery.terminal(owner, { id, type: 'error', message: error instanceof Error ? error.message : 'Gateway stream interrupted.' })
         } finally { reader.releaseLock(); release() }
       })()
     } else { operation?.end({ status: response.ok ? 'ok' : 'error', attributes: { receivedBytes, httpStatus } }); release() }
@@ -208,7 +180,7 @@ async function handleRequest(event, payload, context) {
   assertPresentation()
   const execute = async () => {
   if (request.gatewayFetch) return gatewayFetch(event, request.gatewayFetch)
-  if (request.cancelGatewayFetch) { gatewayRequests.get(request.cancelGatewayFetch)?.controller.abort(); deferredGateway.delete(request.cancelGatewayFetch); return { ok: true } }
+  if (request.cancelGatewayFetch) { gatewayRequests.get(request.cancelGatewayFetch)?.controller.abort(); presentationDelivery.discard(request.cancelGatewayFetch); return { ok: true } }
   if ('copyText' in request) { await clipboard.writeText(request.copyText); return { ok: true } }
   if ('copyImage' in request) {
     const image = nativeImage.createFromDataURL(request.copyImage)
@@ -314,7 +286,7 @@ function subscribeWindowNotifications(target) {
   const owner = target.webContents
   target.webContents.once('destroyed', () => {
     detach()
-    for (const [id, pending] of deferredGateway) if (pending.owner === owner) deferredGateway.delete(id)
+    presentationDelivery.discardOwner(owner)
   })
   target.webContents.on('render-process-gone', detach)
   target.webContents.on('did-start-loading', () => {

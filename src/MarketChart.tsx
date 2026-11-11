@@ -26,20 +26,14 @@ import { createChartPlotCache } from '@/chart-render'
 import type { Bar, ChartSourceStatus, PreparedChartState, ReadyChartWindow } from '@/chart-data'
 import { measureOperation } from '../electron/services/operations.js'
 import { getPresentation, usePresentation, usePresentedStore, waitForPresentation } from '@/presentation-store'
+import { isPriceFresh, watchPriceFreshness, watchPriceCountdown } from '@/price-clock'
 
+const presentationActive = () => getPresentation().active
 const EMPTY_BARS: readonly Bar[] = []
 const PriceStatus = memo(function PriceStatus({ observedAt, realtime, active }: { observedAt?: number | null; realtime?: 'live' | 'stale'; active: boolean }) {
   const [now, setNow] = useState(Date.now)
-  useEffect(() => {
-    if (!active || realtime !== 'live' || observedAt == null) return
-    const current = Date.now()
-    const remaining = observedAt + 30_000 - current
-    if ((now - observedAt < 30_000) !== (remaining > 0)) setNow(current)
-    if (remaining <= 0) return
-    const timer = window.setTimeout(() => { if (getPresentation().active) setNow(Date.now()) }, remaining)
-    return () => window.clearTimeout(timer)
-  }, [active, observedAt, realtime, now])
-  const fresh = realtime === 'live' && observedAt != null && now - observedAt < 30_000
+  useEffect(() => watchPriceFreshness({ observedAt, realtime, active, displayedAt: now, isActive: presentationActive, onTime: setNow }), [active, observedAt, realtime, now])
+  const fresh = isPriceFresh(observedAt, realtime, now)
   return fresh ? null : <Badge variant="secondary" role="status" title={observedAt ? `Last price observation ${new Date(observedAt).toLocaleTimeString('en-US')}` : 'Waiting for a current price observation'}>Cached price</Badge>
 })
 
@@ -79,12 +73,7 @@ const documentVisible = () => document.visibilityState !== 'hidden'
 const PriceCountdown = memo(function PriceCountdown({ hour, intervalMS, x, y }: { hour: number; intervalMS: number; x: number; y: number }) {
   const [now, setNow] = useState(Date.now)
   const visible = useContext(PlotVisible)
-  useEffect(() => {
-    if (!visible) return
-    setNow(Date.now())
-    const timer = window.setInterval(() => { if (getPresentation().active) setNow(Date.now()) }, 1000)
-    return () => window.clearInterval(timer)
-  }, [visible])
+  useEffect(() => watchPriceCountdown(visible, presentationActive, setNow), [visible])
   const seconds = Math.max(0, Math.floor((hour + intervalMS - now) / 1000))
   const value = `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`
   return <text data-chart-countdown x={x} y={y} dominantBaseline="middle" fill="var(--muted-foreground)">{value}</text>
