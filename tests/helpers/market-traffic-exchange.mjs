@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
 import { once } from 'node:events'
-import { marketTrafficPayloadIdentity, monotonicMicroseconds } from '../../electron/services/market-traffic-callback-probe.js'
+import { marketTrafficPayloadIdentity, marketTrafficWireFingerprint, monotonicMicroseconds } from '../../electron/services/market-traffic-callback-probe.js'
 import { ownFixtureServer } from './fixture-server.mjs'
 
 export const marketTrafficIntervals = Object.freeze({ '5m': 300_000, '15m': 900_000, '1H': 3_600_000 })
@@ -111,9 +111,10 @@ export async function createMarketTrafficExchange({ candidateCount = 50, passing
     const bytes = Buffer.byteLength(text)
     const sidecar = kind === 'data' && window.active && currentRoundEvidence && Array.isArray(value?.data)
       ? value.data.map(payload => ({
-        ...(marketTrafficPayloadIdentity(channel, value.arg?.instId, payload)
+        ...(marketTrafficPayloadIdentity(channel, value.arg?.instId, payload, value.action ?? null)
           ?? { channel, instId: value.arg?.instId ?? null, identity: null, payloadFingerprint: null }),
-        roundId, sequence: 0, sentAt: now(),
+        wireFingerprint: marketTrafficWireFingerprint(payload, value.action ?? null),
+        roundId, sequence: 0, sentAt: now(), wireAction: value.action ?? null, wirePayload: structuredClone(payload),
       })) : []
     const sentAtMonotonicUS = sidecar.length ? monotonicMicroseconds() : null
     client.socket.write(frame(text))

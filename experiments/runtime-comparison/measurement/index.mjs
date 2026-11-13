@@ -158,6 +158,13 @@ export function intervalFor(previous, current) {
         if (t1 === null || t0 === null || t1 < t0 || (before && totals.some(key => BigInt(p.counters[key]) < BigInt(before.counters[key])))) { totalValid = false; valid = false; continue }
         total += t1 - t0
         if (p1 === null || p0 === null || p1 > t1 || p0 > t0 || p1 < p0 || p1 - p0 > t1 - t0 || (before && performance.some(key => BigInt(p.counters[key]) < BigInt(before.counters[key])))) { valid = false; continue }
+        // User and system are independent counters: excess in one cannot be
+        // offset by spare capacity in the other, even when their sums fit.
+        if (totals.some((key, index) => {
+          const tAfter = BigInt(p.counters[key]), pAfter = BigInt(p.counters[performance[index]])
+          const tBefore = before ? BigInt(before.counters[key]) : 0n, pBefore = before ? BigInt(before.counters[performance[index]]) : 0n
+          return pAfter > tAfter || pBefore > tBefore || pAfter - pBefore > tAfter - tBefore
+        })) { valid = false; continue }
         pcore += p1 - p0
       }
       const toNs = value => value * BigInt(timebase.numer) / BigInt(timebase.denom)

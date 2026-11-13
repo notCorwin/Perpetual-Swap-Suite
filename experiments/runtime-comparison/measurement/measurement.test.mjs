@@ -182,3 +182,41 @@ test('validates Mach ticks before conversion and records the rounding remainder'
   assert.equal(invalid.pCoreExact, null)
   assert.equal(invalid.totalExact, '83')
 })
+
+test('rejects offsetting user and system P-core counter errors while retaining totals', () => {
+  for (const ticks of [true, false]) {
+    const snapshot = (end, total, pcore) => {
+      const suffix = ticks ? 'TicksExact' : 'NsExact'
+      return { sampleStartMonotonicNsExact: String(end - 1), sampleEndMonotonicNsExact: String(end),
+        ...(ticks ? { timebase: { numer: 1, denom: 1 } } : {}), cpuPTimeSupported: true,
+        cpuEnergySupported: true, cpuPEnergySupported: true,
+        processes: [{ pid: 42, birthIdentity: '42:1:0', group: 'runtime', counters: {
+          startMonotonicNsExact: '1',
+          [`cpuUser${suffix}`]: String(total[0]), [`cpuSystem${suffix}`]: String(total[1]),
+          [`cpuPUser${suffix}`]: String(pcore[0]), [`cpuPSystem${suffix}`]: String(pcore[1]),
+          cpuEnergyNjExact: String(end), cpuPEnergyNjExact: String(end / 2),
+        } }] }
+    }
+    for (const [beforeTotal, beforeP, afterTotal, afterP] of [
+      [[100, 100], [50, 50], [110, 200], [70, 50]], // user interval exceeds its total
+      [[100, 100], [50, 50], [200, 110], [50, 70]], // system interval exceeds its total
+      [[100, 100], [110, 0], [200, 200], [110, 0]], // invalid initial cumulative counter
+      [[100, 100], [50, 50], [110, 200], [111, 50]], // invalid final cumulative counter
+    ]) {
+      const result = intervalFor(snapshot(100, beforeTotal, beforeP), snapshot(200, afterTotal, afterP)).runtime
+      const cpu = result.breakdown.cpuTimeNs
+      assert.equal(cpu.source, ticks ? 'mach-ticks' : 'legacy-nanoseconds')
+      assert.equal(cpu.complete, false)
+      assert.equal(cpu.totalComplete, true)
+      assert.equal(cpu.totalExact, String(afterTotal[0] + afterTotal[1] - beforeTotal[0] - beforeTotal[1]))
+      assert.equal(cpu.pCoreExact, null)
+      assert.equal(cpu.eCoreExact, null)
+      assert.equal(result.cpuEnergyNjExact, '100')
+      assert.equal(result.breakdown.cpuEnergyNj.complete, true)
+    }
+    const zero = intervalFor(snapshot(100, [100, 100], [0, 0]), snapshot(200, [110, 200], [0, 0])).runtime.breakdown.cpuTimeNs
+    assert.equal(zero.complete, true)
+    assert.equal(zero.pCoreExact, '0')
+    assert.equal(zero.eCoreExact, '110')
+  }
+})

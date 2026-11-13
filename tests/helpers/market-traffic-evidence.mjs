@@ -161,6 +161,11 @@ function deriveEvidenceChannels({ expectedSubscriptions, fixtureEvents, nativeIn
     const ingress = native[0], accepted = callback[0]
     assert.equal(ingress.identity, fixtureEvent.identity, `Native ingress identity shifted for ${channel}/${instId}.`)
     assert.equal(accepted.identity, fixtureEvent.identity, `Application callback identity shifted for ${channel}/${instId}.`)
+    if (fixtureEvent.wireFingerprint !== undefined) {
+      assert.match(fixtureEvent.wireFingerprint, /^[a-f0-9]{64}$/, 'Invalid full wire fingerprint.')
+      assert.equal(ingress.wireFingerprint, fixtureEvent.wireFingerprint, `Native full wire fingerprint shifted for ${channel}/${instId}.`)
+      assert.equal(accepted.wireFingerprint, fixtureEvent.wireFingerprint, `Callback full wire fingerprint shifted for ${channel}/${instId}.`)
+    }
     assert.equal(ingress.payloadFingerprint, fixtureEvent.payloadFingerprint, `Native payload fingerprint shifted for ${channel}/${instId}.`)
     assert.equal(accepted.payloadFingerprint, fixtureEvent.payloadFingerprint, `Application payload fingerprint shifted for ${channel}/${instId}.`)
     assert.equal(accepted.nativeMessageSequence, ingress.nativeMessageSequence,

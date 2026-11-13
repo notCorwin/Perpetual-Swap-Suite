@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { realpathSync } from 'node:fs'
 import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
@@ -10,6 +10,7 @@ import { parseArgs } from 'node:util'
 import { _electron } from 'playwright'
 import { requireForegroundTests } from '../electron/test-presentation.js'
 import { createMarketTrafficExchange } from '../tests/helpers/market-traffic-exchange.mjs'
+import { replayInputDigest } from '../tests/helpers/market-replay-input.mjs'
 import { createMarketTrafficEvidence } from '../tests/helpers/market-traffic-evidence.mjs'
 import { inspectMarketTrafficReadiness } from '../tests/helpers/market-traffic-readiness.mjs'
 import { compareMarketTrafficReports, validateMarketTrafficReport } from './market-traffic-comparison.mjs'
@@ -259,17 +260,21 @@ if (baselineReportPath) {
     throw new Error(`Invalid --baseline-report ${baselineReportPath}: ${error.message}`)
   }
 }
-const app = await appEntryFor(values['app-root'] ?? root)
-const checkout = checkoutMetadata(app.selected.endsWith('.app') || app.selected.endsWith('.asar') ? root : app.selected)
-const target = await targetMetadata(app, checkout)
-const replayFingerprint = fixedRounds ? await replaySourceFingerprint(app) : null
+const runId = randomUUID()
 const output = resolve(values.output ?? join(root, '.build/traffic-optimization/market-traffic.json'))
-const userData = process.env.PERPETUAL_SWAP_USER_DATA
-if (!userData || (!foreground && !process.env.PERPETUAL_SWAP_TEST_GUARD)) throw new Error('Protected sandbox user data is required.')
-if (fixedRounds) assert.deepEqual(await readdir(userData), [], 'Fixed replay requires a fresh, empty sandbox user-data directory.')
-const fixture = await createMarketTrafficExchange({ candidateCount, passingCount, spreadFailureCount, seed: 17 })
-let electron, cadence, resourceSampler, failureMeasurements, completedReport, runtimeEvidence, presentationEvidence, readinessFailureEvidence, stopDiagnostics, mainLoopStarted = false
+await mkdir(dirname(output), { recursive: true })
+await writeFile(output, `${JSON.stringify({ schemaVersion: 1, runId, outcome: 'running', partial: true, startedAt: new Date().toISOString() }, null, 2)}\n`)
+let app, checkout, target, replayFingerprint, userData, fixture
+let electron, cadence, resourceSampler, failureMeasurements, completedReport, successSummary, runtimeEvidence, presentationEvidence, readinessFailureEvidence, stopDiagnostics, mainLoopStarted = false
 try {
+  app = await appEntryFor(values['app-root'] ?? root)
+  checkout = checkoutMetadata(app.selected.endsWith('.app') || app.selected.endsWith('.asar') ? root : app.selected)
+  target = await targetMetadata(app, checkout)
+  replayFingerprint = fixedRounds ? await replaySourceFingerprint(app) : null
+  userData = process.env.PERPETUAL_SWAP_USER_DATA
+  if (!userData || (!foreground && !process.env.PERPETUAL_SWAP_TEST_GUARD)) throw new Error('Protected sandbox user data is required.')
+  if (fixedRounds) assert.deepEqual(await readdir(userData), [], 'Fixed replay requires a fresh, empty sandbox user-data directory.')
+  fixture = await createMarketTrafficExchange({ candidateCount, passingCount, spreadFailureCount, seed: 17 })
   electron = await _electron.launch({ args: [app.entry], cwd: app.cwd,
     env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_E2E_LIVE_REFRESH: '1',
       PERPETUAL_SWAP_E2E_HTTP_ORIGIN: fixture.environment.PERPETUAL_SWAP_E2E_HTTP_ORIGIN,
@@ -396,7 +401,7 @@ try {
   }
   let resources
   failureMeasurements = {
-    schemaVersion: 1, mode: benchmarkMode, partial: true, generatedAt: new Date().toISOString(),
+    schemaVersion: 1, runId, mode: benchmarkMode, partial: true, generatedAt: new Date().toISOString(),
     diagnosticOnly: values.diagnostic === true,
     app: { path: app.selected, entry: app.entry, build: target, checkout },
     runtime: { ...runtime, testPresentation: runtime.testPresentation, presentation,
@@ -407,8 +412,8 @@ try {
       cadenceMS, durationSeconds, sampleStartedAt, expectOptimized, readiness, searchScenario,
       ...(fixedRounds ? { replay: { version: 'fixed-rounds-v1', expectedRounds: roundCount, actualRounds: traffic.rounds.length,
         timeSemantics: 'Live wall-clock timestamps; values use fixed round offsets. Runs crossing a 5-minute candle boundary are rejected; timestamps are not byte-identical.',
-        inputHash: createHash('sha256').update(await readFile(join(root, 'tests/helpers/market-traffic-exchange.mjs'))).digest('hex'),
-        inputHashMeaning: 'SHA-256 of the fixture source; configHash identifies its parameters.',
+        fixtureSourceHash: createHash('sha256').update(await readFile(join(root, 'tests/helpers/market-traffic-exchange.mjs'))).digest('hex'),
+        fixtureSourceHashMeaning: 'SHA-256 of the fixture source; configHash identifies its parameters.',
         databaseFixtureHash: createHash('sha256').update('empty-sandbox-user-data-v1').digest('hex'),
         databaseFixtureHashMeaning: 'SHA-256 of the empty initial-state descriptor, verified by listing the fresh user-data directory; no database file exists at that point.',
         sourceFingerprint: replayFingerprint,
@@ -446,6 +451,7 @@ try {
     drainDeadlineMonotonicUS: traffic.drainDeadlineMonotonicUS, cadenceMS,
     allowNoFillTrades: true,
     probeObserverCostMonotonicUS: appReceipts.probeObserverCostMonotonicUS })
+  if (fixedRounds) Object.assign(failureMeasurements.fixture.replay, replayInputDigest(receiptEvidence.fixtureEvents))
   if (foreground) assert.equal(renderer.presentation.totalViolations, 0, 'Foreground visibility and focus must hold throughout sampling.')
   assert.ok(Math.abs(traffic.durationSeconds - durationSeconds) <= 0.75,
     `Steady-state traffic sample duration drifted outside the bounded window: ${traffic.durationSeconds}s.`)
@@ -512,6 +518,7 @@ try {
   const httpResponsePayloadBytes = Object.values(traffic.http).reduce((sum, value) => sum + value.payloadBytes, 0)
   const report = {
     schemaVersion: 1,
+    runId,
     mode: benchmarkMode,
     generatedAt: new Date().toISOString(),
     diagnosticOnly: values.diagnostic === true,
@@ -565,21 +572,21 @@ try {
       throw error
     }
   }
-  await writeFile(output, `${JSON.stringify(report, null, 2)}\n`)
-  console.log(JSON.stringify({ report: output, diagnosticOnly: values.diagnostic === true, candidates: candidateCount, qualified: passingCount,
+  successSummary = { report: output, diagnosticOnly: values.diagnostic === true, candidates: candidateCount, qualified: passingCount,
     completeRounds: receiptEvidence.fixtureRounds.length, matchedPayloads: receiptEvidence.fixtureEvents.length,
     maximumSendToCallbackAcceptanceMS: receiptEvidence.aggregateLatenciesUS.fixtureSendToCallbackAcceptance.maximumUS / 1_000,
-    totalPayloadBytes: report.traffic.totalPayloadBytes }, null, 2))
+    totalPayloadBytes: report.traffic.totalPayloadBytes }
 } catch (error) {
   if (failureMeasurements && error?.marketTrafficEvidence) failureMeasurements.rawCausalEvidence = error.marketTrafficEvidence
-  const requestCounts = Object.fromEntries([...new Set(fixture.requests.map(request => request.path))].map(path => [path,
-    fixture.requests.filter(request => request.path === path).length]))
-  const channels = Object.fromEntries(Object.entries(fixture.currentAcknowledgements).map(([channel, ids]) => [channel, ids.length]))
-  const deliveryCounts = Object.fromEntries(Object.entries(fixture.deliverySummary().byChannel).map(([channel, value]) => [channel, value.instrumentCount]))
-  const diagnostics = { benchmarkFailure: error.message, fixtureErrors: fixture.errors, fixtureAsOf: fixture.asOf,
-    fixtureRequests: requestCounts, fixtureReadyClients: fixture.readyState.clients,
+  const requests = fixture?.requests ?? []
+  const requestCounts = Object.fromEntries([...new Set(requests.map(request => request.path))].map(path => [path,
+    requests.filter(request => request.path === path).length]))
+  const channels = Object.fromEntries(Object.entries(fixture?.currentAcknowledgements ?? {}).map(([channel, ids]) => [channel, ids.length]))
+  const deliveryCounts = Object.fromEntries(Object.entries(fixture?.deliverySummary().byChannel ?? {}).map(([channel, value]) => [channel, value.instrumentCount]))
+  const diagnostics = { benchmarkFailure: error.message, fixtureErrors: fixture?.errors ?? [], fixtureAsOf: fixture?.asOf ?? null,
+    fixtureRequests: requestCounts, fixtureReadyClients: fixture?.readyState.clients ?? null,
     fixtureSubscriptions: channels, instrumentsWithFixtureDeliveries: deliveryCounts,
-    fixtureRequestDetails: fixtureRequestEvidence(fixture.requests),
+    fixtureRequestDetails: fixtureRequestEvidence(requests),
     ...(error.readinessEvidence ?? readinessFailureEvidence ? { chartReadiness: error.readinessEvidence ?? readinessFailureEvidence } : {}) }
   if (completedReport) {
     try {
@@ -598,13 +605,13 @@ try {
     } catch (reportError) { diagnostics.partialFailureReportError = reportError.message }
   } else {
     try {
-      const partial = { schemaVersion: 1, mode: benchmarkMode, partial: true, outcome: 'failed', generatedAt: new Date().toISOString(),
+      const partial = { schemaVersion: 1, runId, mode: benchmarkMode, partial: true, outcome: 'failed', generatedAt: new Date().toISOString(),
         failure: error.message, diagnostics,
-        app: { path: app.selected, entry: app.entry, build: target, checkout },
+        app: app ? { path: app.selected, entry: app.entry, build: target, checkout } : null,
         runtime: runtimeEvidence ? { ...runtimeEvidence, presentation: presentationEvidence,
           network: 'external network disabled; injected HTTP/WebSocket origins are 127.0.0.1' } : null,
-        fixture: { asOf: fixture.asOf, candidateCount, passingCount, spreadFailureCount, oiFailureCount: fixture.oiFailureCount, seed: fixture.seed,
-          dataFingerprint: `market-traffic-v3-app-receipts-${candidateCount}-${passingCount}-${spreadFailureCount}-seed-${fixture.seed}`,
+        fixture: { asOf: fixture?.asOf ?? null, candidateCount, passingCount, spreadFailureCount, oiFailureCount: fixture?.oiFailureCount ?? null, seed: fixture?.seed ?? null,
+          dataFingerprint: `market-traffic-v3-app-receipts-${candidateCount}-${passingCount}-${spreadFailureCount}-seed-${fixture?.seed ?? 17}`,
           cadenceMS, durationSeconds, expectOptimized, readiness: readinessFailureEvidence ?? null } }
       await mkdir(dirname(output), { recursive: true })
       await writeFile(output, `${JSON.stringify(partial, null, 2)}\n`)
@@ -615,13 +622,30 @@ try {
   console.error(error.stack ?? error.message)
   process.exitCode = 1
 } finally {
-  try { cadence?.stop() } catch (error) { console.error(error); process.exitCode = 1 }
-  try { await resourceSampler?.stop() } catch (error) { console.error(error); process.exitCode = 1 }
+  const cleanupErrors = []
+  const recordCleanup = (step, error) => { cleanupErrors.push({ step, message: error.message }); console.error(error); process.exitCode = 1 }
+  try { cadence?.stop() } catch (error) { recordCleanup('cadence', error) }
+  try { await resourceSampler?.stop() } catch (error) { recordCleanup('resourceSampler', error) }
   if (mainLoopStarted) {
     try { await electron.evaluate(() => globalThis.__mainLoopWitness?.stop()) }
-    catch (error) { console.error(error); process.exitCode = 1 }
+    catch (error) { recordCleanup('mainLoopWitness', error) }
   }
-  try { await stopDiagnostics?.() } catch (error) { console.error(error); process.exitCode = 1 }
-  try { await electron?.close() } catch (error) { console.error(error); process.exitCode = 1 }
-  try { await fixture?.close() } catch (error) { console.error(error); process.exitCode = 1 }
+  try { await stopDiagnostics?.() } catch (error) { recordCleanup('diagnostics', error) }
+  try { await electron?.close() } catch (error) { recordCleanup('electron', error) }
+  try { await fixture?.close() } catch (error) { recordCleanup('fixture', error) }
+  if (cleanupErrors.length) {
+    try {
+      const prior = completedReport ?? await readFile(output, 'utf8').then(JSON.parse).catch(() => failureMeasurements ?? { schemaVersion: 1, mode: benchmarkMode })
+      prior.outcome = 'failed'
+      prior.partial = true
+      prior.failure ??= `Cleanup failed: ${cleanupErrors.map(item => item.step).join(', ')}`
+      prior.cleanupErrors = cleanupErrors
+      await mkdir(dirname(output), { recursive: true })
+      await writeFile(output, `${JSON.stringify(prior, null, 2)}\n`)
+    } catch (error) { console.error('Failed to persist cleanup failure report:', error); process.exitCode = 1 }
+  } else if (completedReport && !process.exitCode) {
+    completedReport.outcome = 'passed'
+    await writeFile(output, `${JSON.stringify(completedReport, null, 2)}\n`)
+    console.log(JSON.stringify(successSummary, null, 2))
+  }
 }

@@ -36,12 +36,17 @@ function normalizeCandle(payload) {
   }
 }
 
+// Hash every JSON value exactly as parsed, preserving field presence, types and arrays.
+export function marketTrafficWireFingerprint(payload, action = null) {
+  return createHash('sha256').update(JSON.stringify([action, payload])).digest('hex')
+}
+
 /**
  * Build a stable identity from fields already present in OKX data. This is
  * called only while the loopback traffic observer is armed; normal live
  * messages are neither hashed nor retained.
  */
-export function marketTrafficPayloadIdentity(channel, instId, payload) {
+export function marketTrafficPayloadIdentity(channel, instId, payload, action = null) {
   if (typeof channel !== 'string' || typeof instId !== 'string' || !payload) return null
   let identityFields, normalized
   if (channel === 'tickers') {
@@ -55,7 +60,7 @@ export function marketTrafficPayloadIdentity(channel, instId, payload) {
     const bids = Array.isArray(payload.bids) ? payload.bids.map(level => Array.isArray(level) ? level.slice(0, 4).map(text) : []) : []
     const asks = Array.isArray(payload.asks) ? payload.asks.map(level => Array.isArray(level) ? level.slice(0, 4).map(text) : []) : []
     identityFields = [text(payload.seqId), text(payload.ts)]
-    normalized = { seqId: numeric(payload.seqId), ts: text(payload.ts), bids, asks }
+    normalized = { action, seqId: numeric(payload.seqId), prevSeqId: numeric(payload.prevSeqId), ts: text(payload.ts), bids, asks }
   } else if (channel === 'trades') {
     identityFields = [text(payload.tradeId)]
     normalized = Object.fromEntries(['tradeId', 'ts', 'side', 'sz', 'px', 'count']

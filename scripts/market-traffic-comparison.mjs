@@ -4,6 +4,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
+import { replayInputDigest } from '../tests/helpers/market-replay-input.mjs'
 import { validateMarketTrafficEvidence } from '../tests/helpers/market-traffic-evidence.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
@@ -87,6 +88,11 @@ export function validateMarketTrafficReport(report, label, { baseline = false } 
   assert.deepEqual([...report.fixture.candidateIDs].sort(), report.fixture.candidateIDs, `${label} fixture candidate IDs must be sorted.`)
   const receiptEvidence = report.traffic.receiptEvidence
   validateMarketTrafficEvidence(receiptEvidence)
+  if (report.fixture?.replay) {
+    const digest = replayInputDigest(receiptEvidence.fixtureEvents)
+    assert.deepEqual({ payloadHash: report.fixture.replay.payloadHash, normalizedInputHash: report.fixture.replay.normalizedInputHash,
+      normalization: report.fixture.replay.normalization, bases: report.fixture.replay.bases, eventCount: report.fixture.replay.eventCount }, digest, `${label} replay input digest does not match its receipt evidence.`)
+  }
   assert.equal(receiptEvidence.sampleStartedAt, report.fixture.sampleStartedAt, `${label} receipt timestamps must use the fixture sample start.`)
   assert.ok(Math.abs(receiptEvidence.durationMS / 1_000 - report.fixture.durationSeconds) <= .75, `${label} receipt window drifted from the measured traffic duration.`)
   assert.deepEqual(report.traffic.configuredDemand?.candidateIDs, report.fixture.candidateIDs,
@@ -216,6 +222,8 @@ export function compareMarketTrafficReports(before, after) {
     assert.equal(after.fixture[key], before.fixture[key], `Before/after fixture input ${key} must match exactly.`)
   }
   assert.deepEqual(after.fixture.candidateIDs, before.fixture.candidateIDs, 'Before/after fixture candidate IDs must match exactly.')
+  assert.ok(before.fixture.replay && after.fixture.replay, 'Both reports need matched replay input evidence for comparison.')
+  assert.equal(after.fixture.replay.normalizedInputHash, before.fixture.replay.normalizedInputHash, 'Replay semantic input hashes must match for comparison.')
   assert.equal(after.runtime.electronVersion, before.runtime.electronVersion, 'Before/after must use the same Electron version.')
   if (foreground) {
     assert.deepEqual(after.fixture.searchScenario, before.fixture.searchScenario, 'Before/after must use the same search schedule.')

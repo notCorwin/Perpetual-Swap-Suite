@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
-import { createHash } from 'node:crypto'
 import test from 'node:test'
+import { marketTrafficPayloadIdentity, marketTrafficWireFingerprint } from '../../electron/services/market-traffic-callback-probe.js'
+import { replayInputDigest } from '../helpers/market-replay-input.mjs'
 import { createMarketTrafficEvidence } from '../helpers/market-traffic-evidence.mjs'
 import { compareMarketTrafficReports, validateMarketTrafficReport } from '../../scripts/market-traffic-comparison.mjs'
 
@@ -31,17 +32,24 @@ function trafficEvidence() {
     const roundId = index + 1, roundEvents = []
     const sentAtMonotonicUS = sampleStartedMonotonicUS + 500_000 + index * 500_000
     for (const [channel, ids] of Object.entries(expectedSubscriptions)) for (const instId of ids) {
-      const identity = JSON.stringify([channel, instId, roundId])
-      const payloadFingerprint = createHash('sha256').update(identity).digest('hex')
-      const event = { channel, instId, identity, payloadFingerprint, roundId, sequence: index + 1,
+      const ts = String(sampleStartedAt + index * 500)
+      const wireAction = channel === 'books' ? 'update' : null
+      const wirePayload = channel === 'books' ? { seqId: roundId + 1, prevSeqId: roundId, ts, bids: [], asks: [] }
+        : channel === 'trades' ? { tradeId: String(roundId), ts, side: 'buy', sz: '1', px: '1', count: '1' }
+        : channel === 'candle5m' ? [ts, '1', '1', '1', String(roundId), '1', '1', '1', '0']
+        : channel === 'tickers' ? { ts, last: String(roundId), bidPx: '1', askPx: '1' }
+        : { ts, oi: String(roundId), oiUsd: '1' }
+      const { identity, payloadFingerprint } = marketTrafficPayloadIdentity(channel, instId, wirePayload, wireAction)
+      const wireFingerprint = marketTrafficWireFingerprint(wirePayload, wireAction)
+      const event = { channel, instId, identity, payloadFingerprint, wireFingerprint, wireAction, wirePayload, roundId, sequence: index + 1,
         sentAt: sampleStartedAt + 500 + index * 500, sentAtMonotonicUS }
       fixtureEvents.push(event)
       roundEvents.push(event)
       nativeMessageSequence++
       const nativeHandlerEnteredAtMonotonicUS = sentAtMonotonicUS + 1_000
-      nativeIngressEvents.push({ channel, instId, identity, payloadFingerprint, nativeMessageSequence, nativeHandlerEnteredAtMonotonicUS })
+      nativeIngressEvents.push({ channel, instId, identity, payloadFingerprint, wireFingerprint, nativeMessageSequence, nativeHandlerEnteredAtMonotonicUS })
       callbackID++
-      callbackEvents.push({ channel, instId, identity, payloadFingerprint, nativeMessageSequence, callbackID,
+      callbackEvents.push({ channel, instId, identity, payloadFingerprint, wireFingerprint, nativeMessageSequence, callbackID,
         nativeHandlerEnteredAtMonotonicUS, callbackEnteredAtMonotonicUS: sentAtMonotonicUS + 2_000,
         callbackAcceptedAtMonotonicUS: sentAtMonotonicUS + 20_000,
         receivedAt: sampleStartedAt + 505 + index * 500, fillCount: channel === 'trades' ? 1 : 0 })
@@ -95,7 +103,7 @@ function report({ baseline = false, foreground = false, multiplier = 1, seed = 1
         executable: '/fixture/electron' } : { sourceFingerprint: 'a'.repeat(64) }), electronVersion: '44.9.0' },
     fixture: { candidateCount: 10, candidateIDs, passingCount: 2, spreadFailureCount: 4, oiFailureCount: 4, seed,
       dataFingerprint: `market-traffic-v3-app-receipts-10-2-4-seed-${seed}`, cadenceMS: 500, durationSeconds: 7,
-      sampleStartedAt, expectOptimized: !baseline, requiredChannels,
+      sampleStartedAt, expectOptimized: !baseline, requiredChannels, replay: replayInputDigest(receiptEvidence.fixtureEvents),
       qualification: { total: 10, completed: 10, pending: 0, verified: 2, failed: 8, unknown: 0 },
       ...(foreground ? { readinessPhase: 'all-passing-15m-frames-ready-before-steady-state-sample',
         searchScenario: { version: 'distributed-input-v1', eventCount: 21, windowMS: 7_000, lastInputAtMS: 6_900 },
@@ -245,4 +253,17 @@ test('foreground search measurements require complete, distributed, correct resu
   wrongResults.renderer.searchInputToSecondRAFMS.samples[3].correct = false
   wrongResults.renderer.searchInputToSecondRAFMS.samples[3].actualResultCount = 2
   assert.throws(() => compareMarketTrafficReports(before, wrongResults), /filtered results/)
+})
+
+test('comparison rejects legacy reports without matched actual input evidence', () => {
+  const before = report({ baseline: true }), after = report()
+  delete before.fixture.replay
+  delete after.fixture.replay
+  assert.throws(() => compareMarketTrafficReports(before, after), /matched replay input evidence/)
+})
+
+test('comparison rejects altered full native wire fingerprint', () => {
+  const before = report({ baseline: true }), after = report()
+  after.traffic.receiptEvidence.nativeIngressEvents[0].wireFingerprint = 'f'.repeat(64)
+  assert.throws(() => compareMarketTrafficReports(before, after), /Native full wire fingerprint shifted/)
 })

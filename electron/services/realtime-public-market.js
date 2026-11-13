@@ -2,7 +2,7 @@ import { hookOperationMethods } from './operations.js'
 // Native OKX public streams cover the entire eligible universe independently of
 // chart selection. https://www.okx.com/docs-v5/en/#order-book-trading-market-data
 import { recordedWebSocketFactory } from './network-operations.js'
-import { marketTrafficPayloadIdentity, monotonicMicroseconds } from './market-traffic-callback-probe.js'
+import { marketTrafficPayloadIdentity, marketTrafficWireFingerprint, monotonicMicroseconds } from './market-traffic-callback-probe.js'
 
 export const OKX_PUBLIC_WEBSOCKET_URL = 'wss://ws.okx.com/ws/v5/public'
 export const PUBLIC_MARKET_CONTRACTS_PER_CONNECTION = 25
@@ -511,8 +511,9 @@ class PublicMarketConnection {
     if (Number.isSafeInteger(nativeHandlerEnteredAtMonotonicUS) && typeof trafficObserver === 'function') {
       const probeStartedAtMonotonicUS = monotonicMicroseconds()
       trafficEvents = message.data.map(payload => ({
-        ...(marketTrafficPayloadIdentity(subscription.channel, subscription.instId, payload)
+        ...(marketTrafficPayloadIdentity(subscription.channel, subscription.instId, payload, message.action ?? null)
           ?? { channel: subscription.channel, instId: subscription.instId, identity: null, payloadFingerprint: null }),
+        wireFingerprint: marketTrafficWireFingerprint(payload, message.action ?? null),
         nativeMessageSequence, nativeHandlerEnteredAtMonotonicUS,
       }))
       const probeCostMonotonicUS = monotonicMicroseconds() - probeStartedAtMonotonicUS

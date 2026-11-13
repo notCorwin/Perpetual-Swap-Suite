@@ -1,6 +1,6 @@
 import { hookOperationMethods } from './operations.js'
 import { recordedWebSocketFactory } from './network-operations.js'
-import { marketTrafficPayloadIdentity, monotonicMicroseconds } from './market-traffic-callback-probe.js'
+import { marketTrafficPayloadIdentity, marketTrafficWireFingerprint, monotonicMicroseconds } from './market-traffic-callback-probe.js'
 
 // OKX business WebSocket: https://www.okx.com/docs-v5/en/#order-book-trading-market-data-ws-candlesticks-channel
 // Port 8443 retires on 2026-10-31: https://www.okx.com/docs-v5/log_en/
@@ -432,6 +432,7 @@ export class RealtimeMarket {
       const trafficEvent = {
         ...(marketTrafficPayloadIdentity(channel, subscription.instId, raw)
           ?? { channel, instId: subscription.instId, identity: null, payloadFingerprint: null }),
+        wireFingerprint: marketTrafficWireFingerprint(raw),
         nativeMessageSequence, nativeHandlerEnteredAtMonotonicUS,
       }
       trafficContext = { marketTrafficEvents: [trafficEvent] }
