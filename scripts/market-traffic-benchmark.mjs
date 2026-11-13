@@ -14,6 +14,8 @@ import { compareMarketTrafficReports, validateMarketTrafficReport } from './mark
 import { startRendererDiagnostics } from './renderer-diagnostics.mjs'
 import { installMainLoopWitness } from './main-loop-witness.mjs'
 import { installMarketTrafficRendererProbe } from './market-traffic-renderer-probe.mjs'
+import { startSampling } from '../experiments/runtime-comparison/measurement/index.mjs'
+import { summarizeResources } from '../experiments/runtime-comparison/analyze.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
 const { values } = parseArgs({
@@ -23,6 +25,7 @@ const { values } = parseArgs({
     'spread-failure-count': { type: 'string' }, 'duration-seconds': { type: 'string' }, 'cadence-ms': { type: 'string' },
     'expect-optimized': { type: 'boolean' }, foreground: { type: 'boolean' }, diagnostic: { type: 'boolean' },
     'wait-ready': { type: 'boolean' }, 'baseline-report': { type: 'string' },
+    resources: { type: 'boolean' },
   },
   allowPositionals: false,
 })
@@ -44,6 +47,7 @@ const expectOptimized = values['expect-optimized'] === true
 const foreground = values.foreground === true
 const baselineReportPath = values['baseline-report'] ? resolve(values['baseline-report']) : null
 if (values.diagnostic && baselineReportPath) throw new Error('Diagnostic profiling cannot be compared with an acceptance baseline.')
+if (values.resources && (values.diagnostic || foreground || !values['wait-ready'])) throw new Error('--resources requires --wait-ready and a hidden, non-diagnostic run.')
 const waitReady = foreground || values['wait-ready'] === true
 const searchEventCount = (passingCount + 1) * (foreground ? Math.ceil(21 / (passingCount + 1)) : 1)
 const searchScenario = foreground ? { version: 'distributed-input-v1', eventCount: searchEventCount,
@@ -228,13 +232,15 @@ const output = resolve(values.output ?? join(root, '.build/traffic-optimization/
 const userData = process.env.PERPETUAL_SWAP_USER_DATA
 if (!userData || (!foreground && !process.env.PERPETUAL_SWAP_TEST_GUARD)) throw new Error('Protected sandbox user data is required.')
 const fixture = await createMarketTrafficExchange({ candidateCount, passingCount, spreadFailureCount, seed: 17 })
-let electron, cadence, failureMeasurements, completedReport, runtimeEvidence, presentationEvidence, readinessFailureEvidence, stopDiagnostics, mainLoopStarted = false
+let electron, cadence, resourceSampler, failureMeasurements, completedReport, runtimeEvidence, presentationEvidence, readinessFailureEvidence, stopDiagnostics, mainLoopStarted = false
 try {
   electron = await _electron.launch({ args: [app.entry], cwd: app.cwd,
     env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_E2E_LIVE_REFRESH: '1',
       PERPETUAL_SWAP_E2E_HTTP_ORIGIN: fixture.environment.PERPETUAL_SWAP_E2E_HTTP_ORIGIN,
       PERPETUAL_SWAP_E2E_WEBSOCKET_ORIGIN: fixture.environment.PERPETUAL_SWAP_E2E_WEBSOCKET_ORIGIN,
       PERPETUAL_SWAP_USER_DATA: userData } })
+  if (values.resources) resourceSampler = await startSampling({ rootPids: [electron.process().pid], intervalMS: 1000, includeWebKit: false,
+    onSample(sample) { assert.equal(sample.frontmostIsRuntime, false, 'The test runtime must never be frontmost.') } })
   const page = await electron.firstWindow()
   await page.waitForLoadState('domcontentloaded')
   const presentation = foreground ? await assertForeground(electron, page) : await assertHidden(electron)
@@ -346,6 +352,24 @@ try {
   })()
   await Promise.all([interactionTask, sleep(durationSeconds * 1_000)])
   const traffic = fixture.endSample()
+  let resources
+  if (resourceSampler) {
+    // stop() drains the in-flight read, verifies its callback, and checks the
+    // final sample before any successful acceptance report can be written.
+    const capture = await resourceSampler.stop()
+    resourceSampler = undefined
+    // timestampMS is recorded after the native read. Drop the first candidate
+    // to avoid counting an interval that may have started before the fixture.
+    const samples = capture.samples.filter(sample => sample.timestampMS >= traffic.startedAt && sample.timestampMS <= traffic.endedAt).slice(1)
+    assert.ok(samples.length >= 2, 'Insufficient process samples inside the traffic window.')
+    const summary = summarizeResources({ samples, skippedSamples: capture.skippedSamples }).combined
+    assert.equal(summary.coverage.cpu.complete, true, 'Incomplete process-tree CPU coverage inside the traffic window.')
+    resources = { measurement: 'Electron process tree CPU including worker threads, over a conservative subwindow selected using helper-return timestamps. CPU energy excludes GPU and display; the sampler itself is outside the process tree. Operation recording may affect results.',
+      trafficWindow: { from: traffic.startedAt, through: traffic.endedAt },
+      sampleWindow: { from: samples[0].timestampMS, through: samples.at(-1).timestampMS, count: samples.length },
+      skippedSamples: capture.skippedSamples, skippedSamplesScope: 'Entire sampler run, including setup and shutdown; not specific to the traffic window.',
+      rawSamples: samples, summary }
+  }
   failureMeasurements = {
     schemaVersion: 1, mode: benchmarkMode, partial: true, generatedAt: new Date().toISOString(),
     diagnosticOnly: values.diagnostic === true,
@@ -452,6 +476,7 @@ try {
       fixtureRequests: fixture.requests.length,
       fixtureRequestDetails: fixtureRequestEvidence(fixture.requests) },
     renderer: { ...renderer, measurement: searchMeasurement },
+    ...(resources ? { resources } : {}),
     mainProcess,
     correctness: { finalRealtimeState: finalSnapshot.realtimeState, connectedWebSocketClients: fixture.readyState.clients,
       allCandidatesHaveContinuousTickerOpenInterestAnd5mReceipts: true,
@@ -525,12 +550,13 @@ try {
   console.error(error.stack ?? error.message)
   process.exitCode = 1
 } finally {
-  cadence?.stop()
+  try { cadence?.stop() } catch (error) { console.error(error); process.exitCode = 1 }
+  try { await resourceSampler?.stop() } catch (error) { console.error(error); process.exitCode = 1 }
   if (mainLoopStarted) {
     try { await electron.evaluate(() => globalThis.__mainLoopWitness?.stop()) }
     catch (error) { console.error(error); process.exitCode = 1 }
   }
   try { await stopDiagnostics?.() } catch (error) { console.error(error); process.exitCode = 1 }
-  if (electron) await electron.close()
-  if (fixture) await fixture.close()
+  try { await electron?.close() } catch (error) { console.error(error); process.exitCode = 1 }
+  try { await fixture?.close() } catch (error) { console.error(error); process.exitCode = 1 }
 }

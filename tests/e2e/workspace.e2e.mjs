@@ -85,9 +85,7 @@ before(async () => {
         const stale = state.staleNextSnapshot
         state.staleNextSnapshot = false
         if (stale) state.staleReplies += 1
-        const snapshot = { rows: stale ? [] : state.rows, turnoverOrder: [...state.rows].sort((a, b) => (b.turnover24hUSDT ?? -1) - (a.turnover24hUSDT ?? -1) || a.instId.localeCompare(b.instId, 'en')).map(row => row.instId), revision: state.revision - (stale ? 1 : 0), serviceSession: 'renderer-fixture',
-          realtimeState: state.realtimeState, updatedAt: state.updatedAt,
-          catalogSource: state.catalogSource, catalogProgress: state.catalogProgress, error: state.error, loading: state.loading }
+        const snapshot = state.marketSnapshot(stale)
         state.snapshotActive += 1
         state.snapshotMaximum = Math.max(state.snapshotMaximum, state.snapshotActive)
         try {
@@ -99,8 +97,7 @@ before(async () => {
           return snapshot
         } finally { state.snapshotActive -= 1 }
       }
-      if (value.chartUniverse) return { frames: state.rows.flatMap(({ instId }) => ['5m', '15m', '1H']
-        .filter(timeframe => !state.coldTimeframes.includes(timeframe)).map(timeframe => prepared({ instId, timeframe }))) }
+      if (value.chartUniverse) return { frames: state.preparedFrames() }
       if (value.chartFocus) return { ok: true }
       if (value.chartLocal || value.chartHistory) {
         const query = value.chartLocal ?? value.chartHistory
@@ -152,12 +149,43 @@ before(async () => {
       }
       throw new Error(`Unsupported renderer fixture operation: ${Object.keys(value).join(', ')}`)
     }
+    state.marketSnapshot = stale => ({ rows: stale ? [] : state.rows, turnoverOrder: [...state.rows].sort((a, b) => (b.turnover24hUSDT ?? -1) - (a.turnover24hUSDT ?? -1) || a.instId.localeCompare(b.instId, 'en')).map(row => row.instId), revision: state.revision - (stale ? 1 : 0), serviceSession: 'renderer-fixture',
+      realtimeState: state.realtimeState, updatedAt: state.updatedAt,
+      catalogSource: state.catalogSource, catalogProgress: state.catalogProgress, error: state.error, loading: state.loading })
+    state.preparedFrames = () => state.rows.flatMap(({ instId }) => ['5m', '15m', '1H']
+      .filter(timeframe => !state.coldTimeframes.includes(timeframe)).map(timeframe => prepared({ instId, timeframe })))
+    // Resume barriers must use the same fixture as ordinary desktop requests.
+    // Fence any in-flight real-backend restore before replacing its boundary.
+    await globalThis.__presentationTest.setActive(false)
+    globalThis.__marketBackend.presentation = async (active, epoch) => active ? {
+      market: state.marketSnapshot(false), frames: state.preparedFrames(), preferences: state.preferences,
+      audit: structuredClone(state.audit), download: structuredClone(state.historyDownload),
+    } : { epoch }
+    await globalThis.__presentationTest.setActive(true)
     ipcMain.handle('radar:request', async (event, value) => {
       const result = await state.request(event, value)
       return value.chartUniverse || value.chartLocal || value.chartHistory || value.chartWindow ? encodeChartWire(result) : result
     })
   })
   await page.setViewportSize({ width: Number(process.env.PERPETUAL_SWAP_UI_INITIAL_WIDTH ?? 800), height: Number(process.env.PERPETUAL_SWAP_UI_INITIAL_HEIGHT ?? 572) })
+  // Observe capture replies at the renderer boundary without changing the
+  // production bridge or the returned values used by the application.
+  await page.addInitScript(() => {
+    window.__captureReplies = 0
+    const define = Object.defineProperty
+    Object.defineProperty = function (target, key, descriptor) {
+      if (target === window && key === 'radarDesktop') {
+        Object.defineProperty = define
+        const original = descriptor.value
+        descriptor.value = Object.freeze({ ...original, request: (...args) => {
+          const reply = original.request(...args)
+          if (!args[0]?.captureChart) return reply
+          return reply.then(value => { window.__captureReplies++; return value }, error => { window.__captureReplies++; throw error })
+        } })
+      }
+      return define(target, key, descriptor)
+    }
+  })
   // Install before mounting so renderer timers and performance.now() share one clock.
   await page.clock.install()
   await page.reload({ waitUntil: 'domcontentloaded' })
@@ -904,15 +932,25 @@ test('market notifications wait while hidden and refresh immediately when the wo
 test('a delayed chart capture cannot copy pixels after the selected timeframe changes', async () => {
   await electron.evaluate(() => { globalThis.__workspaceFixture.holdCapture = true })
   const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.copyImage).length)
-  await page.getByRole('button', { name: 'Copy chart', exact: true }).click()
-  await page.waitForFunction(() => document.querySelector('button') && [...document.querySelectorAll('button')].some(button => button.textContent.includes('Copying…')))
-  await selectTimeframe(page, '1h')
-  await electron.evaluate(() => globalThis.__workspaceFixture.releaseCapture())
-  await page.waitForFunction(() => [...document.querySelectorAll('[role="alert"]')].some(element => element.textContent.includes('Chart changed during capture')))
-  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.copyImage).length), before)
-  await selectTimeframe(page, '15m')
-  await page.getByRole('button', { name: 'Copy chart', exact: true }).click()
-  await page.getByRole('status').filter({ hasText: 'Chart copied to clipboard' }).waitFor()
+  const replies = await page.evaluate(() => window.__captureReplies)
+  try {
+    await page.getByRole('button', { name: 'Copy chart', exact: true }).click()
+    // Copying precedes the two animation frames that dispatch capture.
+    await waitForAuditFixture(() => typeof globalThis.__workspaceFixture.releaseCapture === 'function')
+    await selectTimeframe(page, '1h')
+    await electron.evaluate(() => globalThis.__workspaceFixture.releaseCapture())
+    await page.waitForFunction(previous => window.__captureReplies > previous, replies)
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)))
+    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.copyImage).length), before)
+    assert.equal(await page.getByRole('alert').filter({ hasText: 'Chart changed during capture' }).count(), 0,
+      'An obsolete capture cannot publish an error into the new chart session.')
+    await page.getByRole('button', { name: 'Copy chart', exact: true }).click()
+    await page.getByRole('status').filter({ hasText: 'Chart copied to clipboard' }).waitFor()
+    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.copyImage).length), before + 1)
+  } finally {
+    await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.holdCapture = false; state.releaseCapture?.() })
+    await selectTimeframe(page, '15m')
+  }
 })
 
 test('search preserves selection while six width/DPR combinations share page, pointer, and capture coordinates', async () => {
@@ -1472,6 +1510,8 @@ test('long market errors remain fully visible when the list is empty', async () 
 })
 
 test('a rejected old snapshot preserves notifications and backend exclusions remove rows immediately', async () => {
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  await page.locator('[data-market-index][aria-selected="true"][aria-label="View BETA-USDT-SWAP chart"]').waitFor()
   try {
     await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.staleNextSnapshot = true; state.notify() })
     await waitForAuditFixture(() => globalThis.__workspaceFixture.staleReplies > 0)

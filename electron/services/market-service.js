@@ -657,7 +657,8 @@ export class MarketService {
       // A late deadline callback must not restart the delay at its arrival time.
       this.bufferListRemoval(entry, now)
     }
-    const changed = JSON.stringify([...next]) !== JSON.stringify([...this.catalog])
+    const changed = next.size !== previous.size || [...next.keys()].some(instId => !previous.has(instId))
+      || JSON.stringify([...next]) !== JSON.stringify([...previous])
     this.catalog = next
     for (const entry of next.values()) this.instruments.set(entry.instrument.instId, entry.instrument)
     if (changed) { this.catalogRevision += 1; this.touchList() }

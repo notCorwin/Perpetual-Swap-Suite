@@ -242,6 +242,26 @@ test('price-only updates reuse ordering while changed keys and membership rebuil
   } finally { await f.close() }
 })
 
+test('catalog replacement detects membership and record changes without false revisions', async () => {
+  const f = await fixture()
+  try {
+    const id = instId, other = 'ETH-USDT-SWAP'
+    const entry = (name: string, last = '100') => ({ instrument: { ...instrument, instId: name },
+      ticker: { ...ticker, instId: name, last }, result: { eligible: true, status: 'verified' },
+      observedAt: 1, expiresAt: Number.MAX_SAFE_INTEGER })
+    assert.equal(f.service.replaceCatalog([entry(id)]), true)
+    const revision = f.service.catalogRevision
+    assert.equal(f.service.replaceCatalog([entry(id)]), false)
+    assert.equal(f.service.catalogRevision, revision)
+    assert.equal(f.service.replaceCatalog([entry(id, '101')]), true)
+    assert.equal(f.service.catalog.get(id).ticker.last, '101')
+    assert.equal(f.service.replaceCatalog([entry(other)]), true)
+    assert.equal(f.service.catalog.has(id), false)
+    assert.equal(f.service.catalog.has(other), true)
+    assert.equal(f.service.replaceCatalog([]), true)
+  } finally { await f.close() }
+})
+
 test('request queues retain priority, fairness and per-instrument rate limits at scale', async context => {
   let now = 1_800_000_000_000
   context.mock.method(Date, 'now', () => now)
