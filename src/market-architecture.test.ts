@@ -242,3 +242,26 @@ test('an older bulk OI value cannot renew newer native evidence during scoped re
   assert.equal(service.sourceRecoveries.has(`${instId}:openInterest`), true)
   assert.ok(recovery.retryAt > Date.now())
 })
+
+test('a candidate source observation cancels an in-flight repair immediately', async t => {
+  const entered = deferred(), release = deferred()
+  t.after(() => release.resolve())
+  const { service } = await fixture(t, preferences('openInterest'), async input => {
+    if (new URL(String(input)).pathname.endsWith('/public/open-interest')) {
+      entered.resolve()
+      await release.promise
+      return response([{ instId, oiUsd: '7000000', ts: String(Date.now()) }])
+    }
+    return nativeResponse(input)
+  })
+  seedInstrument(service); service.autoRefresh = true
+  service.recoverRequiredSources(instId); service.processMarketDeadline()
+  await entered.promise
+  const recovery = service.sourceRecoveries.get(`${instId}:openInterest`)
+  const now = Date.now()
+  service.acceptObservation(instId, 'openInterest', { value: { oiUsd: '8000000', ts: String(now) }, observedAt: now, expiresAt: now + 90000 })
+  assert.equal(service.sourceRecoveries.has(`${instId}:openInterest`), false)
+  assert.equal(recovery.controller.signal.aborted, true)
+  release.resolve(); await recovery.task
+  assert.equal(service.observations.get(instId).openInterest.value.oiUsd, '8000000')
+})

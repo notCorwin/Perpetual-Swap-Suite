@@ -355,3 +355,34 @@ test('committed historical observation on another contract becomes visible at th
   }
   equalDeadlines(expected, actual)
 })
+
+test('ticker updates preserve pending list and book retirement deadlines', async t => {
+  let now = Math.floor(Date.now() / 300000) * 300000 + 20000
+  t.mock.method(Date, 'now', () => now)
+  const { expected, actual } = await pair(t, () => now)
+  const retirementAt = now + 9000
+  for (const service of [expected, actual]) {
+    const entry = service.catalog.get(ids[1])
+    service.listRemovals.set(ids[1], { entry, removeAt: now + 14000 })
+    service.bookRetirements.set(ids[1], retirementAt)
+    service.scheduleMarketDeadline()
+  }
+  let scans = 0
+  const full = actual.scheduleMarketDeadline.bind(actual)
+  actual.scheduleMarketDeadline = () => { scans++; return full() }
+  for (let i = 0; i < 50; i++) {
+    now++
+    for (const service of [expected, actual]) service.receivePublicObservation(ids[0], 'ticker', quote(ids[0], now))
+    equalDeadlines(expected, actual)
+    assert.equal(actual.marketDeadlineAt, retirementAt)
+  }
+  assert.equal(scans, 0)
+  // The owning operation may replace deadlines without changing map sizes.
+  // Its reconciliation must immediately publish the earlier deadline.
+  for (const service of [expected, actual]) {
+    service.bookRetirements.set(ids[1], now + 1000)
+    service.scheduleMarketDeadline()
+  }
+  equalDeadlines(expected, actual)
+  assert.equal(actual.marketDeadlineAt, now + 1000)
+})

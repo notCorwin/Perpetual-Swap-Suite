@@ -2204,9 +2204,6 @@ export class MarketService {
 
   scheduleTickerDeadline(instId) {
     if (this.closing || this.disposed || this.processingMarketDeadline) return
-    // Keep the full synchronous cleanup if any source recovery may need to
-    // be cancelled. The common live case has none.
-    if (this.sourceRecoveries.size || this.tickerRecoveries.size || this.candleWaits.size || this.listRemovals.size || this.bookRetirements.size) return this.scheduleMarketDeadline()
     const now = Date.now()
     // Once due, the existing callback owns its captured set of deadlines.
     if (this.marketDeadlineTimer && this.marketDeadlineAt <= now) return
@@ -2250,7 +2247,7 @@ export class MarketService {
     }
     previous.now = now
     const earliest = Math.min(previous.ids.size ? previous.boundary + FIVE_MINUTES : Infinity,
-      this.marketDeadlineIndex.peek()?.deadline ?? Infinity, this.marketRemovalIndex.peek()?.deadline ?? Infinity)
+      this.marketDeadlineIndex.peek()?.deadline ?? Infinity, this.marketRemovalIndex.peek()?.deadline ?? Infinity, previous.pendingDeadline)
     if (earliest !== this.marketDeadlineAt) {
       clearTimeout(this.marketDeadlineTimer)
       this.marketDeadlineAt = Number.isFinite(earliest) ? earliest : null
@@ -2297,7 +2294,12 @@ export class MarketService {
     this.marketDeadlineIndex = new DeadlineIndex(deadlines)
     this.marketRemovalIndex = new DeadlineIndex(indexedRemovals)
     this.marketDeadlineState.indexUsable = indexUsable
-    const next = Math.min(boundary, ...deadlines.values(), ...tickerRetries, ...sourceRetries, ...candleDeadlines, ...removalDeadlines)
+    // Pending work is reconciled whenever its owning state changes. Its
+    // earliest deadline is independent of ticker lease updates.
+    const pendingDeadline = Math.min(...tickerRetries, ...sourceRetries, ...candleDeadlines,
+      ...[...this.listRemovals.values()].map(removal => removal.removeAt), ...this.bookRetirements.values())
+    this.marketDeadlineState.pendingDeadline = pendingDeadline
+    const next = Math.min(boundary, ...deadlines.values(), ...removalDeadlines, pendingDeadline)
     if (this.marketDeadlineAt === next) return
     if (this.marketDeadlineTimer) clearTimeout(this.marketDeadlineTimer)
     this.marketDeadlineTimer = null
@@ -2409,7 +2411,7 @@ export class MarketService {
           this.#markMarketDeadlineDirty(recovery.instId)
           this.observations.set(recovery.instId, observations)
           await this.observeHistoricalSource(recovery.instId, recovery.source, observations, signal, true,
-            () => !this.closing && this.sourceRecoveries.get(recovery.key) === recovery && this.requiredRecoveryCurrent(recovery))
+            () => !this.closing && this.sourceRecoveries.get(recovery.key) === recovery && this.requiredRecoveryCurrent(recovery), recovery)
           if (signal.aborted || this.sourceRecoveries.get(recovery.key) !== recovery) return
           if (!this.requiredRecoveryCurrent(recovery) && !this.observation(this.observations.get(recovery.instId) ?? {}, recovery.source)) { this.cancelRequiredRecovery(recovery.key); return }
           if (!this.observation(this.observations.get(recovery.instId) ?? {}, recovery.source)) throw new Error(`The completed ${recovery.source} range is not available.`)
@@ -2498,6 +2500,11 @@ export class MarketService {
       observations[key] = { ...observation, sourceTimestamp: timestamp }
     }
     this.observations.set(instId, observations)
+    const recovery = this.sourceRecoveries.get(`${instId}:${key}`)
+    if (recovery && this.observation(observations, key)) {
+      this.cancelRequiredRecovery(recovery.key)
+      this.scheduleMarketDeadline()
+    }
     return observations[key]
   }
 
@@ -2694,7 +2701,7 @@ export class MarketService {
     }
   }
 
-  async observeHistoricalSource(instId, key, observations, signal, acquire, current) {
+  async observeHistoricalSource(instId, key, observations, signal, acquire, current, ownerRecovery = null) {
     const timeframe = key === 'turnover' ? '5m' : '1H', count = key === 'turnover' ? 288 : 24, step = timeframeMilliseconds(timeframe)
     const calculate = (rows, end, from) => {
       if (key === 'turnover') {
@@ -2705,11 +2712,18 @@ export class MarketService {
       if (rows.length !== 24 || rows.some((row, index) => row.timestamp !== from + index * step || !row.confirmed || number(row.quoteVolume) === null)) throw new Error('Incomplete hourly source range.')
       return { rows }
     }
+    const retireCompetingRecovery = () => {
+      const recovery = this.sourceRecoveries.get(`${instId}:${key}`)
+      if (recovery && recovery !== ownerRecovery) {
+        this.cancelRequiredRecovery(recovery.key)
+        this.scheduleMarketDeadline()
+      }
+    }
     while (current()) {
       signal.throwIfAborted()
       const end = closedBoundary(timeframe), from = end - count * step, through = end - step
       const cached = this.observation(observations, key)
-      if (cached?.value.asOf === end) return cached
+      if (cached?.value.asOf === end) { retireCompetingRecovery(); return cached }
       const retained = this.historicalWindows.get(`${instId}:${timeframe}`)
       if (retained?.revision === this.liquidityHistoryRevision(instId, timeframe)
         && retained.storeRevision === this.store.candlePriceRevision(instId, timeframe)) {
@@ -2777,6 +2791,7 @@ export class MarketService {
       this.historicalInputs.set(observation, new Map(rows.map(row => [row.timestamp, row.quoteVolume])))
       this.#markMarketDeadlineDirty(instId)
       observations[key] = observation
+      if (this.observation(observations, key)) retireCompetingRecovery()
       return observation
     }
     return null
