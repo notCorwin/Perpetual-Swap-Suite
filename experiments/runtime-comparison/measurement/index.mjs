@@ -66,7 +66,7 @@ function normalize(raw, rootPids, extraPids) {
     // backend even if that backend is also a child of the runtime root.
     p.group = p.extraMember ? 'backend' : 'runtime'
     if (p.counters) {
-      for (const key of ['cpuUserNs', 'cpuSystemNs', 'cpuEnergyNj', 'startMonotonicNs']) {
+      for (const key of ['cpuUserNs', 'cpuSystemNs', 'cpuEnergyNj', 'startMonotonicNs', 'cpuPUserNs', 'cpuPSystemNs', 'cpuPEnergyNj', 'cpuCycles', 'cpuInstructions', 'cpuPCycles', 'cpuPInstructions']) {
         p.counters[key] = numeric(p.counters[`${key}Exact`])
       }
     }
@@ -76,6 +76,7 @@ function normalize(raw, rootPids, extraPids) {
   return {
     timestamp: new Date(timestampMS).toISOString(), timestampMS, ...raw, rootPids, extraPids, missingPids, totals,
     frontmostIsRuntime: raw.frontmostPid === null ? null : raw.processes.some(p => p.pid === raw.frontmostPid && p.group === 'runtime'),
+    capabilityMeaning: 'Supported means the helper probe observed that counter advancing. False means unconfirmed, not proof the kernel lacks it; nonzero target counters can independently confirm availability. A zero is valid once availability is confirmed.',
     unavailable: {
       totalEnergyJoules: 'Total app/device energy is not measured: GPU, display, shared services, I/O and other system energy cannot be attributed here.',
       gpuEnergyJoules: 'GPU and WindowServer activity may run in shared system processes and cannot be attributed by this sampler.',
@@ -91,7 +92,7 @@ function sumGroup(processes, group, energySupported) {
   const complete = members.every(p => p.counters)
   const sum = key => members.reduce((n, p) => n + BigInt(p.counters?.[key] ?? 0), 0n)
   const user = sum('cpuUserNsExact'), system = sum('cpuSystemNsExact')
-  const allEnergy = energySupported && members.every(p => p.counters?.cpuEnergyNjExact != null)
+  const allEnergy = (energySupported || members.some(p => p.counters?.cpuEnergyNjExact != null && BigInt(p.counters.cpuEnergyNjExact) > 0n)) && members.every(p => p.counters?.cpuEnergyNjExact != null)
   const energy = allEnergy ? sum('cpuEnergyNjExact') : null
   return {
     processCount: members.length, sampledProcessCount: members.filter(p => p.counters).length, complete,
@@ -102,49 +103,90 @@ function sumGroup(processes, group, energySupported) {
   }
 }
 
-function intervalFor(previous, current) {
+export function intervalFor(previous, current) {
   const elapsed = BigInt(current.sampleEndMonotonicNsExact) - BigInt(previous.sampleEndMonotonicNsExact)
   const old = new Map(previous.processes.map(p => [p.birthIdentity, p]))
   const currentIds = new Set(current.processes.map(p => p.birthIdentity))
-  const groups = Object.fromEntries(['runtime', 'backend', 'combined'].map(name => [name, { cpu: 0n, energy: 0n, energyAvailable: true, unknownPids: [] }]))
+  const groups = Object.fromEntries(['runtime', 'backend', 'combined'].map(name => [name, { unknownPids: [] }]))
+  const unknown = (name, pid) => { if (!groups[name].unknownPids.includes(pid)) groups[name].unknownPids.push(pid) }
   for (const p of current.processes) {
     const before = old.get(p.birthIdentity)
-    const newlyBorn = !before && p.counters && BigInt(p.counters.startMonotonicNsExact) >= BigInt(previous.sampleEndMonotonicNsExact)
-    const keys = ['combined', p.group]
-    for (const key of keys) {
-      const target = groups[key]
-      if (!p.counters || (!before && !newlyBorn) || (before && (!before.counters || (key !== 'combined' && before.group !== p.group)))) {
-        target.unknownPids.push(p.pid); target.energyAvailable = false; continue
-      }
-      const nowCpu = BigInt(p.counters.cpuUserNsExact) + BigInt(p.counters.cpuSystemNsExact)
-      const oldCpu = before ? BigInt(before.counters.cpuUserNsExact) + BigInt(before.counters.cpuSystemNsExact) : 0n
-      const nowEnergy = p.counters.cpuEnergyNjExact === null ? null : BigInt(p.counters.cpuEnergyNjExact)
-      const oldEnergy = before?.counters.cpuEnergyNjExact == null ? (before ? null : 0n) : BigInt(before.counters.cpuEnergyNjExact)
-      if (nowCpu < oldCpu) { target.unknownPids.push(p.pid); target.energyAvailable = false; continue }
-      target.cpu += nowCpu - oldCpu
-      if (nowEnergy === null || oldEnergy === null || nowEnergy < oldEnergy) target.energyAvailable = false
-      else target.energy += nowEnergy - oldEnergy
+    const born = !before && p.counters && BigInt(p.counters.startMonotonicNsExact) >= BigInt(previous.sampleEndMonotonicNsExact)
+    if (!p.counters || (!before && !born) || (before && !before.counters)) {
+      unknown('combined', p.pid); unknown(p.group, p.pid)
+      if (before && before.group !== p.group) unknown(before.group, p.pid)
+    } else if (before && before.group !== p.group) {
+      unknown(before.group, p.pid); unknown(p.group, p.pid)
     }
   }
   const disappearedPids = previous.processes.filter(p => !currentIds.has(p.birthIdentity)).map(p => p.pid)
-  for (const missing of previous.processes.filter(p => !currentIds.has(p.birthIdentity))) {
-    for (const group of ['combined', missing.group]) {
-      groups[group].unknownPids.push(missing.pid)
-      groups[group].energyAvailable = false
+  for (const p of previous.processes.filter(p => !currentIds.has(p.birthIdentity))) {
+    unknown('combined', p.pid); unknown(p.group, p.pid)
+  }
+  const counters = [
+    ['cpuTimeNs', ['cpuUserNsExact', 'cpuSystemNsExact'], ['cpuPUserNsExact', 'cpuPSystemNsExact']],
+    ['cpuEnergyNj', ['cpuEnergyNjExact'], ['cpuPEnergyNjExact']],
+    ['cpuCycles', ['cpuCyclesExact'], ['cpuPCyclesExact']],
+    ['cpuInstructions', ['cpuInstructionsExact'], ['cpuPInstructionsExact']],
+  ]
+  for (const [name, target] of Object.entries(groups)) {
+    target.breakdown = {}
+    for (const [metric, nsTotals, nsPerformance] of counters) {
+      const tickTotals = ['cpuUserTicksExact', 'cpuSystemTicksExact'], tickPerformance = ['cpuPUserTicksExact', 'cpuPSystemTicksExact']
+      const timebase = current.timebase
+      const useTicks = metric === 'cpuTimeNs' && Number.isSafeInteger(timebase?.numer) && timebase.numer > 0 && Number.isSafeInteger(timebase?.denom) && timebase.denom > 0
+        && previous.timebase?.numer === timebase.numer && previous.timebase?.denom === timebase.denom
+        && [previous, current].every(snapshot => snapshot.processes.filter(process => selected(process, name) && process.counters).every(process => tickTotals.every(key => process.counters[key] != null)))
+      const totals = useTicks ? tickTotals : nsTotals, performance = useTicks ? tickPerformance : nsPerformance
+      const supported = metric === 'cpuEnergyNj' ? previous.cpuEnergySupported === true && current.cpuEnergySupported === true
+        : metric === 'cpuCycles' ? previous.cpuCyclesSupported === true && current.cpuCyclesSupported === true
+          : metric === 'cpuInstructions' ? previous.cpuInstructionsSupported === true && current.cpuInstructionsSupported === true : true
+      const pSupportKey = { cpuTimeNs: 'cpuPTimeSupported', cpuEnergyNj: 'cpuPEnergySupported', cpuCycles: 'cpuPCyclesSupported', cpuInstructions: 'cpuPInstructionsSupported' }[metric]
+      const observed = keys => [previous, current].some(snapshot => snapshot.processes.some(process => selected(process, name) && process.counters && keys.some(key => process.counters[key] != null && BigInt(process.counters[key]) > 0n)))
+      let total = 0n, pcore = 0n, totalValid = (supported || observed(totals)) && target.unknownPids.length === 0
+      let valid = totalValid && ((previous[pSupportKey] === true && current[pSupportKey] === true) || observed(performance))
+      for (const p of current.processes.filter(p => selected(p, name))) {
+        const before = old.get(p.birthIdentity)
+        const born = !before && p.counters && BigInt(p.counters.startMonotonicNsExact) >= BigInt(previous.sampleEndMonotonicNsExact)
+        if (!p.counters || (!before && !born) || (before && (!before.counters || (name !== 'combined' && before.group !== p.group)))) { valid = false; totalValid = false; continue }
+        const read = (entry, keys) => {
+          if (!entry) return 0n
+          const values = keys.map(key => entry.counters[key])
+          return values.some(value => value == null) ? null : values.reduce((sum, value) => sum + BigInt(value), 0n)
+        }
+        const t1 = read(p, totals), p1 = read(p, performance), t0 = read(before, totals), p0 = read(before, performance)
+        if (t1 === null || t0 === null || t1 < t0 || (before && totals.some(key => BigInt(p.counters[key]) < BigInt(before.counters[key])))) { totalValid = false; valid = false; continue }
+        total += t1 - t0
+        if (p1 === null || p0 === null || p1 > t1 || p0 > t0 || p1 < p0 || p1 - p0 > t1 - t0 || (before && performance.some(key => BigInt(p.counters[key]) < BigInt(before.counters[key])))) { valid = false; continue }
+        pcore += p1 - p0
+      }
+      const toNs = value => value * BigInt(timebase.numer) / BigInt(timebase.denom)
+      const totalDisplay = useTicks ? toNs(total) : total, pDisplay = useTicks ? toNs(pcore) : pcore
+      const adjustment = useTicks && valid ? totalDisplay - pDisplay - toNs(total - pcore) : null
+      target.breakdown[metric] = { complete: valid, totalComplete: totalValid, totalExact: totalValid ? String(totalDisplay) : null,
+        pCoreExact: valid ? String(pDisplay) : null, eCoreExact: valid ? String(totalDisplay - pDisplay) : null,
+        ...(metric === 'cpuTimeNs' ? { source: useTicks ? 'mach-ticks' : 'legacy-nanoseconds',
+          totalTicksExact: useTicks && totalValid ? String(total) : null, pCoreTicksExact: useTicks && valid ? String(pcore) : null,
+          eCoreTicksExact: useTicks && valid ? String(total - pcore) : null,
+          eCoreRoundingAdjustmentNsExact: adjustment === null ? null : String(adjustment) } : {}) }
     }
   }
-  const results = Object.fromEntries(Object.entries(groups).map(([name, value]) => [name, {
-    complete: value.unknownPids.length === 0,
-    cpuNs: value.unknownPids.length ? null : numeric(value.cpu), cpuNsExact: value.unknownPids.length ? null : String(value.cpu),
-    cpuPercentOfOneCore: !value.unknownPids.length && elapsed > 0n ? Number(value.cpu) / Number(elapsed) * 100 : null,
-    cpuEnergyNj: value.energyAvailable ? numeric(value.energy) : null,
-    cpuEnergyNjExact: value.energyAvailable ? String(value.energy) : null,
-    cpuEnergyJoules: value.energyAvailable ? Number(value.energy) / 1e9 : null,
-    cpuWatts: value.energyAvailable && elapsed > 0n ? Number(value.energy) / Number(elapsed) : null,
-    unknownPids: value.unknownPids,
-  }]))
+  const results = Object.fromEntries(Object.entries(groups).map(([name, value]) => {
+    const cpu = value.breakdown.cpuTimeNs.totalExact, energy = value.breakdown.cpuEnergyNj.totalExact
+    return [name, {
+      complete: value.unknownPids.length === 0,
+      cpuNs: numeric(cpu), cpuNsExact: cpu,
+      cpuPercentOfOneCore: cpu !== null && elapsed > 0n ? Number(cpu) / Number(elapsed) * 100 : null,
+      cpuEnergyNj: numeric(energy), cpuEnergyNjExact: energy,
+      cpuEnergyJoules: energy === null ? null : Number(energy) / 1e9,
+      cpuWatts: energy !== null && elapsed > 0n ? Number(energy) / Number(elapsed) : null,
+      unknownPids: value.unknownPids, breakdown: value.breakdown,
+    }]
+  }))
   return {
     elapsedNs: numeric(elapsed), elapsedNsExact: String(elapsed), ...results, disappearedPids,
+    observationWindow: { previousSnapshotStartNsExact: previous.sampleStartMonotonicNsExact, previousSnapshotEndNsExact: previous.sampleEndMonotonicNsExact,
+      currentSnapshotStartNsExact: current.sampleStartMonotonicNsExact, currentSnapshotEndNsExact: current.sampleEndMonotonicNsExact },
     limitation: 'Known-process deltas; processes that exit or start and exit between samples can be missed. Per-PID reads are not simultaneous.',
   }
 }
@@ -174,6 +216,7 @@ async function openHelper() {
     })
   }
   return {
+    pid: child.pid,
     request(rootPids, extraPids, includeWebKit) {
       return request(`${rootPids.join(',') || '-'}|${extraPids.join(',') || '-'}|${includeWebKit ? 1 : 0}`)
     },
@@ -213,9 +256,9 @@ export async function startSampling({ rootPids = [], extraPids, intervalMS = 100
   if (![500, 1000].includes(intervalMS)) throw new TypeError('intervalMS must be 500 or 1000.')
   if (!Array.isArray(samples)) throw new TypeError('samples must be an array.')
   const helper = await openHelper(), startedAt = new Date().toISOString()
-  let previous, timer, inFlight, error, stopped = false, stopPromise, nextDue, skippedSamples = 0
+  let previous, timer, inFlight, error, stopped = false, stopPromise, nextDue, stoppedAtMS, skippedSamples = 0, boundaryQueue = Promise.resolve(), boundaryPending = 0
   const identities = new Map()
-  const take = async () => {
+  const take = async boundary => {
     const sample = normalize(await helper.request(rootPids, extraPids, includeWebKit), rootPids, extraPids)
     for (const pid of [...rootPids, ...extraPids]) {
       const found = sample.processes.find(p => p.pid === pid && p.counters)
@@ -223,6 +266,7 @@ export async function startSampling({ rootPids = [], extraPids, intervalMS = 100
       if (identities.has(pid) && identities.get(pid) !== found.birthIdentity) throw new Error(`PID ${pid} was reused during measurement; refusing to attribute a different process.`)
       identities.set(pid, found.birthIdentity)
     }
+    if (boundary) sample.boundary = boundary
     sample.interval = previous ? intervalFor(previous, sample) : null
     previous = sample
     samples.push(sample)
@@ -230,9 +274,10 @@ export async function startSampling({ rootPids = [], extraPids, intervalMS = 100
   }
   const nowMS = () => Number(process.hrtime.bigint() / 1000000n)
   const schedule = () => {
-    if (stopped || error) return
-    const now = nowMS()
+    if (error || boundaryPending) return
+    const now = stopped ? stoppedAtMS : nowMS()
     while (nextDue <= now) { nextDue += intervalMS; skippedSamples++ }
+    if (stopped) return
     timer = setTimeout(() => {
       nextDue += intervalMS
       inFlight = take().catch(cause => { error = cause }).finally(() => { inFlight = undefined; schedule() })
@@ -241,14 +286,32 @@ export async function startSampling({ rootPids = [], extraPids, intervalMS = 100
   try { await take(); nextDue = nowMS() + intervalMS; schedule() } catch (cause) { await helper.close(); throw cause }
   return {
     samples,
+    sampleBoundary(boundary) {
+      if (!['start', 'end'].includes(boundary)) return Promise.reject(new TypeError('Boundary must be start or end.'))
+      if (stopped) return Promise.reject(new Error('Sampling has stopped.'))
+      boundaryPending++
+      clearTimeout(timer)
+      const result = boundaryQueue.then(async () => {
+        if (inFlight) await inFlight
+        if (error) throw error
+        await take(boundary)
+      }).catch(cause => { error = cause; throw cause }).finally(() => {
+        boundaryPending--
+        if (!boundaryPending) schedule()
+      })
+      boundaryQueue = result.catch(() => {})
+      return result
+    },
     stop() {
       if (!stopPromise) stopPromise = (async () => {
-        stopped = true; clearTimeout(timer)
+        stoppedAtMS = nowMS(); stopped = true; clearTimeout(timer); schedule()
         if (inFlight) await inFlight
+        await boundaryQueue
         try {
           if (error) throw error
           await take()
           return { intervalMS, startedAt, finishedAt: new Date().toISOString(), rootPids, extraPids, samples, skippedSamples,
+            observer: { controllerPid: process.pid, helperPid: helper.pid, inclusion: 'Included only if present in the sampled process trees; see each snapshot process list.' },
             scope: 'Runtime tree and conservatively attributed WebKit XPC; the explicit backend tree is separate. CPU energy is a per-process CPU counter, not total app energy.',
             coverage: 'Periodic samples can miss short-lived processes and focus changes; WebKit responsibility is a private best-effort lookup. RSS sums can double-count shared pages.' }
         } finally { await helper.close() }

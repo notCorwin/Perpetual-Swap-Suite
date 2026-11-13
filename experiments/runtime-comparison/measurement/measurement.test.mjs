@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { setTimeout as delay } from 'node:timers/promises'
-import { snapshotProcessTree, startSampling } from './index.mjs'
+import { intervalFor, snapshotProcessTree, startSampling } from './index.mjs'
 
 test('samples a controlled process tree, separate backend, CPU time and energy', { timeout: 15000 }, async () => {
   const source = `
@@ -27,10 +27,16 @@ test('samples a controlled process tree, separate backend, CPU time and energy',
     const samples = []
     sampler = await startSampling({ rootPids: [target.pid, backend.pid], intervalMS: 500, samples })
     const getUsage = async () => { target.send('usage'); const [message] = await once(target, 'message'); return message.usage }
+    await sampler.sampleBoundary('start')
     const before = await getUsage()
     await delay(1200)
     const after = await getUsage()
+    await sampler.sampleBoundary('end')
     const result = await sampler.stop()
+    assert.equal(samples.filter(sample => sample.boundary === 'start').length, 1)
+    assert.equal(samples.filter(sample => sample.boundary === 'end').length, 1)
+    const measured = samples.find(sample => sample.boundary === 'end').interval.runtime.breakdown
+    for (const metric of Object.values(measured)) if (metric.complete) assert.equal(BigInt(metric.totalExact), BigInt(metric.pCoreExact) + BigInt(metric.eCoreExact))
     assert.equal(result.samples, samples)
     assert.ok(samples.length >= 3)
     const first = samples[0], last = samples.at(-1)
@@ -95,4 +101,84 @@ test('marks an interval incomplete when a sampled child exits', { timeout: 10000
     if (childPid) { try { process.kill(childPid) } catch {} }
     target.kill()
   }
+})
+
+test('serializes boundary requests with stop', { timeout: 10000 }, async () => {
+  const sampler = await startSampling({ rootPids: [process.pid], includeWebKit: false })
+  const start = sampler.sampleBoundary('start')
+  const end = sampler.sampleBoundary('end')
+  const stop = sampler.stop()
+  await Promise.all([start, end])
+  const result = await stop
+  assert.deepEqual(result.samples.filter(sample => sample.boundary).map(sample => sample.boundary), ['start', 'end'])
+  await assert.rejects(sampler.sampleBoundary('start'), /stopped/)
+})
+
+
+test('keeps counter availability independent and marks both sides of group migration', () => {
+  const snapshot = (end, group, user, energy) => ({ sampleStartMonotonicNsExact: String(end - 1), sampleEndMonotonicNsExact: String(end),
+    cpuEnergySupported: false, cpuCyclesSupported: true, cpuInstructionsSupported: true,
+    cpuPTimeSupported: true, cpuPEnergySupported: false, cpuPCyclesSupported: true, cpuPInstructionsSupported: true,
+    processes: [{ pid: 42, birthIdentity: '42:1:0', group, counters: {
+      startMonotonicNsExact: '1', cpuUserNsExact: String(user), cpuSystemNsExact: '0',
+      cpuPUserNsExact: '0', cpuPSystemNsExact: '0', cpuEnergyNjExact: String(energy), cpuPEnergyNjExact: String(energy / 2),
+      cpuCyclesExact: String(energy), cpuPCyclesExact: String(energy / 2), cpuInstructionsExact: String(energy), cpuPInstructionsExact: String(energy / 2),
+    } }] })
+  const old = snapshot(100, 'runtime', 10, 10), current = snapshot(200, 'runtime', 8, 20)
+  const result = intervalFor(old, current).runtime
+  assert.equal(result.complete, true)
+  assert.equal(result.cpuNsExact, null)
+  assert.equal(result.cpuEnergyNjExact, '10')
+  assert.equal(result.breakdown.cpuEnergyNj.pCoreExact, '5')
+  assert.equal(result.breakdown.cpuCycles.totalExact, '10')
+  const moved = intervalFor(old, snapshot(200, 'backend', 20, 20))
+  assert.equal(moved.runtime.complete, false)
+  assert.equal(moved.backend.complete, false)
+  assert.equal(moved.combined.complete, true)
+  assert.equal(moved.combined.cpuEnergyNjExact, '10')
+})
+
+test('counts periodic deadlines missed while a boundary is sampled', { timeout: 10000 }, async () => {
+  const sampler = await startSampling({ rootPids: [process.pid], includeWebKit: false, intervalMS: 500,
+    onSample: async sample => { if (sample.boundary === 'start') await delay(600) } })
+  try {
+    await sampler.sampleBoundary('start')
+    const result = await sampler.stop()
+    assert.ok(result.skippedSamples >= 1)
+  } finally { await sampler.stop().catch(() => {}) }
+})
+
+
+test('counts deadlines before stop while a boundary remains in flight', { timeout: 10000 }, async () => {
+  const sampler = await startSampling({ rootPids: [process.pid], includeWebKit: false, intervalMS: 500,
+    onSample: async sample => { if (sample.boundary === 'start') await delay(700) } })
+  const boundary = sampler.sampleBoundary('start')
+  await delay(550)
+  const stop = sampler.stop()
+  await boundary
+  const result = await stop
+  assert.ok(result.skippedSamples >= 1)
+})
+
+test('validates Mach ticks before conversion and records the rounding remainder', () => {
+  const snapshot = (end, total, pcore) => ({ sampleStartMonotonicNsExact: String(end - 1), sampleEndMonotonicNsExact: String(end),
+    timebase: { numer: 125, denom: 3 }, cpuPTimeSupported: true,
+    processes: [{ pid: 42, birthIdentity: '42:1:0', group: 'runtime', counters: {
+      startMonotonicNsExact: '1', cpuUserTicksExact: String(total), cpuSystemTicksExact: '0', cpuPUserTicksExact: String(pcore), cpuPSystemTicksExact: '0',
+      cpuUserNsExact: String(Math.floor(total * 125 / 3)), cpuSystemNsExact: '0', cpuPUserNsExact: String(Math.floor(pcore * 125 / 3)), cpuPSystemNsExact: '0',
+    } }] })
+  const before = snapshot(100, 2, 1), after = snapshot(200, 4, 3)
+  const valid = intervalFor(before, after).runtime.breakdown.cpuTimeNs
+  assert.equal(valid.complete, true)
+  assert.equal(valid.totalExact, '83')
+  assert.equal(valid.pCoreExact, '83')
+  assert.equal(valid.eCoreExact, '0')
+  assert.equal(valid.totalTicksExact, '2')
+  const remainder = intervalFor(before, snapshot(200, 4, 2)).runtime.breakdown.cpuTimeNs
+  assert.equal(remainder.eCoreRoundingAdjustmentNsExact, '1')
+  assert.equal(BigInt(remainder.pCoreExact) + BigInt(remainder.eCoreExact), BigInt(remainder.totalExact))
+  const invalid = intervalFor(before, snapshot(200, 4, 4)).runtime.breakdown.cpuTimeNs
+  assert.equal(invalid.complete, false)
+  assert.equal(invalid.pCoreExact, null)
+  assert.equal(invalid.totalExact, '83')
 })

@@ -91,6 +91,7 @@ export async function createMarketTrafficExchange({ candidateCount = 50, passing
   const window = { active: false, startedAt: null, endedAt: null, startedAtMonotonicUS: null, endedAtMonotonicUS: null,
     ws: {}, http: {}, ack: {}, deliveries: {}, deliveryTimestamps: {}, events: [], rounds: [] }
   let tick = 0, cadenceRound = 0, cadenceTimer = null, cadenceIntervalMS = null, sampleStartWaiter = null, currentRoundEvidence = null
+  let fixedRoundCount = null, fixedRoundResolve = null, fixedRoundCompletion = null
   const streamSequences = new Map()
   const latestCounter = (channel, instId) => {
     const key = `${channel}:${instId}`
@@ -359,6 +360,10 @@ export async function createMarketTrafficExchange({ candidateCount = 50, passing
     tick++
     cadenceRound++
     if (sampleStartWaiter) {
+      if (fixedRoundCount !== null) {
+        assert.ok(tick < 1_000, 'Warmup exceeded the fixed replay sequence baseline.')
+        tick = 1_000
+      }
       window.active = true
       window.startedAt = now()
       window.startedAtMonotonicUS = monotonicMicroseconds()
@@ -381,6 +386,12 @@ export async function createMarketTrafficExchange({ candidateCount = 50, passing
       sampleStartWaiter = null
       resolveStart({ startedAt: window.startedAt, startedAtMonotonicUS: window.startedAtMonotonicUS })
     }
+    if (fixedRoundCount !== null && window.rounds.length === fixedRoundCount) {
+      clearInterval(cadenceTimer)
+      cadenceTimer = null
+      fixedRoundResolve()
+      fixedRoundResolve = null
+    }
   }
   return {
     asOf, instIds, instruments, kinds, passingCount, spreadFailureCount, oiFailureCount, seed,
@@ -398,9 +409,16 @@ export async function createMarketTrafficExchange({ candidateCount = 50, passing
       cadenceTimer.unref?.()
       return { stop: () => { if (cadenceTimer) clearInterval(cadenceTimer); cadenceTimer = null }, intervalMS }
     },
-    beginSample() {
+    beginSample({ rounds = null } = {}) {
       if (window.active || sampleStartWaiter) throw new Error('A traffic sample is already active or starting.')
+      assert.ok(rounds === null || (Number.isSafeInteger(rounds) && rounds >= 2), 'Fixed sample rounds must be at least two.')
+      fixedRoundCount = rounds
+      fixedRoundCompletion = rounds === null ? null : new Promise(resolve => { fixedRoundResolve = resolve })
       return new Promise(resolve => { sampleStartWaiter = resolve })
+    },
+    waitForFixedRounds() {
+      if (!fixedRoundCompletion) throw new Error('No fixed-round sample is active.')
+      return fixedRoundCompletion
     },
     endSample() {
       if (!window.active || !Number.isSafeInteger(window.startedAtMonotonicUS)) throw new Error('A traffic sample is not active.')
@@ -411,6 +429,8 @@ export async function createMarketTrafficExchange({ candidateCount = 50, passing
       while (lastSendUS != null && window.endedAtMonotonicUS <= lastSendUS) window.endedAtMonotonicUS = monotonicMicroseconds()
       window.endedAt = now()
       window.active = false
+      if (fixedRoundCount !== null && window.rounds.length !== fixedRoundCount) throw new Error('Fixed-round sample ended before all declared rounds were dispatched.')
+      fixedRoundCount = null
       const events = structuredClone(window.events), rounds = structuredClone(window.rounds)
       const drainDeadlineMonotonicUS = events.length
         ? Math.max(...events.map(event => event.sentAtMonotonicUS + 1_000 * cadenceIntervalMS)) : window.endedAtMonotonicUS

@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { realpathSync } from 'node:fs'
+import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { dirname, extname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
@@ -16,6 +18,7 @@ import { installMainLoopWitness } from './main-loop-witness.mjs'
 import { installMarketTrafficRendererProbe } from './market-traffic-renderer-probe.mjs'
 import { startSampling } from '../experiments/runtime-comparison/measurement/index.mjs'
 import { summarizeResources } from '../experiments/runtime-comparison/analyze.mjs'
+import { replayHarnessFingerprint } from './replay-fingerprint.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
 const { values } = parseArgs({
@@ -26,6 +29,7 @@ const { values } = parseArgs({
     'expect-optimized': { type: 'boolean' }, foreground: { type: 'boolean' }, diagnostic: { type: 'boolean' },
     'wait-ready': { type: 'boolean' }, 'baseline-report': { type: 'string' },
     resources: { type: 'boolean' },
+    'fixed-rounds': { type: 'boolean' },
   },
   allowPositionals: false,
 })
@@ -43,6 +47,9 @@ const passingCount = numberOption('passing-count', 6)
 const spreadFailureCount = numberOption('spread-failure-count', Math.floor((candidateCount - passingCount) / 2))
 const durationSeconds = numberOption('duration-seconds', 7)
 const cadenceMS = numberOption('cadence-ms', 500)
+const fixedRounds = values['fixed-rounds'] === true
+const roundCount = durationSeconds * 1_000 / cadenceMS + 1
+if (fixedRounds && !Number.isSafeInteger(roundCount)) throw new Error('Fixed replay requires duration-seconds to be divisible by cadence-ms.')
 const expectOptimized = values['expect-optimized'] === true
 const foreground = values.foreground === true
 const baselineReportPath = values['baseline-report'] ? resolve(values['baseline-report']) : null
@@ -57,7 +64,7 @@ const benchmarkMode = foreground
   : 'hidden-electron-loopback-market-traffic-and-renderer-responsiveness'
 const searchMeasurement = `${foreground ? 'Native foreground' : 'Hidden offscreen'} renderer RAF callback opportunity gaps and input-to-second-RAF scheduling latency. These timings do not measure SVG commit or native compositor paint; filtered result counts are sampled after the second RAF.`
 if (candidateCount < 3 || candidateCount > 100) throw new Error('--candidate-count must be between 3 and 100.')
-if (durationSeconds < 5 || durationSeconds > 10) throw new Error('--duration-seconds must be between 5 and 10.')
+if (durationSeconds < 5 || durationSeconds > (fixedRounds && !foreground ? 60 : 10)) throw new Error(`--duration-seconds must be between 5 and ${fixedRounds && !foreground ? 60 : 10}.`)
 if (cadenceMS < 100 || cadenceMS > 2_000) throw new Error('--cadence-ms must be between 100 and 2000.')
 if (baselineReportPath && !foreground) throw new Error('--baseline-report is supported only with --foreground.')
 if (baselineReportPath && !expectOptimized) throw new Error('--baseline-report requires --expect-optimized for the after run.')
@@ -90,15 +97,42 @@ async function appEntryFor(appRoot) {
   return { selected, entry: selected, cwd: selected }
 }
 
+async function replaySourceFingerprint(app) {
+  const files = {}
+  const add = async (label, path) => { files[label] = createHash('sha256').update(await readFile(path)).digest('hex') }
+  const visit = async (base, relative) => {
+    for (const entry of await readdir(join(base, relative), { withFileTypes: true })) {
+      if (['node_modules', '.git', 'artifacts', '.build'].includes(entry.name)) continue
+      const path = join(relative, entry.name)
+      if (entry.isDirectory()) await visit(base, path)
+      else if (entry.isFile()) await add(`target/${path}`, join(base, path))
+    }
+  }
+  const targetInfo = await stat(app.entry)
+  if (targetInfo.isFile()) await add('target/archive', app.entry)
+  else {
+    for (const path of ['electron', 'dist']) await visit(app.entry, path)
+    await add('target/package.json', join(app.entry, 'package.json'))
+  }
+  const ordered = Object.fromEntries(Object.entries(files).sort(([left], [right]) => left.localeCompare(right)))
+  return { target: { scope: 'Target electron and dist trees plus package.json, or target archive; node_modules, .git, artifacts and .build directories excluded.',
+    sha256: createHash('sha256').update(JSON.stringify(ordered)).digest('hex'), files: ordered },
+    harness: await replayHarnessFingerprint() }
+}
+
 function checkoutMetadata(directory = root) {
-  const revision = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: directory, encoding: 'utf8' }).trim()
-  const dirty = Boolean(execFileSync('git', ['status', '--porcelain'], { cwd: directory, encoding: 'utf8' }).trim())
-  return { revision, dirty }
+  try {
+    const top = execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: directory, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+    if (realpathSync(top) !== realpathSync(directory)) return { revision: null, dirty: null, provenance: 'unversioned' }
+    const revision = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: directory, encoding: 'utf8' }).trim()
+    const dirty = Boolean(execFileSync('git', ['status', '--porcelain'], { cwd: directory, encoding: 'utf8' }).trim())
+    return { revision, dirty, provenance: 'checkout' }
+  } catch { return { revision: null, dirty: null, provenance: 'unversioned' } }
 }
 
 async function targetMetadata(app, checkout) {
   if (!app.selected.endsWith('.app') && !app.selected.endsWith('.asar')) {
-    return { path: app.selected, provenance: 'working-tree checkout', revision: checkout.revision, dirty: checkout.dirty }
+    return { path: app.selected, provenance: checkout.provenance === 'checkout' ? 'working-tree checkout' : 'unversioned', revision: checkout.revision, dirty: checkout.dirty }
   }
   const path = app.selected.endsWith('.app') ? join(app.selected, 'Contents', 'Resources', 'build-revision.json')
     : join(dirname(app.selected), 'build-revision.json')
@@ -228,9 +262,11 @@ if (baselineReportPath) {
 const app = await appEntryFor(values['app-root'] ?? root)
 const checkout = checkoutMetadata(app.selected.endsWith('.app') || app.selected.endsWith('.asar') ? root : app.selected)
 const target = await targetMetadata(app, checkout)
+const replayFingerprint = fixedRounds ? await replaySourceFingerprint(app) : null
 const output = resolve(values.output ?? join(root, '.build/traffic-optimization/market-traffic.json'))
 const userData = process.env.PERPETUAL_SWAP_USER_DATA
 if (!userData || (!foreground && !process.env.PERPETUAL_SWAP_TEST_GUARD)) throw new Error('Protected sandbox user data is required.')
+if (fixedRounds) assert.deepEqual(await readdir(userData), [], 'Fixed replay requires a fresh, empty sandbox user-data directory.')
 const fixture = await createMarketTrafficExchange({ candidateCount, passingCount, spreadFailureCount, seed: 17 })
 let electron, cadence, resourceSampler, failureMeasurements, completedReport, runtimeEvidence, presentationEvidence, readinessFailureEvidence, stopDiagnostics, mainLoopStarted = false
 try {
@@ -337,7 +373,8 @@ try {
   if (values.diagnostic) stopDiagnostics = await startRendererDiagnostics(electron, page, diagnosticDirectory)
   await electron.evaluate(installMainLoopWitness)
   mainLoopStarted = true
-  const sampleWindow = await fixture.beginSample()
+  if (resourceSampler && fixedRounds) await resourceSampler.sampleBoundary('start')
+  const sampleWindow = await fixture.beginSample(fixedRounds ? { rounds: roundCount } : undefined)
   const sampleStartedAt = sampleWindow.startedAt
   await page.evaluate(installMarketTrafficRendererProbe, { requireForeground: foreground, passingIDs: [...qualifyingIDs] })
   const search = page.locator('input[aria-label="Search contracts"]')
@@ -350,26 +387,14 @@ try {
       if (!foreground) await sleep(30)
     }
   })()
-  await Promise.all([interactionTask, sleep(durationSeconds * 1_000)])
+  await Promise.all([interactionTask, fixedRounds ? fixture.waitForFixedRounds() : sleep(durationSeconds * 1_000)])
   const traffic = fixture.endSample()
-  let resources
-  if (resourceSampler) {
-    // stop() drains the in-flight read, verifies its callback, and checks the
-    // final sample before any successful acceptance report can be written.
-    const capture = await resourceSampler.stop()
-    resourceSampler = undefined
-    // timestampMS is recorded after the native read. Drop the first candidate
-    // to avoid counting an interval that may have started before the fixture.
-    const samples = capture.samples.filter(sample => sample.timestampMS >= traffic.startedAt && sample.timestampMS <= traffic.endedAt).slice(1)
-    assert.ok(samples.length >= 2, 'Insufficient process samples inside the traffic window.')
-    const summary = summarizeResources({ samples, skippedSamples: capture.skippedSamples }).combined
-    assert.equal(summary.coverage.cpu.complete, true, 'Incomplete process-tree CPU coverage inside the traffic window.')
-    resources = { measurement: 'Electron process tree CPU including worker threads, over a conservative subwindow selected using helper-return timestamps. CPU energy excludes GPU and display; the sampler itself is outside the process tree. Operation recording may affect results.',
-      trafficWindow: { from: traffic.startedAt, through: traffic.endedAt },
-      sampleWindow: { from: samples[0].timestampMS, through: samples.at(-1).timestampMS, count: samples.length },
-      skippedSamples: capture.skippedSamples, skippedSamplesScope: 'Entire sampler run, including setup and shutdown; not specific to the traffic window.',
-      rawSamples: samples, summary }
+  if (fixedRounds) {
+    assert.equal(traffic.rounds.length, roundCount, 'Fixed replay must dispatch every declared round.')
+    assert.equal(Math.floor(fixture.asOf / 300_000), Math.floor(traffic.endedAt / 300_000),
+      'Replay crossed a 5-minute candle boundary during startup or sampling; retry in a fresh sandbox.')
   }
+  let resources
   failureMeasurements = {
     schemaVersion: 1, mode: benchmarkMode, partial: true, generatedAt: new Date().toISOString(),
     diagnosticOnly: values.diagnostic === true,
@@ -380,9 +405,18 @@ try {
       candidateIDs: fixture.instIds,
       dataFingerprint: `market-traffic-v3-app-receipts-${candidateCount}-${passingCount}-${spreadFailureCount}-seed-${fixture.seed}`,
       cadenceMS, durationSeconds, sampleStartedAt, expectOptimized, readiness, searchScenario,
+      ...(fixedRounds ? { replay: { version: 'fixed-rounds-v1', expectedRounds: roundCount, actualRounds: traffic.rounds.length,
+        timeSemantics: 'Live wall-clock timestamps; values use fixed round offsets. Runs crossing a 5-minute candle boundary are rejected; timestamps are not byte-identical.',
+        inputHash: createHash('sha256').update(await readFile(join(root, 'tests/helpers/market-traffic-exchange.mjs'))).digest('hex'),
+        inputHashMeaning: 'SHA-256 of the fixture source; configHash identifies its parameters.',
+        databaseFixtureHash: createHash('sha256').update('empty-sandbox-user-data-v1').digest('hex'),
+        databaseFixtureHashMeaning: 'SHA-256 of the empty initial-state descriptor, verified by listing the fresh user-data directory; no database file exists at that point.',
+        sourceFingerprint: replayFingerprint,
+        configHash: createHash('sha256').update(JSON.stringify({ candidateCount, passingCount, spreadFailureCount, seed: fixture.seed, cadenceMS, roundCount, durationSeconds, foreground, waitReady, expectOptimized })).digest('hex') } } : {}),
       readinessPhase: readiness ? 'all-passing-15m-frames-ready-before-steady-state-sample' : null },
     rawFixtureSample: traffic,
     renderer: null,
+    ...(resources ? { resources } : {}),
   }
   let rendererCaptureError
   const renderer = await page.evaluate(() => globalThis.__marketTrafficResponsiveness.stop())
@@ -427,6 +461,8 @@ try {
     if (outputMatchesLatest && JSON.stringify(finalSnapshot.catalogProgress) === JSON.stringify(snapshot.catalogProgress)) break
     await sleep(25)
   }
+  if (fixedRounds) assert.equal(Math.floor(fixture.asOf / 300_000), Math.floor(Date.now() / 300_000),
+    'Replay crossed a 5-minute candle boundary during final drain; retry in a fresh sandbox.')
   assert.ok(['live', 'connecting'].includes(finalSnapshot.realtimeState), 'Realtime cannot disconnect or recover during the sample.')
   assert.ok(fixture.readyState.clients >= 3, 'The public and business loopback transports must stay connected for the sample.')
   if (expectOptimized) for (const channel of ['candle15m', 'candle1H']) {
@@ -447,6 +483,31 @@ try {
   assert.deepEqual(fixture.errors, [], 'The fixture observed a production protocol or endpoint error during measurement.')
   const unsolicitedHTTP = fixture.requests.filter(request => !request.respondedAt || request.responsePayloadBytes <= 0)
   assert.deepEqual(unsolicitedHTTP, [], 'Every production HTTP request must receive a measured fixture response.')
+  if (fixedRounds) assert.equal(Math.floor(fixture.asOf / 300_000), Math.floor(Date.now() / 300_000),
+    'Replay crossed a 5-minute candle boundary before final verification completed; retry in a fresh sandbox.')
+  if (resourceSampler && fixedRounds) await resourceSampler.sampleBoundary('end')
+  if (resourceSampler) {
+    // stop() drains the in-flight read, verifies its callback, and checks the
+    // final sample before any successful acceptance report can be written.
+    const capture = await resourceSampler.stop()
+    resourceSampler = undefined
+    // timestampMS is recorded after the native read. Drop the first candidate
+    // to avoid counting an interval that may have started before the fixture.
+    const samples = fixedRounds ? capture.samples : capture.samples.filter(sample => sample.timestampMS >= traffic.startedAt && sample.timestampMS <= traffic.endedAt).slice(1)
+    assert.ok(samples.length >= 2, 'Insufficient process samples inside the traffic window.')
+    const summary = summarizeResources(fixedRounds ? capture : { samples, skippedSamples: capture.skippedSamples }).combined
+    if (fixedRounds) assert.equal(summary.coverage.boundaryStatus, 'explicit', 'The replay requires explicit resource sample boundaries.')
+    assert.equal(summary.coverage.cpu.complete, true, 'Incomplete process-tree CPU coverage inside the traffic window.')
+    const boundaryStart = fixedRounds ? samples.find(sample => sample.boundary === 'start') : samples[0]
+    const boundaryEnd = fixedRounds ? samples.find(sample => sample.boundary === 'end') : samples.at(-1)
+    resources = { measurement: fixedRounds ? 'Electron process tree CPU between explicit samples surrounding the replay; CPU energy excludes GPU and display. The sampler is outside the process tree; operation recording may affect results.' : 'Electron process tree CPU including worker threads, over a conservative subwindow selected using helper-return timestamps. CPU energy excludes GPU and display; the sampler itself is outside the process tree. Operation recording may affect results.',
+      trafficWindow: { from: traffic.startedAt, through: traffic.endedAt },
+      sampleWindow: { from: boundaryStart.timestampMS, through: boundaryEnd.timestampMS,
+        count: fixedRounds ? samples.filter(sample => sample.timestampMS >= boundaryStart.timestampMS && sample.timestampMS <= boundaryEnd.timestampMS).length : samples.length },
+      skippedSamples: capture.skippedSamples, skippedSamplesScope: 'Entire sampler run, including setup and shutdown; not specific to the traffic window.',
+      rawSamples: samples, summary }
+  }
+  if (resources) failureMeasurements.resources = resources
   const websocketPayloadBytes = Object.values(traffic.websocket).reduce((sum, value) => sum + value.payloadBytes, 0)
   const httpResponsePayloadBytes = Object.values(traffic.http).reduce((sum, value) => sum + value.payloadBytes, 0)
   const report = {
@@ -464,6 +525,7 @@ try {
         pending: finalSnapshot.catalogProgress.pending, verified: finalSnapshot.catalogProgress.verified,
         failed: finalSnapshot.catalogProgress.failed, unknown: finalSnapshot.catalogProgress.unknown },
       requiredChannels, cadenceMS, durationSeconds, sampleStartedAt, expectOptimized, readiness, searchScenario,
+      ...(fixedRounds ? { replay: failureMeasurements.fixture.replay } : {}),
       readinessPhase: readiness ? 'all-passing-15m-frames-ready-before-steady-state-sample' : null },
     traffic: { durationSeconds: traffic.durationSeconds,
       measurement: 'Application payload bytes: WebSocket text before framing and HTTP response bodies. HTTP requests, headers, WebSocket framing, and TCP/TLS overhead are not measured.',
@@ -483,6 +545,9 @@ try {
       passingIDs: (finalSnapshot.rows ?? []).map(row => row.instId).sort(),
       failures: finalSnapshot.catalogProgress.failed, unknown: finalSnapshot.catalogProgress.unknown,
       outputMatchesLatestFixtureTickers: outputMatchesLatest, optimizedDemand },
+    ...(fixedRounds ? { finalStateDigest: createHash('sha256').update(JSON.stringify({ progress: finalSnapshot.catalogProgress,
+      rows: (finalSnapshot.rows ?? []).map(row => ({ instId: row.instId, lastPrice: row.lastPrice,
+        rankingChange: row.rankingChange ?? null, rankingAsOf: row.rankingAsOf ?? null })).sort((a, b) => a.instId.localeCompare(b.instId)) })).digest('hex') } : {}),
     fixtureErrors: fixture.errors,
   }
   await mkdir(dirname(output), { recursive: true })

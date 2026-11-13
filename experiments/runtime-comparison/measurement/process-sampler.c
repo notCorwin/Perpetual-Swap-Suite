@@ -25,7 +25,7 @@
 typedef pid_t (*responsible_fn)(pid_t);
 static mach_timebase_info_data_t timebase;
 static responsible_fn responsible;
-static bool energy_supported;
+static bool energy_supported, cycles_supported, instructions_supported, ptime_supported, penergy_supported, pcycles_supported, pinstructions_supported;
 static int argmax_size = 262144;
 extern int frontmost_pid(void);
 extern int running_bundle_pids(const char *path, int *pids, int capacity);
@@ -209,8 +209,15 @@ static void print_entry(process_entry *p) {
   fputs("null", stdout);
   printf(",\"counters\":{\"cpuUserNsExact\":\"%" PRIu64 "\",\"cpuSystemNsExact\":\"%" PRIu64 "\",\"residentBytes\":%" PRIu64 ",\"physicalFootprintBytes\":%" PRIu64 ",\"startMonotonicNsExact\":\"%" PRIu64 "\",\"cpuEnergyNjExact\":",
     ns(usage.ri_user_time), ns(usage.ri_system_time), usage.ri_resident_size, usage.ri_phys_footprint, ns(usage.ri_proc_start_abstime));
-  if (energy_supported && flavor == RUSAGE_INFO_V6) printf("\"%" PRIu64 "\"", usage.ri_energy_nj);
+  if (flavor == RUSAGE_INFO_V6) printf("\"%" PRIu64 "\"", usage.ri_energy_nj);
   else fputs("null", stdout);
+  printf(",\"cpuUserTicksExact\":\"%" PRIu64 "\",\"cpuSystemTicksExact\":\"%" PRIu64 "\"", usage.ri_user_time, usage.ri_system_time);
+  if (flavor == RUSAGE_INFO_V6) {
+    printf(",\"cpuPUserTicksExact\":\"%" PRIu64 "\",\"cpuPSystemTicksExact\":\"%" PRIu64 "\"", usage.ri_user_ptime, usage.ri_system_ptime);
+    printf(",\"cpuPUserNsExact\":\"%" PRIu64 "\",\"cpuPSystemNsExact\":\"%" PRIu64 "\",\"cpuCyclesExact\":\"%" PRIu64 "\",\"cpuInstructionsExact\":\"%" PRIu64 "\",\"cpuPCyclesExact\":\"%" PRIu64 "\",\"cpuPInstructionsExact\":\"%" PRIu64 "\",\"cpuPEnergyNjExact\":",
+      ns(usage.ri_user_ptime), ns(usage.ri_system_ptime), usage.ri_cycles, usage.ri_instructions, usage.ri_pcycles, usage.ri_pinstructions);
+    printf("\"%" PRIu64 "\"", usage.ri_penergy_nj);
+  } else fputs(",\"cpuPUserTicksExact\":null,\"cpuPSystemTicksExact\":null,\"cpuPUserNsExact\":null,\"cpuPSystemNsExact\":null,\"cpuCyclesExact\":null,\"cpuInstructionsExact\":null,\"cpuPCyclesExact\":null,\"cpuPInstructionsExact\":null,\"cpuPEnergyNjExact\":null", stdout);
   fputs("}}", stdout);
 }
 
@@ -252,8 +259,8 @@ static void snapshot(char *line) {
     }
     propagate(list, count);
   }
-  printf("{\"sampleStartMonotonicNsExact\":\"%" PRIu64 "\",\"timebase\":{\"numer\":%u,\"denom\":%u},\"responsibleLookupAvailable\":%s,\"cpuEnergySupported\":%s,\"processes\":[",
-    start, timebase.numer, timebase.denom, responsible ? "true" : "false", energy_supported ? "true" : "false");
+  printf("{\"sampleStartMonotonicNsExact\":\"%" PRIu64 "\",\"timebase\":{\"numer\":%u,\"denom\":%u},\"responsibleLookupAvailable\":%s,\"cpuEnergySupported\":%s,\"cpuCyclesSupported\":%s,\"cpuInstructionsSupported\":%s,\"cpuPTimeSupported\":%s,\"cpuPEnergySupported\":%s,\"cpuPCyclesSupported\":%s,\"cpuPInstructionsSupported\":%s,\"processes\":[",
+    start, timebase.numer, timebase.denom, responsible ? "true" : "false", energy_supported ? "true" : "false", cycles_supported ? "true" : "false", instructions_supported ? "true" : "false", ptime_supported ? "true" : "false", penergy_supported ? "true" : "false", pcycles_supported ? "true" : "false", pinstructions_supported ? "true" : "false");
   bool first_entry = true;
   for (int i = 0; i < count; i++) {
     if (!(list[i].flags & (RUNTIME | BACKEND))) continue;
@@ -284,7 +291,15 @@ int main(void) {
     while (ns(mach_absolute_time()) < until) { }
     sched_yield();
     usleep(1000);
-    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V6, (rusage_info_t *)&after) == 0 && after.ri_energy_nj > before.ri_energy_nj) energy_supported = true;
+    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V6, (rusage_info_t *)&after) == 0) {
+      energy_supported = after.ri_energy_nj > before.ri_energy_nj;
+      cycles_supported = after.ri_cycles > before.ri_cycles;
+      instructions_supported = after.ri_instructions > before.ri_instructions;
+      ptime_supported = after.ri_user_ptime + after.ri_system_ptime > before.ri_user_ptime + before.ri_system_ptime;
+      penergy_supported = energy_supported && after.ri_penergy_nj > before.ri_penergy_nj;
+      pcycles_supported = cycles_supported && after.ri_pcycles > before.ri_pcycles;
+      pinstructions_supported = instructions_supported && after.ri_pinstructions > before.ri_pinstructions;
+    }
   }
   setvbuf(stdout, NULL, _IOLBF, 0);
   char *line = NULL;

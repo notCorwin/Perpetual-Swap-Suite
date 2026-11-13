@@ -4,6 +4,22 @@ import { createMarketTrafficExchange } from '../helpers/market-traffic-exchange.
 
 const urlOf = (fixture, path) => `${fixture.environment.PERPETUAL_SWAP_E2E_HTTP_ORIGIN}/api/v5${path}`
 
+test('fixed replay sends exactly the requested rounds independent of warmup', async t => {
+  const fixture = await createMarketTrafficExchange({ candidateCount: 3, passingCount: 1, spreadFailureCount: 1 })
+  const socket = new WebSocket(`${fixture.environment.PERPETUAL_SWAP_E2E_WEBSOCKET_ORIGIN}/ws/v5/public`)
+  t.after(async () => { socket.close(); await fixture.close() })
+  await new Promise(resolve => socket.addEventListener('open', resolve, { once: true }))
+  socket.send(JSON.stringify({ op: 'subscribe', args: [{ channel: 'tickers', instId: 'T000-USDT-SWAP' }] }))
+  await new Promise(resolve => socket.addEventListener('message', resolve, { once: true }))
+  fixture.startCadence(100)
+  await fixture.beginSample({ rounds: 3 })
+  await fixture.waitForFixedRounds()
+  const sample = fixture.endSample()
+  assert.equal(sample.rounds.length, 3)
+  assert.equal(sample.events.length, 3)
+  assert.equal(fixture.latestValues['tickers:T000-USDT-SWAP'].last, '101.003')
+})
+
 test('market traffic fixture keeps valid deterministic qualification and history inputs', async t => {
   const fixture = await createMarketTrafficExchange()
   t.after(() => fixture.close())
