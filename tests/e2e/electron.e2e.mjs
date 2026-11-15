@@ -113,6 +113,21 @@ before(async () => {
 })
 after(async () => { await electron?.close(); await rm(userData, { recursive: true, force: true }) })
 
+test('window position and size survive an immediate restart', async () => {
+  const initial = await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].getBounds())
+  const expected = await electron.evaluate(({ BrowserWindow, screen }) => {
+    const target = BrowserWindow.getAllWindows()[0]
+    const area = screen.getPrimaryDisplay().workArea
+    target.setBounds({ x: area.x + 20, y: area.y + 20, width: 1250, height: 700 })
+    return target.getNormalBounds()
+  })
+  await electron.close()
+  await launchElectron()
+  const restored = await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].getBounds())
+  assert.deepEqual(restored, expected)
+  await electron.evaluate(({ BrowserWindow }, bounds) => BrowserWindow.getAllWindows()[0].setBounds(bounds), initial)
+})
+
 test('desktop window loads the React workspace with a restricted renderer', async () => {
   if (process.env.PERPETUAL_SWAP_TEST_UI !== 'foreground') {
     const native = await electron.evaluate(({ app, BrowserWindow }) => {

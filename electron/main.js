@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, ClipboardItem, contentTracing, ipcMain, nativeImage, net, session, shell } from 'electron'
+import { app, BrowserWindow, clipboard, ClipboardItem, contentTracing, ipcMain, nativeImage, net, screen, session, shell } from 'electron'
 import { mkdirSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -18,6 +18,7 @@ import { operationRecordingRequested } from './services/operation-policy.js'
 import { installElectronOperationHooks } from './services/operation-hooks.js'
 import { MarketBackend } from './services/market-backend.js'
 import { windowToolbarLayout } from './window-layout.js'
+import { restoreWindowBounds, saveWindowBounds } from './window-state.js'
 import { PresentationLifecycle } from './services/presentation-lifecycle.js'
 import { PresentationDelivery } from './services/presentation-delivery.js'
 
@@ -211,11 +212,13 @@ async function handleRequest(event, payload, context) {
 
 async function createWindow() {
   if (shuttingDown || window && !window.isDestroyed()) return
+  const windowStatePath = join(app.getPath('userData'), 'window-state.json')
+  const savedBounds = restoreWindowBounds(windowStatePath, screen.getAllDisplays())
   window = new BrowserWindow({
     ...testWindowOptions(backgroundTests),
     frame: false,
     ...(process.platform === 'darwin' ? { titleBarStyle: 'hidden', trafficLightPosition: windowToolbarLayout(1600, true).buttonsPosition } : {}),
-    width: 1600, height: 1000, minWidth: 1200, minHeight: 640,
+    width: 1600, height: 1000, ...savedBounds, minWidth: 1200, minHeight: 640,
     title: 'Perpetual Swap Suite', backgroundColor: '#101114', show: !testMode && !backgroundTests,
     webPreferences: { ...testWindowOptions(backgroundTests).webPreferences,
       additionalArguments: [...(operationRecording ? ['--perpetual-swap-operation-recording'] : []),
@@ -246,7 +249,7 @@ async function createWindow() {
   let allowClose = false, closing = false
   const target = window
   target.on('close', event => {
-    if (allowClose || shuttingDown) return
+    if (allowClose || shuttingDown) { saveWindowBounds(windowStatePath, target); return }
     event.preventDefault()
     if (closing) return
     closing = true
