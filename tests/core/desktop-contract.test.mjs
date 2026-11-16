@@ -193,3 +193,20 @@ test('validation errors never include rejected credential values', () => {
   const rejectedCredential = 'fake-credential-must-not-appear'
   assert.throws(() => parseDesktopRequest({ analysisSettings: { action: 'save', model: 1, apiKey: rejectedCredential } }), error => error.code === 'INVALID_DESKTOP_REQUEST' && !error.message.includes(rejectedCredential))
 })
+
+test('viewport size crosses the production parser only on focus targets and history reads', () => {
+  for (const windowBars of [96, 144, 192, 240, 288]) {
+    for (const request of [
+      { chartFocus: { id: 'wide-focus', target: { instId, timeframe: '15m', windowBars } } },
+      { chartHistory: { instId, timeframe: '15m', focusId: 'wide-focus', windowBars } },
+    ]) assert.deepEqual(parseDesktopRequest(request), request)
+    reject({ chartLocal: { instId, timeframe: '15m', windowBars } })
+    reject({ chartWindow: { instId, timeframe: '15m', windowBars } })
+  }
+  for (const windowBars of [0, 95, 97, 143, 145, 289, 4_096, 144.5, NaN, Infinity, '192', null, true]) {
+    reject({ chartFocus: { id: 'wide-focus', target: { instId, timeframe: '15m', windowBars } } })
+    reject({ chartHistory: { instId, timeframe: '15m', windowBars } })
+  }
+  assert.deepEqual(parseDesktopRequest({ chartHistory: { instId, timeframe: '15m', windowBars: undefined } }),
+    { chartHistory: { instId, timeframe: '15m' } })
+})

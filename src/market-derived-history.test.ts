@@ -95,7 +95,7 @@ test('unselected closes save local Taker facts without acquiring remote statisti
     const [saved] = await f.store.candles({ instrument: instId, timeframe: '5m', from: base, through: base })
     assert.deepEqual([saved.buy, saved.sell, saved.oi], [5, 0, null])
     assert.equal(f.requests.length, 0)
-    f.service.preparedCharts.focus = { instId, timeframe: '5m' }
+    f.service.preparedCharts.focuses.set('primary', { instId, timeframe: '5m', key: `${instId}:5m`, slot: 'primary' })
     assert.equal(f.service.statisticsAcquisitionDemand(instId, '5m'), true)
     assert.equal(f.service.statisticsAcquisitionDemand(instId, '1H'), false)
   } finally { await f.close() }

@@ -66,10 +66,10 @@ export type DesktopCommands = {
   copyText: { input: string; output: { ok: boolean } }
   copyImage: { input: string; output: { ok: boolean } }
   captureChart: { input: ChartCaptureBounds & { output?: 'png' }; output: { ok: boolean } }
-  chartFocus: { input: { id: string; slot?: 'primary' | RadarTimeframe; target: { instId: string; timeframe: RadarTimeframe; endHour?: number } | null }; output: { ok: boolean } }
+  chartFocus: { input: { id: string; slot?: 'primary' | RadarTimeframe; target: { instId: string; timeframe: RadarTimeframe; endHour?: number; windowBars?: number } | null }; output: { ok: boolean } }
   chartWindow: { input: { instId: string; timeframe: RadarTimeframe; endHour?: number; historyBars?: number; focusId?: string }; output: PreparedChartResponse | null }
   chartLocal: { input: { instId: string; timeframe: RadarTimeframe }; output: PreparedChartResponse | null }
-  chartHistory: { input: { instId: string; timeframe: RadarTimeframe; endHour?: number; focusId?: string }; output: PreparedChartResponse | null }
+  chartHistory: { input: { instId: string; timeframe: RadarTimeframe; endHour?: number; focusId?: string; windowBars?: number }; output: PreparedChartResponse | null }
   chartUniverse: { input: Record<string, never>; output: { frames: PreparedChartResponse[] } }
 }
 export type DesktopRequest = { [K in keyof DesktopCommands]: { [P in K]: DesktopCommands[K]['input'] } }[keyof DesktopCommands]

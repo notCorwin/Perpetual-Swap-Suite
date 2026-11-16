@@ -671,3 +671,26 @@ test('a proven listing floor clamps the cursor while observed warmup nulls and u
   assert.equal(controller.getSnapshot().pending, false)
   close()
 })
+
+test('viewport demand is quantized, preserves a historical cursor, and reuses cached canonical data', async () => {
+  const store = cached(400), demands: Array<ChartTarget | null> = []
+  const controller = new ChartController(transport({ focus: target => { demands.push(target) } }), store)
+  const close = controller.open(btc, '1H', 1300 * hour)
+  const narrow = controller.getSnapshot().presented!
+  controller.setWindowBars(192)
+  const wide = controller.getSnapshot().presented!
+  assert.equal(wide.endHour, narrow.endHour)
+  assert.equal(wide.bars.length, 192)
+  assert.equal(wide.bars.at(-1), narrow.bars.at(-1))
+  assert.equal(demands.at(-1)?.windowBars, 192)
+  const admitted = demands.length
+  controller.setWindowBars(192)
+  assert.equal(demands.length, admitted)
+  controller.scroll(-1)
+  assert.equal(controller.getSnapshot().presented!.bars.length, 192)
+  assert.equal(demands.at(-1)?.windowBars, 192)
+  controller.setWindowBars(96)
+  assert.equal(controller.getSnapshot().presented!.bars.length, 96)
+  close()
+  await settled()
+})

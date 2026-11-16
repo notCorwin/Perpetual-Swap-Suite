@@ -104,9 +104,17 @@ test('backend adapters keep resident reads separate from viewport demand and for
     assert.deepEqual(await request({ chartWindow: { ...target, historyBars: 512, focusId: 'focus-1' } }), frame)
     assert.deepEqual(await request({ chartFocus: { id: 'focus-2', target: null } }), { ok: true })
     assert.deepEqual(calls, [
-      ['setFocus', target, 'focus-1'], ['localHistory', instId, timeframe, endHour, { focusId: 'focus-1' }],
+      ['setFocus', target, 'focus-1', undefined], ['localHistory', instId, timeframe, endHour, { focusId: 'focus-1', windowBars: undefined }],
       ['prepare', instId, timeframe, endHour, 512, { focusId: 'focus-1' }],
-      ['setFocus', null, 'focus-2'],
+      ['setFocus', null, 'focus-2', undefined],
+    ])
+    calls.length = 0
+    const wideTarget = { ...target, windowBars: 192 }
+    assert.deepEqual(await request({ chartFocus: { id: 'wide-focus', slot: '15m', target: wideTarget } }), { ok: true })
+    assert.deepEqual(await request({ chartHistory: { ...wideTarget, focusId: 'wide-focus' } }), frame)
+    assert.deepEqual(calls, [
+      ['setFocus', wideTarget, 'wide-focus', '15m'],
+      ['localHistory', instId, timeframe, endHour, { focusId: 'wide-focus', windowBars: 192 }],
     ])
     assert.equal(fixture.service.barTasks.size, 0)
   } finally {

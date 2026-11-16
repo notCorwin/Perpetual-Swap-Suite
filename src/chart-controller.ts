@@ -3,7 +3,7 @@ import { completeChartPriceRange } from './chart-data.ts'
 import type { ChartSourceStatus, PreparedChartNotification, PreparedChartResponse, ReadyChartWindow } from './chart-data.ts'
 import { timeframeMilliseconds, type RadarTimeframe } from './timeframe.ts'
 
-export type ChartTarget = { instId: string; timeframe: RadarTimeframe; end: number | null }
+export type ChartTarget = { instId: string; timeframe: RadarTimeframe; end: number | null; windowBars?: number }
 export type ChartView = {
   requested: ChartTarget | null
   presented: ReadyChartWindow | null
@@ -19,7 +19,7 @@ export type ChartTransport = {
   history?: (target: ChartTarget, focusId: string) => Promise<PreparedChartResponse | null>
   universe: () => Promise<{ frames: PreparedChartResponse[] }>
 }
-const targetKey = (target: ChartTarget) => `${target.timeframe}:${target.instId}:${target.end ?? 'latest'}`
+const targetKey = (target: ChartTarget) => `${target.timeframe}:${target.instId}:${target.end ?? 'latest'}:${target.windowBars ?? 96}`
 const sameSeries = (left: Pick<ChartTarget, 'instId' | 'timeframe'>, right: Pick<ChartTarget, 'instId' | 'timeframe'>) => left.instId === right.instId && left.timeframe === right.timeframe
 const seriesKey = (target: Pick<ChartTarget, 'instId' | 'timeframe'>) => `${target.timeframe}:${target.instId}`
 type SourceRevision = Pick<PreparedChartResponse, 'generation' | 'revision'>
@@ -32,6 +32,7 @@ export class ChartController {
   private transport: ChartTransport
   private listeners = new Set<() => void>()
   private view: ChartView = { requested: null, presented: null, pending: false, error: '', oldestHour: null, latestEnd: null, historyExhausted: false }
+  private windowBars = 96
   private owner = 0
   private focusVersion = 0
   private readonly identity = crypto.randomUUID()
@@ -136,9 +137,10 @@ export class ChartController {
     this.sourceRevisions.set(key, { generation: response.generation, revision: response.revision, cursor: sourceCursor(response) })
     const previous = this.priceSource?.target === targetKey(target) ? this.priceSource.status
       : this.store.window(target.instId, target.timeframe, target.end)?.priceStatus
-    const first = response.endHour === null ? null : Math.max(response.endHour - 95 * response.intervalMS,
+    const first = response.endHour === null ? null : Math.max(response.endHour - ((target.windowBars ?? 96) - 1) * response.intervalMS,
       response.historyExhausted ? response.oldestHour ?? -Infinity : -Infinity)
-    const recovered = response.priceStatus?.state === 'ready' || response.priceState === 'ready'
+    const recovered = (response.windowBars ?? 96) >= (target.windowBars ?? 96)
+      && (response.priceStatus?.state === 'ready' || response.priceState === 'ready')
       || first !== null && completeChartPriceRange(response.bars, first, response.endHour!, response.intervalMS)
     const status = recovered ? undefined : response.priceStatus?.state === 'error' ? response.priceStatus
       : previous?.state === 'error' ? previous : response.priceStatus
@@ -176,6 +178,17 @@ export class ChartController {
     }
   }
 
+  setWindowBars(count: number) {
+    const next = Math.max(96, Math.min(288, Math.round(count / 48) * 48))
+    if (next === this.windowBars) return
+    this.windowBars = next
+    const target = this.view.requested
+    if (target && this.active) {
+      this.store.setWindowBars(target.instId, target.timeframe, next)
+      this.setTarget({ ...target, windowBars: next }, true)
+    }
+  }
+
   open(instId: string, timeframe: RadarTimeframe, end: number | null = null) {
     const owner = ++this.owner
     this.active = true
@@ -183,7 +196,8 @@ export class ChartController {
     const unsubscribe = this.store.subscribe(instId, timeframe, () => { if (this.active && this.presentationActive) this.commit() })
     this.store.setUniverse(this.universeIds, timeframe, instId)
     this.publish({ ...this.view })
-    this.setTarget({ instId, timeframe, end }, true)
+    this.store.setWindowBars(instId, timeframe, this.windowBars)
+    this.setTarget({ instId, timeframe, end, ...(this.windowBars === 96 ? {} : { windowBars: this.windowBars }) }, true)
     return () => {
       unsubscribe(); unpin()
       if (owner !== this.owner) return
@@ -199,7 +213,7 @@ export class ChartController {
     if (latest === null) return
     const interval = timeframeMilliseconds(target.timeframe)
     const meta = this.store.snapshotMeta(target.instId, target.timeframe)
-    const floor = meta?.historyExhausted && meta.oldestHour !== null ? Math.min(latest, meta.oldestHour) : 95 * interval
+    const floor = meta?.historyExhausted && meta.oldestHour !== null ? Math.min(latest, meta.oldestHour) : ((target.windowBars ?? 96) - 1) * interval
     const end = Math.max(floor, Math.min(latest, (target.end ?? latest) + Math.trunc(steps) * interval))
     this.setTarget({ ...target, end: end >= latest ? null : end })
   }
@@ -253,7 +267,7 @@ export class ChartController {
 
   private completePrices(window: ReadyChartWindow) {
     const meta = this.store.snapshotMeta(window.instId, window.timeframe)
-    const first = Math.max(window.endHour - 95 * window.intervalMS, meta?.historyExhausted ? meta.oldestHour ?? -Infinity : -Infinity)
+    const first = Math.max(window.endHour - ((window.windowBars ?? 96) - 1) * window.intervalMS, meta?.historyExhausted ? meta.oldestHour ?? -Infinity : -Infinity)
     return completeChartPriceRange(window.bars, first, window.endHour, window.intervalMS)
   }
 
@@ -382,9 +396,9 @@ const sharedChartStore = new PreparedChartStore()
 let universeRead: Promise<{ frames: PreparedChartResponse[] }> | null = null
 const readUniverse = () => universeRead ??= window.radarDesktop.request({ chartUniverse: {} }).finally(() => { universeRead = null })
 const desktopController = (slot: 'primary' | RadarTimeframe) => new ChartController({
-  focus: (target, id) => window.radarDesktop.request({ chartFocus: { id, slot, target: target ? { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined } : null } }),
+  focus: (target, id) => window.radarDesktop.request({ chartFocus: { id, slot, target: target ? { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined, windowBars: target.windowBars } : null } }),
   local: (instId, timeframe) => window.radarDesktop.request({ chartLocal: { instId, timeframe } }),
-  history: (target, focusId) => window.radarDesktop.request({ chartHistory: { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined, focusId } }),
+  history: (target, focusId) => window.radarDesktop.request({ chartHistory: { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined, windowBars: target.windowBars, focusId } }),
   universe: readUniverse,
 }, sharedChartStore)
 

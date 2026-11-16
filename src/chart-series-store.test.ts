@@ -1383,3 +1383,51 @@ test('all open timeframe histories survive byte and series pressure until their 
   for (const release of releases) release()
   assert.equal(store.size, 0)
 })
+
+test('viewport expansion reuses resident bars and invalidates projection and boundary caches at the same cursor', () => {
+  const store = new PreparedChartStore()
+  store.ingest(response(bars(0, 400)))
+  const narrow = store.window(instId, '1H', 300 * hour)!
+  assert.equal(narrow.bars.length, 96)
+  store.readyBoundaries(instId, '1H')
+  store.setWindowBars(instId, '1H', 192)
+  const wide = store.window(instId, '1H', 300 * hour)!
+  assert.equal(wide.bars.length, 192)
+  assert.equal(wide.bars.at(-1), narrow.bars.at(-1))
+  assert.equal(wide.bars[96], narrow.bars[0], 'Existing canonical candles and indicators are reused.')
+  assert.equal(wide.priceState, 'ready')
+  assert.equal(store.window(instId, '1H', 300 * hour), wide)
+  assert.equal(store.readyBoundaries(instId, '1H')[0].firstEnd, 191 * hour)
+  store.setWindowBars(instId, '1H', 96)
+  assert.equal(store.window(instId, '1H', 300 * hour)!.bars.length, 96)
+  assert.equal(store.readyBoundaries(instId, '1H')[0].firstEnd, 95 * hour)
+})
+
+test('wide latest frames keep their range through live updates and compact candidate notifications', () => {
+  const store = new PreparedChartStore()
+  store.setUniverse([instId], '1H', instId)
+  store.setWindowBars(instId, '1H', 192)
+  store.ingestLatest(response(bars(0, 192)))
+  const wide = store.window(instId, '1H')!
+  store.ingestLatest(response(bars(96, 96), { revision: 2 }))
+  assert.equal(store.window(instId, '1H')!.bars.length, 192)
+  assert.equal(store.window(instId, '1H')!.bars[0], wide.bars[0])
+  const liveBar = { ...bar(192), confirmed: false as const }
+  store.ingestLive({ type: 'live', instId, timeframe: '1H', generation: 1, revision: 3,
+    endHour: 191 * hour, liveBar, priceState: 'ready', priceAsOf: Date.now(), realtimeState: 'live' })
+  assert.equal(store.window(instId, '1H')!.windowBars, 192)
+  assert.equal(store.window(instId, '1H')!.liveBar?.hour, 192 * hour)
+})
+
+test('compact frames from a new generation cannot certify retained wide candles from an older input basis', () => {
+  const store = new PreparedChartStore()
+  store.setUniverse([instId], '1H', instId)
+  store.setWindowBars(instId, '1H', 192)
+  store.ingestLatest(response(bars(0, 192)))
+  store.ingestLatest(response(bars(96, 96), { generation: 2, revision: 2 }))
+  const frame = store.window(instId, '1H')!
+  assert.equal(frame.generation, 2)
+  assert.equal(frame.bars.length, 96)
+  assert.equal(frame.priceState, 'partial')
+  assert.equal(frame.bars[0].hour, 96 * hour)
+})

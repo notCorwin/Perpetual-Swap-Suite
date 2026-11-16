@@ -1,9 +1,9 @@
 export const WORKSPACE_DESIGN_WIDTH = 1600
 
-// Native buttons stay in macOS points while the renderer uses CSS zoom.
+// Keep normal density above the design width; compact windows scale down.
 // Both sides must use the same physical toolbar height and vertical center.
 export function windowToolbarLayout(width, nativeWindowControls = false) {
-  const scale = width / WORKSPACE_DESIGN_WIDTH
+  const scale = Math.min(1, width / WORKSPACE_DESIGN_WIDTH)
   const height = Math.max(48 * scale, nativeWindowControls ? 36 : 0)
   return {
     scale, height, controlsInset: nativeWindowControls ? 72 : 0,

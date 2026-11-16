@@ -4,6 +4,7 @@ import type { Bar, ChartSourceStatus, PreparedChartBar, PreparedChartLiveUpdate,
 import { RADAR_TIMEFRAMES, timeframeMilliseconds, type RadarTimeframe } from './timeframe.ts'
 
 const WINDOW_BARS = 96
+const MAX_WINDOW_BARS = 288
 const indicatorFields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw'] as const
 const barFields = ['hour', 'open', 'high', 'low', 'close', 'confirmed', 'priceComplete', 'statisticsSources', 'statisticsObserved', 'oiObserved', 'takerObserved', 'indicatorsObserved', ...indicatorFields, 'oi', 'buy', 'sell', 'oiUnavailableReason', 'takerUnavailableReason'] as const
 const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value)
@@ -103,7 +104,7 @@ function retainedSourceMeta(meta: PreparedChartMeta, hours: readonly number[], l
   if (!meta.sourceStatuses?.length) return meta
   const ranges: Array<{ from: number; through: number }> = []
   for (const hour of [...hours, ...(liveEnd === undefined ? [] : [liveEnd])].sort((left, right) => left - right)) {
-    const from = hour - (WINDOW_BARS - 1) * meta.intervalMS, previous = ranges.at(-1)
+    const from = hour - (MAX_WINDOW_BARS - 1) * meta.intervalMS, previous = ranges.at(-1)
     if (previous && from <= previous.through + meta.intervalMS) previous.through = hour
     else ranges.push({ from, through: hour })
   }
@@ -196,26 +197,27 @@ function presentWindow(meta: PreparedChartMeta, bars: readonly PreparedChartBar[
     && previous.realtimeState === (meta.realtimeState ?? 'stale') && previous.priceObservedAt === meta.priceObservedAt
     && (previous.sourceVersions === meta.sourceVersions || JSON.stringify(previous.sourceVersions) === JSON.stringify(meta.sourceVersions))) return previous
   return Object.freeze({
-    key: meta.key, instId: meta.instId, timeframe: meta.timeframe, intervalMS: meta.intervalMS, generation: meta.generation, bars: sameBars ? previous.bars : Object.freeze(bars), endHour,
+    windowBars: previous?.windowBars, key: meta.key, instId: meta.instId, timeframe: meta.timeframe, intervalMS: meta.intervalMS, generation: meta.generation, bars: sameBars ? previous.bars : Object.freeze(bars), endHour,
     priceStatus, oiState: oi.state, takerState: taker.state, oiStatus, takerStatus,
     indicatorState: indicator.state, indicatorStatus,
     ...(liveBar ? { liveBar } : {}), priceState, priceAsOf: meta.priceAsOf, priceObservedAt: meta.priceObservedAt, realtimeState: meta.realtimeState ?? 'stale', sourceVersions: meta.sourceVersions,
   })
 }
 
-function readyWindow(meta: PreparedChartMeta, bars: readonly PreparedChartBar[], endHour: number, liveBar?: Bar, previous?: ReadyChartWindow): ReadyChartWindow {
-  const first = Math.max(endHour - (WINDOW_BARS - 1) * meta.intervalMS, meta.historyExhausted ? meta.oldestHour ?? -Infinity : -Infinity)
+function readyWindow(meta: PreparedChartMeta, bars: readonly PreparedChartBar[], endHour: number, liveBar?: Bar, previous?: ReadyChartWindow, windowBars = WINDOW_BARS): ReadyChartWindow {
+  const first = Math.max(endHour - (windowBars - 1) * meta.intervalMS, meta.historyExhausted ? meta.oldestHour ?? -Infinity : -Infinity)
   const complete = completeChartPriceRange(bars, first, endHour, meta.intervalMS)
   const price = windowSource(meta, bars, first, endHour, 'price').status
   const oi = windowSource(meta, bars, first, endHour, 'oi'), taker = windowSource(meta, bars, first, endHour, 'taker')
   const indicator = windowSource(meta, bars, first, endHour, 'indicator')
-  return presentWindow(meta, bars, endHour, liveBar, first, complete, price, oi, taker, indicator, previous)
+  const result = presentWindow(meta, bars, endHour, liveBar, first, complete, price, oi, taker, indicator, previous)
+  return result.windowBars === windowBars ? result : Object.freeze({ ...result, windowBars })
 }
 
 // Live deltas change freshness and the forming candle, but not the source
 // slots that established a historical window's availability and statuses.
 function refreshHistoricalWindow(meta: PreparedChartMeta, previous: ReadyChartWindow): ReadyChartWindow {
-  const first = Math.max(previous.endHour - (WINDOW_BARS - 1) * meta.intervalMS, meta.historyExhausted ? meta.oldestHour ?? -Infinity : -Infinity)
+  const first = Math.max(previous.endHour - ((previous.windowBars ?? WINDOW_BARS) - 1) * meta.intervalMS, meta.historyExhausted ? meta.oldestHour ?? -Infinity : -Infinity)
   return presentWindow(meta, previous.bars, previous.endHour, undefined, first, previous.priceState === 'ready', previous.priceStatus,
     { state: previous.oiState, status: previous.oiStatus }, { state: previous.takerState, status: previous.takerStatus },
     { state: previous.indicatorState, status: previous.indicatorStatus }, previous)
@@ -227,9 +229,9 @@ function liveWindow(meta: PreparedChartMeta, liveBar: Bar | undefined, previous:
   // generation, or history boundary; failures in other sources are reusable.
   // Empty, partial, and price-error windows still need the full projection.
   if (!previous.bars.length || previous.priceState !== 'ready' && previous.priceState !== 'stale') {
-    return readyWindow(meta, previous.bars, previous.endHour, liveBar, previous)
+    return readyWindow(meta, previous.bars, previous.endHour, liveBar, previous, previous.windowBars)
   }
-  const first = Math.max(previous.endHour - (WINDOW_BARS - 1) * meta.intervalMS, meta.historyExhausted ? meta.oldestHour ?? -Infinity : -Infinity)
+  const first = Math.max(previous.endHour - ((previous.windowBars ?? WINDOW_BARS) - 1) * meta.intervalMS, meta.historyExhausted ? meta.oldestHour ?? -Infinity : -Infinity)
   return presentWindow(meta, previous.bars, previous.endHour, liveBar, first, true, previous.priceStatus,
     { state: previous.oiState, status: previous.oiStatus }, { state: previous.takerState, status: previous.takerStatus },
     { state: previous.indicatorState, status: previous.indicatorStatus }, previous)
@@ -237,6 +239,20 @@ function liveWindow(meta: PreparedChartMeta, liveBar: Bar | undefined, previous:
 
 /** Confirmed prices remain visible while each incomplete source repairs independently. */
 export class PreparedChartStore {
+  private readonly viewportBars = new Map<string, number>()
+  setWindowBars(instId: string, timeframe: RadarTimeframe, count: number) {
+    if (!Number.isInteger(count) || count < WINDOW_BARS || count > MAX_WINDOW_BARS || (count - WINDOW_BARS) % 48) throw new RangeError('Invalid chart viewport size.')
+    const key = keyFor(instId, timeframe)
+    if ((this.viewportBars.get(key) ?? WINDOW_BARS) === count) return
+    this.viewportBars.set(key, count)
+    const entry = this.series.get(key)
+    if (entry) { entry.windows.clear(); entry.boundaries = null }
+    if (entry && entry.meta.latestEnd !== null) {
+      const window = this.seriesWindow(entry, entry.meta.latestEnd)
+      if (window) this.setLatestFrame(key, { meta: entry.meta, window })
+    }
+  }
+  private count(key: string) { return this.viewportBars.get(key) ?? WINDOW_BARS }
   private nextEpoch = 0
   private readonly series = new Map<string, Series>()
   private readonly latestFrames = new Map<string, { meta: PreparedChartMeta; window: ReadyChartWindow }>()
@@ -389,6 +405,11 @@ export class PreparedChartStore {
       this.renderedUniverse = new Set(instIds.map(instId => keyFor(instId, _timeframe)))
       this.universe = new Set([...instIds, ...(focusInstId ? [focusInstId] : [])].flatMap(instId => RADAR_TIMEFRAMES.map(({ value }) => keyFor(instId, value))))
       for (const key of this.latestFrames.keys()) if (!this.universe.has(key)) this.setLatestFrame(key, null)
+      for (const key of this.viewportBars.keys()) if (!this.universe.has(key) && !this.pinned.has(key)) {
+        this.viewportBars.delete(key)
+        const entry = this.series.get(key)
+        if (entry) { entry.windows.clear(); entry.boundaries = null }
+      }
       for (const [key, entry] of this.series) {
         if (!this.universe.has(key) || this.latestFrame(key) || entry.meta.latestEnd === null) continue
         const window = this.seriesWindow(entry, entry.meta.latestEnd)
@@ -454,8 +475,8 @@ export class PreparedChartStore {
       const incoming = new Map(response.bars.map(bar => [bar.hour, bar]))
       const previousBars = new Map(previous?.window.bars.map(bar => [bar.hour, bar]))
       const bars: PreparedChartBar[] = []
-      for (let index = WINDOW_BARS - 1; index >= 0; index -= 1) {
-        const hour = endHour - index * intervalMS, value = incoming.get(hour)
+      for (let index = this.count(key) - 1; index >= 0; index -= 1) {
+        const hour = endHour - index * intervalMS, value = incoming.get(hour) ?? (previous?.meta.generation === generation ? previousBars.get(hour) : undefined)
         if (!value) continue
         const previousBar = previousBars.get(hour)
         const bar = preparedBar(value, intervalMS, previousBar, previous?.meta.generation === generation)
@@ -474,7 +495,7 @@ export class PreparedChartStore {
         oldestHour: response.oldestHour === null ? previous?.meta.oldestHour ?? null : Math.min(previous?.meta.oldestHour ?? Infinity, response.oldestHour),
         historyExhausted: response.historyExhausted || (previous?.meta.historyExhausted ?? false), error: response.error,
       })
-      const window = readyWindow(meta, bars, endHour, liveBar, previous?.window)
+      const window = readyWindow(meta, bars, endHour, liveBar, previous?.window, this.count(key))
       this.setLatestFrame(key, { meta, window })
       this.trimBytes()
       if (window !== previous?.window || revision !== previous?.meta.revision) this.markChanged(key)
@@ -571,7 +592,7 @@ export class PreparedChartStore {
       }
       if (current.bars.size > this.maxBarsPerSeries) {
         const anchor = finite(response.endHour) ? response.endHour : current.meta.latestEnd ?? current.hours.at(-1)!
-        const first = anchor - (WINDOW_BARS - 1) * intervalMS
+        const first = anchor - (this.count(key) - 1) * intervalMS
         const removable = current.hours.filter(hour => hour < first || hour > anchor)
           .sort((left, right) => Math.abs(right - anchor) - Math.abs(left - anchor) || left - right)
         const excess = current.bars.size - this.maxBarsPerSeries
@@ -633,8 +654,8 @@ export class PreparedChartStore {
 
   window(instId: string, timeframe: RadarTimeframe, end?: number | null): ReadyChartWindow | null {
     const key = keyFor(instId, timeframe), entry = this.access(key), latest = this.latestFrame(key)
-    if (latest && (end === null || end === undefined || end === latest.window.endHour)) return latest.window
-    if ((end === null || end === undefined) && this.universe.has(key)) return null
+    if (latest && (latest.window.windowBars ?? WINDOW_BARS) === this.count(key) && (end === null || end === undefined || end === latest.window.endHour)) return latest.window
+    if ((end === null || end === undefined) && this.universe.has(key) && !entry) return null
     const endHour = end ?? entry?.meta.latestEnd
     if (!entry || entry.meta.generation !== this.generations.get(key) || endHour === null || endHour === undefined || !Number.isSafeInteger(endHour)) return null
     return this.seriesWindow(entry, endHour)
@@ -657,6 +678,7 @@ export class PreparedChartStore {
   private seriesWindow(entry: Series, endHour: number): ReadyChartWindow | null {
     if (entry.meta.generation !== this.generations.get(entry.meta.key)) return null
     const liveBar = endHour === entry.meta.latestEnd ? entry.liveBar : undefined
+    const windowBars = this.count(entry.meta.key)
     const cached = entry.windows.get(endHour)
     // Immutable metadata owns source status/freshness; version owns changed or
     // evicted bars. Repeated navigation reads need no 96-slot projection work.
@@ -667,14 +689,14 @@ export class PreparedChartStore {
       && cached.meta.latestEnd === entry.meta.latestEnd && cached.meta.oldestHour === entry.meta.oldestHour
       && cached.meta.historyExhausted === entry.meta.historyExhausted && cached.meta.sourceStatuses === entry.meta.sourceStatuses
     const window = reusable ? cached.window : historicalRefresh ? refreshHistoricalWindow(entry.meta, cached.window) : measureOperation({ category: 'cpu', name: 'chart.window.project', resource: entry.meta.instId,
-      attributes: { inputRows: WINDOW_BARS } }, () => {
+      attributes: { inputRows: windowBars } }, () => {
       const bars: PreparedChartBar[] = []
-      for (let index = WINDOW_BARS - 1; index >= 0; index -= 1) {
+      for (let index = windowBars - 1; index >= 0; index -= 1) {
         const value = entry.bars.get(endHour - index * entry.meta.intervalMS)
         if (value?.generation === entry.meta.generation) bars.push(value.bar)
       }
       if (entry.bars.get(endHour)?.generation !== entry.meta.generation && !liveBar || !bars.length && !liveBar) return null
-      return readyWindow(entry.meta, bars, endHour, liveBar, cached?.window)
+      return readyWindow(entry.meta, bars, endHour, liveBar, cached?.window, windowBars)
     })
     if (!window) return null
     entry.windows.delete(endHour)
@@ -706,7 +728,7 @@ export class PreparedChartStore {
         // Navigation consumes a whole viewport. Counting the first 95 candles
         // as available runway postpones acquisition until the chart is stuck.
         const firstEnd = entry.meta.historyExhausted && first === entry.meta.oldestHour
-          ? first : first + (WINDOW_BARS - 1) * entry.meta.intervalMS
+          ? first : first + (this.count(key) - 1) * entry.meta.intervalMS
         if (firstEnd <= lastEnd) runs.push(Object.freeze({ firstEnd, lastEnd }))
       }
       start = index

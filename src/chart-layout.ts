@@ -1,15 +1,20 @@
+// Quantized demand avoids acquiring or projecting history for every resize pixel.
+export function chartViewportBars(plotWidth: number) {
+  return Math.min(288, 96 + Math.max(0, Math.floor((plotWidth - 1180) / 480)) * 48)
+}
+
 export const CHART_PANELS = ["price", "roc", "rsi", "atr", "oi", "taker"] as const
 export type ChartPanel = typeof CHART_PANELS[number]
 
 type Range = readonly [number, number]
 
-export function chartCandleWidth(plotWidth: number) {
-  return Math.max(5, Math.min(13, plotWidth / 96 * 0.68))
+export function chartCandleWidth(plotWidth: number, windowBars = 96) {
+  return Math.max(5, Math.min(13, plotWidth / windowBars * 0.68))
 }
 
-export function chartHourX(hour: number, latestHour: number, start: number, end: number, intervalMS = 3_600_000) {
-  const candleWidth = chartCandleWidth(end - start)
-  return start + candleWidth / 2 + (hour - (latestHour - 95 * intervalMS)) * (end - start - candleWidth) / (95 * intervalMS)
+export function chartHourX(hour: number, latestHour: number, start: number, end: number, intervalMS = 3_600_000, windowBars = 96) {
+  const candleWidth = chartCandleWidth(end - start, windowBars)
+  return start + candleWidth / 2 + (hour - (latestHour - (windowBars - 1) * intervalMS)) * (end - start - candleWidth) / ((windowBars - 1) * intervalMS)
 }
 
 export function chartPriceLabelLayout(priceY: number, panel: Range, fontSize: number, paddingY: number, showCountdown: boolean) {

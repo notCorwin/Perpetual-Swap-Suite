@@ -5,18 +5,18 @@ import { createChartGeometryCache, type ChartGeometryOverscan } from './chart-ge
 export function createChartPlotCache(measureText: (text: string) => number) {
   const geometry = createChartGeometryCache(measureText)
   type Plot = { bars: readonly Bar[]; geometry: ReturnType<typeof geometry>; before?: Bar; after?: Bar }
-  const cache = new WeakMap<readonly Bar[], WeakMap<object, { bars: readonly Bar[]; variants: Plot[] }>>()
+  const cache = new WeakMap<readonly Bar[], WeakMap<object, { bars: readonly Bar[]; variants: Plot[]; windowBars?: number }>>()
   return (window: ReadyChartWindow | null, size: { width: number; height: number }, overscan: ChartGeometryOverscan = {}, currentPriceTickSz?: string | null, priceOnly = false): Plot | null => {
     if (!window || !(size.width > 0 && size.height > 0)) return null
     let liveVariants = cache.get(window.bars)
     if (!liveVariants) { liveVariants = new WeakMap(); cache.set(window.bars, liveVariants) }
     const key = window.liveBar ?? window.bars
     let input = liveVariants.get(key)
-    if (!input) {
+    if (!input || input.windowBars !== window.windowBars) {
       const bars = window.liveBar
-        ? [...window.bars.filter(bar => bar.hour < window.liveBar!.hour), window.liveBar].slice(-96)
+        ? [...window.bars.filter(bar => bar.hour < window.liveBar!.hour), window.liveBar].slice(-(window.windowBars ?? 96))
         : window.bars
-      input = { bars, variants: [] }
+      input = { bars, variants: [], windowBars: window.windowBars }
       liveVariants.set(key, input)
     }
     const { bars, variants } = input
@@ -26,7 +26,7 @@ export function createChartPlotCache(measureText: (text: string) => number) {
     if (cached) return cached
     if (!bars.length) return null
     const endHour = bars.at(-1)!.hour
-    const plot = { bars, before: overscan.before, after: overscan.after, geometry: geometry(bars, { ...size, endHour, intervalMS: window.intervalMS,
+    const plot = { bars, before: overscan.before, after: overscan.after, geometry: geometry(bars, { ...size, endHour, intervalMS: window.intervalMS, windowBars: window.windowBars,
       liveClose: (window.liveBar ?? bars.at(-1)!).close, currentPriceTickSz, priceOnly }, overscan) }
     variants.push(plot)
     if (variants.length > 2) variants.shift()

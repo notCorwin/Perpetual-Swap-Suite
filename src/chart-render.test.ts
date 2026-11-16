@@ -74,3 +74,17 @@ test('current-price precision reserves label width and reuses unchanged chart in
   assert.equal(labels.length, 0, 'Unchanged precision must reuse geometry without measuring or rebuilding paths.')
   assert.equal(cache(live, size), unpadded, 'Historical formatting keeps its independent cached geometry.')
 })
+
+test('wide live plots render the expanded time range with matching coordinates', () => {
+  const cache = createChartPlotCache(text => text.length * 6), base = window()
+  const bars = Array.from({ length: 192 }, (_, index) => ({ ...base.bars[index % 96], hour: index * step }))
+  const frame = { ...base, bars, windowBars: 192, endHour: 191 * step,
+    liveBar: { ...bars.at(-1)!, confirmed: false, hour: 192 * step } }
+  const plot = cache(frame, { width: 2100, height: 700 })!
+  assert.equal(plot.bars.length, 192)
+  assert.equal(plot.bars[0].hour, step)
+  assert.equal(plot.bars.at(-1)!.hour, 192 * step)
+  assert.ok(plot.geometry.x[0] >= plot.geometry.layout.left)
+  assert.ok(plot.geometry.x.at(-1)! <= plot.geometry.layout.right)
+  assert.ok(Math.abs((plot.geometry.x[1] - plot.geometry.x[0]) - plot.geometry.barPitch) < 1e-8)
+})

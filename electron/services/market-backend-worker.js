@@ -137,11 +137,11 @@ async function request(value) {
     if (service.closing || service.disposed) throw new Error('Market service is closed.')
     const task = service.ready.then(() => {
       if (value.chartFocus) { service.preparedCharts.setFocus(value.chartFocus.target, value.chartFocus.id, value.chartFocus.slot); return { ok: true } }
-      const { instId, timeframe, endHour, historyBars, focusId } = value.chartWindow ?? value.chartLocal ?? value.chartHistory
+      const { instId, timeframe, endHour, historyBars, focusId, windowBars } = value.chartWindow ?? value.chartLocal ?? value.chartHistory
       if (value.chartWindow) return service.preparedCharts.prepare(instId, timeframe, endHour, historyBars, { focusId })
       if (value.chartLocal) return service.preparedCharts.local(instId, timeframe)
       return focusId === undefined ? service.preparedCharts.localHistory(instId, timeframe, endHour)
-        : service.preparedCharts.localHistory(instId, timeframe, endHour, { focusId })
+        : service.preparedCharts.localHistory(instId, timeframe, endHour, { focusId, windowBars })
     })
     service.barTasks.add(task)
     return task.finally(() => service.barTasks.delete(task))

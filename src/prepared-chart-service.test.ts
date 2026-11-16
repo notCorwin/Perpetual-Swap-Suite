@@ -3754,3 +3754,81 @@ test('three scoped chart focuses retain independent histories and cancel only th
     assert.equal(pipeline.currentFocus(hourly), true)
   } finally { await fixture.close() }
 })
+
+test('wide chart focuses expand only selected series and reuse prepared values when resizing', async () => {
+  const { store, pipeline } = fixture(source(800))
+  try {
+    pipeline.setFocus({ instId, timeframe: '15m' }, 'normal')
+    await pipeline.focus.task
+    await finishSeed(pipeline)
+    const normal = pipeline.frame(pipeline.state(instId, '15m'))
+    assert.equal(normal.windowBars, 96)
+    assert.equal(normal.bars.length, 96)
+    pipeline.setFocus({ instId, timeframe: '15m', windowBars: 192 }, 'wide')
+    await pipeline.focus.task
+    await finishSeed(pipeline)
+    const wide = pipeline.frame(pipeline.state(instId, '15m'))
+    assert.equal(wide.windowBars, 192)
+    assert.equal(wide.bars.length, 192)
+    assert.equal(wide.priceState, 'ready')
+    assert.equal(wide.priceStatus.from, wide.endHour - 191 * interval)
+    for (const field of indicatorFields) assert.equal(wide.bars.at(-1)[field], normal.bars.at(-1)[field], field)
+    const queries = store.queries.length, calculations = pipeline.nextCalculation
+    pipeline.setFocus({ instId, timeframe: '15m', windowBars: 144 }, 'smaller')
+    await pipeline.focus.task
+    await finishSeed(pipeline)
+    const smaller = pipeline.frame(pipeline.state(instId, '15m'))
+    assert.equal(smaller.bars.length, 144)
+    assert.equal(store.queries.length, queries, 'Shrinking the viewport must use resident source data.')
+    assert.equal(pipeline.nextCalculation, calculations, 'Already prepared indicators must survive viewport changes.')
+    assert.equal(pipeline.visibleBars('OTHER:15m'), 96)
+    assert.equal(pipeline.tailBars('OTHER:15m'), 128)
+    assert.throws(() => pipeline.setFocus({ instId, timeframe: '15m', windowBars: 289 }), /Invalid chart window/)
+  } finally { await pipeline.dispose() }
+})
+
+test('wide historical viewport statuses and focus reads cover the whole selected range', async () => {
+  const { pipeline } = fixture(source(1200))
+  try {
+    const target = end() - 150 * interval
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: target, windowBars: 288 }, 'wide-history')
+    await pipeline.focus.task
+    await finishSeed(pipeline)
+    const frame = pipeline.frame(pipeline.state(instId, '15m'), target, true)
+    assert.equal(frame.bars.length, 288)
+    assert.equal(frame.windowBars, 288)
+    assert.equal(frame.priceState, 'ready')
+    assert.equal(frame.priceStatus.from, target - 287 * interval)
+    assert.equal(frame.indicatorStatus.from, target - 287 * interval)
+    const history = await pipeline.localHistory(instId, '15m', target, { focusId: 'wide-history', windowBars: 288 })
+    assert.equal(history.windowBars, 288)
+    assert.equal(await pipeline.localHistory(instId, '15m', target, { focusId: 'wide-history', windowBars: 192 }), null)
+  } finally { await pipeline.dispose() }
+})
+
+test('wide latest windows retain their older edge across confirmed updates and report gaps beyond the normal viewport', async () => {
+  const { pipeline, store } = fixture(source(800))
+  try {
+    pipeline.setFocus({ instId, timeframe: '15m', windowBars: 288 }, 'wide-live')
+    await pipeline.focus.task
+    await finishSeed(pipeline)
+    const latest = pipeline.state(instId, '15m').latestHour
+    const appended = candle(latest + interval, 801)
+    store.change(appended)
+    pipeline.observe([appended], new Map())
+    await finishSeed(pipeline)
+    const live = pipeline.liveStates.get(`${instId}:15m`)
+    const frame = pipeline.frame(live)
+    assert.equal(frame.windowBars, 288)
+    assert.equal(frame.bars.length, 288)
+    assert.equal(frame.bars.at(-1).hour, appended.timestamp)
+    assert.equal(frame.bars[0].hour, appended.timestamp - 287 * interval)
+    assert.equal(frame.priceState, 'ready')
+    const missing = appended.timestamp - 200 * interval
+    live.rows.delete(missing)
+    const incomplete = pipeline.frame(live)
+    assert.equal(incomplete.bars.length, 287)
+    assert.equal(incomplete.priceState, 'partial', 'Missing prices outside the former 96-bar range must remain visible in source status.')
+    assert.equal(incomplete.priceStatus.from, appended.timestamp - 287 * interval)
+  } finally { await pipeline.dispose() }
+})

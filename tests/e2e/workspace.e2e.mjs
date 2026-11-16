@@ -54,19 +54,20 @@ before(async () => {
       BrowserWindow.getAllWindows()[0].webContents.send('radar:history-download-changed', report)
       return report
     }
-    const prepared = ({ instId, timeframe }) => {
+    state.viewportBars = {}
+    const prepared = ({ instId, timeframe, windowBars = state.viewportBars[`${timeframe}:${instId}`] ?? 96 }) => {
       if (state.chartOverride?.instId === instId && state.chartOverride.timeframe === timeframe) return structuredClone(state.chartOverride)
       const intervalMS = timeframe === '1H' ? 3_600_000 : timeframe === '15m' ? 900_000 : 300_000
       const endHour = Math.floor(Date.UTC(2026, 9, 18) / intervalMS) * intervalMS
-      const bars = Array.from({ length: 96 }, (_, index) => {
+      const bars = Array.from({ length: windowBars }, (_, index) => {
         const close = state.bollMode === 'constant' ? 100 : 100 + index * .01
-        return { hour: endHour - (95 - index) * intervalMS, open: close + (index % 2 ? -.05 : .05), high: close + .2, low: close - .2, close,
+        return { hour: endHour - (windowBars - 1 - index) * intervalMS, open: close + (index % 2 ? -.05 : .05), high: close + .2, low: close - .2, close,
           confirmed: true, statisticsSources: 3, statisticsObserved: true, indicatorsObserved: true,
           ema: close, vwap: close - .02, bollUpper: state.bollMode === 'constant' ? 100 : close + .5,
           bollMiddle: state.bollMode === 'constant' ? 100 : close, bollLower: state.bollMode === 'negative' ? -1 : state.bollMode === 'constant' ? 100 : close - .5,
           roc: .5, maroc: .25, rsi6: 50, rsi12: 55, rsi24: 60, atrPercent: .4 / close * 100, bbw: state.bollMode === 'constant' ? 0 : state.bollMode === 'negative' ? (close + 1.5) / close * 100 : 1 / close * 100, oi: 1_000_000 + index, buy: 12_000, sell: 10_000 }
       })
-      return { instId, timeframe, intervalMS, endHour, latestEnd: endHour, oldestHour: bars[0].hour, historyExhausted: true,
+      return { instId, timeframe, windowBars, intervalMS, endHour, latestEnd: endHour, oldestHour: bars[0].hour, historyExhausted: true,
         generation: state.chartGeneration, revision: state.chartGeneration, bars, oiState: 'ready', takerState: 'ready', indicatorState: 'ready', error: '' }
     }
     ipcMain.removeHandler('radar:request')
@@ -98,7 +99,14 @@ before(async () => {
         } finally { state.snapshotActive -= 1 }
       }
       if (value.chartUniverse) return { frames: state.preparedFrames() }
-      if (value.chartFocus) return { ok: true }
+      if (value.chartFocus) {
+        const target = value.chartFocus.target
+        if (target) {
+          state.viewportBars[`${target.timeframe}:${target.instId}`] = target.windowBars ?? 96
+          if (!state.coldTimeframes.includes(target.timeframe)) state.sendChart(prepared(target))
+        }
+        return { ok: true }
+      }
       if (value.chartLocal || value.chartHistory) {
         const query = value.chartLocal ?? value.chartHistory
         return state.coldTimeframes.includes(query.timeframe) ? null : prepared(query)
@@ -960,7 +968,7 @@ test('search preserves selection while six width/DPR combinations share page, po
   try {
     for (const deviceScaleFactor of [1, 2]) for (const width of [1_200, 1_600, 2_000]) {
       await client.send('Emulation.setDeviceMetricsOverride', { width, height: 1_000, deviceScaleFactor, mobile: false })
-      await page.waitForFunction(({ width, deviceScaleFactor }) => innerWidth === width && devicePixelRatio === deviceScaleFactor && Number(document.querySelector('[data-layout="market-workspace"]')?.dataset.uiScale) === width / 1_600, { width, deviceScaleFactor })
+      await page.waitForFunction(({ width, deviceScaleFactor }) => innerWidth === width && devicePixelRatio === deviceScaleFactor && Number(document.querySelector('[data-layout="market-workspace"]')?.dataset.uiScale) === Math.min(1, width / 1_600), { width, deviceScaleFactor })
       await assertWorkspaceLayout(page)
       const target = await vwapCandleTarget(24, fixture)
       await page.mouse.move(target.x, target.y)
@@ -1006,7 +1014,7 @@ test('search preserves selection while six width/DPR combinations share page, po
     await client.detach()
     await page.setViewportSize({ width: viewport.width + 1, height: viewport.height })
     await page.setViewportSize(viewport)
-    await page.waitForFunction(({ width, height }) => innerWidth === width && innerHeight === height && Number(document.querySelector('[data-layout="market-workspace"]')?.dataset.uiScale) === width / 1_600, viewport)
+    await page.waitForFunction(({ width, height }) => innerWidth === width && innerHeight === height && Number(document.querySelector('[data-layout="market-workspace"]')?.dataset.uiScale) === Math.min(1, width / 1_600), viewport)
   }
 })
 
@@ -1799,5 +1807,53 @@ test('failed and unavailable chart sources preserve qualified rows and report di
     await electron.evaluate(() => { const state = globalThis.__workspaceFixture; delete state.chartOverride; delete state.sourceBaseline })
     await page.reload({ waitUntil: 'domcontentloaded' })
     await page.locator('svg[data-rendered-inst="BETA-USDT-SWAP"]').waitFor({ state: 'visible' })
+  }
+})
+
+test('larger windows retain control density while showing more rows and candles in every stacked timeframe', async () => {
+  const publish = values => electron.evaluate((_electron, values) => {
+    const state = globalThis.__workspaceFixture
+    Object.assign(state, values)
+    state.revision += 1
+    state.notify()
+  }, values)
+  const client = await page.context().newCDPSession(page)
+  const measure = () => page.evaluate(() => {
+    const list = document.querySelector('[data-market-list]'), scroller = list.querySelector('[data-market-scroll]')
+    const row = list.querySelector('[data-market-index]'), bounds = row.getBoundingClientRect(), viewport = scroller.getBoundingClientRect()
+    return { rowHeight: bounds.height, fontSize: getComputedStyle(row).fontSize, listWidth: list.getBoundingClientRect().width,
+      visibleRows: [...list.querySelectorAll('[data-market-index]')].filter(row => { const r = row.getBoundingClientRect(); return r.top >= viewport.top && r.bottom <= viewport.bottom }).length,
+      candles: [...document.querySelectorAll('[data-chart-rendered-bars]')].map(chart => Number(chart.dataset.chartRenderedBars)) }
+  })
+  try {
+    await client.send('Emulation.setDeviceMetricsOverride', { width: 1600, height: 900, deviceScaleFactor: 1, mobile: false })
+    await page.getByRole('button', { name: 'Multi-timeframe', exact: true }).click()
+    await publish({ rows: await electron.evaluate(() => {
+      const initial = globalThis.__workspaceFixture.initialRows
+      return [...initial, ...Array.from({ length: 80 }, (_, index) => ({ ...initial[0], instId: `MARKET${index}-USDT-SWAP`, rankingChange: .01 }))]
+    }) })
+    await page.waitForFunction(() => document.querySelectorAll('[data-chart-rendered-bars="96"]').length === 3)
+    const normal = await measure()
+    await client.send('Emulation.setDeviceMetricsOverride', { width: 2600, height: 1300, deviceScaleFactor: 1, mobile: false })
+    await page.waitForFunction(() => document.querySelectorAll('[data-chart-rendered-bars="192"]').length === 3)
+    await assertWorkspaceLayout(page)
+    const expanded = await measure()
+    assert.equal(expanded.rowHeight, normal.rowHeight)
+    assert.equal(expanded.fontSize, normal.fontSize)
+    assert.equal(expanded.listWidth, normal.listWidth)
+    assert.ok(expanded.visibleRows > normal.visibleRows, `${JSON.stringify({ normal, expanded })}`)
+    assert.deepEqual(expanded.candles, [192, 192, 192])
+    const focusCount = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartFocus).length)
+    await client.send('Emulation.setDeviceMetricsOverride', { width: 2610, height: 1300, deviceScaleFactor: 1, mobile: false })
+    await page.waitForFunction(() => innerWidth === 2610)
+    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartFocus).length), focusCount,
+      'Resizing inside a density band must reuse the same data demand.')
+    await client.send('Emulation.setDeviceMetricsOverride', { width: 1600, height: 900, deviceScaleFactor: 1, mobile: false })
+    await page.waitForFunction(() => document.querySelectorAll('[data-chart-rendered-bars="96"]').length === 3)
+  } finally {
+    await client.send('Emulation.clearDeviceMetricsOverride')
+    await client.detach()
+    await publish({ rows: await electron.evaluate(() => globalThis.__workspaceFixture.initialRows) })
+    await page.getByRole('button', { name: 'Indicators', exact: true }).click()
   }
 })

@@ -116,7 +116,8 @@ function fixture(snapshotFailure = false) {
     },
     useLayoutEffect(setup: () => void | (() => void), dependencies: unknown[]) { environment.useEffect(setup, dependencies) },
   }
-  const render = new Function(...Object.keys(environment), `${logic}\nreturn App`)(...Object.values(environment)) as () => View
+  const scope = { ...environment, chartControllers: [environment.chartController], ingestPreparedChart: environment.chartController.ingestPrepared }
+  const render = new Function(...Object.keys(scope), `${logic}\nreturn App`)(...Object.values(scope)) as () => View
   return {
     state, snapshotRequests, universeRequests,
     get view() { return rendered },

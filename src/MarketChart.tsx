@@ -1,3 +1,4 @@
+import { chartViewportBars } from './chart-layout.ts'
 import { createContext, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { flushSync } from "react-dom"
 import { Camera } from "lucide-react"
@@ -89,7 +90,7 @@ const chartOverscan = (surface: ReadyChartWindow | null, chartController: ChartC
   if (!surface?.bars.length) return {}
   if (chartController.store.snapshotMeta(surface.instId, surface.timeframe)?.generation !== surface.generation) return {}
   const bars = surface.liveBar
-    ? [...surface.bars.filter(bar => bar.hour < surface.liveBar!.hour), surface.liveBar].slice(-96)
+    ? [...surface.bars.filter(bar => bar.hour < surface.liveBar!.hour), surface.liveBar].slice(-(surface.windowBars ?? 96))
     : surface.bars
   const first = bars[0]!.hour, last = bars.at(-1)!.hour
   const [before, after] = chartController.store.knownBars(surface.instId, surface.timeframe,
@@ -330,6 +331,8 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
   const chartRef = useRef<HTMLElement>(null)
   const plotRef = useRef<HTMLDivElement>(null)
   const [plotSize, setPlotSize] = useState({ width: 0, height: 0 })
+  const viewportBars = chartViewportBars(plotSize.width)
+  useLayoutEffect(() => { if (isActive) chartController.setWindowBars(viewportBars) }, [chartController, viewportBars, isActive])
   const overscan = chartOverscan(surface, chartController)
   const preparedPlot = chartPlot(surface, plotSize, overscan, currentPriceTickSz, priceOnly)
   const bars = preparedPlot?.bars ?? surface?.bars ?? EMPTY_BARS
@@ -548,7 +551,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
   const active = inspectedBar ?? bars[inspected ?? bars.length - 1]
   const oiState = surface?.oiState ?? 'ready'
   const takerState = surface?.takerState ?? 'ready'
-  const atBoundary = view.historyExhausted && surface && view.oldestHour !== null && surface.endHour === Math.min(view.latestEnd ?? Infinity, view.oldestHour + 95 * intervalMS)
+  const atBoundary = view.historyExhausted && surface && view.oldestHour !== null && surface.endHour === Math.min(view.latestEnd ?? Infinity, view.oldestHour + ((surface.windowBars ?? 96) - 1) * intervalMS)
   const priceScale = plotGeometry?.priceAxis.kind ?? 'logarithmic'
   const priceState = surface?.priceState ?? 'loading'
   const statusMessages: string[] = []
@@ -596,7 +599,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}</div>}
     {capture.error && <p role="alert" className="shrink-0 border-b px-5 py-2 text-destructive">{capture.error}</p>}
     <div className="flex min-h-0 flex-1">
-    <section ref={chartRef} data-chart-inst={displayedId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={96} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={priceState} data-chart-statistics-state={surface?.oiState === 'error' || surface?.takerState === 'error' ? 'error' : surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={priceState !== 'ready' || surface?.indicatorState !== 'ready' || oiState !== 'ready' || takerState !== 'ready' ? 'true' : 'false'} data-chart-loading={pending ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
+    <section ref={chartRef} data-chart-inst={displayedId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={surface?.windowBars ?? 96} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={priceState} data-chart-statistics-state={surface?.oiState === 'error' || surface?.takerState === 'error' ? 'error' : surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={priceState !== 'ready' || surface?.indicatorState !== 'ready' || oiState !== 'ready' || takerState !== 'ready' ? 'true' : 'false'} data-chart-loading={pending ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
       <div className="flex h-9 shrink-0 items-center gap-6 border-b px-4">
         <h2 className="min-w-0 max-w-1/2 truncate text-base font-semibold tracking-tight" title={displayedId}>{displayedId.replace(/-SWAP$/, '')} · {timeframeLabel(displayedFrame)}</h2>
         {priceOnly && !historical && <PriceStatus observedAt={surface?.priceObservedAt} realtime={surface?.realtimeState} active={isActive && windowVisible && presentation.active} />}

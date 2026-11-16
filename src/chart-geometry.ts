@@ -25,7 +25,7 @@ const axisFormatter = (decimals: number) => {
 }
 
 type Range = readonly [number, number]
-export type ChartGeometryOptions = Readonly<{ width: number; height: number; endHour: number; intervalMS: number; liveClose?: number; currentPriceTickSz?: string | null; priceOnly?: boolean }>
+export type ChartGeometryOptions = Readonly<{ width: number; height: number; endHour: number; intervalMS: number; liveClose?: number; currentPriceTickSz?: string | null; priceOnly?: boolean; windowBars?: number }>
 export type ChartGeometryOverscan = Readonly<{ before?: Bar; after?: Bar }>
 const linearScale = (min: number, max: number, panel: Range) => {
   const span = max - min || 1, height = panel[1] - panel[0]
@@ -40,7 +40,8 @@ const paddedIndicatorRange = (min: number, max: number) => {
 /** One immutable viewport owns its axes, coordinates and paths. */
 function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, measureText: (text: string) => number, overscan: ChartGeometryOverscan = {}) {
   const { width, height, endHour, intervalMS, liveClose } = options
-  const firstHour = endHour - 95 * intervalMS, firstAtLeft = bars[0].hour === firstHour
+  const windowBars = options.windowBars ?? 96
+  const firstHour = endHour - (windowBars - 1) * intervalMS, firstAtLeft = bars[0].hour === firstHour
   const pathBars = [
     ...(overscan.before?.hour === firstHour - intervalMS ? [overscan.before] : []),
     ...bars,
@@ -85,10 +86,10 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
   ]
   const gutter = Math.ceil(Math.max(...labels.map(measureText)) + 16)
   const layout = chartLayout(width, height, gutter, options.priceOnly), { left, right } = layout
-  const x = bars.map(bar => chartHourX(bar.hour, endHour, left, right, intervalMS))
-  const barWidth = chartCandleWidth(right - left)
-  const barPitch = (right - left - barWidth) / 95
-  const pathX = pathBars.map(bar => chartHourX(bar.hour, endHour, left, right, intervalMS))
+  const x = bars.map(bar => chartHourX(bar.hour, endHour, left, right, intervalMS, windowBars))
+  const barWidth = chartCandleWidth(right - left, windowBars)
+  const barPitch = (right - left - barWidth) / (windowBars - 1)
+  const pathX = pathBars.map(bar => chartHourX(bar.hour, endHour, left, right, intervalMS, windowBars))
   const priceY = priceAxis.kind === 'linear' ? linearScale(priceAxis.min, priceAxis.max, panels.price) : logarithmicScale(priceAxis, panels.price)
   const rsiY = linearScale(0, 100, panels.rsi), rocY = linearScale(rocAxis.min, rocAxis.max, panels.roc)
   const visibleIndex = new Map(bars.map((bar, index) => [bar.hour, index]))
@@ -207,7 +208,7 @@ export function createChartGeometryCache(measureText: (text: string) => number) 
     const liveClose = finite(options.liveClose) ? options.liveClose : undefined
     const index = variants.findIndex(({ value, before, after }) => value.width === options.width && value.height === options.height
       && value.endHour === options.endHour && value.intervalMS === options.intervalMS && value.liveClose === liveClose
-      && value.currentPriceTickSz === options.currentPriceTickSz && value.priceOnly === options.priceOnly
+      && (value.windowBars ?? 96) === (options.windowBars ?? 96) && value.currentPriceTickSz === options.currentPriceTickSz && value.priceOnly === options.priceOnly
       && before === overscan.before && after === overscan.after)
     if (index >= 0) {
       const [variant] = variants.splice(index, 1)

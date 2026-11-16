@@ -33,6 +33,7 @@ export const completeChartPriceRange = (bars: readonly Pick<Bar, 'hour' | 'price
 export type PreparedChartBar = Bar & { confirmed: true }
 export type PreparedChartGeneration = number
 export type PreparedChartResponse = {
+  windowBars?: number
   instId: string
   timeframe: RadarTimeframe
   intervalMS: number
@@ -89,6 +90,7 @@ export type PreparedChartMeta = Readonly<{
 }>
 
 export type ReadyChartWindow = Readonly<{
+  windowBars?: number
   key: string; instId: string; timeframe: RadarTimeframe; intervalMS: number
   generation: PreparedChartGeneration
   bars: readonly PreparedChartBar[]; endHour: number

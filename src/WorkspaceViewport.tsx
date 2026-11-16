@@ -26,5 +26,5 @@ export function WorkspaceViewport({ children }: { children: ReactNode }) {
       for (const property of ['--workspace-height', '--native-window-controls-width', '--window-toolbar-height']) document.body.style.removeProperty(property)
     }
   }, [scale, viewport.height, controlsInset, toolbarHeight])
-  return <div data-layout="market-workspace" data-design-width={WORKSPACE_DESIGN_WIDTH} data-ui-scale={scale} className="flex overflow-hidden" style={{ width: WORKSPACE_DESIGN_WIDTH, height: viewport.height / scale }}>{children}</div>
+  return <div data-layout="market-workspace" data-design-width={WORKSPACE_DESIGN_WIDTH} data-ui-scale={scale} className="flex overflow-hidden" style={{ width: viewport.width / scale, height: viewport.height / scale }}>{children}</div>
 }
