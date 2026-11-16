@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { advanceChartWheel, chartRsiNavigationTarget, chartWheelContentOffset, createChartWheelBatch, createChartWheelScheduler } from './chart-navigation.ts'
+import { advanceChartWheel, chartWheelIntent, chartZoomDemand, chartZoomWindow, chartRsiNavigationTarget, chartWheelContentOffset, createChartWheelBatch, createChartWheelScheduler } from './chart-navigation.ts'
 
 function wheelSchedulerHarness() {
   const microtasks: Array<() => void> = []
@@ -172,4 +172,34 @@ test('plot translation follows the wheel fraction only when its adjacent candle 
   assert.equal(chartWheelContentOffset(-0.5, 10, false, true), 0)
   assert.equal(chartWheelContentOffset(0.5, 10, true, false), 0)
   assert.equal(chartWheelContentOffset(0.5, 10, true, true), -5)
+})
+
+
+test('trackpad pinch owns ctrl-wheel while ordinary two-finger input retains history pan', () => {
+  assert.deepEqual(chartWheelIntent({ ctrlKey: true, deltaX: 100, deltaY: -2, deltaMode: 0 }), { kind: 'zoom', pixels: -2 })
+  assert.deepEqual(chartWheelIntent({ ctrlKey: false, deltaX: 30, deltaY: 2, deltaMode: 0 }), { kind: 'pan', pixels: 30 })
+  assert.deepEqual(chartWheelIntent({ ctrlKey: false, deltaX: 0, deltaY: 3, deltaMode: 1 }), { kind: 'pan', pixels: -48 })
+})
+
+test('continuous zoom preserves the pointer time and clamps at finite candle limits', () => {
+  for (const anchor of [0, 0.25, 0.5, 1]) {
+    const before = 144, end = 1000
+    const next = chartZoomWindow(before, -12, anchor)
+    assert.ok(next.count < before)
+    assert.ok(Math.abs((end - (before - 1) * (1 - anchor)) - (end + next.shift - (next.count - 1) * (1 - anchor))) < 1e-9)
+    const reverse = chartZoomWindow(next.count, 12, anchor)
+    assert.ok(Math.abs(reverse.count - before) < 1e-9)
+    assert.ok(Math.abs(reverse.shift + next.shift) < 1e-9)
+  }
+  assert.equal(chartZoomWindow(96, -10000, 0.5).count, 12)
+  assert.equal(chartZoomWindow(96, 10000, 0.5).count, 288)
+  assert.equal(chartZoomWindow(12, -2, 0.5).shift, 0)
+})
+
+test('zoom reuses coarse history demand between bucket boundaries', () => {
+  assert.equal(chartZoomDemand(12), 96)
+  assert.equal(chartZoomDemand(94.8), 96)
+  assert.equal(chartZoomDemand(96), 144)
+  assert.equal(chartZoomDemand(139.2), 144)
+  assert.equal(chartZoomDemand(288), 288)
 })

@@ -43,9 +43,9 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
   const windowBars = options.windowBars ?? 96
   const firstHour = endHour - (windowBars - 1) * intervalMS, firstAtLeft = bars[0].hour === firstHour
   const pathBars = [
-    ...(overscan.before?.hour === firstHour - intervalMS ? [overscan.before] : []),
+    ...(overscan.before?.hour === bars[0].hour - intervalMS ? [overscan.before] : []),
     ...bars,
-    ...(overscan.after?.hour === endHour + intervalMS ? [overscan.after] : []),
+    ...(overscan.after?.hour === bars.at(-1)!.hour + intervalMS ? [overscan.after] : []),
   ]
   let priceMin = Infinity, priceMax = -Infinity, rocExtent = 0, minATR = Infinity, maxATR = 0, minBBW = Infinity, maxBBW = 0, maxTaker = 1
   let candleHigh = -Infinity, candleLow = Infinity, highIndex = 0, lowIndex = 0

@@ -5,9 +5,9 @@ import { createChartGeometryCache, type ChartGeometryOverscan } from './chart-ge
 /** Selection and background rendering share the exact same immutable paths. */
 export function createChartPlotCache(measureText: (text: string) => number, layoutDensity?: ChartLayoutDensity) {
   const geometry = createChartGeometryCache(measureText)
-  type Plot = { bars: readonly Bar[]; geometry: ReturnType<typeof geometry>; before?: Bar; after?: Bar }
+  type Plot = { sourceBefore?: Bar; sourceAfter?: Bar; bars: readonly Bar[]; geometry: ReturnType<typeof geometry>; before?: Bar; after?: Bar }
   const cache = new WeakMap<readonly Bar[], WeakMap<object, { bars: readonly Bar[]; variants: Plot[]; windowBars?: number }>>()
-  return (window: ReadyChartWindow | null, size: { width: number; height: number }, overscan: ChartGeometryOverscan = {}, currentPriceTickSz?: string | null, priceOnly = false): Plot | null => {
+  return (window: ReadyChartWindow | null, size: { width: number; height: number }, overscan: ChartGeometryOverscan = {}, currentPriceTickSz?: string | null, priceOnly = false, viewport?: { count: number; offset: number }): Plot | null => {
     if (!window || !(size.width > 0 && size.height > 0)) return null
     let liveVariants = cache.get(window.bars)
     if (!liveVariants) { liveVariants = new WeakMap(); cache.set(window.bars, liveVariants) }
@@ -20,15 +20,21 @@ export function createChartPlotCache(measureText: (text: string) => number, layo
       input = { bars, variants: [], windowBars: window.windowBars }
       liveVariants.set(key, input)
     }
-    const { bars, variants } = input
+    const { bars: sourceBars, variants } = input
+    const count = viewport?.count ?? window.windowBars
+    const endHour = sourceBars.at(-1)?.hour === undefined ? window.endHour : sourceBars.at(-1)!.hour + (viewport?.offset ?? 0) * window.intervalMS
+    const firstHour = endHour - ((count ?? 96) - 1) * window.intervalMS
     const cached = variants.find(plot => plot.geometry.width === size.width && plot.geometry.height === size.height && plot.geometry.intervalMS === window.intervalMS
+      && plot.geometry.endHour === endHour && (plot.geometry.windowBars ?? 96) === (count ?? 96)
       && plot.geometry.currentPriceTickSz === currentPriceTickSz && plot.geometry.priceOnly === priceOnly
-      && plot.before === overscan.before && plot.after === overscan.after)
+      && plot.sourceBefore === overscan.before && plot.sourceAfter === overscan.after)
     if (cached) return cached
+    const bars = viewport ? sourceBars.filter(bar => bar.hour >= firstHour - 0.001 && bar.hour <= endHour + 0.001) : sourceBars
     if (!bars.length) return null
-    const endHour = bars.at(-1)!.hour
-    const plot = { bars, before: overscan.before, after: overscan.after, geometry: geometry(bars, { ...size, endHour, intervalMS: window.intervalMS, windowBars: window.windowBars, layoutDensity,
-      liveClose: (window.liveBar ?? bars.at(-1)!).close, currentPriceTickSz, priceOnly }, overscan) }
+    const before = viewport ? sourceBars.find(bar => bar.hour === bars[0].hour - window.intervalMS) ?? overscan.before : overscan.before
+    const after = viewport ? sourceBars.find(bar => bar.hour === bars.at(-1)!.hour + window.intervalMS) ?? overscan.after : overscan.after
+    const plot = { bars, before, after, sourceBefore: overscan.before, sourceAfter: overscan.after, geometry: geometry(bars, { ...size, endHour, intervalMS: window.intervalMS, windowBars: count, layoutDensity,
+      liveClose: (window.liveBar && window.liveBar.hour <= endHour && window.liveBar.hour >= firstHour ? window.liveBar : bars.at(-1)!).close, currentPriceTickSz, priceOnly }, { before, after }) }
     variants.push(plot)
     if (variants.length > 2) variants.shift()
     return plot

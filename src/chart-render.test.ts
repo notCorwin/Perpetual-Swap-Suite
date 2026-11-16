@@ -88,3 +88,31 @@ test('wide live plots render the expanded time range with matching coordinates',
   assert.ok(plot.geometry.x.at(-1)! <= plot.geometry.layout.right)
   assert.ok(Math.abs((plot.geometry.x[1] - plot.geometry.x[0]) - plot.geometry.barPitch) < 1e-8)
 })
+
+
+test('pinch projects continuous spans from cached indicators without changing canonical frames', () => {
+  const cache = createChartPlotCache(text => text.length * 6), frame = window(), size = { width: 960, height: 700 }
+  const canonical = cache(frame, size)!
+  const viewport = { count: 42.5, offset: -0.25 }
+  const plot = cache(frame, size, {}, undefined, false, viewport)!
+  assert.equal(plot.geometry.endHour, 94.75 * step)
+  assert.equal(plot.geometry.firstHour, 53.25 * step)
+  assert.equal(plot.bars[0], frame.bars[54], 'Reuse the already calculated bar and its indicators.')
+  assert.equal(plot.bars.at(-1), frame.bars[94])
+  assert.equal(plot.before, frame.bars[53])
+  assert.equal(plot.after, frame.bars[95])
+  assert.ok(plot.geometry.barPitch > canonical.geometry.barPitch)
+  assert.ok(plot.geometry.x.every(x => x >= plot.geometry.layout.left && x <= plot.geometry.layout.right))
+  assert.equal(cache(frame, size, {}, undefined, false, viewport), plot, 'Unchanged zoom reuses immutable paths.')
+  assert.equal(cache(frame, size), canonical, 'Pinching cannot change canonical candidate windows.')
+  assert.equal(frame.bars.length, 96)
+})
+
+
+test('a forming price outside the zoom viewport cannot distort the visible price axis', () => {
+  const cache = createChartPlotCache(text => text.length * 6), frame = window(), size = { width: 960, height: 700 }
+  const live = { ...frame, liveBar: { ...frame.bars.at(-1)!, hour: 96 * step, close: 1_000_000 } }
+  const plot = cache(live, size, {}, undefined, false, { count: 42.5, offset: -2.25 })!
+  assert.ok(plot.geometry.priceAxis.max < 1000)
+  assert.equal(plot.geometry.liveClose, 102)
+})

@@ -1,3 +1,24 @@
+export const CHART_MIN_ZOOM_BARS = 12
+export const CHART_MAX_ZOOM_BARS = 288
+
+/** Chromium exposes a trackpad pinch as ctrl+wheel. Ordinary scrolling stays pan. */
+export function chartWheelIntent(event: { ctrlKey: boolean; deltaX: number; deltaY: number; deltaMode: number }) {
+  const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 240 : 1
+  return event.ctrlKey
+    ? { kind: 'zoom' as const, pixels: event.deltaY * unit }
+    : { kind: 'pan' as const, pixels: (Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : -event.deltaY) * unit }
+}
+
+/** Continuous candle spacing; fetching remains in the existing coarse cache buckets. */
+export function chartZoomWindow(count: number, pixels: number, anchor: number) {
+  const next = Math.max(CHART_MIN_ZOOM_BARS, Math.min(CHART_MAX_ZOOM_BARS, count * Math.exp(Math.max(-20, Math.min(20, pixels * 0.01)))))
+  return { count: next, shift: (next - count) * (1 - Math.max(0, Math.min(1, anchor))) }
+}
+
+export function chartZoomDemand(count: number) {
+  return Math.max(96, Math.min(288, Math.ceil((count + 1) / 48) * 48))
+}
+
 export const CHART_WHEEL_PIXELS_PER_BAR = 12
 
 export function chartRsiNavigationTarget(indices: readonly number[], current: number, direction: -1 | 1) {

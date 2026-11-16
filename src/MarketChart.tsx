@@ -14,7 +14,7 @@ import { captureStableChart, chartCaptureBounds } from '@/chart-capture'
 import { CHART_PANELS, chartContentClip, chartPanelClip, chartPriceLabelLayout, type ChartPanel as Panel } from "@/chart-layout"
 import { chartCompact as compact, chartPercent, type ChartGeometry } from "@/chart-geometry"
 import { formatCurrentPrice, formatHistoricalPrice, formatIndicatorPrice } from '@/price-format'
-import { chartRsiNavigationTarget, chartWheelContentOffset, createChartWheelBatch, createChartWheelScheduler } from '@/chart-navigation'
+import { chartRsiNavigationTarget, chartWheelIntent, chartZoomDemand, chartZoomWindow, chartWheelContentOffset, createChartWheelBatch, createChartWheelScheduler } from '@/chart-navigation'
 import { chartStatisticsSamples } from '@/chart-legend'
 import { RSI_FIELDS, type RsiField } from '@/rsi-crossings'
 import { cn } from "@/lib/utils"
@@ -302,11 +302,12 @@ const ChartSurface = memo(function ChartSurface({ instId, timeframe, hasComplete
       data-prepared-chart-ready={ready} data-prepared-indicator-state={indicatorState} data-prepared-oi-state={oiState} data-prepared-taker-state={takerState}
       data-rendered-inst={selected ? instId : undefined} data-rendered-timeframe={selected ? timeframe : undefined}
       data-rendered-start={bars[0]!.hour} data-rendered-end={bars.at(-1)!.hour}
+      data-chart-domain-start={geometry.firstHour} data-chart-domain-end={geometry.endHour} data-chart-plot-right={geometry.layout.right}
       viewBox={`0 0 ${size.width} ${size.height}`} aria-hidden={!selected}
       style={{ visibility: selected ? 'visible' : 'hidden' }}
       className={cn('absolute inset-0 h-full w-full font-mono text-[length:var(--chart-text-size)] select-none outline-none', !selected && 'pointer-events-none')}
       role="img" tabIndex={selected ? 0 : -1} aria-describedby={readoutId}
-      aria-label={`${instId} ${bars.length}-candle ${timeframeLabel(timeframe)} chart. Hold the primary mouse button to inspect a candle, drag to inspect others, and release to return to the window end.${geometry.priceOnly ? '' : ' Hover RSI crossing triangles to inspect their candle and time. Alt+Left and Alt+Right inspect RSI crossings;'} Escape clears inspection. Scroll to review history. Arrow keys navigate markets.`}>
+      aria-label={`${instId} ${bars.length}-candle ${timeframeLabel(timeframe)} chart. Hold the primary mouse button to inspect a candle, drag to inspect others, and release to return to the window end.${geometry.priceOnly ? '' : ' Hover RSI crossing triangles to inspect their candle and time. Alt+Left and Alt+Right inspect RSI crossings;'} Escape clears inspection. Scroll to review history. Pinch the trackpad to zoom around the pointer. Arrow keys navigate markets.`}>
       <Plot bars={bars} geometry={geometry} liveBar={liveBar ?? bars.at(-1)!} liveOverlay={!!liveBar} contentOffset={contentOffset}
         inspected={selected ? inspected : null} inspectedBar={selected ? inspectedBar : undefined} oiState={oiState} takerState={takerState} oiStatus={oiStatus} takerStatus={takerStatus} />
     </svg>
@@ -341,16 +342,19 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
   const plotRef = useRef<HTMLDivElement>(null)
   const [plotSize, setPlotSize] = useState({ width: 0, height: 0 })
   const viewportBars = chartViewportBars(plotSize.width)
-  useLayoutEffect(() => { if (isActive) chartController.setWindowBars(viewportBars) }, [chartController, viewportBars, isActive])
+  const [zoom, setZoom] = useState<{ count: number; offset: number } | null>(null)
+  const zoomRef = useRef(zoom)
+  const demandBars = zoom ? chartZoomDemand(zoom.count) : viewportBars
+  useLayoutEffect(() => { if (isActive) chartController.setWindowBars(demandBars) }, [chartController, demandBars, isActive])
   const overscan = chartOverscan(surface, chartController)
-  const preparedPlot = chartPlot(surface, plotSize, overscan, currentPriceTickSz, priceOnly)
+  const preparedPlot = chartPlot(surface, plotSize, overscan, currentPriceTickSz, priceOnly, zoom ?? undefined)
   const bars = preparedPlot?.bars ?? surface?.bars ?? EMPTY_BARS
   const plotGeometry = preparedPlot?.geometry ?? null
   const [inspection, setInspection] = useState<{ instId: string; timeframe: RadarTimeframe; hour: number } | null>(null)
   const inspectedIndex = inspection?.instId === surface?.instId && inspection?.timeframe === surface?.timeframe ? bars.findIndex(bar => bar.hour === inspection?.hour) : -1
   const inspected = inspectedIndex >= 0 ? inspectedIndex : null
   const inspectedBar = inspection?.instId === surface?.instId && inspection?.timeframe === surface?.timeframe
-    ? [overscan.before, ...bars, overscan.after].find(bar => bar?.hour === inspection?.hour) : undefined
+    ? [preparedPlot?.before, ...bars, preparedPlot?.after].find(bar => bar?.hour === inspection?.hour) : undefined
   const heldPointer = useRef<{ pointerId: number; target: SVGSVGElement } | null>(null)
   const releaseInspection = useCallback(() => {
     const held = heldPointer.current
@@ -372,6 +376,8 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
   const captureStatus = capture.status
   const wheelBatch = useRef(createChartWheelBatch())
   const wheelRemainder = useRef(0)
+  const zoomPixels = useRef(0)
+  const gestureKind = useRef<'pan' | 'zoom' | null>(null)
   const [wheelScheduler] = useState(() => createChartWheelScheduler({
     queueMicrotask: callback => queueMicrotask(callback),
     requestFrame: callback => window.requestAnimationFrame(callback),
@@ -402,10 +408,25 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     navigationTask.current = null
     wheelBatch.current.reset()
     wheelRemainder.current = 0
+    zoomPixels.current = 0
+    gestureKind.current = null
+    if (zoomRef.current) {
+      zoomRef.current = { ...zoomRef.current, offset: 0 }
+      setZoom(zoomRef.current)
+    }
     wheelScheduler.cancel()
     wheelOwnerRef.current = null
     releaseInspection()
   }, [isActive, instId, timeframe, releaseInspection, wheelScheduler])
+  useLayoutEffect(() => {
+    if (presentation.active) return
+    wheelScheduler.cancel()
+    wheelBatch.current.reset()
+    zoomPixels.current = 0
+    gestureKind.current = null
+    wheelRemainder.current = 0
+    wheelOwnerRef.current = null
+  }, [presentation.active, wheelScheduler])
   useLayoutEffect(() => {
     const element = chartRef.current
     if (element) {
@@ -467,8 +488,54 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     window.addEventListener('keydown', navigate, true)
     return () => window.removeEventListener('keydown', navigate, true)
   }, [isActive, navigation, listOrder, turnoverOrder, onSelect])
+  const startGesture = (kind: 'pan' | 'zoom') => {
+    if (gestureKind.current === kind) return
+    wheelScheduler.cancel()
+    wheelBatch.current.reset()
+    zoomPixels.current = 0
+    wheelRemainder.current = 0
+    setWheelFraction(0)
+    gestureKind.current = kind
+  }
+  const queueZoom = (pixels: number, clientX: number) => {
+    if (!isActive || !getPresentation().active || !surface || !matchesSelection || !plotGeometry || !Number.isFinite(pixels) || !pixels) return
+    const rect = plotRef.current?.getBoundingClientRect()
+    if (!rect?.width) return
+    const x = (clientX - rect.left) * plotSize.width / rect.width
+    const anchor = (x - plotGeometry.layout.left) / (plotGeometry.layout.right - plotGeometry.layout.left)
+    startGesture('zoom')
+    zoomPixels.current += pixels
+    wheelScheduler.schedule(() => {
+      if (!getPresentation().active) return
+      const previous = zoomRef.current ?? { count: viewportBars, offset: 0 }
+      const next = chartZoomWindow(previous.count, zoomPixels.current, anchor)
+      zoomPixels.current = 0
+      if (next.count === previous.count) return
+      const offset = previous.offset + next.shift
+      // Keep a fractional endpoint while using the existing integer cache cursor.
+      const current = chartController.getSnapshot()
+      const sourceEnd = current.requested?.end ?? current.latestEnd
+      const latestHasLive = Boolean(chartController.store.window(instId, timeframe, null)?.liveBar)
+      const oldLive = current.requested?.end === null && latestHasLive ? 1 : 0
+      const steps = oldLive && offset < 0 ? Math.min(0, Math.ceil(offset + 1)) : Math.ceil(offset)
+      flushSync(() => {
+        chartController.setWindowBars(chartZoomDemand(next.count))
+        if (steps) chartController.scroll(steps)
+        const target = chartController.getSnapshot().requested
+        const targetEnd = target?.end ?? current.latestEnd
+        const actualSteps = sourceEnd !== undefined && sourceEnd !== null && targetEnd !== null && targetEnd !== undefined ? (targetEnd - sourceEnd) / intervalMS : 0
+        const newLive = target?.end === null && latestHasLive ? 1 : 0
+        const remaining = offset - actualSteps - (newLive - oldLive)
+        const nextZoom = { count: next.count, offset: Math.min(0, remaining) }
+        zoomRef.current = nextZoom
+        setZoom(nextZoom)
+        endInspection()
+      })
+    })
+  }
   const queueWheel = (pixels: number) => {
     if (!isActive || !getPresentation().active || !surface || !matchesSelection || !Number.isFinite(pixels) || pixels === 0) return
+    startGesture('pan')
     const owner = { session: wheelSession, instId: surface.instId, timeframe: surface.timeframe, generation: surface.generation }
     const currentOwner = wheelOwnerRef.current
     if (!currentOwner || currentOwner.session !== owner.session) {
@@ -496,7 +563,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     const rect = target.getBoundingClientRect()
     if (rect.width <= 0) return
     const svgX = (clientX - rect.left) * plotSize.width / rect.width
-    const candidates = [wheelContentOffset > 0 ? overscan.before : undefined, ...bars, wheelContentOffset < 0 ? overscan.after : undefined].filter((bar): bar is Bar => Boolean(bar))
+    const candidates = [wheelContentOffset > 0 ? preparedPlot?.before : undefined, ...bars, wheelContentOffset < 0 ? preparedPlot?.after : undefined].filter((bar): bar is Bar => Boolean(bar))
     const position = (bar: Bar) => plotGeometry.x[0] + (bar.hour - bars[0].hour) / intervalMS * plotGeometry.barPitch + wheelContentOffset
     let nearest = candidates[0]
     for (const bar of candidates.slice(1)) {
@@ -596,7 +663,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
       <div className="flex flex-col gap-4">
         <h2 id="chart-controls-title" className="text-base font-medium">Chart controls</h2>
         <ul className="flex list-disc flex-col gap-2 pl-4 text-sm">
-          <li>Scroll over the chart to browse history</li>
+          <li>Scroll over the chart to browse history; pinch to zoom around the pointer</li>
           <li>Hold and drag on the chart to inspect candles; release to return to the window end</li>
           <li>Hover an RSI crossing marker to inspect it, or focus the chart and use Alt + Left or Right to move between crossings</li>
           <li>Press Escape to clear a chart inspection</li>
@@ -608,7 +675,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}</div>}
     {capture.error && <p role="alert" className="shrink-0 border-b px-5 py-2 text-destructive">{capture.error}</p>}
     <div className="flex min-h-0 flex-1">
-    <section ref={chartRef} data-chart-inst={displayedId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={surface?.windowBars ?? 96} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={priceState} data-chart-statistics-state={surface?.oiState === 'error' || surface?.takerState === 'error' ? 'error' : surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={priceState !== 'ready' || surface?.indicatorState !== 'ready' || oiState !== 'ready' || takerState !== 'ready' ? 'true' : 'false'} data-chart-loading={pending ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
+    <section ref={chartRef} data-chart-inst={displayedId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={surface?.windowBars ?? 96} data-chart-visible-bars={zoom?.count ?? surface?.windowBars ?? 96} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={priceState} data-chart-statistics-state={surface?.oiState === 'error' || surface?.takerState === 'error' ? 'error' : surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={priceState !== 'ready' || surface?.indicatorState !== 'ready' || oiState !== 'ready' || takerState !== 'ready' ? 'true' : 'false'} data-chart-loading={pending ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
       <div data-chart-summary className="flex shrink-0 items-center border-b px-4">
         <h2 data-chart-title className="min-w-0 max-w-40 shrink-0 truncate" title={displayedId} aria-label={`${displayedId.replace(/-SWAP$/, '')} · ${timeframeLabel(displayedFrame)}`}>{priceOnly && matchesSelection ? timeframeLabel(displayedFrame) : `${displayedId.replace(/-SWAP$/, '')} · ${timeframeLabel(displayedFrame)}`}</h2>
         {priceOnly && !historical && <PriceStatus observedAt={surface?.priceObservedAt} realtime={surface?.realtimeState} active={isActive && windowVisible && presentation.active} />}
@@ -655,12 +722,13 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
         inspectAt(held.target, event.clientX)
       }} onWheel={event => {
         if (analysis?.phase === 'capturing') return
-        const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : -event.deltaY
-        queueWheel(delta * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 240 : 1))
+        const intent = chartWheelIntent(event)
+        if (intent.kind === 'zoom') queueZoom(intent.pixels, event.clientX)
+        else queueWheel(intent.pixels)
       }}>
         {surface && preparedPlot && <ChartSurface instId={surface.instId} timeframe={surface.timeframe} hasCompletedBars={surface.bars.length > 0}
           priceState={surface.priceState} indicatorState={surface.indicatorState} oiState={surface.oiState} takerState={surface.takerState}
-          oiStatus={surface.oiStatus} takerStatus={surface.takerStatus} liveBar={surface.liveBar} plot={preparedPlot} size={plotSize}
+          oiStatus={surface.oiStatus} takerStatus={surface.takerStatus} liveBar={surface.liveBar && surface.liveBar.hour <= preparedPlot.geometry.endHour ? surface.liveBar : undefined} plot={preparedPlot} size={plotSize}
           selected={matchesSelection} visible={matchesSelection && isActive && windowVisible && presentation.active} inspected={inspected} inspectedBar={inspectedBar} wheelFraction={activeWheelFraction} readoutId={readoutId} />}
       </div>
       {captureStatus === 'flashing' && <div aria-hidden="true" className="pointer-events-none absolute inset-0 z-10 bg-[var(--chart-capture-flash)] motion-safe:animate-[chart-capture-flash_550ms_ease-out_both] motion-reduce:hidden" />}
