@@ -96,7 +96,8 @@ export async function waitForRendered(page, fixture, timeframe = fixture.timefra
       return svg?.getAttribute('data-rendered-inst') === instId
         && svg.getAttribute('data-rendered-timeframe') === timeframe
         && Number(chart.getAttribute('data-chart-completed-end') ?? svg.getAttribute('data-rendered-end')) === end
-        && chart.getAttribute('data-chart-rendered-bars') === '96'
+        && Number(chart.getAttribute('data-chart-rendered-bars')) > 0
+        && chart.getAttribute('data-chart-rendered-bars') === chart.getAttribute('data-chart-target-bars')
         && chart.getAttribute('data-chart-loading') === 'false'
     }, { instId: fixture.instId, timeframe, end }, { timeout: 20_000 })
   } catch (error) {
@@ -120,7 +121,8 @@ export async function waitForTargetSnapshot(page, fixture, timeframe, end) {
       && svg.getAttribute('data-rendered-timeframe') === timeframe
       && Number(svg.getAttribute('data-rendered-end')) === end
       && Number(chart.getAttribute('data-chart-completed-end')) === end
-      && chart.getAttribute('data-chart-rendered-bars') === '96'
+      && Number(chart.getAttribute('data-chart-rendered-bars')) > 0
+        && chart.getAttribute('data-chart-rendered-bars') === chart.getAttribute('data-chart-target-bars')
   }, { instId: fixture.instId, timeframe, end }, { timeout: 20_000 })
 }
 
