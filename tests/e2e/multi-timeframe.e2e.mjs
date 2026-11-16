@@ -95,6 +95,23 @@ test('default multi-timeframe charts share native prices, isolate history and re
     assert.ok(fractional.same, `Partial scrolling must retain the existing SVG path and geometry: ${JSON.stringify(fractional)}`)
     assert.notEqual(fractional.moved, 0, 'A cached adjacent candle permits immediate partial movement.')
     assert.equal(fractional.reversed, 0, 'Reversing the gesture returns to the original position.')
+    // A zoomed historical viewport must return to the forming candle and
+    // resume native WebSocket updates without retaining its fractional offset.
+    const zoomCount = await page.locator('[data-chart-plot]').nth(1).evaluate(async plot => {
+      const rect = plot.getBoundingClientRect()
+      plot.dispatchEvent(new WheelEvent('wheel', { ctrlKey: true, deltaY: -19, clientX: rect.left + rect.width * .4, bubbles: true, cancelable: true }))
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+      const count = Number(plot.closest('[data-chart-inst]').dataset.chartVisibleBars)
+      plot.dispatchEvent(new WheelEvent('wheel', { deltaX: 100_000, bubbles: true, cancelable: true }))
+      return count
+    })
+    await page.waitForFunction(() => {
+      const chart = document.querySelectorAll('[data-chart-inst]')[1], snapshot = chart?.__chartSnapshot
+      return snapshot?.liveBar && Number(chart.dataset.chartEnd) === snapshot.liveBar.hour
+        && Number(chart.querySelector('svg[data-rendered-inst]').dataset.chartDomainEnd) === snapshot.liveBar.hour
+    })
+    await live(btc, 141.25, 35)
+    assert.equal(await page.locator('[data-chart-inst]').nth(1).getAttribute('data-chart-visible-bars'), String(zoomCount))
     await page.evaluate(() => { location.hash = '#/settings/workspace' })
     await page.getByRole('link', { name: 'Back to markets' }).click()
     await page.waitForFunction(() => document.querySelectorAll('[data-multi-timeframe-charts] svg[data-rendered-inst]').length === 3)

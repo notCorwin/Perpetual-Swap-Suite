@@ -18,6 +18,13 @@ test('trackpad pinch zooms the cached chart around the pointer and keeps wheel h
     page.on('pageerror', error => errors.push(error.message))
     await page.evaluate(() => window.radarDesktop.request({ e2e: { action: 'seedInstrumentNavigationBenchmark' } }))
     await page.waitForFunction(() => document.querySelector('[data-chart-inst][data-chart-loading="false"] svg[data-rendered-inst]'))
+    const initial = await page.locator('[data-chart-inst]').evaluate(chart => ({
+      visible: Number(chart.dataset.chartVisibleBars), prepared: Number(chart.dataset.chartTargetBars),
+      rendered: Number(chart.dataset.chartRenderedBars),
+    }))
+    assert.ok(initial.visible >= 64 && initial.visible <= 192, 'Default candles use a readable density.')
+    assert.ok(initial.visible < initial.prepared, 'Display density is independent from coarse history demand.')
+    assert.equal(initial.rendered, initial.visible, 'The default viewport projects the recent candles without gaps.')
     const input = async (deltaY, ctrlKey = true, deltaX = 0) => page.locator('[data-chart-plot]').evaluate((plot, options) => {
       const rect = plot.getBoundingClientRect()
       const event = new WheelEvent('wheel', { ...options, bubbles: true, cancelable: true, clientX: rect.left + rect.width * 0.4 })
@@ -47,6 +54,19 @@ test('trackpad pinch zooms the cached chart around the pointer and keeps wheel h
     await page.waitForFunction(end => Number(document.querySelector('[data-chart-inst]').dataset.chartCompletedEnd) > end, zoomed.end)
     const panned = await state()
     assert.equal(panned.count, zoomed.count, 'Two-finger scrolling preserves zoom.')
+    // Pinching leaves a fractional endpoint; reaching latest must release it.
+    await input(-100_000, false)
+    await page.waitForFunction(() => {
+      const chart = document.querySelector('[data-chart-inst]'), snapshot = chart.__chartSnapshot
+      const latest = snapshot?.liveBar?.hour ?? snapshot?.endHour
+      return Number(chart.querySelector('svg[data-rendered-inst]')?.dataset.chartDomainEnd) === latest
+        && Number(chart.dataset.chartEnd) === latest
+    })
+    assert.equal((await state()).count, zoomed.count, 'Returning to latest preserves candle spacing.')
+    await input(-1, false)
+    await input(1, false)
+    await page.waitForFunction(() => Number(document.querySelector('[data-chart-wheel-content]').dataset.chartWheelOffset) > 0)
+    assert.equal((await state()).count, zoomed.count, 'Reversing from the latest edge responds immediately without changing zoom.')
     await input(10)
     await page.waitForFunction(count => Number(document.querySelector('[data-chart-visible-bars]').dataset.chartVisibleBars) > count, zoomed.count)
     assert.ok((await state()).count > zoomed.count)

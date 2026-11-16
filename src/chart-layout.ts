@@ -1,6 +1,6 @@
-// Quantized demand avoids acquiring or projecting history for every resize pixel.
+// Wider default candles; resize in coarse steps while data demand stays independent.
 export function chartViewportBars(plotWidth: number) {
-  return Math.min(288, 96 + Math.max(0, Math.floor((plotWidth - 720) / 240)) * 48)
+  return Math.min(192, 64 + Math.max(0, Math.floor((plotWidth - 720) / 240)) * 32)
 }
 
 export const CHART_PANELS = ["price", "roc", "rsi", "atr", "oi", "taker"] as const

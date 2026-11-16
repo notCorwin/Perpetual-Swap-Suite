@@ -354,10 +354,11 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
   const viewportBars = chartViewportBars(plotSize.width)
   const [zoom, setZoom] = useState<{ count: number; offset: number } | null>(null)
   const zoomRef = useRef(zoom)
-  const demandBars = zoom ? chartZoomDemand(zoom.count) : viewportBars
+  const viewport = useMemo(() => zoom ?? { count: viewportBars, offset: 0 }, [zoom, viewportBars])
+  const demandBars = chartZoomDemand(viewport.count)
   useLayoutEffect(() => { if (isActive) chartController.setWindowBars(demandBars) }, [chartController, demandBars, isActive])
   const overscan = chartOverscan(surface, chartController)
-  const preparedPlot = chartPlot(surface, plotSize, overscan, currentPriceTickSz, priceOnly, zoom ?? undefined)
+  const preparedPlot = chartPlot(surface, plotSize, overscan, currentPriceTickSz, priceOnly, viewport)
   const bars = preparedPlot?.bars ?? surface?.bars ?? EMPTY_BARS
   const plotGeometry = preparedPlot?.geometry ?? null
   const [inspection, setInspection] = useState<{ instId: string; timeframe: RadarTimeframe; hour: number } | null>(null)
@@ -561,10 +562,23 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
       const progress = wheelBatch.current.consume(wheelRemainder.current)
       wheelRemainder.current = progress.remainderPixels
       flushSync(() => {
-        setWheelFraction(progress.fraction)
         setWheelOwner(current => current?.session === owner.session && current.instId === owner.instId && current.timeframe === owner.timeframe && current.generation === owner.generation ? current : owner)
         endInspection()
         if (progress.steps) chartController.scroll(progress.steps)
+        const atLatest = chartController.getSnapshot().requested?.end === null
+        const viewport = zoomRef.current
+        // The cache cursor stops at latest, so it cannot consume a pinch's
+        // fractional endpoint. Release that endpoint when panning reaches it.
+        const reachedLatest = viewport && atLatest && (progress.steps > 0
+          || progress.fraction > 0 && progress.fraction + viewport.offset >= 0)
+        if (reachedLatest) {
+          if (viewport.offset !== 0) {
+            zoomRef.current = { ...viewport, offset: 0 }
+            setZoom(zoomRef.current)
+          }
+          wheelRemainder.current = 0
+          setWheelFraction(0)
+        } else setWheelFraction(progress.fraction)
       })
       if (progress.fraction && wheelOwnerRef.current?.session === owner.session) chartController.prefetchAdjacent(progress.fraction)
     })
@@ -686,7 +700,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}</div>}
     {capture.error && <p role="alert" className="shrink-0 border-b px-5 py-2 text-destructive">{capture.error}</p>}
     <div className="flex min-h-0 flex-1">
-    <section ref={chartRef} data-chart-inst={displayedId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={surface?.windowBars ?? 96} data-chart-visible-bars={zoom?.count ?? surface?.windowBars ?? 96} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={priceState} data-chart-statistics-state={surface?.oiState === 'error' || surface?.takerState === 'error' ? 'error' : surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={priceState !== 'ready' || surface?.indicatorState !== 'ready' || oiState !== 'ready' || takerState !== 'ready' ? 'true' : 'false'} data-chart-loading={pending ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
+    <section ref={chartRef} data-chart-inst={displayedId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={surface?.windowBars ?? 96} data-chart-visible-bars={viewport.count} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={priceState} data-chart-statistics-state={surface?.oiState === 'error' || surface?.takerState === 'error' ? 'error' : surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={priceState !== 'ready' || surface?.indicatorState !== 'ready' || oiState !== 'ready' || takerState !== 'ready' ? 'true' : 'false'} data-chart-loading={pending ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
       <div data-chart-summary className="flex shrink-0 items-center border-b px-4">
         <h2 data-chart-title className="min-w-0 max-w-40 shrink-0 truncate" title={displayedId} aria-label={`${displayedId.replace(/-SWAP$/, '')} · ${timeframeLabel(displayedFrame)}`}>{priceOnly && matchesSelection ? timeframeLabel(displayedFrame) : `${displayedId.replace(/-SWAP$/, '')} · ${timeframeLabel(displayedFrame)}`}</h2>
         {priceOnly && !historical && <PriceStatus observedAt={surface?.priceObservedAt} realtime={surface?.realtimeState} active={isActive && windowVisible && presentation.active} />}
