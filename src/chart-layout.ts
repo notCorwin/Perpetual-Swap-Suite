@@ -47,8 +47,12 @@ export function chartPanelClip(layout: ReturnType<typeof chartLayout>, panel: Ch
   }
 }
 
-export function chartLayout(width: number, height: number, labelGutter = 64, priceOnly = false) {
-  const rightMargin = 4, top = 4, headerHeight = 24, rowGap = 3, bottomAxis = 22
+export type ChartLayoutDensity = { top: number; headerHeight: number; rowGap: number; bottomAxis: number; headerBaseline: number }
+const compactChartDensity: ChartLayoutDensity = { top: 2, headerHeight: 18, rowGap: 2, bottomAxis: 16, headerBaseline: 11 }
+
+export function chartLayout(width: number, height: number, labelGutter = 64, priceOnly = false, density: ChartLayoutDensity = compactChartDensity) {
+  const rightMargin = 4
+  const { top, headerHeight, rowGap, bottomAxis, headerBaseline } = density
   const right = width - rightMargin - labelGutter, column: Range = [0, right]
   const order: readonly ChartPanel[] = priceOnly ? ['price'] : CHART_PANELS
   const availableHeight = Math.max(1, height - top - bottomAxis - headerHeight * order.length - rowGap * (order.length - 1))
@@ -57,7 +61,7 @@ export function chartLayout(width: number, height: number, labelGutter = 64, pri
   const headerY = {} as Record<ChartPanel, number>
   let cursor = top
   for (const key of order) {
-    headerY[key] = cursor + 13
+    headerY[key] = cursor + headerBaseline
     cursor += headerHeight
     panels[key] = [cursor, cursor + availableHeight * (priceOnly ? 1 : weights[key])]
     cursor = panels[key][1] + rowGap

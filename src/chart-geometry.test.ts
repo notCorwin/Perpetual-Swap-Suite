@@ -241,7 +241,7 @@ test('price-only geometry fills the plot and has a separate reusable cache varia
   const full = geometry(bars, { ...viewport, height: 240, priceOnly: false })
   assert.notEqual(multi, full)
   assert.equal(geometry(bars, { ...viewport, height: 240, priceOnly: true }), multi)
-  assert.equal(multi.layout.panels.price[1], 218)
+  assert.equal(multi.layout.panels.price[1], 224)
   assert.ok(multi.layout.panels.price[1] - multi.layout.panels.price[0] > 180)
   assert.ok(multi.lines.bollUpper && multi.lines.vwap)
 })

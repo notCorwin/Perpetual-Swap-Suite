@@ -1,5 +1,5 @@
 import { chartAxis, chartAxisForLabels, logarithmicChartAxis, logarithmicScale } from './chart-axis.ts'
-import { chartCandleWidth, chartHourX, chartLayout } from './chart-layout.ts'
+import { chartCandleWidth, chartHourX, chartLayout, type ChartLayoutDensity } from './chart-layout.ts'
 import type { Bar } from './chart-data.ts'
 import { finitePercentage, formatPercent } from './market-percent.ts'
 import { measureOperation } from '../electron/services/operations.js'
@@ -25,7 +25,7 @@ const axisFormatter = (decimals: number) => {
 }
 
 type Range = readonly [number, number]
-export type ChartGeometryOptions = Readonly<{ width: number; height: number; endHour: number; intervalMS: number; liveClose?: number; currentPriceTickSz?: string | null; priceOnly?: boolean; windowBars?: number }>
+export type ChartGeometryOptions = Readonly<{ width: number; height: number; endHour: number; intervalMS: number; liveClose?: number; currentPriceTickSz?: string | null; priceOnly?: boolean; windowBars?: number; layoutDensity?: ChartLayoutDensity }>
 export type ChartGeometryOverscan = Readonly<{ before?: Bar; after?: Bar }>
 const linearScale = (min: number, max: number, panel: Range) => {
   const span = max - min || 1, height = panel[1] - panel[0]
@@ -66,7 +66,7 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
   if (finite(liveClose)) { priceMin = Math.min(priceMin, liveClose); priceMax = Math.max(priceMax, liveClose) }
   // Panel heights do not depend on the label gutter, so each axis is computed
   // once and shared by both the gutter measurement and the final plot.
-  const { panels } = chartLayout(0, height, 64, options.priceOnly)
+  const { panels } = chartLayout(0, height, 64, options.priceOnly, options.layoutDensity)
   const priceLabels = axisLabelLimit(panels.price, 9)
   const priceAxis = priceMin <= 0
     ? { ...chartAxisForLabels(priceMin, priceMax, priceLabels), kind: 'linear' as const }
@@ -85,7 +85,7 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
     `${formatCurrentPrice(liveClose ?? bars.at(-1)!.close, options.currentPriceTickSz)} ↑`, '00:00',
   ]
   const gutter = Math.ceil(Math.max(...labels.map(measureText)) + 16)
-  const layout = chartLayout(width, height, gutter, options.priceOnly), { left, right } = layout
+  const layout = chartLayout(width, height, gutter, options.priceOnly, options.layoutDensity), { left, right } = layout
   const x = bars.map(bar => chartHourX(bar.hour, endHour, left, right, intervalMS, windowBars))
   const barWidth = chartCandleWidth(right - left, windowBars)
   const barPitch = (right - left - barWidth) / (windowBars - 1)
@@ -208,7 +208,7 @@ export function createChartGeometryCache(measureText: (text: string) => number) 
     const liveClose = finite(options.liveClose) ? options.liveClose : undefined
     const index = variants.findIndex(({ value, before, after }) => value.width === options.width && value.height === options.height
       && value.endHour === options.endHour && value.intervalMS === options.intervalMS && value.liveClose === liveClose
-      && (value.windowBars ?? 96) === (options.windowBars ?? 96) && value.currentPriceTickSz === options.currentPriceTickSz && value.priceOnly === options.priceOnly
+      && value.layoutDensity === options.layoutDensity && (value.windowBars ?? 96) === (options.windowBars ?? 96) && value.currentPriceTickSz === options.currentPriceTickSz && value.priceOnly === options.priceOnly
       && before === overscan.before && after === overscan.after)
     if (index >= 0) {
       const [variant] = variants.splice(index, 1)

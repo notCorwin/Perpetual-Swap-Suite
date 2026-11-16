@@ -1,8 +1,9 @@
+import type { ChartLayoutDensity } from './chart-layout.ts'
 import type { Bar, ReadyChartWindow } from './chart-data.ts'
 import { createChartGeometryCache, type ChartGeometryOverscan } from './chart-geometry.ts'
 
 /** Selection and background rendering share the exact same immutable paths. */
-export function createChartPlotCache(measureText: (text: string) => number) {
+export function createChartPlotCache(measureText: (text: string) => number, layoutDensity?: ChartLayoutDensity) {
   const geometry = createChartGeometryCache(measureText)
   type Plot = { bars: readonly Bar[]; geometry: ReturnType<typeof geometry>; before?: Bar; after?: Bar }
   const cache = new WeakMap<readonly Bar[], WeakMap<object, { bars: readonly Bar[]; variants: Plot[]; windowBars?: number }>>()
@@ -26,7 +27,7 @@ export function createChartPlotCache(measureText: (text: string) => number) {
     if (cached) return cached
     if (!bars.length) return null
     const endHour = bars.at(-1)!.hour
-    const plot = { bars, before: overscan.before, after: overscan.after, geometry: geometry(bars, { ...size, endHour, intervalMS: window.intervalMS, windowBars: window.windowBars,
+    const plot = { bars, before: overscan.before, after: overscan.after, geometry: geometry(bars, { ...size, endHour, intervalMS: window.intervalMS, windowBars: window.windowBars, layoutDensity,
       liveClose: (window.liveBar ?? bars.at(-1)!).close, currentPriceTickSz, priceOnly }, overscan) }
     variants.push(plot)
     if (variants.length > 2) variants.shift()

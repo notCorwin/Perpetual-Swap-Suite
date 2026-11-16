@@ -160,17 +160,17 @@ export async function assertWorkspaceLayout(page) {
   assert.ok(Math.abs(layout.list.height - layout.viewport.height) < 1 && Math.abs(layout.chart.height - layout.list.height) < 1, 'Both workspace columns must use the full window height.')
   if (layout.toolbar) assert.ok(layout.toolbar.y === 0 && Math.abs(layout.toolbar.x - layout.chart.x) < 1 && Math.abs(layout.toolbar.width - layout.chart.width) < 1, 'The existing chart toolbar must form the top of the chart column without an extra title bar.')
   if (layout.toolbar && layout.sidebarToolbar) {
-    assert.ok(Math.abs(layout.toolbar.height - layout.sidebarToolbar.height) < 1, 'The sidebar and chart must share one toolbar height.')
+    assert.ok(Math.abs(layout.toolbar.height - 36) < 1 && Math.abs(layout.sidebarToolbar.height - 36) < 1, 'The sidebar and chart must share the compact 36px toolbar height.')
     const center = layout.toolbar.y + layout.toolbar.height / 2
     assert.ok(layout.toolbarControls.every(control => Math.abs(control.y + control.height / 2 - center) < 1), 'All chart toolbar controls must share the same vertical center.')
   }
   if (layout.nativeControls) {
     const { row, title, settings, inset } = layout.nativeControls
-    assert.ok(Math.abs(inset - 16 * layout.scale - 72) < 1 && row.height >= 35, 'Native traffic lights need fixed-size clearance at every workspace scale.')
+    assert.ok(Math.abs(inset - 12 - 72) < 1 && Math.abs(row.height - 36) < 1, 'Native traffic lights need fixed-size clearance at every workspace scale.')
     assert.ok(title.x >= row.x + inset - 1 && title.x + title.width <= settings.x + 1, 'Native controls, application title, and settings must not overlap.')
     assert.ok([title, settings].every(control => Math.abs(control.y + control.height / 2 - (row.y + row.height / 2)) < 1), 'Application title and settings must align with the chart toolbar controls.')
   }
-  assert.ok(Math.abs(layout.list.width - Math.max(360, Math.min(420, layout.viewport.width * .3))) < 2, 'The contract list must follow its shared responsive width token.')
+  assert.ok(Math.abs(layout.list.width - Math.min(300, layout.viewport.width * .35)) < 2, 'The contract list must follow its shared responsive width token.')
   assert.ok(Math.abs(layout.chart.width - (layout.viewport.width - layout.list.width)) < 2, `The chart panel must fill the remaining window width: ${JSON.stringify(layout)}`)
   assert.ok(Math.abs(layout.list.x + layout.list.width - layout.chart.x) < 2, 'The chart must sit beside the contract list.')
   assert.ok(layout.documentWidth <= layout.viewport.width + 1 && layout.documentHeight <= layout.viewport.height + 1, 'The workspace must scroll inside its panels, not the window.')

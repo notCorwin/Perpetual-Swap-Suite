@@ -255,8 +255,8 @@ test('contract header remains distinct from an adjacent selected row', async () 
       })
       assert.notEqual(styles.headerBackground, styles.selectedBackground, `${colorScheme}: header and selected row must not merge`)
       assert.notEqual(styles.headerColor, styles.rowColor, `${colorScheme}: headings must be visually distinct from values`)
-      assert.deepEqual(styles.leftPadding, ['16px', '16px'])
-      assert.deepEqual(styles.rightPadding, ['16px', '16px'])
+      assert.deepEqual(styles.leftPadding, ['12px', '12px'])
+      assert.deepEqual(styles.rightPadding, ['12px', '12px'])
       if (process.env.PERPETUAL_SWAP_UI_SCREENSHOTS) await page.locator('[data-market-list]').screenshot({ path: join(process.env.PERPETUAL_SWAP_UI_SCREENSHOTS, `contract-list-${colorScheme}.png`) })
     }
   } finally { await page.emulateMedia({ colorScheme: null }) }
@@ -672,7 +672,7 @@ test('chart source updates stay outside the plot without resizing its viewport a
   try {
     for (const size of [{ width: 800, height: 572 }, { width: 1600, height: 1000 }]) {
       await page.setViewportSize(size)
-      await page.waitForFunction(width => Number(document.querySelector('[data-layout="market-workspace"]')?.dataset.uiScale) === 1, size.width)
+      await page.waitForFunction(size => { const r = document.querySelector('[data-layout="market-workspace"]').getBoundingClientRect(); return r.width === size.width && r.height === size.height }, size)
       await publish({ oiState: 'ready', takerState: 'ready', indicatorState: 'ready' })
       const status = page.locator('[data-chart-status]')
       await page.waitForFunction(() => {
@@ -1849,14 +1849,14 @@ test('larger windows retain control density while showing more rows and candles 
     await page.waitForFunction(() => document.querySelectorAll('[data-chart-rendered-bars="96"]').length === 3)
     const normal = await measure()
     await client.send('Emulation.setDeviceMetricsOverride', { width: 1510, height: 1000, deviceScaleFactor: 1, mobile: false })
-    await page.waitForFunction(() => document.querySelectorAll('[data-chart-rendered-bars="144"]').length === 3)
+    await page.waitForFunction(() => document.querySelectorAll('[data-chart-rendered-bars="192"]').length === 3)
     await assertWorkspaceLayout(page)
     const expanded = await measure()
     assert.equal(expanded.rowHeight, normal.rowHeight)
     assert.equal(expanded.fontSize, normal.fontSize)
     assert.ok(expanded.listWidth >= normal.listWidth && expanded.listWidth <= 420)
     assert.ok(expanded.visibleRows > normal.visibleRows, `${JSON.stringify({ normal, expanded })}`)
-    assert.deepEqual(expanded.candles, [144, 144, 144])
+    assert.deepEqual(expanded.candles, [192, 192, 192])
     const focusCount = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartFocus).length)
     await client.send('Emulation.setDeviceMetricsOverride', { width: 1520, height: 1000, deviceScaleFactor: 1, mobile: false })
     await page.waitForFunction(() => innerWidth === 1520)
@@ -1910,5 +1910,55 @@ test('compact workspaces preserve complete market prices and keep overflowing ch
       state.revision += 1
       state.notify()
     })
+  }
+})
+
+test('compact density reserves at least eighty percent of each stacked chart for price geometry', async () => {
+  const previousSize = page.viewportSize(), folder = process.env.PERPETUAL_SWAP_DENSITY_SCREENSHOTS
+  const baseline = process.env.PERPETUAL_SWAP_DENSITY_STAGE === 'before'
+  try {
+    await page.emulateMedia({ colorScheme: 'dark' })
+    await page.getByRole('button', { name: 'Multi-timeframe', exact: true }).click()
+    if (folder) await mkdir(folder, { recursive: true })
+    const readings = []
+    for (const width of [1200, 1710]) {
+      await page.setViewportSize({ width, height: width === 1200 ? 1007 : 1008 })
+      await page.waitForFunction(width => {
+        const root = document.querySelector('[data-layout="market-workspace"]')
+        const charts = [...document.querySelectorAll('[data-chart-workspace]')]
+        return root.getBoundingClientRect().width === width && charts.length === 3 && charts.every(chart => {
+          const surface = chart.querySelector('[data-chart-inst]')
+          const svg = chart.querySelector('svg[data-rendered-inst]'), plot = chart.querySelector('[data-chart-plot]')
+          const count = Math.min(288, 96 + Math.max(0, Math.floor((plot.clientWidth - 720) / 240)) * 48)
+          return svg && Number(surface?.dataset.chartRenderedBars) === count && Number(surface?.dataset.chartTargetBars) === count
+            && Math.abs(svg.viewBox.baseVal.width - plot.clientWidth) < 1
+            && Math.abs(svg.viewBox.baseVal.height - plot.clientHeight) < 1
+            && svg.querySelector('clipPath[id$="-price"] rect')
+        })
+      }, width)
+      const reading = await page.evaluate(() => ({ width: innerWidth,
+        sidebar: document.querySelector('[data-market-list]').getBoundingClientRect().width,
+        rowHeight: document.querySelector('[data-market-index]').getBoundingClientRect().height,
+        fontSize: getComputedStyle(document.querySelector('[data-market-index]')).fontSize,
+        charts: [...document.querySelectorAll('[data-chart-workspace]')].map(chart => {
+          const svg = chart.querySelector('svg[data-rendered-inst]'), clip = svg.querySelector('clipPath[id$="-price"] rect')
+          const height = chart.getBoundingClientRect().height
+          const priceHeight = Number(clip.getAttribute('height')) * svg.getBoundingClientRect().height / svg.viewBox.baseVal.height
+          return { height, priceHeight, ratio: priceHeight / height, bars: Number(chart.querySelector('[data-chart-inst]').dataset.chartRenderedBars), fontSize: getComputedStyle(svg).fontSize }
+        }) }))
+      readings.push(reading)
+      if (!baseline) {
+        assert.ok(reading.sidebar <= 320)
+        assert.ok(reading.rowHeight >= 28 && reading.rowHeight <= 30)
+        assert.equal(reading.fontSize, '12px')
+        assert.ok(reading.charts.every(chart => chart.ratio >= .80), JSON.stringify(reading))
+      }
+      if (folder) await page.screenshot({ path: join(folder, `${baseline ? 'before' : 'after'}-${width}.png`) })
+    }
+    if (!baseline) assert.ok(readings[1].charts[0].bars > readings[0].charts[0].bars)
+    if (folder) await import('node:fs/promises').then(({ writeFile }) => writeFile(join(folder, `${baseline ? 'before' : 'after'}-measurements.json`), JSON.stringify(readings, null, 2)))
+  } finally {
+    await page.setViewportSize(previousSize)
+    await page.getByRole('button', { name: 'Indicators', exact: true }).click()
   }
 })

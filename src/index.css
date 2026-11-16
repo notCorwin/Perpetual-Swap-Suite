@@ -5,6 +5,14 @@
 @source "../node_modules/@streamdown/code/dist/*.js";
 
 @theme inline {
+  --text-xs: var(--ui-font-meta);
+  --text-xs--line-height: var(--ui-line-meta);
+  --text-sm: var(--ui-font-size);
+  --text-sm--line-height: var(--ui-line-height);
+  --text-base: var(--ui-font-heading);
+  --text-base--line-height: var(--ui-line-height);
+  --text-lg: var(--ui-font-heading);
+  --text-lg--line-height: var(--ui-line-height);
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
   --font-sans: var(--font-mono);
   --font-heading: var(--font-sans);
@@ -52,7 +60,23 @@
 }
 
 :root {
-  --market-list-width: clamp(360px, 30vw, 420px);
+  --ui-rem-size: 12px;
+  --ui-font-size: 12px;
+  --ui-font-meta: 10px;
+  --ui-font-heading: 13px;
+  --ui-line-height: 16px;
+  --ui-line-meta: 14px;
+  --ui-row-height: 29px;
+  --ui-inline-gap: 12px;
+  --market-status-height: 28px;
+  --market-list-max-width: 300px;
+  --market-list-width: min(var(--market-list-max-width), 35vw);
+  --chart-summary-height: 24px;
+  --chart-panel-header-height: 18px;
+  --chart-panel-header-baseline: 11px;
+  --chart-top-inset: 2px;
+  --chart-row-gap: 2px;
+  --chart-bottom-axis-height: 16px;
   color-scheme: light;
   --positive: rgb(142 188 57);
   --negative: rgb(232 85 168);
@@ -64,9 +88,9 @@
   --chart-roc-negative-area: color-mix(in srgb, var(--negative) 12%, transparent);
   --chart-positive-label: color-mix(in srgb, var(--positive) 50%, var(--foreground));
   --chart-negative-label: color-mix(in srgb, var(--negative) 50%, var(--foreground));
-  --chart-text-size: 14px;
+  --chart-text-size: 11px;
   --chart-line-width: 1px;
-  --chart-legend-gap: 24px;
+  --chart-legend-gap: 16px;
   --chart-price-label-padding-y: 3px;
   --chart-capture-flash: #fff;
   --radius: 0.625rem;
@@ -158,11 +182,14 @@
   }
 
   html {
+    font-size: var(--ui-rem-size);
     @apply font-sans;
   }
 
   body {
     @apply bg-background text-foreground;
+    font-size: var(--ui-font-size);
+    line-height: var(--ui-line-height);
     margin: 0;
     overscroll-behavior: none;
   }
@@ -240,3 +267,21 @@
 html[data-presentation-idle] *, html[data-presentation-idle] *::before, html[data-presentation-idle] *::after {
   animation-play-state: paused !important;
 }
+
+[data-slot="button"], [data-slot="toggle-group-item"] { font-size: var(--ui-font-size); }
+[data-market-index] { height: var(--ui-row-height); }
+[data-chart-summary] {
+  height: var(--chart-summary-height);
+  min-height: var(--chart-summary-height);
+  gap: var(--ui-inline-gap);
+  overflow-x: auto;
+  scrollbar-width: none;
+  white-space: nowrap;
+  font-size: var(--chart-text-size);
+}
+[data-chart-summary] > :not([data-chart-status]), [data-chart-summary] [data-chart-ohlc],
+[data-chart-summary] [data-chart-inspection-readout] > * { flex-shrink: 0; }
+[data-chart-inspection-readout] { display: contents; }
+
+[data-market-status-row] { line-height: var(--ui-line-meta); }
+[data-market-status-row][data-has-markets="true"] { height: var(--market-status-height); }
