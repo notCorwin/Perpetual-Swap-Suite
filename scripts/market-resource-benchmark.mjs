@@ -97,6 +97,8 @@ try {
   stopProcessWitness = await startProcessWitness(electron, 'market-resources', { capacity: loopCapacity,
     directory: join(dirname(reportPath), 'process-witness') })
   page = await electron.firstWindow()
+  // Preserve the fixed 96-candle performance workload independently of screen size.
+  await page.setViewportSize({ width: 1200, height: 1000 })
   await page.waitForLoadState('domcontentloaded')
   report.windowBeforeBenchmark = await electron.evaluate(({ BrowserWindow }) => { const window = BrowserWindow.getAllWindows()[0]; return { visible: window.isVisible(), focused: window.isFocused() } })
   // Test-mode windows start hidden. A visible-paint budget requires an actual

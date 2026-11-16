@@ -88,6 +88,8 @@ try {
   electron = await _electron.launch({ args: [app.entry], cwd: app.cwd,
     env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_E2E_LIVE_REFRESH: '0', PERPETUAL_SWAP_USER_DATA: userData } })
   let page = await electron.firstWindow()
+  // Preserve the fixed 96-candle performance workload independently of screen size.
+  await page.setViewportSize({ width: 1200, height: 1000 })
   await page.waitForLoadState('domcontentloaded')
   const presentation = await assertHiddenOffscreen(electron)
   const runtime = await protectedRuntime(electron)
@@ -106,6 +108,8 @@ try {
   electron = await _electron.launch({ args: ['-r', bootstrap, app.entry], cwd: app.cwd,
     env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_E2E_LIVE_REFRESH: '0', PERPETUAL_SWAP_USER_DATA: userData } })
   page = await electron.firstWindow()
+  // Preserve the fixed 96-candle performance workload independently of screen size.
+  await page.setViewportSize({ width: 1200, height: 1000 })
   await page.waitForLoadState('domcontentloaded')
   await assertHiddenOffscreen(electron)
   const restartRuntime = await protectedRuntime(electron)

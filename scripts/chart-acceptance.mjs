@@ -249,6 +249,9 @@ export async function assertIndicatorLegends(page, { requireFittedVolatility = f
 }
 
 export async function openChart(page, fixture, timeframe = fixture.timeframe) {
+  // These timing/oracle fixtures use a fixed 96-candle workload. Responsive
+  // width and density coverage belongs to the workspace resize acceptance.
+  await page.setViewportSize({ width: 1200, height: 1000 })
   await page.reload({ waitUntil: 'domcontentloaded' })
   await page.locator('[aria-label="Chart display mode"]').waitFor({ state: 'visible' })
   const indicators = page.getByRole('button', { name: 'Indicators', exact: true })
