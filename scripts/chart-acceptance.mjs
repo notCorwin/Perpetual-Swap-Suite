@@ -97,7 +97,8 @@ export async function waitForRendered(page, fixture, timeframe = fixture.timefra
         && svg.getAttribute('data-rendered-timeframe') === timeframe
         && Number(chart.getAttribute('data-chart-completed-end') ?? svg.getAttribute('data-rendered-end')) === end
         && Number(chart.getAttribute('data-chart-rendered-bars')) > 0
-        && chart.getAttribute('data-chart-rendered-bars') === chart.getAttribute('data-chart-target-bars')
+        && Number(chart.getAttribute('data-chart-rendered-bars')) === Math.floor(Number(chart.getAttribute('data-chart-visible-bars')))
+        && Number(chart.getAttribute('data-chart-target-bars')) >= Number(chart.getAttribute('data-chart-visible-bars'))
         && chart.getAttribute('data-chart-loading') === 'false'
     }, { instId: fixture.instId, timeframe, end }, { timeout: 20_000 })
   } catch (error) {
@@ -122,7 +123,8 @@ export async function waitForTargetSnapshot(page, fixture, timeframe, end) {
       && Number(svg.getAttribute('data-rendered-end')) === end
       && Number(chart.getAttribute('data-chart-completed-end')) === end
       && Number(chart.getAttribute('data-chart-rendered-bars')) > 0
-        && chart.getAttribute('data-chart-rendered-bars') === chart.getAttribute('data-chart-target-bars')
+      && Number(chart.getAttribute('data-chart-rendered-bars')) === Math.floor(Number(chart.getAttribute('data-chart-visible-bars')))
+      && Number(chart.getAttribute('data-chart-target-bars')) >= Number(chart.getAttribute('data-chart-visible-bars'))
   }, { instId: fixture.instId, timeframe, end }, { timeout: 20_000 })
 }
 
@@ -251,7 +253,7 @@ export async function assertIndicatorLegends(page, { requireFittedVolatility = f
 export async function openChart(page, fixture, timeframe = fixture.timeframe) {
   // These timing/oracle fixtures use a fixed 96-candle workload. Responsive
   // width and density coverage belongs to the workspace resize acceptance.
-  await page.setViewportSize({ width: 1200, height: 1000 })
+  await page.setViewportSize({ width: 1360, height: 1000 })
   await page.reload({ waitUntil: 'domcontentloaded' })
   await page.locator('[aria-label="Chart display mode"]').waitFor({ state: 'visible' })
   const indicators = page.getByRole('button', { name: 'Indicators', exact: true })
@@ -263,6 +265,8 @@ export async function openChart(page, fixture, timeframe = fixture.timeframe) {
   await page.locator(`[data-chart-inst="${fixture.instId}"]`).waitFor({ state: 'visible' })
   await assertWorkspaceLayout(page)
   await waitForRendered(page, fixture, timeframe)
+  assert.equal(await page.locator(`[data-chart-inst="${fixture.instId}"]`).getAttribute('data-chart-visible-bars'), '96',
+    'Timing and mathematical oracles require exactly 96 visible candles.')
 }
 
 // Inspect the actual immutable data passed to Plot and its SVG, rather than
@@ -407,7 +411,7 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
       const chartState = shareRecord(previous?.chart, {
         instId: chart.dataset.chartInst, label: chart.getAttribute('aria-label'), start: chart.dataset.chartStart, end: chart.dataset.chartEnd,
         completedEnd: chart.dataset.chartCompletedEnd, requestedEnd: chart.dataset.chartRequestedEnd, renderedBars: chart.dataset.chartRenderedBars,
-        targetBars: chart.dataset.chartTargetBars, loading: chart.dataset.chartLoading, visualStale: chart.dataset.chartVisualStale,
+        targetBars: chart.dataset.chartTargetBars, visibleBars: chart.dataset.chartVisibleBars, loading: chart.dataset.chartLoading, visualStale: chart.dataset.chartVisualStale,
         candleState: chart.dataset.chartCandleState, statisticsState: chart.dataset.chartStatisticsState, statisticsEnd: chart.dataset.chartStatisticsEnd,
         oiState: chart.dataset.chartOiState, takerState: chart.dataset.chartTakerState, incomplete: chart.dataset.chartIncomplete,
         oiSamples: chart.dataset.chartOiSamples, takerSamples: chart.dataset.chartTakerSamples,
@@ -677,7 +681,7 @@ async function validateStoppedPaintProbe(page, { readyTarget, includeRequestComm
           readyFrame = { at, frame: true, snapshot: { ...snapshot, bars: undefined }, bars }
         }
         if (Array.isArray(bars)) {
-          if (Number(chart.renderedBars) !== bars.length || Number(chart.targetBars) !== 96) fail('Chart candle-count metadata disagrees with the actual snapshot.')
+          if (Number(chart.renderedBars) !== bars.length || Number(chart.visibleBars) !== 96 || Number(chart.targetBars) < 96) fail('Chart candle-count metadata disagrees with the actual snapshot.')
           if (Number(svg.start) !== bars[0]?.hour || Number(svg.end) !== bars.at(-1)?.hour) fail('SVG labels and the drawn range disagree.')
           if (Number(chart.start) !== bars[0]?.hour || Number(chart.end) !== bars.at(-1)?.hour) fail('Header and actual plot refer to different ranges.')
           if (Number(chart.completedEnd) !== snapshot.endHour || Number(chart.statisticsEnd) !== snapshot.endHour) fail('Chart completed-range metadata disagrees with the snapshot.')

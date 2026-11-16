@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { _electron } from 'playwright'
+import { openChart, waitForTargetSnapshot } from '../../scripts/chart-acceptance.mjs'
 
 test('trackpad pinch zooms the cached chart around the pointer and keeps wheel history navigation', { timeout: 90_000 }, async () => {
   const userData = await mkdtemp(join(tmpdir(), 'perp-chart-zoom-'))
@@ -105,6 +106,18 @@ test('trackpad pinch zooms the cached chart around the pointer and keeps wheel h
     const switched = await state()
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
     assert.deepEqual(await state(), switched, 'A previous timeframe cannot consume a queued pinch after selection changes.')
+    const fixture = await page.locator('[data-chart-inst]').evaluate(chart => ({
+      instId: chart.dataset.chartInst, timeframe: '1H', end: chart.__chartSnapshot.endHour,
+    }))
+    await openChart(page, fixture)
+    await waitForTargetSnapshot(page, fixture, fixture.timeframe, fixture.end)
+    const oracle = await page.locator('[data-chart-inst]').evaluate(chart => ({
+      rendered: chart.__chartRenderedBars.length, visible: Number(chart.dataset.chartVisibleBars),
+      prepared: Number(chart.dataset.chartTargetBars), cached: chart.__chartSnapshot.bars.length,
+    }))
+    assert.equal(oracle.visible, 96, 'Fixed timing/oracle fixtures explicitly select a 96-candle display.')
+    assert.equal(oracle.rendered, 96, 'The oracle uses the actual projected candle input.')
+    assert.ok(oracle.prepared > oracle.visible && oracle.cached >= oracle.visible, 'The prepared cache may retain additional candles.')
     assert.deepEqual(errors, [])
   } finally {
     await electron?.close()
