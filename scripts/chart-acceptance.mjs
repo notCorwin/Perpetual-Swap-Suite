@@ -172,9 +172,10 @@ export async function assertWorkspaceLayout(page) {
 }
 
 export async function assertIndicatorLegends(page, { requireFittedVolatility = false } = {}) {
+  assert.equal(await page.locator('[data-chart-indicator="ema"], [data-chart-legend="EMA(200)"]').count(), 0, 'EMA must not appear on a main chart.')
   const reading = await page.locator('svg[data-rendered-inst]').evaluate(svg => {
     const fields = {
-      'VWAP(14)': 'vwap', 'EMA(200)': 'ema', 'BOLL(20,2)': 'bollMiddle',
+      'VWAP(14)': 'vwap', 'BOLL(20,2)': 'bollMiddle',
       'ROC(9)': 'roc', 'MAROC(9)': 'maroc', 'RSI(6)': 'rsi6', 'RSI(12)': 'rsi12', 'RSI(24)': 'rsi24',
       'ATR%(14)': 'atrPercent', 'BBW(20,2)': 'bbw', 'OI (Contracts)': 'oi',
     }
@@ -289,7 +290,7 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
     if (!(chart instanceof HTMLElement)) throw new Error('No chart surface to inspect.')
     const expectedTimeframe = chart.__chartSnapshot?.timeframe
     if (!series[expectedTimeframe]) throw new Error('The initial chart needs a known fixture timeframe.')
-    const curveFields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi']
+    const curveFields = ['vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi']
     const probe = {
       instId, expectedTimeframe, series, requireMatureData, requireWarmStatistics, indicatorValidation,
       active: true, frames: 0, pendingFrames: 0, paints: 0, minimumBars: Infinity, errors: [],

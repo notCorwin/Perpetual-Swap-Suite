@@ -119,7 +119,7 @@ test('qualified rows stay stable while one SVG surface handles canonical frames,
     const sharedSurface = await page.locator('svg[data-rendered-inst]').elementHandle()
     await page.evaluate(() => {
       window.__sharedSurface = document.querySelector('svg[data-rendered-inst]')
-      window.__sharedEMA = window.__sharedSurface.querySelector('[data-chart-indicator="ema"]')
+      window.__sharedVWAP = window.__sharedSurface.querySelector('[data-chart-indicator="vwap"]')
     })
     const assertSharedSurface = async phase => {
       assert.equal(await page.locator('svg[data-rendered-inst]').count(), 1, `${phase} must leave exactly one active SVG.`)
@@ -137,7 +137,7 @@ test('qualified rows stay stable while one SVG surface handles canonical frames,
     const backgroundBeforeCorrection = await page.evaluate(() => {
       const bar = document.querySelector('[data-chart-inst]').__chartSnapshot.bars.at(-1)
       return { close: bar.close, ema: bar.ema,
-        path: document.querySelector('svg[data-rendered-inst] [data-chart-indicator="ema"]').getAttribute('d') }
+        path: document.querySelector('svg[data-rendered-inst] [data-chart-indicator="vwap"]').getAttribute('d') }
     })
     assert.equal(await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFocused()), false,
       'The acceptance app must never take macOS window focus.')
@@ -162,9 +162,9 @@ test('qualified rows stay stable while one SVG surface handles canonical frames,
       const chart = document.querySelector('[data-chart-inst]')
       window.__surfaceBeforeCorrection = svg
       window.__snapshotBeforeCorrection = chart.__chartSnapshot
-      window.__emaBeforeCorrection = svg.querySelector('[data-chart-indicator="ema"]')
+      window.__vwapBeforeCorrection = svg.querySelector('[data-chart-indicator="vwap"]')
       return { instId: svg.dataset.renderedInst, timeframe: svg.dataset.renderedTimeframe,
-        ema: svg.querySelector('[data-chart-indicator="ema"]')?.getAttribute('d') }
+        vwap: svg.querySelector('[data-chart-indicator="vwap"]')?.getAttribute('d') }
     })
     assert.equal(beforeCorrection.instId, target)
     await page.evaluate(({ instId, hour, close }) => {
@@ -177,11 +177,11 @@ test('qualified rows stay stable while one SVG surface handles canonical frames,
       const chart = document.querySelector('[data-chart-inst]')
       return { instId: svg?.dataset.renderedInst, timeframe: svg?.dataset.renderedTimeframe,
         count: document.querySelectorAll('svg[data-rendered-inst]').length,
-        ema: svg?.querySelector('[data-chart-indicator="ema"]')?.getAttribute('d'),
+        vwap: svg?.querySelector('[data-chart-indicator="vwap"]')?.getAttribute('d'),
         sameSurface: svg === window.__surfaceBeforeCorrection,
         sameSnapshot: chart.__chartSnapshot === window.__snapshotBeforeCorrection,
-        sameEMAPath: svg?.querySelector('[data-chart-indicator="ema"]') === window.__emaBeforeCorrection }
-    }), { ...beforeCorrection, count: 1, sameSurface: true, sameSnapshot: true, sameEMAPath: true },
+        sameVWAPPath: svg?.querySelector('[data-chart-indicator="vwap"]') === window.__vwapBeforeCorrection }
+    }), { ...beforeCorrection, count: 1, sameSurface: true, sameSnapshot: true, sameVWAPPath: true },
     'A durable correction for an unselected contract must leave the current chart untouched.')
 
     await page.locator(`[aria-label="View ${background} chart"]`).evaluate(row => {
@@ -197,12 +197,12 @@ test('qualified rows stay stable while one SVG surface handles canonical frames,
     const expectedEMA = backgroundBeforeCorrection.ema + 2 / 201 * (correction.close - backgroundBeforeCorrection.close)
     assert.equal(await page.evaluate(({ previousPath, hour, close, expectedEMA }) => {
       const svg = document.querySelector('svg[data-rendered-inst]'), chart = document.querySelector('[data-chart-inst]')
-      const ema = svg?.querySelector('[data-chart-indicator="ema"]')
-      return svg === window.__sharedSurface && ema === window.__sharedEMA
-        && ema?.getAttribute('d') !== previousPath && chart.__chartSnapshot.bars.some(bar => bar.hour === hour && bar.close === close
+      const vwap = svg?.querySelector('[data-chart-indicator="vwap"]')
+      return svg === window.__sharedSurface && vwap === window.__sharedVWAP
+        && vwap?.getAttribute('d') !== previousPath && chart.__chartSnapshot.bars.some(bar => bar.hour === hour && bar.close === close
           && Math.abs(bar.ema - expectedEMA) < 1e-10)
     }, { previousPath: backgroundBeforeCorrection.path, hour: fixture.end, close: correction.close, expectedEMA }), true,
-    'Selecting the corrected contract must immediately redraw its indicator on the existing SVG and EMA path nodes.')
+    'Selecting the corrected contract must immediately redraw its indicator on the existing SVG and VWAP path nodes.')
     await assertSharedSurface('Corrected contract switch')
 
     // A selected contract consumes a canonical live update and selection in one

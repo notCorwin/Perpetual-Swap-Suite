@@ -11,8 +11,8 @@ const axisFormatters = new Map<number, Intl.NumberFormat>()
 export const chartCompact = (value: number | null) => value === null ? '—' : compactFormatter.format(value)
 export const chartPercent = (value: number | null, decimals = 2) => value === null ? '—' : `${value.toFixed(decimals)}%`
 const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value)
-const priceFields = ['low', 'high', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower'] as const
-const lineFields = ['bollUpper', 'bollMiddle', 'bollLower', 'vwap', 'ema', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'roc', 'maroc', 'oi'] as const
+const priceFields = ['low', 'high', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower'] as const
+const lineFields = ['bollUpper', 'bollMiddle', 'bollLower', 'vwap', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'roc', 'maroc', 'oi'] as const
 const axisLabelLimit = (panel: readonly [number, number], maximum: number) =>
   Math.min(maximum, Math.max(2, Math.floor((panel[1] - panel[0]) / 32) + 1))
 const axisFormatter = (decimals: number) => {

@@ -19,7 +19,7 @@ before(async () => {
   // of source downloads, persistence workers, and any configured AI service.
   await electron.evaluate(async ({ ipcMain, BrowserWindow }) => {
     const { encodeChartWire } = process.getBuiltinModule('module').createRequire(`${process.cwd()}/package.json`)('./electron/chart-wire.js')
-    const preferences = { chartTimeframe: '15m', rankingLookback: 15, historyDays: 30, liquidity: {
+    const preferences = { chartDisplayMode: 'indicators', chartTimeframe: '15m', rankingLookback: 15, historyDays: 30, liquidity: {
       spread: { enabled: true, maxPercent: .05 }, depth: { enabled: true, minUSDT: 100_000 },
       slippage: { enabled: true, maxPercent: .1, notionalUSDT: 100_000 }, volume24h: { enabled: true, minUSDT: 30_000_000 },
       openInterest: { enabled: true, minUSDT: 5_000_000 }, volumeStability: { enabled: false, maxRatio: 2 },
@@ -272,10 +272,10 @@ const backToMarkets = async () => {
   await settingsPage().waitFor({ state: 'hidden' })
   await page.getByRole('textbox', { name: 'Search contracts' }).waitFor({ state: 'visible' })
 }
-const emaCandleTarget = async (slot, fixture) => {
+const vwapCandleTarget = async (slot, fixture) => {
   const target = await page.locator('svg[data-rendered-inst]').evaluate((svg, { slot, intervalMS }) => {
-    const commands = svg.querySelector('[data-chart-indicator="ema"]').getAttribute('d').match(/[ML][^ML]+/g)
-    if (commands.length !== 97) throw new Error('The fixture must draw 96 EMA samples and their leading left-edge extension.')
+    const commands = svg.querySelector('[data-chart-indicator="vwap"]').getAttribute('d').match(/[ML][^ML]+/g)
+    if (commands.length !== 97) throw new Error('The fixture must draw 96 VWAP samples and their leading left-edge extension.')
     const x = Number.parseFloat(commands[slot + 1].slice(1))
     const rect = svg.getBoundingClientRect()
     return { x: rect.x + x / svg.viewBox.baseVal.width * rect.width, y: rect.y + rect.height * .1,
@@ -452,7 +452,7 @@ test('cold and warm chart periods preserve list nodes, order, count, and selecti
 })
 
 test('the existing chart toolbar provides window dragging while its controls remain interactive', async () => {
-  const toolbar = page.locator('[data-chart-toolbar]')
+  const toolbar = page.locator('[data-chart-workspace] [data-chart-toolbar]')
   await assertWorkspaceLayout(page)
   assert.equal(await toolbar.evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'drag')
   for (const name of ['5m', '15m', '1h', 'Copy chart', 'Analyze Long', 'Analyze Short', 'Chart controls']) {
@@ -576,14 +576,14 @@ test('contract precision updates pad current quotes while preserving historical 
       const frame = await state.request(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
       Object.assign(frame.bars.at(-1), { open: 100.1, high: 101, low: 99, close: 100.123456789 })
       frame.liveBar = { ...frame.bars.at(-1), hour: frame.endHour + frame.intervalMS, open: 100.1, high: 101, low: 99, close: 100.12,
-        ema: 100.123456789, confirmed: false }
+        vwap: 100.123456789, confirmed: false }
       state.sendChart(frame)
       return frame
     })
     await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '100.1200')
     await waitForLabel('100.1200 ↑')
     assert.equal(await close.textContent(), '100.1200')
-    assert.equal(await chart.locator('[data-chart-legend="EMA(200)"]').locator('..').locator('text').nth(1).textContent(), '100.12346', 'Indicators retain their independent significant-digit display.')
+    assert.equal(await chart.locator('[data-chart-legend="VWAP(14)"]').locator('..').locator('text').nth(1).textContent(), '100.12346', 'Indicators retain their independent significant-digit display.')
     const baseline = await page.evaluate(() => {
       const chart = document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')
       globalThis.__precisionBars = chart.__chartSnapshot.bars
@@ -604,14 +604,14 @@ test('contract precision updates pad current quotes while preserving historical 
       const background = chart.querySelector('[data-chart-price-label-background]').getBoundingClientRect()
       return { fits: label.right <= background.right + 1, width: background.width,
         sameInputs: chart.__chartSnapshot.bars === globalThis.__precisionBars && chart.__chartSnapshot.liveBar === globalThis.__precisionLive,
-        historicalClose: chart.__chartSnapshot.bars.at(-1).close, ema: chart.__chartSnapshot.liveBar.ema }
+        historicalClose: chart.__chartSnapshot.bars.at(-1).close, vwap: chart.__chartSnapshot.liveBar.vwap }
     })
     assert.ok(layout.fits && layout.width > baseline, 'The chart gutter must reserve the newly padded quote width.')
     assert.equal(layout.sameInputs, true, 'A precision-only update must reuse source bars and calculated values.')
     assert.equal(layout.historicalClose, 100.123456789)
-    assert.equal(layout.ema, 100.123456789)
+    assert.equal(layout.vwap, 100.123456789)
     assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), reads, 'Precision updates must not request chart data again.')
-    const target = await emaCandleTarget(94, frame)
+    const target = await vwapCandleTarget(94, frame)
     await page.mouse.move(target.x, target.y)
     await page.mouse.down()
     await page.waitForFunction(() => document.querySelector('[data-chart-ohlc="close"] span[title]')?.textContent === '100.123456789')
@@ -711,7 +711,7 @@ test('pointer inspection selects the drawn first, middle, and latest candle befo
       const frame = await publish(forming)
       await waitForFrame(frame)
       for (const slot of [0, 24, 95]) {
-        const target = await emaCandleTarget(slot, frame)
+        const target = await vwapCandleTarget(slot, frame)
         const fixtureIndex = slot + Number(forming)
         assert.equal(target.hour, frame.bars[0].hour + fixtureIndex * frame.intervalMS)
         assert.equal(target.close, fixtureIndex === 96 ? 137 : 100 + fixtureIndex * .01)
@@ -962,7 +962,7 @@ test('search preserves selection while six width/DPR combinations share page, po
       await client.send('Emulation.setDeviceMetricsOverride', { width, height: 1_000, deviceScaleFactor, mobile: false })
       await page.waitForFunction(({ width, deviceScaleFactor }) => innerWidth === width && devicePixelRatio === deviceScaleFactor && Number(document.querySelector('[data-layout="market-workspace"]')?.dataset.uiScale) === width / 1_600, { width, deviceScaleFactor })
       await assertWorkspaceLayout(page)
-      const target = await emaCandleTarget(24, fixture)
+      const target = await vwapCandleTarget(24, fixture)
       await page.mouse.move(target.x, target.y)
       await page.mouse.down()
       await page.waitForFunction(() => document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))

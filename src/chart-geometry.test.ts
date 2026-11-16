@@ -68,12 +68,12 @@ test('fractional overscan extends paths and crossings without changing the 96-ba
   assert.deepEqual(geometry.oiAxis, baseline.oiAxis)
   assert.equal(geometry.x.length, 96)
   close(geometry.barPitch, geometry.x[1] - geometry.x[0])
-  const emaX = [...geometry.lines.ema.matchAll(/[ML]([\d.-]+) ([\d.-]+)/g)].map(([, x]) => Number(x))
-  assert.equal(emaX.length, 98)
-  assert.ok(emaX[0] < geometry.layout.left)
-  assert.ok(emaX.at(-1)! > geometry.layout.right)
+  const vwapX = [...geometry.lines.vwap.matchAll(/[ML]([\d.-]+) ([\d.-]+)/g)].map(([, x]) => Number(x))
+  assert.equal(vwapX.length, 98)
+  assert.ok(vwapX[0] < geometry.layout.left)
+  assert.ok(vwapX.at(-1)! > geometry.layout.right)
   const priceClip = chartPanelClip(geometry.layout, 'price', geometry.barPitch)
-  assert.ok(emaX[0] >= priceClip.x && emaX.at(-1)! <= priceClip.x + priceClip.width,
+  assert.ok(vwapX[0] >= priceClip.x && vwapX.at(-1)! <= priceClip.x + priceClip.width,
     'The translated price panel clip must admit adjacent bar centers on both sides.')
   const leftCrossing = geometry.rsiMarkers.find(marker => marker.hour === bars[0].hour && marker.field === 'rsi6')
   const rightCrossing = geometry.rsiMarkers.find(marker => marker.hour === after.hour && marker.field === 'rsi6')
@@ -87,11 +87,11 @@ test('fractional overscan extends paths and crossings without changing the 96-ba
 })
 
 test('missing periods and unavailable observations break paths and filled areas without inventing zero samples', () => {
-  const bars = [0, 1, 3, 4, 5].map(index => ({ ...candle(index), ema: index === 3 ? null : 100,
+  const bars = [0, 1, 3, 4, 5].map(index => ({ ...candle(index), vwap: index === 3 ? null : 100,
     atrPercent: index === 3 ? null : 2.5, bbw: index === 3 ? null : 6,
     buy: index === 3 ? null : 7, sell: index === 3 ? null : 3, oi: index === 3 ? null : index * 10 }))
   const geometry = createChartGeometryCache(text => text.length * 6)(bars, viewport)
-  assert.equal((geometry.lines.ema.match(/M/g) ?? []).length, 2)
+  assert.equal((geometry.lines.vwap.match(/M/g) ?? []).length, 2)
   assert.equal((geometry.lines.oi.match(/M/g) ?? []).length, 2)
   assert.equal((geometry.lines.atrPercent.match(/M/g) ?? []).length, 2)
   assert.equal((geometry.lines.bbw.match(/M/g) ?? []).length, 2)
@@ -189,7 +189,7 @@ test('Bollinger values crossing zero retain a linear domain and genuine warmup g
   assert.equal(geometry.priceAxis.kind, 'linear')
   assert.ok(geometry.priceAxis.min <= -2 && geometry.priceAxis.max >= 104)
   close(geometry.priceY(0) - geometry.priceY(1), geometry.priceY(1) - geometry.priceY(2))
-  assert.equal(geometry.lines.ema, '')
+  assert.equal('ema' in geometry.lines, false)
   assert.equal((geometry.lines.bollLower.match(/[ML]/g) ?? []).length, 77)
   assert.equal(geometry.bollBands.length, 1)
 })
@@ -219,7 +219,7 @@ test('immutable window revisits reuse geometry while corrections, resize, native
   assert.notEqual(otherPeriod.x[1] - otherPeriod.x[0], initial.x[1] - initial.x[0])
   const quote = get(bars, { ...viewport, liveClose: 1000 })
   assert.ok(quote.priceAxis.max > 1000)
-  assert.notEqual(quote.lines.ema, initial.lines.ema)
+  assert.notEqual(quote.lines.vwap, initial.lines.vwap)
   assert.ok(quote.priceY(1000) >= quote.layout.panels.price[0])
 })
 
@@ -243,5 +243,16 @@ test('price-only geometry fills the plot and has a separate reusable cache varia
   assert.equal(geometry(bars, { ...viewport, height: 240, priceOnly: true }), multi)
   assert.equal(multi.layout.panels.price[1], 218)
   assert.ok(multi.layout.panels.price[1] - multi.layout.panels.price[0] > 180)
-  assert.ok(multi.lines.ema && multi.lines.bollUpper && multi.lines.vwap)
+  assert.ok(multi.lines.bollUpper && multi.lines.vwap)
+})
+
+test('unplotted EMA values cannot widen the main price scale or generate a path', () => {
+  const bars = rows(), get = createChartGeometryCache(text => text.length * 6)
+  for (const priceOnly of [false, true]) {
+    const baseline = get(bars, { ...viewport, priceOnly })
+    const extremeEMA = get(bars.map(bar => ({ ...bar, ema: 1_000_000 })), { ...viewport, priceOnly })
+    assert.deepEqual(extremeEMA.priceAxis, baseline.priceAxis)
+    assert.equal('ema' in extremeEMA.lines, false)
+    assert.ok(extremeEMA.lines.vwap && extremeEMA.lines.bollUpper && extremeEMA.lines.bollMiddle && extremeEMA.lines.bollLower)
+  }
 })

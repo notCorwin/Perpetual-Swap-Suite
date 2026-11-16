@@ -214,7 +214,6 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     {lineStroke("bollMiddle", lines.bollMiddle, "var(--chart-1)")}
     {lineStroke("bollLower", lines.bollLower, "var(--chart-1)")}
     {lineStroke("vwap", lines.vwap, "var(--chart-2)", "2 3")}
-    {lineStroke("ema", lines.ema, "var(--chart-3)", "7 4")}
     </g>
     {!geometry.priceOnly && <g clipPath={`url(#${areaClipId}-rsi)`}>
     {lineStroke("rsi6", lines.rsi6, "var(--chart-1)")}
@@ -255,7 +254,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
       <text data-chart-price-label-value x={axisStarts.price} y={latestY} dominantBaseline="middle" fill="var(--foreground)">{latestPrice}</text>
       {priceLabel.countdownY !== null && <PriceCountdown hour={liveBar.hour} intervalMS={intervalMS} x={axisStarts.price} y={priceLabel.countdownY} />}
     </g>}
-    {legend("price", [["VWAP(14)", formatIndicatorPrice(active.vwap), "var(--chart-2)", "2 3"], ["EMA(200)", formatIndicatorPrice(active.ema), "var(--chart-3)", "7 4"], ["BOLL(20,2)", `U ${formatIndicatorPrice(active.bollUpper)}\u00a0·\u00a0M ${formatIndicatorPrice(active.bollMiddle)}\u00a0·\u00a0L ${formatIndicatorPrice(active.bollLower)}`, "var(--chart-1)"]])}
+    {legend("price", [["VWAP(14)", formatIndicatorPrice(active.vwap), "var(--chart-2)", "2 3"], ["BOLL(20,2)", `U ${formatIndicatorPrice(active.bollUpper)}\u00a0·\u00a0M ${formatIndicatorPrice(active.bollMiddle)}\u00a0·\u00a0L ${formatIndicatorPrice(active.bollLower)}`, "var(--chart-1)"]])}
     {legend("roc", [["ROC(9)", formatPercent(active.roc), "var(--chart-1)"], ["MAROC(9)", formatPercent(active.maroc), "var(--chart-2)", "7 4"]])}
     {legend("rsi", [["RSI(6)", rsiValue('rsi6'), "var(--chart-1)"], ["RSI(12)", rsiValue('rsi12'), "var(--chart-2)", "7 4"], ["RSI(24)", rsiValue('rsi24'), "var(--chart-3)", "3 4"]])}
     {legend("atr", [["ATR%(14)", chartPercent(active.atrPercent), "var(--chart-3)"], ["BBW(20,2)", chartPercent(active.bbw), "var(--chart-1)", "7 4"]])}

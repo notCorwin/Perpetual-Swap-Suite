@@ -46,7 +46,8 @@ test('default multi-timeframe charts share native prices, isolate history and re
       assert.deepEqual(await page.locator('svg[data-rendered-inst]').evaluateAll(svgs => svgs.map(svg => svg.dataset.renderedTimeframe)), frames)
       assert.equal(await page.locator('[data-chart-panel-header]:not([data-chart-panel-header="price"])').count(), 0)
       assert.equal(await page.locator('[data-chart-indicator="rsi6"]').count(), 0)
-      assert.equal(await page.locator('[data-chart-indicator="ema"]').count(), 3)
+      assert.equal(await page.locator('[data-chart-indicator="ema"], [data-chart-legend="EMA(200)"]').count(), 0)
+      for (const field of ['vwap', 'bollUpper', 'bollMiddle', 'bollLower']) assert.equal(await page.locator(`[data-chart-indicator="${field}"]`).count(), 3)
       const positions = await page.locator('svg[data-rendered-inst]').evaluateAll(svgs => svgs.map(svg => ({ top: svg.getBoundingClientRect().top, height: svg.getBoundingClientRect().height })))
       assert.ok(positions.every(position => position.height > 60))
       assert.ok(positions[0].top < positions[1].top && positions[1].top < positions[2].top)
@@ -84,6 +85,12 @@ test('default multi-timeframe charts share native prices, isolate history and re
     await live(eth, 142.75, 40)
     await page.getByRole('button', { name: 'Indicators', exact: true }).click()
     await page.waitForFunction(() => document.querySelectorAll('svg[data-rendered-inst]').length === 1 && document.querySelector('[data-chart-panel-header="rsi"]'))
+    for (const [timeframe, label] of [['1H', '1h'], ['15m', '15m'], ['5m', '5m']]) {
+      await page.locator('[aria-label="Chart timeframe"] button').filter({ hasText: new RegExp(`^${label}$`, 'i') }).click()
+      await page.waitForFunction(timeframe => document.querySelector('svg[data-rendered-inst]')?.getAttribute('data-rendered-timeframe') === timeframe, timeframe)
+      assert.equal(await page.locator('[data-chart-indicator="ema"], [data-chart-legend="EMA(200)"]').count(), 0)
+      for (const field of ['vwap', 'bollUpper', 'bollMiddle', 'bollLower']) assert.equal(await page.locator(`[data-chart-indicator="${field}"]`).count(), 1)
+    }
     await page.waitForFunction(async () => (await window.radarDesktop.request({ preferences: { action: 'read' } })).chartDisplayMode === 'indicators')
     await page.reload({ waitUntil: 'domcontentloaded' })
     await page.waitForFunction(() => document.querySelector('[data-chart-display-mode="indicators"]'))
