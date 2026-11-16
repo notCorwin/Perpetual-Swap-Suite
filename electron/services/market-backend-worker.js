@@ -136,7 +136,7 @@ async function request(value) {
   if (value.chartFocus || value.chartWindow || value.chartLocal || value.chartHistory) {
     if (service.closing || service.disposed) throw new Error('Market service is closed.')
     const task = service.ready.then(() => {
-      if (value.chartFocus) { service.preparedCharts.setFocus(value.chartFocus.target, value.chartFocus.id); return { ok: true } }
+      if (value.chartFocus) { service.preparedCharts.setFocus(value.chartFocus.target, value.chartFocus.id, value.chartFocus.slot); return { ok: true } }
       const { instId, timeframe, endHour, historyBars, focusId } = value.chartWindow ?? value.chartLocal ?? value.chartHistory
       if (value.chartWindow) return service.preparedCharts.prepare(instId, timeframe, endHour, historyBars, { focusId })
       if (value.chartLocal) return service.preparedCharts.local(instId, timeframe)

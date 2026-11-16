@@ -27,7 +27,7 @@ export class PreparedChartPipeline {
     onFocus?(focus: { instId: string; timeframe: HistoryTimeframe } | null): void
   })
   /** Declare viewport demand and immediately own its hydration, repair, priority and bounded reserve. */
-  setFocus(target: { instId: string; timeframe: HistoryTimeframe; endHour?: number } | null, id?: string): void
+  setFocus(target: { instId: string; timeframe: HistoryTimeframe; endHour?: number } | null, id?: string, slot?: 'primary' | HistoryTimeframe): void
   /** Pauses chart-owned preparation and publication without changing live inputs or demand. */
   setPresentationActive(active: boolean): void
   /** Rehydrates invalidated cached and focused states locally before capturing a resume snapshot. */

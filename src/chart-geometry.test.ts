@@ -234,3 +234,14 @@ test('derived geometry has a global retention bound even while source windows re
   assert.notEqual(get(windows[0], viewport), first, 'A source-window reference cannot retain derived paths beyond the global cache limit.')
   assert.equal(get(windows[1], viewport), second, 'Recently used windows survive eviction.')
 })
+
+test('price-only geometry fills the plot and has a separate reusable cache variant', () => {
+  const bars = rows(), geometry = createChartGeometryCache(text => text.length * 6)
+  const multi = geometry(bars, { ...viewport, height: 240, priceOnly: true })
+  const full = geometry(bars, { ...viewport, height: 240, priceOnly: false })
+  assert.notEqual(multi, full)
+  assert.equal(geometry(bars, { ...viewport, height: 240, priceOnly: true }), multi)
+  assert.equal(multi.layout.panels.price[1], 218)
+  assert.ok(multi.layout.panels.price[1] - multi.layout.panels.price[0] > 180)
+  assert.ok(multi.lines.ema && multi.lines.bollUpper && multi.lines.vwap)
+})

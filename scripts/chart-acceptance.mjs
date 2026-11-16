@@ -81,6 +81,8 @@ export async function foregroundPaintWindow(electron, page) {
 }
 
 export async function selectTimeframe(page, timeframe) {
+  const mode = page.locator('[data-chart-display-mode="multi"]')
+  if (await mode.count()) await page.getByRole('button', { name: 'Indicators', exact: true }).click()
   const button = page.locator('[aria-label="Chart timeframe"] button')
     .filter({ hasText: new RegExp(`^${timeframe}$`, 'i') })
   await button.click()
@@ -240,6 +242,9 @@ export async function assertIndicatorLegends(page, { requireFittedVolatility = f
 
 export async function openChart(page, fixture, timeframe = fixture.timeframe) {
   await page.reload({ waitUntil: 'domcontentloaded' })
+  await page.locator('[aria-label="Chart display mode"]').waitFor({ state: 'visible' })
+  const indicators = page.getByRole('button', { name: 'Indicators', exact: true })
+  if (await indicators.count()) await indicators.click()
   // Admission belongs to the requested timeframe's committed chart. A fixture
   // can intentionally have no sources for the previously saved timeframe.
   await selectTimeframe(page, timeframe)

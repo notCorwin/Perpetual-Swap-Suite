@@ -14,6 +14,7 @@ export const LIQUIDITY_FIELDS: { key: LiquidityKey; label: string; description?:
   { key: 'volumeStability', label: 'Volume stability', description: '24 completed hours · max / min volume', parameter: 'maxRatio', parameterLabel: 'Maximum hourly volume ratio' },
 ]
 export type PreferencesDraft = {
+  chartDisplayMode: Preferences['chartDisplayMode']
   chartTimeframe: RadarTimeframe
   rankingLookback: string
   historyDays: string
@@ -22,7 +23,7 @@ export type PreferencesDraft = {
 }
 export function preferencesDraft(value: Preferences): PreferencesDraft {
   return {
-    chartTimeframe: value.chartTimeframe, rankingLookback: String(value.rankingLookback), historyDays: String(value.historyDays),
+    chartDisplayMode: value.chartDisplayMode, chartTimeframe: value.chartTimeframe, rankingLookback: String(value.rankingLookback), historyDays: String(value.historyDays),
     liquidity: Object.fromEntries(LIQUIDITY_FIELDS.map(field => [field.key, { enabled: value.liquidity[field.key].enabled, threshold: String((value.liquidity[field.key] as unknown as Record<string, number>)[field.parameter]) }])) as PreferencesDraft['liquidity'],
     slippageNotional: String(value.liquidity.slippage.notionalUSDT),
   }
@@ -48,5 +49,5 @@ export function validatePreferencesDraft(draft: PreferencesDraft): { values?: Pr
   if (liquidity.volumeStability.maxRatio <= 1) errors.volumeStability = 'Enter a ratio greater than 1.'
   liquidity.slippage.notionalUSDT = number('slippageNotional', draft.slippageNotional, Number.MIN_VALUE)
   if (errors.slippageNotional) errors.slippageNotional = 'Enter a trade size greater than 0.'
-  return { values: Object.keys(errors).length ? undefined : validatePreferences({ chartTimeframe: draft.chartTimeframe, rankingLookback, historyDays, liquidity }), errors }
+  return { values: Object.keys(errors).length ? undefined : validatePreferences({ chartDisplayMode: draft.chartDisplayMode, chartTimeframe: draft.chartTimeframe, rankingLookback, historyDays, liquidity }), errors }
 }

@@ -185,7 +185,7 @@ export class MetadataStore {
     this.#assertOpen()
     const row = this.#database.prepare('SELECT revision, preferences FROM settings WHERE id = 1').get()
     integer(row.revision, 'Settings revision')
-    return { schemaVersion: 1, revision: row.revision, preferences: validatePreferences(JSON.parse(row.preferences)) }
+    return { schemaVersion: 1, revision: row.revision, preferences: validatePreferences(merge(DEFAULT_PREFERENCES, JSON.parse(row.preferences))) }
   }
 
   updateSettings(patch, options = {}) {

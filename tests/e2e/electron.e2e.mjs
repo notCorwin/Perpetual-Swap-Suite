@@ -105,7 +105,7 @@ const removePreparedTransform = async () => electron.evaluate(({ ipcMain }) => {
 })
 
 before(async () => {
-  await writeFile(join(userData, 'settings.json'), JSON.stringify({
+  await writeFile(join(userData, 'settings.json'), JSON.stringify({ chartDisplayMode: 'indicators',
     notificationsEnabled: true, backgroundMonitoringEnabled: true, monitoringPaused: true,
     filterLibraryPreferencesJSON: '{"favorites":["emaTrend"]}',
   }))

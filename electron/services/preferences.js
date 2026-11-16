@@ -9,6 +9,7 @@ function freeze(value) {
 
 export const DEFAULT_PREFERENCES = freeze({
   chartTimeframe: '15m',
+  chartDisplayMode: 'multi',
   rankingLookback: 15,
   historyDays: 30,
   liquidity: {
@@ -43,7 +44,9 @@ export function validatePreferenceFields(value, partial = false) {
   keys(value, Object.keys(DEFAULT_PREFERENCES), 'Preferences')
   for (const key of Object.keys(DEFAULT_PREFERENCES)) {
     if (partial && !Object.hasOwn(value, key)) continue
-    if (key === 'chartTimeframe') {
+    if (key === 'chartDisplayMode') {
+      if (!['multi', 'indicators'].includes(value[key])) throw new TypeError('chartDisplayMode must be multi or indicators.')
+    } else if (key === 'chartTimeframe') {
       if (!TIMEFRAMES.has(value[key])) throw new TypeError('chartTimeframe must be 5m, 15m, or 1H.')
     } else if (key === 'rankingLookback') {
       integer(value[key], key)

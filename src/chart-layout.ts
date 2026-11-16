@@ -42,10 +42,10 @@ export function chartPanelClip(layout: ReturnType<typeof chartLayout>, panel: Ch
   }
 }
 
-export function chartLayout(width: number, height: number, labelGutter = 64) {
+export function chartLayout(width: number, height: number, labelGutter = 64, priceOnly = false) {
   const rightMargin = 4, top = 4, headerHeight = 24, rowGap = 3, bottomAxis = 22
   const right = width - rightMargin - labelGutter, column: Range = [0, right]
-  const order = CHART_PANELS
+  const order: readonly ChartPanel[] = priceOnly ? ['price'] : CHART_PANELS
   const availableHeight = Math.max(1, height - top - bottomAxis - headerHeight * order.length - rowGap * (order.length - 1))
   const weights: Record<ChartPanel, number> = { price: 0.4, roc: 0.12, rsi: 0.12, atr: 0.12, oi: 0.12, taker: 0.12 }
   const panels = {} as Record<ChartPanel, Range>
@@ -54,10 +54,11 @@ export function chartLayout(width: number, height: number, labelGutter = 64) {
   for (const key of order) {
     headerY[key] = cursor + 13
     cursor += headerHeight
-    panels[key] = [cursor, cursor + availableHeight * weights[key]]
+    panels[key] = [cursor, cursor + availableHeight * (priceOnly ? 1 : weights[key])]
     cursor = panels[key][1] + rowGap
   }
-  const columns = Object.fromEntries(order.map(key => [key, column])) as Record<ChartPanel, Range>
-  const axisStarts = Object.fromEntries(order.map(key => [key, right + 8])) as Record<ChartPanel, number>
+  if (priceOnly) for (const key of CHART_PANELS) if (key !== 'price') { panels[key] = [height + 1, height + 1]; headerY[key] = height + 1 }
+  const columns = Object.fromEntries(CHART_PANELS.map(key => [key, column])) as Record<ChartPanel, Range>
+  const axisStarts = Object.fromEntries(CHART_PANELS.map(key => [key, right + 8])) as Record<ChartPanel, number>
   return { panels, columns, axisStarts, headerY, left: column[0], right }
 }

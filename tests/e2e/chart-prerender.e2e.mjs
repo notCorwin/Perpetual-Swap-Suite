@@ -9,7 +9,7 @@ test('qualified rows stay stable while one SVG surface handles canonical frames,
   const userData = await mkdtemp(join(tmpdir(), 'perp-chart-prerender-'))
   let electron
   try {
-    await writeFile(join(userData, 'settings.json'), JSON.stringify({ chartTimeframe: '15m' }))
+    await writeFile(join(userData, 'settings.json'), JSON.stringify({ chartDisplayMode: 'indicators', chartTimeframe: '15m' }))
     electron = await _electron.launch({ args: ['.', '--headless', '--disable-gpu'], cwd: new URL('../..', import.meta.url).pathname,
       env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_USER_DATA: userData } })
     const page = await electron.firstWindow()

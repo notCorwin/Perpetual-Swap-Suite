@@ -1604,7 +1604,7 @@ test('in-flight local SQLite reads remain admitted while other series exceed the
     await started.promise
     const admitted = pipeline.series.get(`${instId}:15m`)
     for (let index = 0; index < 20; index += 1) {
-      pipeline.focusKey = `OTHER${index}:15m`
+      pipeline.focuses.set('primary', { key: `OTHER${index}:15m` })
       pipeline.state(`OTHER${index}`, '15m'); pipeline.trim()
       assert.equal(pipeline.series.get(`${instId}:15m`), admitted, 'A read must retain its own state across the asynchronous query.')
     }
@@ -3496,7 +3496,7 @@ test('a statistic acquisition cannot replace a newer observation while its commi
   const state = pipeline.state(instId, '15m')
   state.rows.set(old.timestamp, initial)
   const demand = { key: state.key, instId, timeframe: '15m', end: old.timestamp }
-  pipeline.focus = demand; pipeline.focusKey = state.key
+  pipeline.focuses.set('primary', demand)
   try {
     pipeline.refreshStatistics(state, old.timestamp, old.timestamp, 'interactive', undefined, demand)
     await entered.promise
@@ -3506,7 +3506,7 @@ test('a statistic acquisition cannot replace a newer observation while its commi
     await pipeline.observeStatistics(instId, '15m', old.timestamp, old.timestamp, 'interactive', [newest], 'oi')
     release.resolve(); await task
     assert.equal(state.rows.get(old.timestamp).oi, 9000)
-  } finally { release.resolve(); pipeline.focus = null; await pipeline.dispose() }
+  } finally { release.resolve(); pipeline.focuses.clear(); await pipeline.dispose() }
 })
 
 test('a local read invalidated during coverage reloads the new generation', async () => {
@@ -3547,7 +3547,7 @@ test('statistics acquired while a new price row becomes resident cover the new r
   state.rows.set(first.timestamp, missing(first))
   state.latestHour = first.timestamp
   const demand = { key: state.key, instId, timeframe: '15m', end: second.timestamp }
-  pipeline.focus = demand; pipeline.focusKey = state.key
+  pipeline.focuses.set('primary', demand)
   pipeline.prefetchStatistics = () => {}; pipeline.scheduleRefresh = () => {}
   try {
     pipeline.refreshStatistics(state, first.timestamp, second.timestamp, 'interactive', undefined, demand)
@@ -3559,7 +3559,7 @@ test('statistics acquired while a new price row becomes resident cover the new r
     assert.equal(state.rows.get(first.timestamp).oi, first.oi)
     assert.equal(state.rows.get(second.timestamp).oi, second.oi)
     assert.equal(pipeline.sourceAttempts.size, 0)
-  } finally { release.resolve(); pipeline.focus = null; await pipeline.dispose() }
+  } finally { release.resolve(); pipeline.focuses.clear(); await pipeline.dispose() }
 })
 
 test('idle retains the selected history cursor and live candle continuity without display work', async () => {
@@ -3713,4 +3713,44 @@ test('a correction during idle replays exact indicators from durable inputs afte
     const actual = pipeline.cached(`${instId}:15m`).bars.at(-1)
     for (const field of indicatorFields) assert.equal(actual[field], expected[field], field)
   } finally { await pipeline.dispose() }
+})
+
+test('three scoped chart focuses retain independent histories and cancel only their own consumers', async () => {
+  const rows = ['1H', '15m', '5m'].flatMap(timeframe => {
+    const step = ({ '1H': 3_600_000, '15m': 900_000, '5m': 300_000 } as Record<string, number>)[timeframe]
+    const latest = Math.floor(Date.now() / step) * step - step
+    return Array.from({ length: 400 }, (_, index) => ({ ...candle(latest - (399 - index) * step, index), timeframe }))
+  })
+  const fixture = await sqliteFixture(rows)
+  const { pipeline } = fixture
+  try {
+    const pending = deferred()
+    pipeline.setFocus({ instId, timeframe: '1H' }, 'hour', '1H')
+    const hourly = pipeline.focusFor(`${instId}:1H`)
+    const hourlyWait = pipeline.waitForFocus(hourly, pending.promise)
+    pipeline.setFocus({ instId, timeframe: '15m' }, 'quarter', '15m')
+    pipeline.setFocus({ instId, timeframe: '5m' }, 'five', '5m')
+    assert.equal(pipeline.focuses.size, 3)
+    pending.resolve()
+    assert.equal(await hourlyWait, true, 'Opening another slot must not cancel the first consumer')
+    await Promise.all([...pipeline.focuses.values()].map((focus: any) => focus.task))
+    for (const timeframe of ['1H', '15m', '5m']) {
+      const focus = pipeline.focusFor(`${instId}:${timeframe}`)
+      const frame = await pipeline.localHistory(instId, timeframe, undefined, { focusId: focus.id })
+      assert.ok(frame && frame.bars.length >= 96)
+      assert.equal(frame.timeframe, timeframe)
+    }
+    const quarter = pipeline.focusFor(`${instId}:15m`)
+    const endHour = Math.floor(Date.now() / interval) * interval - 30 * interval
+    pipeline.setFocus({ instId, timeframe: '15m', endHour }, 'quarter-history', '15m')
+    assert.equal(pipeline.currentFocus(hourly), true)
+    assert.equal(pipeline.currentFocus(quarter), false)
+    await pipeline.focusFor(`${instId}:15m`).task
+    const frame = await pipeline.localHistory(instId, '15m', endHour, { focusId: 'quarter-history' })
+    assert.equal(frame.endHour, endHour)
+    assert.equal(await pipeline.localHistory(instId, '15m', undefined, { focusId: 'quarter' }), null)
+    pipeline.setFocus(null, 'close-quarter', '15m')
+    assert.equal(pipeline.focuses.size, 2)
+    assert.equal(pipeline.currentFocus(hourly), true)
+  } finally { await fixture.close() }
 })

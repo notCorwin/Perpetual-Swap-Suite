@@ -78,13 +78,13 @@ export class ChartController {
     if (this.active) { this.commit(); void this.pump() }
   }
 
-  setUniverse(instIds: readonly string[], timeframe: RadarTimeframe, focusInstId?: string) {
+  setUniverse(instIds: readonly string[], timeframe: RadarTimeframe, focusInstId?: string, hydrate = true) {
     const ids = [...new Set(instIds.filter(Boolean))]
     const key = JSON.stringify(ids.toSorted())
     this.universeIds = ids
     const focus = focusInstId ?? (this.view.requested?.timeframe === timeframe ? this.view.requested.instId : undefined)
     this.store.setUniverse(ids, timeframe, focus)
-    if (!this.presentationActive) return this.universeTask
+    if (!this.presentationActive || !hydrate) return this.universeTask
     if (key === this.universeKey) return this.universeTask
     this.universeKey = key
     const request = ++this.universeRequest
@@ -103,9 +103,10 @@ export class ChartController {
   ingestPrepared(response: PreparedChartNotification) {
     const live = 'type' in response
     const sourceChanged = !live && this.retainPriceSource(response)
-    const accepted = this.admitDrawable(response) && (live ? this.store.ingestLive(response)
+    const drawable = this.admitDrawable(response)
+    const accepted = drawable && (live ? this.store.ingestLive(response)
       : response.endHour !== response.latestEnd ? this.store.ingest(response) : this.store.ingestLatest(response))
-    if (!accepted && !sourceChanged) return
+    if (!accepted && !sourceChanged && !drawable) return
     this.notificationVersions.set(seriesKey(response), ++this.notificationVersion)
     this.preparedChanged(response, live || !response.bars.length && !response.liveBar)
   }
@@ -157,6 +158,16 @@ export class ChartController {
         realtimeState: latest.realtimeState, priceState: latest.priceState, sourceVersions: latest.sourceVersions } : response
   }
 
+  observeSharedPrepared(response: PreparedChartNotification) {
+    const target = this.view.requested
+    if (!this.active || !target || !sameSeries(target, response)) return
+    const live = 'type' in response
+    const sourceChanged = !live && this.retainPriceSource(response)
+    if (!this.admitDrawable(response) && !sourceChanged) return
+    this.notificationVersions.set(seriesKey(response), ++this.notificationVersion)
+    this.preparedChanged(response, live || !response.bars.length && !response.liveBar)
+  }
+
   private preparedChanged(response: Pick<PreparedChartResponse, 'instId' | 'timeframe'>, live = false) {
     const target = this.view.requested
     if (this.active && this.presentationActive && target?.instId === response.instId && target.timeframe === response.timeframe) {
@@ -168,10 +179,13 @@ export class ChartController {
   open(instId: string, timeframe: RadarTimeframe, end: number | null = null) {
     const owner = ++this.owner
     this.active = true
+    const unpin = this.store.pin(instId, timeframe)
+    const unsubscribe = this.store.subscribe(instId, timeframe, () => { if (this.active && this.presentationActive) this.commit() })
     this.store.setUniverse(this.universeIds, timeframe, instId)
     this.publish({ ...this.view })
     this.setTarget({ instId, timeframe, end }, true)
     return () => {
+      unsubscribe(); unpin()
       if (owner !== this.owner) return
       this.active = false
       this.updateFocus(null)
@@ -261,7 +275,7 @@ export class ChartController {
     const calculating = ready
       && (ready.indicatorState === 'loading' || target.end !== null && !completePrices)
       && previous?.instId === target.instId && previous.timeframe === target.timeframe
-      && previous.bars.some(bar => bar.indicatorsObserved)
+      && (previous.bars.some(bar => bar.indicatorsObserved) || target.end !== null && this.view.pending && previous.endHour === ready.endHour)
     // A prepared price window owns the requested cursor even while its missing
     // indicators or price slots recover. Never freeze navigation on an unrelated
     // older window; unavailable samples remain explicit gaps in the new frame.
@@ -364,9 +378,21 @@ export class ChartController {
 
 }
 
-export const chartController = new ChartController({
-  focus: (target, id) => window.radarDesktop.request({ chartFocus: { id, target: target ? { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined } : null } }),
+const sharedChartStore = new PreparedChartStore()
+let universeRead: Promise<{ frames: PreparedChartResponse[] }> | null = null
+const readUniverse = () => universeRead ??= window.radarDesktop.request({ chartUniverse: {} }).finally(() => { universeRead = null })
+const desktopController = (slot: 'primary' | RadarTimeframe) => new ChartController({
+  focus: (target, id) => window.radarDesktop.request({ chartFocus: { id, slot, target: target ? { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined } : null } }),
   local: (instId, timeframe) => window.radarDesktop.request({ chartLocal: { instId, timeframe } }),
   history: (target, focusId) => window.radarDesktop.request({ chartHistory: { instId: target.instId, timeframe: target.timeframe, endHour: target.end ?? undefined, focusId } }),
-  universe: () => window.radarDesktop.request({ chartUniverse: {} }),
-})
+  universe: readUniverse,
+}, sharedChartStore)
+
+export const chartController = desktopController('primary')
+export const multiChartControllers = { '1H': desktopController('1H'), '15m': desktopController('15m'), '5m': desktopController('5m') }
+export const chartControllers = [chartController, ...Object.values(multiChartControllers)]
+
+export function ingestPreparedChart(response: PreparedChartNotification) {
+  chartController.ingestPrepared(response)
+  for (const controller of Object.values(multiChartControllers)) controller.observeSharedPrepared(response)
+}

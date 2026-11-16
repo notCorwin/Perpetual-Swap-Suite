@@ -9,7 +9,8 @@ import { MarketRowsViewport } from '@/MarketRowsViewport'
 import { WorkspaceViewport } from '@/WorkspaceViewport'
 import { WorkspaceSettings } from '@/WorkspaceSettings'
 import { settingsHref, useSettingsSection, type SettingsNavigationState } from '@/settings-navigation'
-import { chartController } from '@/chart-controller'
+import { chartControllers, multiChartControllers, ingestPreparedChart } from '@/chart-controller'
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { reconcileMarketOrder, reconcileMarketRows } from '@/market-snapshot'
 import { SnapshotOrder } from '@/snapshot-order'
 import { DEFAULT_PREFERENCES, type Preferences } from '@/renderer-preferences'
@@ -100,13 +101,13 @@ function App() {
     else if (!('unchanged' in snapshot)) setRealtime('Unavailable')
   }, [])
   useLayoutEffect(() => subscribePresentationTransition(update => {
-    if (!update.active) { retainSelection.current = true; chartController.setPresentationActive(false); return }
+    if (!update.active) { retainSelection.current = true; chartControllers.forEach(controller => controller.setPresentationActive(false)); return }
     if (update.snapshot) {
-      chartController.setPresentationActive(true, update.snapshot.frames)
+      chartControllers.forEach(controller => controller.setPresentationActive(true, update.snapshot!.frames))
       applyMarket(update.snapshot.market, true)
       committedPreferences.current = update.snapshot.preferences
       setPreferences(update.snapshot.preferences); setPreferencesError(''); setPreferencesLoaded(true)
-    } else chartController.setPresentationActive(true)
+    } else chartControllers.forEach(controller => controller.setPresentationActive(true))
   }), [applyMarket])
   useLayoutEffect(() => {
     if (!presentation.active) return
@@ -120,7 +121,7 @@ function App() {
   }, [presentation])
 
   useEffect(() => {
-    const receive = (event: Event) => chartController.ingestPrepared((event as CustomEvent<PreparedChartNotification>).detail)
+    const receive = (event: Event) => ingestPreparedChart((event as CustomEvent<PreparedChartNotification>).detail)
     window.addEventListener('radar-chart-prepared', receive)
     return () => window.removeEventListener('radar-chart-prepared', receive)
   }, [])
@@ -191,7 +192,7 @@ function App() {
   const marketStatus = marketProblem || (connectionProblem ? realtime : !rows.length && status !== 'Live' ? status : status === 'Cached' ? 'Cached' : '')
   const marketStatusDetail = [marketStatus, retainedChart ? 'Current chart remains available' : ''].filter(Boolean).join(' · ')
   const listOrder = candidateIds
-  useEffect(() => { if (ready) chartController.setUniverse(retainedChart && selectedID ? [...candidateIds, selectedID] : candidateIds, timeframe) }, [ready, candidateIds, timeframe, retainedChart, selectedID])
+  useEffect(() => { if (ready) chartControllers.forEach(controller => controller.setUniverse(retainedChart && selectedID ? [...candidateIds, selectedID] : candidateIds, timeframe, undefined, controller === chartControllers[0])) }, [ready, candidateIds, timeframe, retainedChart, selectedID])
   const savePreferences = useCallback(async (values: Partial<Preferences>) => {
     const write = ++preferenceWrite.current
     const epoch = getPresentation().epoch
@@ -239,6 +240,14 @@ function App() {
     })
   }, [savePreferences])
 
+  const changeDisplayMode = useCallback((chartDisplayMode: Preferences['chartDisplayMode']) => {
+    setPreferences(current => ({ ...current, chartDisplayMode }))
+    void savePreferences({ chartDisplayMode }).catch(cause => {
+      setPreferences(current => current.chartDisplayMode === chartDisplayMode ? { ...current, chartDisplayMode: committedPreferences.current.chartDisplayMode } : current)
+      setPreferencesError(message(cause))
+    })
+  }, [savePreferences])
+
   return <WorkspaceViewport>
     {presentation.error && <p role="alert" className="px-4 py-2 text-sm text-destructive">{presentation.error}</p>}
     <div hidden={settingsSection !== null} inert={settingsSection !== null} className={cn('h-full min-w-0 flex-1', settingsSection === null ? 'flex' : 'hidden')}>
@@ -261,7 +270,16 @@ function App() {
       </section>
     </aside>
     <section data-chart-panel className="h-full min-w-0 flex-1" aria-label="Market chart workspace">
-      {selectedID ? <MarketChart active={settingsSection === null} instId={selectedID} tickSz={selectedRow?.tickSz} timeframe={timeframe} candidateIds={candidateIds} onTimeframeChange={changeTimeframe} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} /> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}
+      {selectedID ? <div data-chart-display-mode={preferences.chartDisplayMode} className="flex h-full min-h-0 flex-col">
+        <header data-chart-toolbar data-window-toolbar data-window-drag-region className="flex shrink-0 items-center gap-3 border-b px-4">
+          <ToggleGroup variant="outline" size="sm" value={[preferences.chartDisplayMode]} onValueChange={values => { const mode = values[0]; if (mode === 'multi' || mode === 'indicators') changeDisplayMode(mode) }} aria-label="Chart display mode">
+            <ToggleGroupItem value="multi">Multi-timeframe</ToggleGroupItem><ToggleGroupItem value="indicators">Indicators</ToggleGroupItem>
+          </ToggleGroup>
+        </header>
+        {preferences.chartDisplayMode === 'multi' ? <div className="grid min-h-0 flex-1 grid-rows-3 divide-y" data-multi-timeframe-charts>
+          {(['1H', '15m', '5m'] as const).map((frame, index) => <MarketChart key={frame} controller={multiChartControllers[frame]} priceOnly navigation={index === 0} active={settingsSection === null} instId={selectedID} tickSz={selectedRow?.tickSz} timeframe={frame} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} />)}
+        </div> : <MarketChart active={settingsSection === null} instId={selectedID} tickSz={selectedRow?.tickSz} timeframe={timeframe} candidateIds={candidateIds} onTimeframeChange={changeTimeframe} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} />}
+      </div> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}
     </section>
     </div>
     {settingsSection && <WorkspaceSettings section={settingsSection} preferences={preferences} loaded={preferencesLoaded} loadError={preferencesError} onSave={savePreferences} onNavigationStateChange={updateSettingsGuard} />}

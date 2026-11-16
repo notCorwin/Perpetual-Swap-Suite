@@ -21,7 +21,7 @@ import { chartNavigationTarget } from "@/market-sort"
 import { formatPercent } from "@/market-percent"
 import { RADAR_TIMEFRAMES, timeframeLabel, timeframeMilliseconds, type RadarTimeframe } from '@/timeframe'
 
-import { chartController } from '@/chart-controller'
+import { chartController as defaultChartController, type ChartController } from '@/chart-controller'
 import { createChartPlotCache } from '@/chart-render'
 import type { Bar, ChartSourceStatus, PreparedChartState, ReadyChartWindow } from '@/chart-data'
 import { measureOperation } from '../electron/services/operations.js'
@@ -85,7 +85,7 @@ const sourceStatusText = (label: string, state: PreparedChartState, status?: Cha
   return ''
 }
 const chartPlot = createChartPlotCache(legendWidth)
-const chartOverscan = (surface: ReadyChartWindow | null): { before?: Bar; after?: Bar } => {
+const chartOverscan = (surface: ReadyChartWindow | null, chartController: ChartController): { before?: Bar; after?: Bar } => {
   if (!surface?.bars.length) return {}
   if (chartController.store.snapshotMeta(surface.instId, surface.timeframe)?.generation !== surface.generation) return {}
   const bars = surface.liveBar
@@ -127,10 +127,11 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
   const lineStroke = (key: keyof Bar, d: string, color: string, dash?: string) => <path data-chart-indicator={key} d={d} fill="none" stroke={color} strokeLinecap="round" strokeLinejoin="round" strokeDasharray={dash} />
   const lineLabel = (x: number, y: number, label: string, color = "var(--muted-foreground)") =>
     <text x={x} y={y} dominantBaseline="middle" fill={color}>{label}</text>
-  const panelKeys = CHART_PANELS
+  const panelKeys: readonly Panel[] = geometry.priceOnly ? ['price'] : CHART_PANELS
   const grid = panelKeys.flatMap(key => panels[key].map((y, index) =>
     <line key={`${key}-${index}`} x1={columns[key][0]} x2={columns[key][1]} y1={y} y2={y} stroke="var(--border)" opacity={index ? 0.32 : 0.55} />))
   const legend = (key: Panel, items: [string, string, string, string?, number?][]) => {
+    if (geometry.priceOnly && key !== 'price') return null
     const gap = chartTokens.legendGap
     const start = columns[key][0] + gap / 2
     const contexts = items.map(([, , , , sourceHour]) => sourceHour !== undefined && sourceHour !== active.hour ? ` · as of ${time(sourceHour)}` : '')
@@ -176,18 +177,18 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
       <clipPath id={`${areaClipId}-positive`}><rect x={rocClip.x} y={panels.roc[0]} width={rocClip.width} height={rocZeroY - panels.roc[0]} /></clipPath>
       <clipPath id={`${areaClipId}-negative`}><rect x={rocClip.x} y={rocZeroY} width={rocClip.width} height={panels.roc[1] - rocZeroY} /></clipPath>
       <clipPath id={`${areaClipId}-content`}><rect {...contentClip} /></clipPath>
-      {CHART_PANELS.map(key => <clipPath key={key} id={`${areaClipId}-${key}`}><rect {...chartPanelClip(geometry.layout, key, geometry.barPitch)} /></clipPath>)}
+      {panelKeys.map(key => <clipPath key={key} id={`${areaClipId}-${key}`}><rect {...chartPanelClip(geometry.layout, key, geometry.barPitch)} /></clipPath>)}
     </defs>
     <g clipPath={`url(#${areaClipId}-content)`}>
       <g transform={`translate(${contentOffset},0)`} data-chart-wheel-content data-chart-wheel-offset={contentOffset}>
       <g clipPath={`url(#${areaClipId}-price)`}>{bollBands.map((d, index) => <path key={index} data-chart-boll-band d={d} fill="var(--chart-1)" fillOpacity="0.1" />)}</g>
-      <g clipPath={`url(#${areaClipId}-roc)`}>{rocAreas.map((area, index) => <g key={index}>
+      {!geometry.priceOnly && <g clipPath={`url(#${areaClipId}-roc)`}>{rocAreas.map((area, index) => <g key={index}>
         <path d={area} fill="var(--chart-roc-positive-area)" clipPath={`url(#${areaClipId}-positive)`} />
         <path d={area} fill="var(--chart-roc-negative-area)" clipPath={`url(#${areaClipId}-negative)`} />
-      </g>)}</g>
+      </g>)}</g>}
       </g>
     </g>
-    {[30, 50, 70].map(level => <line key={level} data-chart-rsi-threshold={level} x1={columns.rsi[0]} x2={columns.rsi[1]} y1={rsiY(level)} y2={rsiY(level)} stroke={level === 50 ? 'var(--chart-midpoint)' : 'var(--chart-threshold)'} />)}
+    {!geometry.priceOnly && [30, 50, 70].map(level => <line key={level} data-chart-rsi-threshold={level} x1={columns.rsi[0]} x2={columns.rsi[1]} y1={rsiY(level)} y2={rsiY(level)} stroke={level === 50 ? 'var(--chart-midpoint)' : 'var(--chart-threshold)'} />)}
     {grid}
     {rocZeroY > panels.roc[0] && rocZeroY < panels.roc[1] && <line x1={columns.roc[0]} x2={columns.roc[1]} y1={rocZeroY} y2={rocZeroY} stroke="var(--muted-foreground)" strokeOpacity="0.5" />}
     <g clipPath={`url(#${areaClipId}-content)`}>
@@ -203,11 +204,11 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     <path data-chart-candle-direction="up" data-chart-candle-fill="hollow" d={upBodies} fill="none" stroke="var(--positive)" strokeDasharray="2 3" />
     <path data-chart-candle-direction="down" data-chart-candle-fill="solid" d={downBodies} fill="var(--negative)" />
     </g>
-    <g clipPath={`url(#${areaClipId}-taker)`} data-chart-taker={takerComplete ? "complete" : takerAvailable ? "partial" : "empty"} data-chart-taker-state={takerState}>
+    {!geometry.priceOnly && <g clipPath={`url(#${areaClipId}-taker)`} data-chart-taker={takerComplete ? "complete" : takerAvailable ? "partial" : "empty"} data-chart-taker-state={takerState}>
       <path data-chart-taker-buy-samples={geometry.buySamples} d={buys} fill="var(--positive)" stroke="var(--foreground)" opacity="0.9" />
       <path data-chart-taker-sell-samples={geometry.sellSamples} d={sells} fill="var(--negative)" stroke="var(--foreground)" opacity="0.9" />
       <path d={sells} fill={`url(#${areaClipId}-sell-hatch)`} opacity="0.7" />
-    </g>
+    </g>}
     <g clipPath={`url(#${areaClipId}-price)`}>
     {lineStroke("bollUpper", lines.bollUpper, "var(--chart-1)")}
     {lineStroke("bollMiddle", lines.bollMiddle, "var(--chart-1)")}
@@ -215,7 +216,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     {lineStroke("vwap", lines.vwap, "var(--chart-2)", "2 3")}
     {lineStroke("ema", lines.ema, "var(--chart-3)", "7 4")}
     </g>
-    <g clipPath={`url(#${areaClipId}-rsi)`}>
+    {!geometry.priceOnly && <g clipPath={`url(#${areaClipId}-rsi)`}>
     {lineStroke("rsi6", lines.rsi6, "var(--chart-1)")}
     {lineStroke("rsi12", lines.rsi12, "var(--chart-2)", "7 4")}
     {lineStroke("rsi24", lines.rsi24, "var(--chart-3)", "3 4")}
@@ -223,18 +224,18 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
       d={marker.d} fill={`var(--chart-${RSI_FIELDS.indexOf(marker.field) + 1})`} stroke="var(--background)" strokeLinejoin="round">
       <title>{`${time(marker.hour)} · RSI(${marker.field.slice(3)}) crossed ${marker.direction === 'up' ? 'above' : 'below'} ${marker.levels.join(' and ')} · ${marker.value.toFixed(1)}${marker.confirmed ? '' : ' · Forming candle'}`}</title>
     </path>)}
-    </g>
-    <g clipPath={`url(#${areaClipId}-atr)`} data-chart-volatility-panel data-chart-panel-top={panels.atr[0]} data-chart-panel-bottom={panels.atr[1]}>
+    </g>}
+    {!geometry.priceOnly && <g clipPath={`url(#${areaClipId}-atr)`} data-chart-volatility-panel data-chart-panel-top={panels.atr[0]} data-chart-panel-bottom={panels.atr[1]}>
       {lineStroke("atrPercent", lines.atrPercent, "var(--chart-3)")}
       {lineStroke("bbw", lines.bbw, "var(--chart-1)", "7 4")}
-    </g>
-    <g clipPath={`url(#${areaClipId}-roc)`}>
+    </g>}
+    {!geometry.priceOnly && <g clipPath={`url(#${areaClipId}-roc)`}>
     {lineStroke("roc", lines.roc, "var(--chart-1)")}
     {lineStroke("maroc", lines.maroc, "var(--chart-2)", "7 4")}
-    </g>
-    <g clipPath={`url(#${areaClipId}-oi)`} data-chart-oi={oiAxis ? oiComplete ? "complete" : "partial" : "empty"} data-chart-oi-state={oiState} data-chart-oi-samples={oiSamples.length}>
+    </g>}
+    {!geometry.priceOnly && <g clipPath={`url(#${areaClipId}-oi)`} data-chart-oi={oiAxis ? oiComplete ? "complete" : "partial" : "empty"} data-chart-oi-state={oiState} data-chart-oi-samples={oiSamples.length}>
       {oiAxis && <>{lineStroke("oi", lines.oi, "var(--chart-2)")}{!oiComplete && oiSamples.map(sample => <circle key={bars[sample.index].hour} data-chart-oi-sample cx={x[sample.index]} cy={oiY(sample.value)} r="2" fill="var(--chart-2)" />)}</>}
-    </g>
+    </g>}
     {inspecting && panelKeys.map(key => <line key={key} x1={inspectionX} x2={inspectionX} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--foreground)" strokeDasharray="3 5" opacity="0.3" />)}
     <g clipPath={`url(#${areaClipId}-price)`}>
     {([[highIndex, candleHigh, "high"], [lowIndex, candleLow, "low"]] as const).map(([index, value, kind]) => {
@@ -260,14 +261,14 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     {legend("atr", [["ATR%(14)", chartPercent(active.atrPercent), "var(--chart-3)"], ["BBW(20,2)", chartPercent(active.bbw), "var(--chart-1)", "7 4"]])}
     {legend("oi", [["OI (Contracts)", statistics.oi ? compact(statistics.oi.oi) : oiState === "loading" ? "Loading…" : oiState === "error" ? "Failed" : "Unavailable", "var(--chart-2)", undefined, statistics.oi?.hour]])}
     {legend("taker", [["↑ Taker Buy (Contracts)", statistics.taker ? compact(statistics.taker.buy) : takerState === "loading" ? "Loading…" : takerState === "error" ? "Failed" : "Unavailable", "var(--positive)", undefined, statistics.taker?.hour], ["↓ Taker Sell (Contracts)", statistics.taker ? compact(statistics.taker.sell) : takerState === "loading" ? "Loading…" : takerState === "error" ? "Failed" : "Unavailable", "var(--negative)", "2 3", statistics.taker?.hour]])}
-    {[30, 70].map(level => <g key={level} data-chart-rsi-tick={level}>{lineLabel(axisStarts.rsi, rsiY(level), String(level), 'var(--foreground)')}</g>)}
+    {!geometry.priceOnly && [30, 70].map(level => <g key={level} data-chart-rsi-tick={level}>{lineLabel(axisStarts.rsi, rsiY(level), String(level), 'var(--foreground)')}</g>)}
     {panels.rsi[1] - panels.rsi[0] >= chartTokens.textSize * 6 && <>{lineLabel(axisStarts.rsi, rsiY(100), '100')}{lineLabel(axisStarts.rsi, rsiY(50), '50')}{lineLabel(axisStarts.rsi, rsiY(0), '0')}</>}
     {panels.roc[1] - panels.roc[0] >= 35 && <>{lineLabel(axisStarts.roc, panels.roc[0], formatPercent(rocAxis.max, rocAxis.decimals))}{lineLabel(axisStarts.roc, panels.roc[1], formatPercent(rocAxis.min, rocAxis.decimals))}</>}
     {oiAxis && panels.oi[1] - panels.oi[0] >= 35 && geometry.oiTicks.map(({ y, label }, index) => <g key={index} data-chart-oi-tick><line x1={columns.oi[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.25" />{lineLabel(axisStarts.oi, y, label)}</g>)}
     {panels.taker[1] - panels.taker[0] >= 35 && geometry.takerTicks.map(({ y, label }, index) => <g key={index} data-chart-taker-tick>{lineLabel(axisStarts.taker, y, label)}</g>)}
     {inspectedTime && <g data-chart-inspected-time><rect x={inspectedTimeX} y={height - 19} width={inspectedTimeWidth} height={18} rx={3} fill="var(--chart-annotation)" /><text x={inspectedTimeX + inspectedTimeWidth / 2} y={height - 7} textAnchor="middle" fill="var(--foreground)">{inspectedTime}</text></g>}
     {geometry.priceTicks.map(({ y, label }, index) => <g key={index} data-chart-price-tick><line x1={columns.price[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.35" />{(!tag.inViewport || y + tickHalfHeight < priceLabel.top || y - tickHalfHeight > priceLabel.bottom) && lineLabel(axisStarts.price, y, label)}</g>)}
-    <line x1={right} x2={right} y1={panels.price[0]} y2={panels.taker[1]} stroke="var(--border)" opacity="0.8" />
+    <line x1={right} x2={right} y1={panels.price[0]} y2={geometry.priceOnly ? panels.price[1] : panels.taker[1]} stroke="var(--border)" opacity="0.8" />
     {tag.inViewport && tag.rising && <line data-chart-live-price-outline x1={columns.price[0]} x2={right} y1={latestY} y2={latestY} stroke="var(--foreground)" />}
     {tag.inViewport && <line data-chart-live-price x1={columns.price[0]} x2={right} y1={latestY} y2={latestY} stroke={latestColor} strokeDasharray="4 5" />}
   </>
@@ -297,14 +298,14 @@ const ChartSurface = memo(function ChartSurface({ instId, timeframe, hasComplete
       style={{ visibility: selected ? 'visible' : 'hidden' }}
       className={cn('absolute inset-0 h-full w-full font-mono text-[length:var(--chart-text-size)] select-none outline-none', !selected && 'pointer-events-none')}
       role="img" tabIndex={selected ? 0 : -1}
-      aria-label={`${instId} ${bars.length}-candle ${timeframeLabel(timeframe)} chart. Hold the primary mouse button to inspect a candle, drag to inspect others, and release to return to the window end. Hover RSI crossing triangles to inspect their candle and time. Alt+Left and Alt+Right inspect RSI crossings; Escape clears inspection. Scroll to review history. Arrow keys navigate markets.`}>
+      aria-label={`${instId} ${bars.length}-candle ${timeframeLabel(timeframe)} chart. Hold the primary mouse button to inspect a candle, drag to inspect others, and release to return to the window end.${geometry.priceOnly ? '' : ' Hover RSI crossing triangles to inspect their candle and time. Alt+Left and Alt+Right inspect RSI crossings;'} Escape clears inspection. Scroll to review history. Arrow keys navigate markets.`}>
       <Plot bars={bars} geometry={geometry} liveBar={liveBar ?? bars.at(-1)!} liveOverlay={!!liveBar} contentOffset={contentOffset}
         inspected={selected ? inspected : null} inspectedBar={selected ? inspectedBar : undefined} oiState={oiState} takerState={takerState} oiStatus={oiStatus} takerStatus={takerStatus} />
     </svg>
   </PlotVisible>
 })
 
-export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, turnoverOrder, onSelect }: { instId: string; tickSz?: string | null; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; candidateIds?: string[]; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
+export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, turnoverOrder, onSelect, controller: chartController = defaultChartController, priceOnly = false, navigation = true }: { controller?: ChartController; priceOnly?: boolean; navigation?: boolean; instId: string; tickSz?: string | null; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; candidateIds?: string[]; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
   const presentation = usePresentation()
   const windowVisible = usePresentedStore(subscribeVisibility, documentVisible)
   const controlsHelp = useRef<HTMLDialogElement>(null)
@@ -313,7 +314,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     if (!isActive) return
     const target = chartController.getSnapshot().requested
     return chartController.open(instId, timeframe, target?.instId === instId && target.timeframe === timeframe ? target.end : null)
-  }, [instId, timeframe, isActive])
+  }, [instId, timeframe, isActive, chartController])
   const surface = view.presented
   const matchesSelection = surface?.instId === instId && surface.timeframe === timeframe
   const wheelSession = useMemo(() => ({ isActive, instId, timeframe }), [isActive, instId, timeframe])
@@ -330,8 +331,8 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
   const chartRef = useRef<HTMLElement>(null)
   const plotRef = useRef<HTMLDivElement>(null)
   const [plotSize, setPlotSize] = useState({ width: 0, height: 0 })
-  const overscan = chartOverscan(surface)
-  const preparedPlot = chartPlot(surface, plotSize, overscan, currentPriceTickSz)
+  const overscan = chartOverscan(surface, chartController)
+  const preparedPlot = chartPlot(surface, plotSize, overscan, currentPriceTickSz, priceOnly)
   const bars = preparedPlot?.bars ?? surface?.bars ?? EMPTY_BARS
   const plotGeometry = preparedPlot?.geometry ?? null
   const [inspection, setInspection] = useState<{ instId: string; timeframe: RadarTimeframe; hour: number } | null>(null)
@@ -428,7 +429,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     return () => window.clearTimeout(timer)
   }, [capture.status, presentation.active])
   useLayoutEffect(() => {
-    if (!isActive) return
+    if (!isActive || !navigation) return
     const navigate = (event: KeyboardEvent) => {
       if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || event.defaultPrevented || event.isComposing || event.keyCode === 229) return
       const target = event.target instanceof Element ? event.target : document.activeElement
@@ -454,7 +455,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     }
     window.addEventListener('keydown', navigate, true)
     return () => window.removeEventListener('keydown', navigate, true)
-  }, [isActive, listOrder, turnoverOrder, onSelect])
+  }, [isActive, navigation, listOrder, turnoverOrder, onSelect])
   const queueWheel = (pixels: number) => {
     if (!isActive || !getPresentation().active || !surface || !matchesSelection || !Number.isFinite(pixels) || pixels === 0) return
     const owner = { session: wheelSession, instId: surface.instId, timeframe: surface.timeframe, generation: surface.generation }
@@ -561,17 +562,17 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
   if (surface?.indicatorState === 'loading') statusMessages.push('Calculating indicators…')
   if (surface?.indicatorState === 'error') statusMessages.push(sourceStatusText('Indicators', 'error', surface.indicatorStatus))
   if (surface?.indicatorState === 'unavailable') statusMessages.push(surface.indicatorStatus?.reason === 'insufficient-history' ? 'Insufficient history for some indicators' : 'Some indicators are undefined for this range')
-  for (const [label, state, status] of [['OI', oiState, surface?.oiStatus], ['Taker', takerState, surface?.takerStatus]] as const) {
+  if (!priceOnly) for (const [label, state, status] of [['OI', oiState, surface?.oiStatus], ['Taker', takerState, surface?.takerStatus]] as const) {
     const message = sourceStatusText(label, state, status)
     if (message) statusMessages.push(message)
   }
   if (atBoundary && !pending) statusMessages.push('Start of available history')
   if (!statusMessages.length && error) statusMessages.push('Chart update failed')
   const statusLoading = !error && ((pending) || priceState === 'loading' || priceState === 'partial' || priceState === 'stale')
-    || surface?.indicatorState === 'loading' || oiState === 'loading' || takerState === 'loading'
+    || surface?.indicatorState === 'loading' || !priceOnly && (oiState === 'loading' || takerState === 'loading')
   const statusSummary = statusMessages.join(' · ')
   return <section data-chart-workspace aria-label="Market chart workspace" className="flex h-full min-h-0 w-full min-w-0 flex-col overflow-hidden overscroll-none text-sm font-normal tabular-nums">
-    <header data-chart-toolbar data-window-toolbar data-window-drag-region className="flex items-center gap-3 border-b px-4">
+    {!priceOnly && <header data-chart-toolbar data-window-toolbar data-window-drag-region className="flex items-center gap-3 border-b px-4">
       <ToggleGroup variant="outline" size="sm" className="mr-auto" value={[timeframe]} onValueChange={values => { const value = values[0]; if (value) onTimeframeChange?.(value as RadarTimeframe) }} aria-label="Chart timeframe">{RADAR_TIMEFRAMES.map(item => <ToggleGroupItem key={item.value} value={item.value}>{item.label}</ToggleGroupItem>)}</ToggleGroup>
       <Button variant="outline" size="sm" disabled={pending || !bars.length || plotSize.width <= 0 || captureStatus === 'copying' || analysis?.phase === 'capturing'} onClick={() => { void captureChart() }}><Camera data-icon="inline-start" aria-hidden="true" />{captureStatus === 'copying' ? 'Copying…' : 'Copy chart'}</Button>
       <ButtonGroup aria-label="Chart analysis actions">{(['long', 'short'] as const).map(direction => <Button key={direction} variant="outline" size="sm" disabled={captureStatus === 'copying' || (analysis?.direction !== direction && (analysisBusy || pending || !bars.length || plotSize.width <= 0))} title={analysis?.direction === direction ? `Open existing ${direction} analysis` : undefined} onClick={() => { if (analysis?.direction === direction) setAnalysisOpen(true); else analyzeChart(direction) }}>{analysisBusy && analysis?.direction === direction && <Spinner data-icon="inline-start" />}Analyze {direction === 'long' ? 'Long' : 'Short'}</Button>)}</ButtonGroup>
@@ -579,7 +580,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
       <span role="status" className="sr-only">{captureStatus === 'flashing' ? 'Chart copied to clipboard' : ''}</span>
       {(historical || displayedFrame !== timeframe) && <Badge variant="secondary">{timeframeLabel(displayedFrame)}{historical ? ' history' : ' chart'}</Badge>}
       {!historical && <PriceStatus observedAt={surface?.priceObservedAt} realtime={surface?.realtimeState} active={isActive && windowVisible && presentation.active} />}
-    </header>
+    </header>}
     <dialog ref={controlsHelp} aria-labelledby="chart-controls-title" className="m-auto w-[min(28rem,calc(100%-2rem))] rounded-lg border bg-popover p-6 text-popover-foreground backdrop:bg-background/80">
       <div className="flex flex-col gap-4">
         <h2 id="chart-controls-title" className="text-base font-medium">Chart controls</h2>
@@ -599,6 +600,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     <section ref={chartRef} data-chart-inst={displayedId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={96} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={priceState} data-chart-statistics-state={surface?.oiState === 'error' || surface?.takerState === 'error' ? 'error' : surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={priceState !== 'ready' || surface?.indicatorState !== 'ready' || oiState !== 'ready' || takerState !== 'ready' ? 'true' : 'false'} data-chart-loading={pending ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
       <div className="flex h-9 shrink-0 items-center gap-6 border-b px-4">
         <h2 className="min-w-0 max-w-1/2 truncate text-base font-semibold tracking-tight" title={displayedId}>{displayedId.replace(/-SWAP$/, '')} · {timeframeLabel(displayedFrame)}</h2>
+        {priceOnly && !historical && <PriceStatus observedAt={surface?.priceObservedAt} realtime={surface?.realtimeState} active={isActive && windowVisible && presentation.active} />}
         <div data-chart-status data-chart-indicator-state={surface?.indicatorState} data-chart-indicator-input={surface?.indicatorStatus?.inputVersion} role="status" aria-live="polite" aria-atomic="true" className="flex min-w-0 flex-1 items-center gap-2 text-xs text-muted-foreground">
           {statusLoading && <Spinner aria-hidden="true" role="presentation" />}
           <p className="min-w-0 truncate" title={statusSummary}>{statusMessages.map((message, index) => <span key={message}>{index > 0 && ' · '}<span>{message}</span></span>)}</p>
@@ -614,7 +616,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
       </div>}
       <div ref={plotRef} data-chart-plot tabIndex={-1} className="relative min-h-0 flex-1 overflow-hidden outline-none" onKeyDown={event => {
         if (event.key === 'Escape') { endInspection(); return }
-        if (!matchesSelection || !surface || !plotGeometry || !event.altKey || !(event.key === 'ArrowLeft' || event.key === 'ArrowRight')) return
+        if (priceOnly || !matchesSelection || !surface || !plotGeometry || !event.altKey || !(event.key === 'ArrowLeft' || event.key === 'ArrowRight')) return
         event.preventDefault()
         const direction = event.key === 'ArrowLeft' ? -1 : 1
         const current = inspectedBar ? (inspectedBar.hour - bars[0].hour) / intervalMS : direction < 0 ? bars.length : -1

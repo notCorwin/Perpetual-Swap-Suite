@@ -46,7 +46,7 @@ test('preference schema owns immutable snapshots, reuses proven values and valid
   const input = structuredClone(DEFAULT_PREFERENCES)
   const preferences = validatePreferences(input)
   assert.deepEqual(preferences, {
-    chartTimeframe: '15m', rankingLookback: 15, historyDays: 30,
+    chartTimeframe: '15m', chartDisplayMode: 'multi', rankingLookback: 15, historyDays: 30,
     liquidity: {
       spread: { enabled: true, maxPercent: 0.05 }, depth: { enabled: true, minUSDT: 100_000 },
       slippage: { enabled: true, maxPercent: 0.1, notionalUSDT: 100_000 }, volume24h: { enabled: true, minUSDT: 30_000_000 },
@@ -280,4 +280,28 @@ test('ranking batches preserve qualification observations, roll back together, a
     assert.deepEqual(store.getCatalogEntry(first.instrumentID), { ...latest, lastRanking: { lookback: 15, rankingChange: 12.5, rankingAsOf: 600_000 } })
     assert.equal(store.getCatalogEntry(second.instrumentID), null)
   } finally { database.close(); store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('existing SQLite preferences gain the multi default and preserve a saved indicator-mode choice', async () => {
+  const root = await temporary()
+  let store = await MetadataStore.open(root)
+  try {
+    store.updateSettings({ chartTimeframe: '1H', historyDays: 45 })
+    store.close()
+    const database = new DatabaseSync(join(root, 'metadata.sqlite'))
+    try {
+      const row = database.prepare('SELECT preferences FROM settings WHERE id=1').get()!
+      const old = JSON.parse(row.preferences as string)
+      delete old.chartDisplayMode
+      database.prepare('UPDATE settings SET preferences=? WHERE id=1').run(JSON.stringify(old))
+    } finally { database.close() }
+    store = await MetadataStore.open(root)
+    assert.equal(store.getSettings().preferences.chartDisplayMode, 'multi')
+    assert.equal(store.getSettings().preferences.chartTimeframe, '1H')
+    assert.equal(store.getSettings().preferences.historyDays, 45)
+    store.updateSettings({ chartDisplayMode: 'indicators' })
+    store.close(); store = await MetadataStore.open(root)
+    assert.equal(store.getSettings().preferences.chartDisplayMode, 'indicators')
+    assert.throws(() => store.updateSettings({ chartDisplayMode: 'unknown' } as any), /chartDisplayMode/)
+  } finally { store.close(); await rm(root, { recursive: true, force: true }) }
 })

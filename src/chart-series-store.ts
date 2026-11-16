@@ -245,6 +245,7 @@ export class PreparedChartStore {
   private universe = new Set<string>()
   private renderedUniverse = new Set<string>()
   private focusKey: string | null = null
+  private readonly pinned = new Map<string, number>()
   private readonly byteSizes = new WeakMap<object, number>()
   private seriesBytes = 0
   private latestBytes = 0
@@ -365,6 +366,20 @@ export class PreparedChartStore {
     const key = keyFor(instId, timeframe), series = this.access(key), latest = this.latestFrame(key)
     if (!latest) return series ? this.universe.has(key) ? { ...series.meta, latestEnd: null } : series.meta : null
     return series ? { ...series.meta, latestEnd: latest.window.endHour } : latest.meta
+  }
+
+  pin(instId: string, timeframe: RadarTimeframe) {
+    const key = keyFor(instId, timeframe)
+    this.pinned.set(key, (this.pinned.get(key) ?? 0) + 1)
+    let retained = true
+    return () => {
+      if (!retained) return
+      retained = false
+      const count = this.pinned.get(key)! - 1
+      if (count) this.pinned.set(key, count)
+      else this.pinned.delete(key)
+      this.mutate(() => this.trimBytes())
+    }
   }
 
   /** Compact latest frames belong to navigation candidates, independently of the history LRU. */
@@ -490,7 +505,8 @@ export class PreparedChartStore {
         if (previousGeneration !== generation) entry.meta = Object.freeze({ ...entry.meta, indicatorStatus: undefined, sourceStatuses: entry.meta.sourceStatuses?.filter(value => value.source !== 'indicator') })
         this.setSeriesEntry(key, entry)
         while (this.series.size > this.maxSeries) {
-          const evicted = this.series.keys().next().value!
+          const evicted = [...this.series.keys()].find(key => !this.pinned.has(key))
+          if (evicted === undefined) break
           this.setSeriesEntry(evicted, null)
         }
       }
@@ -605,13 +621,13 @@ export class PreparedChartStore {
     if (this.seriesBytes + this.latestBytes <= this.maxBytes) return
     for (const key of this.series.keys()) {
       if (this.seriesBytes + this.latestBytes <= this.maxBytes) break
-      if (key !== this.focusKey) this.setSeriesEntry(key, null)
+      if (key !== this.focusKey && !this.pinned.has(key)) this.setSeriesEntry(key, null)
     }
     for (const key of this.latestFrames.keys()) {
       if (this.seriesBytes + this.latestBytes <= this.maxBytes) break
       // Listed SVGs own their latest inputs. The byte target applies after
       // this bounded candidate working set; deep history is evicted first.
-      if (key !== this.focusKey && !this.renderedUniverse.has(key)) this.setLatestFrame(key, null)
+      if (key !== this.focusKey && !this.pinned.has(key) && !this.renderedUniverse.has(key)) this.setLatestFrame(key, null)
     }
   }
 

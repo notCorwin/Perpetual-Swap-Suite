@@ -25,7 +25,7 @@ const axisFormatter = (decimals: number) => {
 }
 
 type Range = readonly [number, number]
-export type ChartGeometryOptions = Readonly<{ width: number; height: number; endHour: number; intervalMS: number; liveClose?: number; currentPriceTickSz?: string | null }>
+export type ChartGeometryOptions = Readonly<{ width: number; height: number; endHour: number; intervalMS: number; liveClose?: number; currentPriceTickSz?: string | null; priceOnly?: boolean }>
 export type ChartGeometryOverscan = Readonly<{ before?: Bar; after?: Bar }>
 const linearScale = (min: number, max: number, panel: Range) => {
   const span = max - min || 1, height = panel[1] - panel[0]
@@ -65,7 +65,7 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
   if (finite(liveClose)) { priceMin = Math.min(priceMin, liveClose); priceMax = Math.max(priceMax, liveClose) }
   // Panel heights do not depend on the label gutter, so each axis is computed
   // once and shared by both the gutter measurement and the final plot.
-  const { panels } = chartLayout(0, height)
+  const { panels } = chartLayout(0, height, 64, options.priceOnly)
   const priceLabels = axisLabelLimit(panels.price, 9)
   const priceAxis = priceMin <= 0
     ? { ...chartAxisForLabels(priceMin, priceMax, priceLabels), kind: 'linear' as const }
@@ -80,12 +80,11 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
   const oiLabelsText = oiAxis?.ticks.map(chartCompact) ?? [], takerLabelsText = takerAxis.ticks.map(chartCompact)
   const labels = [
     ...priceLabelsText,
-    formatPercent(rocAxis.max, rocAxis.decimals), formatPercent(rocAxis.min, rocAxis.decimals), '100', '0',
-    ...oiLabelsText, ...takerLabelsText,
+    ...(!options.priceOnly ? [formatPercent(rocAxis.max, rocAxis.decimals), formatPercent(rocAxis.min, rocAxis.decimals), '100', '0', ...oiLabelsText, ...takerLabelsText] : []),
     `${formatCurrentPrice(liveClose ?? bars.at(-1)!.close, options.currentPriceTickSz)} ↑`, '00:00',
   ]
   const gutter = Math.ceil(Math.max(...labels.map(measureText)) + 16)
-  const layout = chartLayout(width, height, gutter), { left, right } = layout
+  const layout = chartLayout(width, height, gutter, options.priceOnly), { left, right } = layout
   const x = bars.map(bar => chartHourX(bar.hour, endHour, left, right, intervalMS))
   const barWidth = chartCandleWidth(right - left)
   const barPitch = (right - left - barWidth) / 95
@@ -93,7 +92,7 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
   const priceY = priceAxis.kind === 'linear' ? linearScale(priceAxis.min, priceAxis.max, panels.price) : logarithmicScale(priceAxis, panels.price)
   const rsiY = linearScale(0, 100, panels.rsi), rocY = linearScale(rocAxis.min, rocAxis.max, panels.roc)
   const visibleIndex = new Map(bars.map((bar, index) => [bar.hour, index]))
-  const rsiCrossings = chartRsiCrossings(pathBars, intervalMS)
+  const rsiCrossings = options.priceOnly ? [] : chartRsiCrossings(pathBars, intervalMS)
   const rsiMarkers: (typeof rsiCrossings[number] & { index: number; confirmed: boolean; levels: (30 | 70)[]; x: number; y: number; d: string })[] = []
   for (const crossing of rsiCrossings) {
     const previous = rsiMarkers.at(-1)
@@ -123,7 +122,7 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
     if (segment) segments.push(segment)
     return segments.join(' ')
   }
-  const lines = Object.fromEntries(lineFields.map(field => [field, line(field,
+  const lines = Object.fromEntries(lineFields.map(field => [field, options.priceOnly && !priceFields.includes(field as typeof priceFields[number]) ? '' : line(field,
     field.startsWith('rsi') ? rsiY : field === 'atrPercent' ? atrY : field === 'bbw' ? bbwY : field === 'roc' || field === 'maroc' ? rocY : field === 'oi' ? oiY : priceY)])) as Record<typeof lineFields[number], string>
   const rocArea = (key: 'roc' | 'maroc') => {
     const segments: string[] = []
@@ -146,7 +145,7 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
     finish()
     return segments.join(' ')
   }
-  const rocAreas = [rocArea('roc'), rocArea('maroc')]
+  const rocAreas = options.priceOnly ? [] : [rocArea('roc'), rocArea('maroc')]
   const bollBands: string[] = []
   let upper: string[] = [], lower: string[] = []
   const finishBand = () => {
@@ -208,7 +207,7 @@ export function createChartGeometryCache(measureText: (text: string) => number) 
     const liveClose = finite(options.liveClose) ? options.liveClose : undefined
     const index = variants.findIndex(({ value, before, after }) => value.width === options.width && value.height === options.height
       && value.endHour === options.endHour && value.intervalMS === options.intervalMS && value.liveClose === liveClose
-      && value.currentPriceTickSz === options.currentPriceTickSz
+      && value.currentPriceTickSz === options.currentPriceTickSz && value.priceOnly === options.priceOnly
       && before === overscan.before && after === overscan.after)
     if (index >= 0) {
       const [variant] = variants.splice(index, 1)

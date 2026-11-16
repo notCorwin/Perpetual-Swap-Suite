@@ -169,6 +169,17 @@ export async function smokeElectron({ app, revision, report: reportPath, operati
     assert.ok(files.some(file => file.endsWith('market.sqlite')), 'The durable fixture must create the canonical SQLite database.')
     if (!operationRecording) assert.ok(!files.some(file => /(?:^|\/)(?:Operations|diagnostics)(?:\/|$)|\.health\.json$|\.participant\.json$/.test(file)), 'Disabled recording must create no session, journal or participant files.')
     report.checks.push('SQLite WAL writes and reads in dedicated workers')
+    await page.reload({ waitUntil: 'domcontentloaded' })
+    await page.locator(`[aria-label="View ${fixture.instId} chart"]`).click()
+    await page.waitForFunction(instId => {
+      const charts = [...document.querySelectorAll('[data-chart-inst]')]
+      return charts.length === 3 && charts.every((chart, index) => chart.__chartSnapshot?.instId === instId
+        && chart.__chartSnapshot.timeframe === ['1H', '15m', '5m'][index]
+        && chart.querySelector('svg[data-rendered-inst]'))
+    }, fixture.instId, { timeout: 20_000 })
+    assert.equal(await page.locator('[data-chart-panel-header]:not([data-chart-panel-header="price"])').count(), 0)
+    assert.equal(await page.locator('[data-chart-indicator="ema"]').count(), 3)
+    report.checks.push('default 1h / 15min / 5min price-only SVGs with main overlays')
     await openChart(page, fixture)
     const prepared = await request({ chartHistory: { instId: fixture.instId, timeframe: fixture.timeframe, endHour: fixture.end } })
     assert.ok(prepared.bars.length >= 96, 'The packaged worker must prepare a complete chart.')

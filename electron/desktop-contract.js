@@ -115,9 +115,10 @@ function preferences(value) {
   if (action === 'read') { record(value, path, ['action']); return { action } }
   record(value, path, ['action', 'values'], ['action', 'values'])
   const valuesPath = `${path}.values`
-  const values = record(value.values, valuesPath, ['chartTimeframe', 'rankingLookback', 'historyDays', 'liquidity'])
+  const values = record(value.values, valuesPath, ['chartTimeframe', 'chartDisplayMode', 'rankingLookback', 'historyDays', 'liquidity'])
   if (Object.keys(values).length === 0) invalid(valuesPath, 'must contain an update')
   const result = {}
+  optional(result, values, 'chartDisplayMode', input => choice(input, `${valuesPath}.chartDisplayMode`, ['multi', 'indicators']))
   optional(result, values, 'chartTimeframe', input => choice(input, `${valuesPath}.chartTimeframe`, TIMEFRAMES))
   optional(result, values, 'rankingLookback', input => {
     number(input, `${valuesPath}.rankingLookback`, 5, Number.MAX_SAFE_INTEGER, true)
@@ -211,8 +212,8 @@ export function parseDesktopRequest(value, { allowE2E = false } = {}) {
     }
     case 'chartWindow': return { chartWindow: chart(input, operation) }
     case 'chartFocus': {
-      record(input, operation, ['id', 'target'], ['id', 'target'])
-      return { chartFocus: { id: text(input.id, 'chartFocus.id', { maximum: 256 }), target: input.target === null ? null : chart(input.target, 'chartFocus.target') } }
+      record(input, operation, ['id', 'target', 'slot'], ['id', 'target'])
+      return { chartFocus: optional({ id: text(input.id, 'chartFocus.id', { maximum: 256 }), target: input.target === null ? null : chart(input.target, 'chartFocus.target') }, input, 'slot', value => choice(value, 'chartFocus.slot', ['primary', ...TIMEFRAMES])) }
     }
     case 'chartLocal': return { chartLocal: chart(input, operation) }
     case 'chartHistory': return { chartHistory: chart(input, operation) }

@@ -85,6 +85,7 @@ export async function seedAndPrepare(electron, page, { count, periods }) {
 }
 
 export async function selectChart(page, instId, timeframe) {
+  if (await page.locator('[data-chart-display-mode="multi"]').count()) await page.getByRole('button', { name: 'Indicators', exact: true }).click()
   await page.getByRole('textbox', { name: 'Search contracts' }).fill(instId)
   await page.locator(`[aria-label="View ${instId} chart"]`).evaluate(node => node.click())
   await page.locator('[aria-label="Chart timeframe"] button').filter({ hasText: new RegExp(`^${timeframe}$`, 'i') }).evaluate(node => node.click())

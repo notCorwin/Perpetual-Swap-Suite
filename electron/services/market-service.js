@@ -1952,9 +1952,8 @@ export class MarketService {
   }
 
   statisticsAcquisitionDemand(instId, timeframe) {
-    const focus = this.preparedCharts.focus
     return this.listedUniverse.has(instId) && timeframe === this.preferences().chartTimeframe
-      || focus?.instId === instId && focus.timeframe === timeframe
+      || Boolean(this.preparedCharts.focusFor(`${instId}:${timeframe}`))
   }
 
   priceStreaming(instId, timeframe) {

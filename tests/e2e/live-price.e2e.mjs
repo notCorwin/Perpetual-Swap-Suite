@@ -96,6 +96,7 @@ test('native WebSocket prices reach the selected SVG and survive delayed durable
     try {
       const preferences = structuredClone(DEFAULT_PREFERENCES)
       preferences.chartTimeframe = '15m'
+      preferences.chartDisplayMode = 'indicators'
       for (const condition of Object.values(preferences.liquidity)) condition.enabled = false
       metadata.updateSettings(preferences)
     } finally { metadata.close() }

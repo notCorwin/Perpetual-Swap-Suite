@@ -1367,3 +1367,19 @@ test('percentage fields admit only finite numbers or null and completeness corre
   assert.equal(store.window(instId, '1H')?.priceState, 'ready')
   assert.equal(store.readyBoundaries(instId, '1H').length, 1)
 })
+
+test('all open timeframe histories survive byte and series pressure until their owners release them', () => {
+  const store = new PreparedChartStore({ maxSeries: 1, maxBytes: 1 })
+  const releases = []
+  for (const timeframe of ['1H', '15m', '5m'] as const) {
+    const intervalMS = timeframeMilliseconds(timeframe)
+    releases.push(store.pin(instId, timeframe))
+    store.ingest(response(bars(0, 200, intervalMS), { timeframe, intervalMS }))
+  }
+  for (const timeframe of ['1H', '15m', '5m'] as const) {
+    assert.equal(store.window(instId, timeframe, 150 * timeframeMilliseconds(timeframe))?.bars.length, 96)
+  }
+  assert.equal(store.size, 3, 'A bounded active set takes precedence over the background cache target')
+  for (const release of releases) release()
+  assert.equal(store.size, 0)
+})
