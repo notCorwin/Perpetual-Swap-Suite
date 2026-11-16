@@ -4,6 +4,7 @@ type Price = number | null | undefined
 // 21 preserves its source representation, including prices smaller than 1e-100.
 const historicalFormatter = new Intl.NumberFormat('en-US', { maximumSignificantDigits: 21 })
 const indicatorFormatter = new Intl.NumberFormat('en-US', { maximumSignificantDigits: 8 })
+const compactIndicatorFormatter = new Intl.NumberFormat('en-US', { maximumSignificantDigits: 6 })
 const currentFormatters = new Map<number, Intl.NumberFormat>()
 
 function priceDecimals(tickSz: string | null | undefined): number | null {
@@ -43,6 +44,6 @@ export function formatHistoricalPrice(value: Price): string {
 }
 
 /** Derived values keep their own significant-digit display, never tick rounding. */
-export function formatIndicatorPrice(value: Price): string {
-  return formatted(value, indicatorFormatter)
+export function formatIndicatorPrice(value: Price, compact = false): string {
+  return formatted(value, compact ? compactIndicatorFormatter : indicatorFormatter)
 }

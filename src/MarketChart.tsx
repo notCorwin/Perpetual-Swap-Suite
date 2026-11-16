@@ -142,7 +142,8 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     const gap = chartTokens.legendGap
     const start = columns[key][0] + gap / 2
     const contexts = items.map(([, , , , sourceHour]) => sourceHour !== undefined && sourceHour !== active.hour ? ` · as of ${time(sourceHour)}` : '')
-    const widths = items.map(([label, value], index) => 26 + legendWidth(label) + 10 + legendWidth(value) + legendWidth(contexts[index]))
+    const showValues = !geometry.priceOnly || inspecting
+    const widths = items.map(([label, value], index) => 26 + legendWidth(label) + (showValues ? 10 + legendWidth(value) + legendWidth(contexts[index]) : 0))
     const available = right - start
     const required = widths.reduce((sum, itemWidth) => sum + itemWidth, 0) + gap * (items.length - 1)
     const shrink = Math.min(1, available / required)
@@ -155,11 +156,12 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
         cursor += widths[index] + gap
         const labelColor = key === "rsi" ? "var(--muted-foreground)" : key === "taker" ? index === 0 ? "var(--chart-positive-label)" : "var(--chart-negative-label)" : color
         return <g key={label} transform={`translate(${itemStart},0)`} data-chart-legend-source-hour={sourceHour}>
+        <title>{label} {geometry.priceOnly && key === 'price' ? label === 'VWAP(14)' ? formatIndicatorPrice(active.vwap) : `U ${formatIndicatorPrice(active.bollUpper)} · M ${formatIndicatorPrice(active.bollMiddle)} · L ${formatIndicatorPrice(active.bollLower)}` : value}{contexts[index]}</title>
         {key === "taker" && !dash && <line data-chart-legend-outline={label} x1="0" x2="18" stroke="var(--foreground)" />}
         <line data-chart-legend={label} x1="0" x2="18" stroke={color} strokeDasharray={key === "taker" && !dash ? "2 3" : dash} />
-        <text x="26" dominantBaseline="middle" fill={labelColor}>{label}</text>
-        <text x={26 + legendWidth(label) + 10} dominantBaseline="middle" fill="var(--foreground)">{value}</text>
-        {contexts[index] && <text data-chart-legend-source-context x={26 + legendWidth(label) + 10 + legendWidth(value)} dominantBaseline="middle" fill="var(--muted-foreground)">{contexts[index]}</text>}
+        <text x="26" dominantBaseline="middle" fill={geometry.priceOnly && !inspecting ? "var(--muted-foreground)" : labelColor}>{label}</text>
+        {showValues && <text data-chart-legend-value x={26 + legendWidth(label) + 10} dominantBaseline="middle" fill="var(--foreground)">{value}</text>}
+        {showValues && contexts[index] && <text data-chart-legend-source-context x={26 + legendWidth(label) + 10 + legendWidth(value)} dominantBaseline="middle" fill="var(--muted-foreground)">{contexts[index]}</text>}
         </g>
       })}
       </g>
@@ -261,7 +263,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
       <text data-chart-price-label-value x={axisStarts.price} y={latestY} dominantBaseline="middle" fill="var(--foreground)">{latestPrice}</text>
       {priceLabel.countdownY !== null && <PriceCountdown hour={liveBar.hour} intervalMS={intervalMS} x={axisStarts.price} y={priceLabel.countdownY} />}
     </g>}
-    {legend("price", [["VWAP(14)", formatIndicatorPrice(active.vwap), "var(--chart-2)", "2 3"], ["BOLL(20,2)", `U ${formatIndicatorPrice(active.bollUpper)}\u00a0·\u00a0M ${formatIndicatorPrice(active.bollMiddle)}\u00a0·\u00a0L ${formatIndicatorPrice(active.bollLower)}`, "var(--chart-1)"]])}
+    {legend("price", [["VWAP(14)", formatIndicatorPrice(active.vwap, geometry.priceOnly), "var(--chart-2)", "2 3"], ["BOLL(20,2)", `U ${formatIndicatorPrice(active.bollUpper, geometry.priceOnly)}\u00a0·\u00a0M ${formatIndicatorPrice(active.bollMiddle, geometry.priceOnly)}\u00a0·\u00a0L ${formatIndicatorPrice(active.bollLower, geometry.priceOnly)}`, "var(--chart-1)"]])}
     {legend("roc", [["ROC(9)", formatPercent(active.roc), "var(--chart-1)"], ["MAROC(9)", formatPercent(active.maroc), "var(--chart-2)", "7 4"]])}
     {legend("rsi", [["RSI(6)", rsiValue('rsi6'), "var(--chart-1)"], ["RSI(12)", rsiValue('rsi12'), "var(--chart-2)", "7 4"], ["RSI(24)", rsiValue('rsi24'), "var(--chart-3)", "3 4"]])}
     {legend("atr", [["ATR%(14)", chartPercent(active.atrPercent), "var(--chart-3)"], ["BBW(20,2)", chartPercent(active.bbw), "var(--chart-1)", "7 4"]])}
@@ -284,11 +286,11 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
 type PlotSize = { width: number; height: number }
 
 const ChartSurface = memo(function ChartSurface({ instId, timeframe, hasCompletedBars, priceState, indicatorState, oiState, takerState, oiStatus, takerStatus,
-  liveBar, plot, size, selected, visible, inspected, inspectedBar, wheelFraction }: {
+  liveBar, plot, size, selected, visible, inspected, inspectedBar, wheelFraction, readoutId }: {
   instId: string; timeframe: RadarTimeframe; hasCompletedBars: boolean; priceState?: PreparedChartState; indicatorState: PreparedChartState
   oiState: PreparedChartState; takerState: PreparedChartState; oiStatus?: ChartSourceStatus; takerStatus?: ChartSourceStatus
   liveBar?: Bar; plot: NonNullable<ReturnType<typeof chartPlot>>; size: PlotSize; selected: boolean; visible: boolean; inspected: number | null
-  inspectedBar?: Bar; wheelFraction: number
+  inspectedBar?: Bar; wheelFraction: number; readoutId: string
 }) {
   const ready = Boolean(hasCompletedBars && (priceState === 'ready' || priceState === 'stale')
     && (indicatorState === 'ready' || indicatorState === 'unavailable')
@@ -303,7 +305,7 @@ const ChartSurface = memo(function ChartSurface({ instId, timeframe, hasComplete
       viewBox={`0 0 ${size.width} ${size.height}`} aria-hidden={!selected}
       style={{ visibility: selected ? 'visible' : 'hidden' }}
       className={cn('absolute inset-0 h-full w-full font-mono text-[length:var(--chart-text-size)] select-none outline-none', !selected && 'pointer-events-none')}
-      role="img" tabIndex={selected ? 0 : -1}
+      role="img" tabIndex={selected ? 0 : -1} aria-describedby={readoutId}
       aria-label={`${instId} ${bars.length}-candle ${timeframeLabel(timeframe)} chart. Hold the primary mouse button to inspect a candle, drag to inspect others, and release to return to the window end.${geometry.priceOnly ? '' : ' Hover RSI crossing triangles to inspect their candle and time. Alt+Left and Alt+Right inspect RSI crossings;'} Escape clears inspection. Scroll to review history. Arrow keys navigate markets.`}>
       <Plot bars={bars} geometry={geometry} liveBar={liveBar ?? bars.at(-1)!} liveOverlay={!!liveBar} contentOffset={contentOffset}
         inspected={selected ? inspected : null} inspectedBar={selected ? inspectedBar : undefined} oiState={oiState} takerState={takerState} oiStatus={oiStatus} takerStatus={takerStatus} />
@@ -313,6 +315,7 @@ const ChartSurface = memo(function ChartSurface({ instId, timeframe, hasComplete
 
 export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, turnoverOrder, onSelect, controller: chartController = defaultChartController, priceOnly = false, navigation = true }: { controller?: ChartController; priceOnly?: boolean; navigation?: boolean; instId: string; tickSz?: string | null; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; candidateIds?: string[]; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
   const presentation = usePresentation()
+  const readoutId = useId()
   const windowVisible = usePresentedStore(subscribeVisibility, documentVisible)
   const controlsHelp = useRef<HTMLDialogElement>(null)
   const view = usePresentedStore(chartController.subscribe, chartController.getSnapshot)
@@ -607,20 +610,21 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     <div className="flex min-h-0 flex-1">
     <section ref={chartRef} data-chart-inst={displayedId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={surface?.windowBars ?? 96} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={priceState} data-chart-statistics-state={surface?.oiState === 'error' || surface?.takerState === 'error' ? 'error' : surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={priceState !== 'ready' || surface?.indicatorState !== 'ready' || oiState !== 'ready' || takerState !== 'ready' ? 'true' : 'false'} data-chart-loading={pending ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
       <div data-chart-summary className="flex shrink-0 items-center border-b px-4">
-        <h2 className="min-w-0 max-w-40 shrink-0 truncate text-base font-semibold tracking-tight" title={displayedId}>{displayedId.replace(/-SWAP$/, '')} · {timeframeLabel(displayedFrame)}</h2>
+        <h2 data-chart-title className="min-w-0 max-w-40 shrink-0 truncate" title={displayedId} aria-label={`${displayedId.replace(/-SWAP$/, '')} · ${timeframeLabel(displayedFrame)}`}>{priceOnly && matchesSelection ? timeframeLabel(displayedFrame) : `${displayedId.replace(/-SWAP$/, '')} · ${timeframeLabel(displayedFrame)}`}</h2>
         {priceOnly && !historical && <PriceStatus observedAt={surface?.priceObservedAt} realtime={surface?.realtimeState} active={isActive && windowVisible && presentation.active} />}
         <div data-chart-status data-chart-indicator-state={surface?.indicatorState} data-chart-indicator-input={surface?.indicatorStatus?.inputVersion} role="status" aria-live="polite" aria-atomic="true" className="flex min-w-0 flex-1 items-center gap-2 text-xs text-muted-foreground">
           {statusLoading && <Spinner aria-hidden="true" role="presentation" />}
           <p className="min-w-0 truncate" title={statusSummary}>{statusMessages.map((message, index) => <span key={message}>{index > 0 && ' · '}<span>{message}</span></span>)}</p>
         </div>
-      {active && <div data-chart-inspection-readout aria-live="off">
+      {priceOnly && historical && !inspectedBar && active && <p data-chart-window-end className="text-muted-foreground">Window end {time(active.hour)}</p>}
+      {active && <div id={readoutId} data-chart-inspection-readout hidden={priceOnly && inspectedBar === undefined} aria-live="off">
         <p className="min-w-0 truncate" data-chart-inspected-hour={inspectedBar?.hour}><span className="text-muted-foreground">{inspectedBar === undefined ? historical ? 'Window end' : 'Latest' : 'Selected'}</span> {time(active.hour)}</p>
         {([['Open', active.open], ['High', active.high], ['Low', active.low], ['Close', active.close]] as const).map(([label, value]) => {
           const text = label === 'Close' && active === surface?.liveBar ? formatCurrentPrice(value, currentPriceTickSz) : formatHistoricalPrice(value)
           return <div key={label} data-chart-ohlc={label.toLowerCase()} className="min-w-0"><span className="text-muted-foreground">{label} </span><span title={text}>{text}</span></div>
         })}
-        <span data-chart-price-scale={priceScale} className="ml-auto text-muted-foreground" title={priceScale === 'linear' ? 'Linear scale · BOLL includes zero or negative values' : 'Logarithmic price scale'}>{priceScale === 'linear' ? 'Linear' : 'Log'}</span>
       </div>}
+        <span data-chart-price-scale={priceScale} className="ml-auto text-muted-foreground" title={priceScale === 'linear' ? 'Linear scale · BOLL includes zero or negative values' : 'Logarithmic price scale'}>{priceScale === 'linear' ? 'Linear' : 'Log'}</span>
       </div>
       <div ref={plotRef} data-chart-plot tabIndex={-1} className="relative min-h-0 flex-1 overflow-hidden outline-none" onKeyDown={event => {
         if (event.key === 'Escape') { endInspection(); return }
@@ -657,7 +661,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
         {surface && preparedPlot && <ChartSurface instId={surface.instId} timeframe={surface.timeframe} hasCompletedBars={surface.bars.length > 0}
           priceState={surface.priceState} indicatorState={surface.indicatorState} oiState={surface.oiState} takerState={surface.takerState}
           oiStatus={surface.oiStatus} takerStatus={surface.takerStatus} liveBar={surface.liveBar} plot={preparedPlot} size={plotSize}
-          selected={matchesSelection} visible={matchesSelection && isActive && windowVisible && presentation.active} inspected={inspected} inspectedBar={inspectedBar} wheelFraction={activeWheelFraction} />}
+          selected={matchesSelection} visible={matchesSelection && isActive && windowVisible && presentation.active} inspected={inspected} inspectedBar={inspectedBar} wheelFraction={activeWheelFraction} readoutId={readoutId} />}
       </div>
       {captureStatus === 'flashing' && <div aria-hidden="true" className="pointer-events-none absolute inset-0 z-10 bg-[var(--chart-capture-flash)] motion-safe:animate-[chart-capture-flash_550ms_ease-out_both] motion-reduce:hidden" />}
     </section>

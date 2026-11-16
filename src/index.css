@@ -61,17 +61,17 @@
 
 :root {
   --ui-rem-size: 12px;
-  --ui-font-size: 12px;
+  --ui-font-size: 11px;
   --ui-font-meta: 10px;
-  --ui-font-heading: 13px;
+  --ui-font-heading: 12px;
   --ui-line-height: 16px;
   --ui-line-meta: 14px;
-  --ui-row-height: 29px;
+  --ui-row-height: 28px;
   --ui-inline-gap: 12px;
-  --market-status-height: 28px;
+  --market-status-height: 20px;
   --market-list-max-width: 300px;
   --market-list-width: min(var(--market-list-max-width), 35vw);
-  --chart-summary-height: 24px;
+  --chart-summary-height: 22px;
   --chart-panel-header-height: 18px;
   --chart-panel-header-baseline: 11px;
   --chart-top-inset: 2px;
@@ -88,7 +88,10 @@
   --chart-roc-negative-area: color-mix(in srgb, var(--negative) 12%, transparent);
   --chart-positive-label: color-mix(in srgb, var(--positive) 50%, var(--foreground));
   --chart-negative-label: color-mix(in srgb, var(--negative) 50%, var(--foreground));
-  --chart-text-size: 11px;
+  --chart-text-size: 10px;
+  --ui-weight-normal: 400;
+  --ui-weight-emphasis: 500;
+  --market-row-border: color-mix(in srgb, var(--border) 40%, transparent);
   --chart-line-width: 1px;
   --chart-legend-gap: 16px;
   --chart-price-label-padding-y: 3px;
@@ -285,3 +288,9 @@ html[data-presentation-idle] *, html[data-presentation-idle] *::before, html[dat
 
 [data-market-status-row] { line-height: var(--ui-line-meta); }
 [data-market-status-row][data-has-markets="true"] { height: var(--market-status-height); }
+
+[data-market-list] [data-slot="table-row"][data-market-index] { border-color: var(--market-row-border); }
+[data-market-list] [data-slot="table-cell"], [data-market-list] h1 { font-weight: var(--ui-weight-normal); }
+[data-market-list] [data-slot="table-head"] { font-weight: var(--ui-weight-normal); }
+[data-chart-title] { font-size: var(--ui-font-size); font-weight: var(--ui-weight-emphasis); }
+[data-chart-inspection-readout][hidden] { display: none; }

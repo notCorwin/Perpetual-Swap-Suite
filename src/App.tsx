@@ -255,7 +255,7 @@ function App() {
     <aside data-market-list className="flex h-full w-[var(--market-list-width)] shrink-0 flex-col border-r" aria-label="Contract list">
       <header className="flex flex-col">
         <div data-sidebar-toolbar data-window-toolbar data-window-drag-region data-native-window-controls-row className="flex items-center gap-3 border-b px-4"><h1 className="min-w-0 flex-1 truncate text-sm font-medium">Perpetual Swap Suite</h1><a ref={settingsLauncher} href={settingsHref('workspace')} aria-label="Settings" title="Settings" className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}><Settings2 aria-hidden="true" /></a></div>
-        <div className="flex flex-col gap-4 border-b p-4">
+        <div className="flex flex-col gap-2 border-b p-4">
         <Input aria-label="Search contracts" placeholder="Search contracts…" spellCheck={false} autoCorrect="off" autoCapitalize="off" autoComplete="off" value={query} onChange={event => setQuery(event.target.value)} />
         <div data-market-status-row data-has-markets={visible.length > 0} className="flex min-h-5 min-w-0 items-start justify-between gap-3 text-xs leading-5 text-muted-foreground"><span className="shrink-0">{query.trim() ? `${visible.length} / ${rows.length}` : rows.length} contracts</span><span data-market-status role={marketProblem ? 'alert' : marketStatus ? 'status' : undefined} className={cn('min-w-0 break-words text-left', visible.length > 0 && 'line-clamp-2', (marketProblem || connectionFailure) && 'text-destructive')} title={marketStatusDetail || undefined} aria-label={marketStatusDetail || undefined}>{marketStatus || (updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString('en-US')}` : 'Waiting for market data')}</span></div>
         </div>
@@ -263,7 +263,7 @@ function App() {
       <section data-market-scroll className="min-h-0 flex-1 overflow-y-auto [&>[data-slot=table-container]]:overflow-visible" aria-label="Perpetual swap markets">
         <Table className="table-fixed [&_tr:not([data-virtual-spacer])>:first-child]:pl-4 [&_tr:not([data-virtual-spacer])>:last-child]:pr-4" data-market-count={visible.length} data-total-market-count={rows.length} aria-rowcount={visible.length + 1}>
           <colgroup><col className="w-[35%]" /><col className="w-[33%]" /><col className="w-[32%]" /></colgroup>
-          <TableHeader className="sticky top-0 bg-background [&_th]:text-xs [&_th]:text-muted-foreground"><TableRow className="hover:bg-transparent"><TableHead>Contract</TableHead><TableHead className="text-right">Price</TableHead><TableHead className="text-right" aria-sort="other" title="Sorted by absolute signed relative change from completed candles, largest first"><span className="block">{preferences.rankingLookback}m change</span><span className="block font-normal">By magnitude</span></TableHead></TableRow></TableHeader>
+          <TableHeader className="sticky top-0 bg-background [&_th]:text-xs [&_th]:text-muted-foreground"><TableRow className="hover:bg-transparent"><TableHead>Contract</TableHead><TableHead className="text-right">Price</TableHead><TableHead className="text-right" aria-sort="other" aria-label={`${preferences.rankingLookback}m change By magnitude`} title="Sorted by absolute signed relative change from completed candles, largest first"><span>{preferences.rankingLookback}m change</span></TableHead></TableRow></TableHeader>
           {visible.length ? <MarketRowsViewport ids={visibleIds}>{index => <MarketRowView row={visible[index]} index={index} selected={visible[index].instId === selectedID} lookback={preferences.rankingLookback} onSelect={setSelected} />}</MarketRowsViewport> : <TableBody><TableRow><TableCell colSpan={3}>
             <Empty><EmptyHeader><EmptyTitle>{noSearchMatch ? 'No matching contracts' : emptyTitle}</EmptyTitle><EmptyDescription>{noSearchMatch ? 'Try another contract name.' : emptyDescription}</EmptyDescription></EmptyHeader></Empty>
           </TableCell></TableRow></TableBody>}
@@ -273,6 +273,7 @@ function App() {
     <section data-chart-panel className="h-full min-w-0 flex-1" aria-label="Market chart workspace">
       {selectedID ? <div data-chart-display-mode={preferences.chartDisplayMode} className="flex h-full min-h-0 flex-col">
         <header data-chart-toolbar data-window-toolbar data-window-drag-region className="flex shrink-0 items-center gap-3 border-b px-4">
+          {preferences.chartDisplayMode === 'multi' && <h2 data-chart-title data-shared-chart-title className="truncate" title={selectedID}>{selectedID.replace(/-SWAP$/, '')}</h2>}
           <ToggleGroup variant="outline" size="sm" value={[preferences.chartDisplayMode]} onValueChange={values => { const mode = values[0]; if (mode === 'multi' || mode === 'indicators') changeDisplayMode(mode) }} aria-label="Chart display mode">
             <ToggleGroupItem value="multi">Multi-timeframe</ToggleGroupItem><ToggleGroupItem value="indicators">Indicators</ToggleGroupItem>
           </ToggleGroup>

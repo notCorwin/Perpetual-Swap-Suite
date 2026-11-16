@@ -43,3 +43,10 @@ test('unavailable prices and non-finite derived values have a consistent placeho
     assert.equal(formatIndicatorPrice(value), '—')
   }
 })
+
+test('compact chart indicators retain six significant digits without applying current contract ticks', () => {
+  assert.equal(formatIndicatorPrice(878.52714, true), '878.527')
+  assert.equal(formatIndicatorPrice(0.000000123456789, true), '0.000000123457')
+  assert.equal(formatIndicatorPrice(1.234567891), '1.2345679')
+  assert.equal(formatIndicatorPrice(null, true), '—')
+})

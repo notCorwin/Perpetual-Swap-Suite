@@ -1950,10 +1950,58 @@ test('compact density reserves at least eighty percent of each stacked chart for
       if (!baseline) {
         assert.ok(reading.sidebar <= 320)
         assert.ok(reading.rowHeight >= 28 && reading.rowHeight <= 30)
-        assert.equal(reading.fontSize, '12px')
+        assert.equal(reading.fontSize, '11px')
         assert.ok(reading.charts.every(chart => chart.ratio >= .80), JSON.stringify(reading))
       }
-      if (folder) await page.screenshot({ path: join(folder, `${baseline ? 'before' : 'after'}-${width}.png`) })
+      if (!baseline) {
+        assert.equal(await page.locator('[data-shared-chart-title]').count(), 1)
+        const chart = page.locator('[data-chart-workspace]').first()
+        assert.deepEqual(await page.locator('[data-chart-title]').allTextContents(), ['BETA-USDT', '1h', '15m', '5m'])
+        assert.equal(await chart.locator('[data-chart-inspection-readout]').isVisible(), false)
+        const descriptions = await page.locator('svg[data-rendered-inst]').evaluateAll(svgs => svgs.map(svg => {
+          const id = svg.getAttribute('aria-describedby'), readout = document.getElementById(id)
+          return { id, exists: !!readout, hidden: readout?.hidden, text: readout?.textContent }
+        }))
+        assert.equal(new Set(descriptions.map(item => item.id)).size, 3)
+        assert.ok(descriptions.every(item => item.exists && item.hidden && /Open.*High.*Low.*Close/.test(item.text)))
+        assert.equal(await chart.locator('[data-chart-legend-value]').count(), 0)
+        const plot = await chart.locator('[data-chart-plot]').boundingBox()
+        await page.mouse.move(plot.x + plot.width / 2, plot.y + plot.height / 2)
+        await page.mouse.down()
+        await chart.locator('[data-chart-inspection-readout]').waitFor({ state: 'visible' })
+        assert.equal(await chart.locator('[data-chart-legend-value]').count(), 2)
+        const expected = await chart.locator('[data-chart-inst]').evaluate(element => {
+          const hour = Number(element.querySelector('[data-chart-inspected-hour]').dataset.chartInspectedHour)
+          const bar = element.__chartSnapshot.bars.find(bar => bar.hour === hour)
+          return { close: bar.close, vwap: new Intl.NumberFormat('en-US', { maximumSignificantDigits: 6 }).format(bar.vwap) }
+        })
+        assert.equal(Number(await chart.locator('[data-chart-ohlc="close"] span[title]').textContent()), expected.close)
+        assert.equal(await chart.locator('[data-chart-legend="VWAP(14)"]').locator('..').locator('[data-chart-legend-value]').textContent(), expected.vwap)
+        await page.mouse.up()
+        await chart.locator('[data-chart-inspection-readout]').waitFor({ state: 'hidden' })
+      }
+      if (folder) {
+        await page.screenshot({ path: join(folder, `${baseline ? 'before' : 'after'}-${width}.png`) })
+        if (!baseline && width === 1710) {
+          await page.emulateMedia({ colorScheme: 'light' })
+          await page.evaluate(async () => { await new Promise(requestAnimationFrame); await new Promise(requestAnimationFrame); await Promise.all(document.getAnimations().map(animation => animation.finished)) })
+          await page.screenshot({ path: join(folder, 'after-1710-light.png') })
+          await page.emulateMedia({ colorScheme: 'dark' })
+        }
+      }
+    }
+    if (process.env.PERPETUAL_SWAP_LIGHT_SCREENSHOT) {
+      await page.emulateMedia({ colorScheme: 'light' })
+      await page.evaluate(async () => { await new Promise(requestAnimationFrame); await new Promise(requestAnimationFrame); await Promise.all(document.getAnimations().map(animation => animation.finished)) })
+      const colors = await page.evaluate(() => ({
+        background: getComputedStyle(document.body).backgroundColor,
+        row: getComputedStyle(document.querySelector('[data-market-index="1"] td')).color,
+        button: getComputedStyle(document.querySelector('[data-chart-toolbar] button')).color,
+      }))
+      assert.notEqual(colors.row, colors.background)
+      assert.notEqual(colors.button, colors.background)
+      console.log('Stable light theme colors:', colors)
+      await page.screenshot({ path: process.env.PERPETUAL_SWAP_LIGHT_SCREENSHOT })
     }
     if (!baseline) assert.ok(readings[1].charts[0].bars > readings[0].charts[0].bars)
     if (folder) await import('node:fs/promises').then(({ writeFile }) => writeFile(join(folder, `${baseline ? 'before' : 'after'}-measurements.json`), JSON.stringify(readings, null, 2)))
