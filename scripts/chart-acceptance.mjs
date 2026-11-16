@@ -152,7 +152,7 @@ export async function assertWorkspaceLayout(page) {
   })
   assert.equal(layout.designWidth, 1_600)
   assert.ok(layout.scale > 0)
-  assert.ok(Math.abs(layout.scale - Math.min(1, layout.viewport.width / 1_600)) < 1e-5, `Compact windows scale down and large windows retain normal density: ${JSON.stringify(layout)}`)
+  assert.ok(layout.scale === 1, `Every window retains normal density: ${JSON.stringify(layout)}`)
   assert.ok(layout.list && layout.chart, 'The list and chart panel must remain mounted together.')
   assert.ok(layout.list.y === 0 && layout.chart.y === 0, 'Both original workspace columns must begin at the top of the window.')
   assert.ok(Math.abs(layout.list.height - layout.viewport.height) < 1 && Math.abs(layout.chart.height - layout.list.height) < 1, 'Both workspace columns must use the full window height.')
@@ -168,7 +168,7 @@ export async function assertWorkspaceLayout(page) {
     assert.ok(title.x >= row.x + inset - 1 && title.x + title.width <= settings.x + 1, 'Native controls, application title, and settings must not overlap.')
     assert.ok([title, settings].every(control => Math.abs(control.y + control.height / 2 - (row.y + row.height / 2)) < 1), 'Application title and settings must align with the chart toolbar controls.')
   }
-  assert.ok(Math.abs(layout.list.width / layout.scale - 420) < 2, 'The contract list must keep its design width.')
+  assert.ok(Math.abs(layout.list.width - Math.max(360, Math.min(420, layout.viewport.width * .3))) < 2, 'The contract list must follow its shared responsive width token.')
   assert.ok(Math.abs(layout.chart.width - (layout.viewport.width - layout.list.width)) < 2, `The chart panel must fill the remaining window width: ${JSON.stringify(layout)}`)
   assert.ok(Math.abs(layout.list.x + layout.list.width - layout.chart.x) < 2, 'The chart must sit beside the contract list.')
   assert.ok(layout.documentWidth <= layout.viewport.width + 1 && layout.documentHeight <= layout.viewport.height + 1, 'The workspace must scroll inside its panels, not the window.')

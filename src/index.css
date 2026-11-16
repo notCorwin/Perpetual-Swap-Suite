@@ -52,6 +52,7 @@
 }
 
 :root {
+  --market-list-width: clamp(360px, 30vw, 420px);
   color-scheme: light;
   --positive: rgb(142 188 57);
   --negative: rgb(232 85 168);
@@ -204,6 +205,16 @@
 
 [data-window-toolbar] {
   height: var(--window-toolbar-height, 3rem);
+  flex-shrink: 0;
+}
+
+[data-chart-toolbar] {
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+[data-chart-toolbar] > * {
   flex-shrink: 0;
 }
 

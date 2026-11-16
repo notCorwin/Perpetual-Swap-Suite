@@ -95,3 +95,11 @@ test("a countdown including its padding remains visible at an exact fit", () => 
     countdownY: 17, top: 10, bottom: 34,
   })
 })
+
+test('normal desktop widths expand candle history without requiring an oversized display', async () => {
+  const { chartViewportBars } = await import('./chart-layout.ts')
+  assert.equal(chartViewportBars(840), 96) // 1200px window, 360px sidebar.
+  assert.equal(chartViewportBars(1090), 144) // 1510px window, 420px sidebar.
+  assert.equal(chartViewportBars(1290), 192) // Actual 1710px logical display.
+  assert.equal(chartViewportBars(2180), 288)
+})

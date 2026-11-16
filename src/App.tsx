@@ -36,11 +36,12 @@ const message = (cause: unknown) => cause instanceof Error ? cause.message : 'Th
 
 const MarketRowView = memo(function MarketRowView({ row, index, selected, lookback, onSelect }: { row: RankedMarketRow; index: number; selected: boolean; lookback: number; onSelect: (id: string) => void }) {
   const change = Number.isFinite(row.rankingChange) ? row.rankingChange : null
+  const price = formatCurrentPrice(row.lastPrice, row.tickSz)
   return <TableRow data-market-index={index} aria-rowindex={index + 2} aria-selected={selected} data-state={selected ? 'selected' : undefined} tabIndex={0} aria-label={`View ${row.instId} chart`} onClick={() => onSelect(row.instId)} onKeyDown={event => {
     if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelect(row.instId) }
   }} className="cursor-pointer focus-visible:outline-2 focus-visible:outline-ring focus-visible:-outline-offset-2">
     <TableCell className="font-medium" title={row.instId}><span className="block truncate">{row.instId.replace(/-USDT-SWAP$/, '')}</span></TableCell>
-    <TableCell className="text-right">{formatCurrentPrice(row.lastPrice, row.tickSz)}</TableCell>
+    <TableCell className="text-right"><span className="block truncate" title={price}>{price}</span></TableCell>
     <TableCell className="text-right" title={row.rankingAsOf ? `${lookback}-minute signed relative change · completed candle as of ${new Date(row.rankingAsOf).toLocaleString('en-US')}` : 'Completed candle ranking is not available'}>
       <span className="inline-flex items-center justify-end gap-1"><span aria-hidden="true" className={cn(change === null ? 'text-muted-foreground' : change > 0 ? 'text-positive' : change < 0 ? 'text-negative' : 'text-muted-foreground')}>{change === null ? '' : change > 0 ? '↑' : change < 0 ? '↓' : '→'}</span><span>{change === null ? '—' : `${change > 0 ? '+' : ''}${change.toFixed(2)}%`}</span></span>
     </TableCell>
@@ -251,7 +252,7 @@ function App() {
   return <WorkspaceViewport>
     {presentation.error && <p role="alert" className="px-4 py-2 text-sm text-destructive">{presentation.error}</p>}
     <div hidden={settingsSection !== null} inert={settingsSection !== null} className={cn('h-full min-w-0 flex-1', settingsSection === null ? 'flex' : 'hidden')}>
-    <aside data-market-list className="flex h-full w-[420px] shrink-0 flex-col border-r" aria-label="Contract list">
+    <aside data-market-list className="flex h-full w-[var(--market-list-width)] shrink-0 flex-col border-r" aria-label="Contract list">
       <header className="flex flex-col">
         <div data-sidebar-toolbar data-window-toolbar data-window-drag-region data-native-window-controls-row className="flex items-center gap-3 border-b px-4"><h1 className="min-w-0 flex-1 truncate text-sm font-medium">Perpetual Swap Suite</h1><a ref={settingsLauncher} href={settingsHref('workspace')} aria-label="Settings" title="Settings" className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}><Settings2 aria-hidden="true" /></a></div>
         <div className="flex flex-col gap-4 border-b p-4">

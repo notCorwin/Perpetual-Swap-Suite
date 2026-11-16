@@ -17,7 +17,7 @@ import { createOperationSession, enforceOperationRetention } from './services/op
 import { operationRecordingRequested } from './services/operation-policy.js'
 import { installElectronOperationHooks } from './services/operation-hooks.js'
 import { MarketBackend } from './services/market-backend.js'
-import { windowToolbarLayout } from './window-layout.js'
+import { backgroundWindowLaunch, windowToolbarLayout } from './window-layout.js'
 import { restoreWindowBounds, saveWindowBounds } from './window-state.js'
 import { PresentationLifecycle } from './services/presentation-lifecycle.js'
 import { PresentationDelivery } from './services/presentation-delivery.js'
@@ -210,6 +210,8 @@ async function handleRequest(event, payload, context) {
   return task
 }
 
+const backgroundLaunch = backgroundWindowLaunch(process.argv, testMode, backgroundTests)
+
 async function createWindow() {
   if (shuttingDown || window && !window.isDestroyed()) return
   const windowStatePath = join(app.getPath('userData'), 'window-state.json')
@@ -219,12 +221,13 @@ async function createWindow() {
     frame: false,
     ...(process.platform === 'darwin' ? { titleBarStyle: 'hidden', trafficLightPosition: windowToolbarLayout(1600, true).buttonsPosition } : {}),
     width: 1600, height: 1000, ...savedBounds, minWidth: 1200, minHeight: 640,
-    title: 'Perpetual Swap Suite', backgroundColor: '#101114', show: !testMode && !backgroundTests,
+    title: 'Perpetual Swap Suite', backgroundColor: '#101114', show: !testMode && !backgroundTests && !backgroundLaunch,
     webPreferences: { ...testWindowOptions(backgroundTests).webPreferences,
       additionalArguments: [...(operationRecording ? ['--perpetual-swap-operation-recording'] : []),
         ...(!presentation.getState().active ? ['--perpetual-swap-presentation-idle'] : [])],
       preload: join(root, 'electron', 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true },
   })
+  if (backgroundLaunch) window.once('ready-to-show', () => { if (!window.isDestroyed()) window.showInactive() })
   subscribeWindowNotifications(window)
   if (process.platform === 'darwin') {
     const target = window

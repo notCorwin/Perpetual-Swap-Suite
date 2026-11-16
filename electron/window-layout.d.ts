@@ -5,3 +5,5 @@ export function windowToolbarLayout(width: number, nativeWindowControls?: boolea
   controlsInset: number
   buttonsPosition?: { x: number; y: number }
 }
+
+export function backgroundWindowLaunch(argv: readonly string[], testMode?: boolean, backgroundTests?: boolean): boolean

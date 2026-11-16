@@ -283,7 +283,7 @@ const backToMarkets = async () => {
 const vwapCandleTarget = async (slot, fixture) => {
   const target = await page.locator('svg[data-rendered-inst]').evaluate((svg, { slot, intervalMS }) => {
     const commands = svg.querySelector('[data-chart-indicator="vwap"]').getAttribute('d').match(/[ML][^ML]+/g)
-    if (commands.length !== 97) throw new Error('The fixture must draw 96 VWAP samples and their leading left-edge extension.')
+    if (commands.length !== Number(svg.closest('[data-chart-rendered-bars]').dataset.chartRenderedBars) + 1) throw new Error('The fixture must draw its visible VWAP samples and their leading left-edge extension.')
     const x = Number.parseFloat(commands[slot + 1].slice(1))
     const rect = svg.getBoundingClientRect()
     return { x: rect.x + x / svg.viewBox.baseVal.width * rect.width, y: rect.y + rect.height * .1,
@@ -672,7 +672,7 @@ test('chart source updates stay outside the plot without resizing its viewport a
   try {
     for (const size of [{ width: 800, height: 572 }, { width: 1600, height: 1000 }]) {
       await page.setViewportSize(size)
-      await page.waitForFunction(width => Number(document.querySelector('[data-layout="market-workspace"]')?.dataset.uiScale) === width / 1600, size.width)
+      await page.waitForFunction(width => Number(document.querySelector('[data-layout="market-workspace"]')?.dataset.uiScale) === 1, size.width)
       await publish({ oiState: 'ready', takerState: 'ready', indicatorState: 'ready' })
       const status = page.locator('[data-chart-status]')
       await page.waitForFunction(() => {
@@ -753,12 +753,19 @@ test('RSI crossings retain a flat panel and expose the sampled candle and time a
     globalThis.__workspaceFixture.sendChart(frame)
     return frame
   }, custom)
-  const frame = await publish(true)
-  await page.waitForFunction(generation => document.querySelector('[data-chart-inst]')?.__chartSnapshot?.generation === generation, frame.generation)
   try {
     for (const colorScheme of ['dark', 'light']) for (const width of [800, 1600]) {
       await page.emulateMedia({ colorScheme })
       await page.setViewportSize({ width, height: width === 800 ? 572 : 1000 })
+      await page.waitForFunction(width => document.querySelector('[data-layout="market-workspace"]').getBoundingClientRect().width === width, width)
+      await page.waitForFunction(() => {
+        const chart = document.querySelector('[data-chart-inst]')
+        const width = chart.querySelector('[data-chart-plot]').clientWidth
+        const count = Math.min(288, 96 + Math.max(0, Math.floor((width - 720) / 240)) * 48)
+        return Number(chart.dataset.chartRenderedBars) === count
+      })
+      const frame = await publish(true)
+      await page.waitForFunction(generation => document.querySelector('[data-chart-inst]')?.__chartSnapshot?.generation === generation, frame.generation)
       const svg = page.locator('svg[data-rendered-inst="BETA-USDT-SWAP"]')
       const markerPoint = async () => {
         const handle = await page.waitForFunction(({ hour, width }) => {
@@ -968,9 +975,16 @@ test('search preserves selection while six width/DPR combinations share page, po
   try {
     for (const deviceScaleFactor of [1, 2]) for (const width of [1_200, 1_600, 2_000]) {
       await client.send('Emulation.setDeviceMetricsOverride', { width, height: 1_000, deviceScaleFactor, mobile: false })
-      await page.waitForFunction(({ width, deviceScaleFactor }) => innerWidth === width && devicePixelRatio === deviceScaleFactor && Number(document.querySelector('[data-layout="market-workspace"]')?.dataset.uiScale) === Math.min(1, width / 1_600), { width, deviceScaleFactor })
+      await page.waitForFunction(({ width, deviceScaleFactor }) => innerWidth === width && devicePixelRatio === deviceScaleFactor && Number(document.querySelector('[data-layout="market-workspace"]')?.dataset.uiScale) === 1, { width, deviceScaleFactor })
       await assertWorkspaceLayout(page)
-      const target = await vwapCandleTarget(24, fixture)
+      await page.waitForFunction(() => {
+        const chart = document.querySelector('[data-chart-inst]')
+        const width = chart.querySelector('[data-chart-plot]').clientWidth
+        const count = Math.min(288, 96 + Math.max(0, Math.floor((width - 720) / 240)) * 48)
+        return Number(chart.dataset.chartRenderedBars) === count
+      })
+      const currentFixture = await electron.evaluate(() => globalThis.__workspaceFixture.request(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } }))
+      const target = await vwapCandleTarget(24, currentFixture)
       await page.mouse.move(target.x, target.y)
       await page.mouse.down()
       await page.waitForFunction(() => document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
@@ -1014,7 +1028,7 @@ test('search preserves selection while six width/DPR combinations share page, po
     await client.detach()
     await page.setViewportSize({ width: viewport.width + 1, height: viewport.height })
     await page.setViewportSize(viewport)
-    await page.waitForFunction(({ width, height }) => innerWidth === width && innerHeight === height && Number(document.querySelector('[data-layout="market-workspace"]')?.dataset.uiScale) === Math.min(1, width / 1_600), viewport)
+    await page.waitForFunction(({ width, height }) => innerWidth === width && innerHeight === height && Number(document.querySelector('[data-layout="market-workspace"]')?.dataset.uiScale) === 1, viewport)
   }
 })
 
@@ -1826,7 +1840,7 @@ test('larger windows retain control density while showing more rows and candles 
       candles: [...document.querySelectorAll('[data-chart-rendered-bars]')].map(chart => Number(chart.dataset.chartRenderedBars)) }
   })
   try {
-    await client.send('Emulation.setDeviceMetricsOverride', { width: 1600, height: 900, deviceScaleFactor: 1, mobile: false })
+    await client.send('Emulation.setDeviceMetricsOverride', { width: 1200, height: 800, deviceScaleFactor: 1, mobile: false })
     await page.getByRole('button', { name: 'Multi-timeframe', exact: true }).click()
     await publish({ rows: await electron.evaluate(() => {
       const initial = globalThis.__workspaceFixture.initialRows
@@ -1834,26 +1848,67 @@ test('larger windows retain control density while showing more rows and candles 
     }) })
     await page.waitForFunction(() => document.querySelectorAll('[data-chart-rendered-bars="96"]').length === 3)
     const normal = await measure()
-    await client.send('Emulation.setDeviceMetricsOverride', { width: 2600, height: 1300, deviceScaleFactor: 1, mobile: false })
-    await page.waitForFunction(() => document.querySelectorAll('[data-chart-rendered-bars="192"]').length === 3)
+    await client.send('Emulation.setDeviceMetricsOverride', { width: 1510, height: 1000, deviceScaleFactor: 1, mobile: false })
+    await page.waitForFunction(() => document.querySelectorAll('[data-chart-rendered-bars="144"]').length === 3)
     await assertWorkspaceLayout(page)
     const expanded = await measure()
     assert.equal(expanded.rowHeight, normal.rowHeight)
     assert.equal(expanded.fontSize, normal.fontSize)
-    assert.equal(expanded.listWidth, normal.listWidth)
+    assert.ok(expanded.listWidth >= normal.listWidth && expanded.listWidth <= 420)
     assert.ok(expanded.visibleRows > normal.visibleRows, `${JSON.stringify({ normal, expanded })}`)
-    assert.deepEqual(expanded.candles, [192, 192, 192])
+    assert.deepEqual(expanded.candles, [144, 144, 144])
     const focusCount = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartFocus).length)
-    await client.send('Emulation.setDeviceMetricsOverride', { width: 2610, height: 1300, deviceScaleFactor: 1, mobile: false })
-    await page.waitForFunction(() => innerWidth === 2610)
+    await client.send('Emulation.setDeviceMetricsOverride', { width: 1520, height: 1000, deviceScaleFactor: 1, mobile: false })
+    await page.waitForFunction(() => innerWidth === 1520)
     assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartFocus).length), focusCount,
       'Resizing inside a density band must reuse the same data demand.')
-    await client.send('Emulation.setDeviceMetricsOverride', { width: 1600, height: 900, deviceScaleFactor: 1, mobile: false })
+    for (const [width, height, count] of [[1710, 1008, 192], [1600, 1000, 192], [2600, 1300, 288]]) {
+      await client.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false })
+      await page.waitForFunction(count => document.querySelectorAll(`[data-chart-rendered-bars="${count}"]`).length === 3, count)
+      await assertWorkspaceLayout(page)
+      const resized = await measure()
+      assert.equal(resized.rowHeight, normal.rowHeight)
+      assert.equal(resized.fontSize, normal.fontSize)
+    }
+    await client.send('Emulation.setDeviceMetricsOverride', { width: 1200, height: 800, deviceScaleFactor: 1, mobile: false })
     await page.waitForFunction(() => document.querySelectorAll('[data-chart-rendered-bars="96"]').length === 3)
   } finally {
     await client.send('Emulation.clearDeviceMetricsOverride')
     await client.detach()
     await publish({ rows: await electron.evaluate(() => globalThis.__workspaceFixture.initialRows) })
     await page.getByRole('button', { name: 'Indicators', exact: true }).click()
+  }
+})
+
+test('compact workspaces preserve complete market prices and keep overflowing chart actions reachable', async () => {
+  const previousSize = page.viewportSize()
+  try {
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      state.rows = state.initialRows.map(row => row.instId === 'BETA-USDT-SWAP'
+        ? { ...row, lastPrice: .0000012345, tickSz: '0.0000000001' } : row)
+      state.revision += 1
+      state.notify()
+    })
+    for (const width of [1000, 1200, 1510, 1710]) {
+      await page.setViewportSize({ width, height: 900 })
+      await assertWorkspaceLayout(page)
+      const price = page.locator('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2) span')
+      assert.equal(await price.getAttribute('title'), '0.0000012345')
+      assert.equal(await price.textContent(), '0.0000012345')
+      assert.equal(await price.evaluate(element => getComputedStyle(element).textOverflow), 'ellipsis')
+      await page.getByRole('button', { name: 'Chart controls', exact: true }).click()
+      await page.getByRole('dialog', { name: 'Chart controls', exact: true }).waitFor()
+      await page.getByRole('button', { name: 'Close', exact: true }).click()
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), true)
+    }
+  } finally {
+    await page.setViewportSize(previousSize)
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      state.rows = state.initialRows
+      state.revision += 1
+      state.notify()
+    })
   }
 })

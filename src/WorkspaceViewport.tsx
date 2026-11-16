@@ -2,8 +2,7 @@ import { useLayoutEffect, useState, type ReactNode } from 'react'
 import { WORKSPACE_DESIGN_WIDTH, windowToolbarLayout } from '../electron/window-layout.js'
 import { getPresentation, usePresentation } from '@/presentation-store'
 
-// Zoom the common ancestor of the workspace and all body-mounted portals.
-// DOM rectangles remain screen CSS pixels, which capture and SVG pointers use.
+// Workspace and body-mounted portals share unscaled CSS-pixel coordinates.
 export function WorkspaceViewport({ children }: { children: ReactNode }) {
   const [viewport, setViewport] = useState(() => ({ width: window.innerWidth, height: window.innerHeight }))
   const presentation = usePresentation()
@@ -17,14 +16,14 @@ export function WorkspaceViewport({ children }: { children: ReactNode }) {
     if (presentation.active) setViewport(current => current.width === window.innerWidth && current.height === window.innerHeight ? current : { width: window.innerWidth, height: window.innerHeight })
   }, [presentation.active])
   useLayoutEffect(() => {
-    document.body.style.zoom = String(scale)
-    document.body.style.setProperty("--workspace-height", `${viewport.height / scale}px`)
-    document.body.style.setProperty('--native-window-controls-width', `${controlsInset / scale}px`)
-    document.body.style.setProperty('--window-toolbar-height', `${toolbarHeight / scale}px`)
+    document.body.style.removeProperty('zoom')
+    document.body.style.setProperty("--workspace-height", `${viewport.height}px`)
+    document.body.style.setProperty('--native-window-controls-width', `${controlsInset}px`)
+    document.body.style.setProperty('--window-toolbar-height', `${toolbarHeight}px`)
     return () => {
       document.body.style.removeProperty('zoom')
       for (const property of ['--workspace-height', '--native-window-controls-width', '--window-toolbar-height']) document.body.style.removeProperty(property)
     }
   }, [scale, viewport.height, controlsInset, toolbarHeight])
-  return <div data-layout="market-workspace" data-design-width={WORKSPACE_DESIGN_WIDTH} data-ui-scale={scale} className="flex overflow-hidden" style={{ width: viewport.width / scale, height: viewport.height / scale }}>{children}</div>
+  return <div data-layout="market-workspace" data-design-width={WORKSPACE_DESIGN_WIDTH} data-ui-scale={scale} className="flex overflow-hidden" style={{ width: viewport.width, height: viewport.height }}>{children}</div>
 }
