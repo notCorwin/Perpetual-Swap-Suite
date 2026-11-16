@@ -1,4 +1,5 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { lazy, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { DeferredPanel } from '@/DeferredPanel'
 import { Settings2 } from 'lucide-react'
 import { buttonVariants } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -7,7 +8,6 @@ import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/u
 import { MarketChart } from '@/MarketChart'
 import { MarketRowsViewport } from '@/MarketRowsViewport'
 import { WorkspaceViewport } from '@/WorkspaceViewport'
-import { WorkspaceSettings } from '@/WorkspaceSettings'
 import { settingsHref, useSettingsSection, type SettingsNavigationState } from '@/settings-navigation'
 import { chartControllers, multiChartControllers, ingestPreparedChart } from '@/chart-controller'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
@@ -20,6 +20,8 @@ import type { RadarTimeframe } from '@/timeframe'
 import { cn } from '@/lib/utils'
 import { formatCurrentPrice } from '@/price-format'
 import { getPresentation, subscribePresentationTransition, usePresentation, waitForPresentation } from '@/presentation-store'
+
+const WorkspaceSettings = lazy(() => import('@/WorkspaceSettings').then(module => ({ default: module.WorkspaceSettings })))
 
 const qualificationPending = (progress: MarketSnapshot['catalogProgress']) => !progress || progress.total === 0 || progress.completed < progress.total || progress.pending > 0
 const collectorStatus = (snapshot: MarketSnapshot | UnchangedSnapshot) => {
@@ -284,7 +286,7 @@ function App() {
       </div> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}
     </section>
     </div>
-    {settingsSection && <WorkspaceSettings section={settingsSection} preferences={preferences} loaded={preferencesLoaded} loadError={preferencesError} onSave={savePreferences} onNavigationStateChange={updateSettingsGuard} />}
+    {settingsSection && <DeferredPanel name="Settings" className="p-4" onClose={() => { window.location.hash = '#/' }}><WorkspaceSettings section={settingsSection} preferences={preferences} loaded={preferencesLoaded} loadError={preferencesError} onSave={savePreferences} onNavigationStateChange={updateSettingsGuard} /></DeferredPanel>}
   </WorkspaceViewport>
 }
 export default App

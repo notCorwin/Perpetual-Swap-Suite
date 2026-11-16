@@ -199,6 +199,21 @@ function nativeFixture(status: number, data: string, interrupted = false, before
 }
 
 const delta = (content: string, finish: string | null = null) => `data: ${JSON.stringify({ id: 'response', choices: [{ index: 0, delta: { content }, finish_reason: finish }] })}\n\n`
+test('cancelling while the SDK loads sends no request and a later analysis can reuse the runner', async () => {
+  const native = nativeFixture(200, delta('Ready') + delta('', 'stop') + 'data: [DONE]\n\n')
+  const runner = createAnalysisRunner(native.fetch)
+  const controller = new AbortController()
+  const input = { model: DEFAULT_ANALYSIS_MODEL, instructions: 'Answer briefly.', messages: [{ role: 'user' as const, content: 'Review the chart.' }], signal: controller.signal }
+  const pending = runner(input, () => {})
+  controller.abort()
+  await assert.rejects(pending, { name: 'AbortError' })
+  assert.equal(native.bodies.length, 0)
+  let answer = ''
+  await runner({ ...input, signal: new AbortController().signal }, text => { answer += text })
+  assert.equal(answer, 'Ready')
+  assert.equal(native.bodies.length, 1)
+})
+
 for (const direction of ['long', 'short'] as const) test(`actual compatible SDK serializes ${direction} image and instructions and decodes native UTF-8 SSE`, async () => {
   const native = nativeFixture(200, delta('Wait for confirmation — ') + delta('résumé.') + delta('', 'stop') + 'data: [DONE]\n\n')
   const store = new ChartAnalysisStore(createAnalysisRunner(native.fetch), settings)

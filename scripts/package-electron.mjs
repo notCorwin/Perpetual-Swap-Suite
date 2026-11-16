@@ -1,9 +1,12 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { mkdir, writeFile } from 'node:fs/promises'
+import { listPackage } from '@electron/asar'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { fingerprintInputs, inspectApp, run, withBuildCleanup } from './electron-delivery.mjs'
+
+import { assertDesktopImports, assertPackagedEntries } from './package-layout.mjs'
 
 const execute = promisify(execFile)
 const root = fileURLToPath(new URL('..', import.meta.url))
@@ -13,6 +16,7 @@ if (process.argv.length > 2) throw new Error('Usage: scripts/package-electron.sh
 await withBuildCleanup(root, async () => {
   const revision = (await execute('git', ['rev-parse', 'HEAD'], { cwd: root })).stdout.trim()
   const dirty = Boolean((await execute('git', ['status', '--porcelain'], { cwd: root })).stdout.trim())
+  await assertDesktopImports(join(root, 'electron'))
   await run('npm', ['run', 'build'], { cwd: root })
   const metadata = { schemaVersion: 1, revision, dirty, builtAt: new Date().toISOString(), arch: process.arch }
   const metadataPath = join(root, '.build', 'build-revision.json')
@@ -24,6 +28,8 @@ await withBuildCleanup(root, async () => {
   ], { cwd: root, env: { ...process.env, CSC_IDENTITY_AUTO_DISCOVERY: 'false' } })
   if (await fingerprintInputs(root) !== inputFingerprint) throw new Error('Packaging inputs changed while building the app. Finish edits and package again.')
   const app = join(root, 'dist', process.arch === 'arm64' ? 'mac-arm64' : 'mac', 'Perpetual Swap Suite.app')
+  const entries = listPackage(join(app, 'Contents/Resources/app.asar'))
+  assertPackagedEntries(entries)
   await run('codesign', ['--force', '--deep', '--sign', '-', app])
   await inspectApp(app, revision)
   console.log(JSON.stringify({ app, ...metadata }))

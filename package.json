@@ -50,6 +50,7 @@
   },
   "devDependencies": {
     "@babel/parser": "8.0.7",
+    "@electron/asar": "3.4.1",
     "@tailwindcss/vite": "4.3.3",
     "@types/node": "26.6.5",
     "@types/react": "19.3.0",
@@ -69,7 +70,8 @@
     "appId": "com.perpetualradar.desktop",
     "productName": "Perpetual Swap Suite",
     "files": [
-      "dist/**",
+      "dist/index.html",
+      "dist/assets/**",
       "electron/**",
       "package.json"
     ],

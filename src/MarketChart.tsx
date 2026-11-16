@@ -1,5 +1,6 @@
+import { DeferredPanel } from '@/DeferredPanel'
 import { chartViewportBars } from './chart-layout.ts'
-import { createContext, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react"
+import { lazy, createContext, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { flushSync } from "react-dom"
 import { Camera } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
@@ -7,7 +8,6 @@ import { Button } from "@/components/ui/button"
 import { ButtonGroup } from "@/components/ui/button-group"
 import { Spinner } from "@/components/ui/spinner"
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
-import { ChartAnalysisPanel } from '@/ChartAnalysisPanel'
 import { chartAnalysis } from '@/analysis-service'
 import { analysisSessionKey, type AnalysisDirection } from '@/chart-analysis'
 import { captureStableChart, chartCaptureBounds } from '@/chart-capture'
@@ -37,6 +37,8 @@ const PriceStatus = memo(function PriceStatus({ observedAt, realtime, active }: 
   const fresh = isPriceFresh(observedAt, realtime, now)
   return fresh ? null : <Badge variant="secondary" role="status" title={observedAt ? `Last price observation ${new Date(observedAt).toLocaleTimeString('en-US')}` : 'Waiting for a current price observation'}>Cached price</Badge>
 })
+
+const ChartAnalysisPanel = lazy(() => import('@/ChartAnalysisPanel').then(module => ({ default: module.ChartAnalysisPanel })))
 
 const chartTimeFormatter = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })
 const time = (hour: number) => chartTimeFormatter.format(hour)
@@ -742,7 +744,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
       </div>
       {captureStatus === 'flashing' && <div aria-hidden="true" className="pointer-events-none absolute inset-0 z-10 bg-[var(--chart-capture-flash)] motion-safe:animate-[chart-capture-flash_550ms_ease-out_both] motion-reduce:hidden" />}
     </section>
-    {analysisOpen && <ChartAnalysisPanel instId={instId} sessionKey={sessionKey} timeframe={timeframeLabel(timeframe)} session={analysis} ready={isActive && !pending && bars.length > 0 && plotSize.width > 0 && captureStatus !== 'copying'} onNew={() => analyzeChart(analysis?.direction ?? 'long')} onClose={() => { chartAnalysis.stop(sessionKey); setAnalysisOpen(false) }} />}
+    {analysisOpen && <DeferredPanel name="Chart analysis" className="w-(--analysis-panel-width) shrink-0 border-l p-4" onClose={() => { chartAnalysis.stop(sessionKey); setAnalysisOpen(false) }}><ChartAnalysisPanel instId={instId} sessionKey={sessionKey} timeframe={timeframeLabel(timeframe)} session={analysis} ready={isActive && !pending && bars.length > 0 && plotSize.width > 0 && captureStatus !== 'copying'} onNew={() => analyzeChart(analysis?.direction ?? 'long')} onClose={() => { chartAnalysis.stop(sessionKey); setAnalysisOpen(false) }} /></DeferredPanel>}
     </div>
   </section>
 })

@@ -1,13 +1,19 @@
-import { createOpenAICompatible } from '@ai-sdk/openai-compatible'
-import { streamText } from 'ai'
 import { ChartAnalysisStore, type AnalysisSettingsRequest, type AnalysisRunner } from './chart-analysis.ts'
 import { createGatewayFetch } from './gateway-fetch.ts'
 
 export const requestAnalysisSettings = (request: AnalysisSettingsRequest) => window.radarDesktop.request({ analysisSettings: request })
 
 export function createAnalysisRunner(nativeFetch: typeof fetch): AnalysisRunner {
-  const provider = createOpenAICompatible({ name: 'openai', baseURL: 'https://ai-gateway.vercel.sh/v1', fetch: nativeFetch })
+  // Share one module/provider initialization across concurrent analyses. Failed
+  // imports are retryable, and cancelled requests never start a network stream.
+  let runtime: Promise<{ provider: ReturnType<(typeof import('@ai-sdk/openai-compatible'))['createOpenAICompatible']>; streamText: (typeof import('ai'))['streamText'] }> | undefined
+  const load = () => runtime ??= Promise.all([import('@ai-sdk/openai-compatible'), import('ai')]).then(([{ createOpenAICompatible }, { streamText }]) => ({
+    provider: createOpenAICompatible({ name: 'openai', baseURL: 'https://ai-gateway.vercel.sh/v1', fetch: nativeFetch }), streamText,
+  })).catch(error => { runtime = undefined; throw error })
   return async (input, onText) => {
+    input.signal.throwIfAborted()
+    const { provider, streamText } = await load()
+    input.signal.throwIfAborted()
     const result = streamText({ model: provider(input.model), instructions: input.instructions, messages: input.messages, abortSignal: input.signal, maxRetries: 0, streamRetries: 0, onError: () => {} })
     let finished = false
     for await (const part of result.fullStream) {
