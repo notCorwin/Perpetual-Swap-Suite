@@ -75,6 +75,26 @@ test('default multi-timeframe charts share native prices, isolate history and re
       const charts = [...document.querySelectorAll('[data-chart-inst]')]
       return charts[1].__chartSnapshot.endHour < before[1] && charts[0].__chartSnapshot.endHour === before[0] && charts[2].__chartSnapshot.endHour === before[2]
     }, before)
+    await page.waitForFunction(() => document.querySelectorAll('[data-chart-inst]')[1]?.dataset.chartLoading === 'false')
+    await page.waitForTimeout(1000)
+    // A partial wheel gesture moves existing paths; the path nodes and their
+    // market-data geometry remain untouched until the viewport changes.
+    const fractional = await page.locator('[data-chart-plot]').nth(1).evaluate(async plot => {
+      const path = plot.querySelector('[data-chart-indicator="vwap"]')
+      const content = path.closest('[data-chart-wheel-content]')
+      const svg = path.closest('svg'), before = { d: path.getAttribute('d'), end: svg.dataset.renderedEnd }
+      const frame = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+      plot.dispatchEvent(new WheelEvent('wheel', { deltaY: 3, bubbles: true, cancelable: true }))
+      await frame()
+      const moved = Number(content.dataset.chartWheelOffset)
+      const same = path === plot.querySelector('[data-chart-indicator="vwap"]') && before.d === path.getAttribute('d') && before.end === svg.dataset.renderedEnd
+      plot.dispatchEvent(new WheelEvent('wheel', { deltaY: -3, bubbles: true, cancelable: true }))
+      await frame()
+      return { moved, same, reversed: Number(content.dataset.chartWheelOffset), before, after: { d: path.getAttribute('d'), end: svg.dataset.renderedEnd }, sameNode: path === plot.querySelector('[data-chart-indicator="vwap"]') }
+    })
+    assert.ok(fractional.same, `Partial scrolling must retain the existing SVG path and geometry: ${JSON.stringify(fractional)}`)
+    assert.notEqual(fractional.moved, 0, 'A cached adjacent candle permits immediate partial movement.')
+    assert.equal(fractional.reversed, 0, 'Reversing the gesture returns to the original position.')
     await page.evaluate(() => { location.hash = '#/settings/workspace' })
     await page.getByRole('link', { name: 'Back to markets' }).click()
     await page.waitForFunction(() => document.querySelectorAll('[data-multi-timeframe-charts] svg[data-rendered-inst]').length === 3)

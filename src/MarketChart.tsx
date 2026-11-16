@@ -14,7 +14,7 @@ import { captureStableChart, chartCaptureBounds } from '@/chart-capture'
 import { CHART_PANELS, chartContentClip, chartPanelClip, chartPriceLabelLayout, type ChartPanel as Panel } from "@/chart-layout"
 import { chartCompact as compact, chartPercent, type ChartGeometry } from "@/chart-geometry"
 import { formatCurrentPrice, formatHistoricalPrice, formatIndicatorPrice } from '@/price-format'
-import { chartRsiNavigationTarget, chartWheelIntent, chartZoomDemand, chartZoomWindow, chartWheelContentOffset, createChartWheelBatch, createChartWheelScheduler } from '@/chart-navigation'
+import { chartRsiNavigationTarget, chartWheelIntent, chartZoomDemand, chartZoomWindow, chartWheelContentOffset, chartPresentedWheelFraction, createChartWheelBatch, createChartWheelScheduler } from '@/chart-navigation'
 import { chartStatisticsSamples } from '@/chart-legend'
 import { RSI_FIELDS, type RsiField } from '@/rsi-crossings'
 import { cn } from "@/lib/utils"
@@ -104,6 +104,54 @@ const chartOverscan = (surface: ReadyChartWindow | null, chartController: ChartC
   return { before, after }
 }
 
+const PlotPaths = memo(function PlotPaths({ bars, geometry, areaClipId, oiState, takerState }: { bars: readonly Bar[]; geometry: ChartGeometry; areaClipId: string; oiState: PreparedChartState; takerState: PreparedChartState }) {
+  const { upWicks, downWicks, upBodies, downBodies, buys, sells, lines, rsiMarkers, oiAxis, oiComplete, oiSamples, oiY, x, takerComplete, takerAvailable } = geometry
+  const { panels } = geometry.layout
+  const lineStroke = (key: keyof Bar, d: string, color: string, dash?: string) => <path data-chart-indicator={key} d={d} fill="none" stroke={color} strokeLinecap="round" strokeLinejoin="round" strokeDasharray={dash} />
+  return measureOperation({ category: 'cpu', name: 'chart.svg.paths.construct', attributes: { candles: bars.length } }, () => <>
+    {/* Expose contrasting segments within the same 1px stroke for the mandated light green. */}
+    <g clipPath={`url(#${areaClipId}-price)`}>
+    <path d={upWicks} fill="none" stroke="var(--foreground)" />
+    <path d={upWicks} fill="none" stroke="var(--positive)" strokeDasharray="2 3" />
+    <path d={downWicks} fill="none" stroke="var(--negative)" />
+    <path d={upBodies} fill="var(--background)" stroke="var(--foreground)" />
+    <path data-chart-candle-direction="up" data-chart-candle-fill="hollow" d={upBodies} fill="none" stroke="var(--positive)" strokeDasharray="2 3" />
+    <path data-chart-candle-direction="down" data-chart-candle-fill="solid" d={downBodies} fill="var(--negative)" />
+    </g>
+    {!geometry.priceOnly && <g clipPath={`url(#${areaClipId}-taker)`} data-chart-taker={takerComplete ? "complete" : takerAvailable ? "partial" : "empty"} data-chart-taker-state={takerState}>
+      <path data-chart-taker-buy-samples={geometry.buySamples} d={buys} fill="var(--positive)" stroke="var(--foreground)" opacity="0.9" />
+      <path data-chart-taker-sell-samples={geometry.sellSamples} d={sells} fill="var(--negative)" stroke="var(--foreground)" opacity="0.9" />
+      <path d={sells} fill={`url(#${areaClipId}-sell-hatch)`} opacity="0.7" />
+    </g>}
+    <g clipPath={`url(#${areaClipId}-price)`}>
+    {lineStroke("bollUpper", lines.bollUpper, "var(--chart-1)")}
+    {lineStroke("bollMiddle", lines.bollMiddle, "var(--chart-1)")}
+    {lineStroke("bollLower", lines.bollLower, "var(--chart-1)")}
+    {lineStroke("vwap", lines.vwap, "var(--chart-2)", "2 3")}
+    </g>
+    {!geometry.priceOnly && <g clipPath={`url(#${areaClipId}-rsi)`}>
+    {lineStroke("rsi6", lines.rsi6, "var(--chart-1)")}
+    {lineStroke("rsi12", lines.rsi12, "var(--chart-2)", "7 4")}
+    {lineStroke("rsi24", lines.rsi24, "var(--chart-3)", "3 4")}
+    {rsiMarkers.map(marker => <path key={`${marker.field}:${marker.hour}`} data-chart-rsi-crossing={marker.field} data-chart-rsi-direction={marker.direction} data-chart-rsi-levels={marker.levels.join('/')} data-chart-rsi-hour={marker.hour}
+      d={marker.d} fill={`var(--chart-${RSI_FIELDS.indexOf(marker.field) + 1})`} stroke="var(--background)" strokeLinejoin="round">
+      <title>{`${time(marker.hour)} · RSI(${marker.field.slice(3)}) crossed ${marker.direction === 'up' ? 'above' : 'below'} ${marker.levels.join(' and ')} · ${marker.value.toFixed(1)}${marker.confirmed ? '' : ' · Forming candle'}`}</title>
+    </path>)}
+    </g>}
+    {!geometry.priceOnly && <g clipPath={`url(#${areaClipId}-atr)`} data-chart-volatility-panel data-chart-panel-top={panels.atr[0]} data-chart-panel-bottom={panels.atr[1]}>
+      {lineStroke("atrPercent", lines.atrPercent, "var(--chart-3)")}
+      {lineStroke("bbw", lines.bbw, "var(--chart-1)", "7 4")}
+    </g>}
+    {!geometry.priceOnly && <g clipPath={`url(#${areaClipId}-roc)`}>
+    {lineStroke("roc", lines.roc, "var(--chart-1)")}
+    {lineStroke("maroc", lines.maroc, "var(--chart-2)", "7 4")}
+    </g>}
+    {!geometry.priceOnly && <g clipPath={`url(#${areaClipId}-oi)`} data-chart-oi={oiAxis ? oiComplete ? "complete" : "partial" : "empty"} data-chart-oi-state={oiState} data-chart-oi-samples={oiSamples.length}>
+      {oiAxis && <>{lineStroke("oi", lines.oi, "var(--chart-2)")}{!oiComplete && oiSamples.map(sample => <circle key={bars[sample.index].hour} data-chart-oi-sample cx={x[sample.index]} cy={oiY(sample.value)} r="2" fill="var(--chart-2)" />)}</>}
+    </g>}
+  </>)
+})
+
 export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = false, inspected, inspectedBar, contentOffset = 0, oiState = 'ready', takerState = 'ready', oiStatus, takerStatus }: { bars: readonly Bar[]; geometry: ChartGeometry; liveBar: Bar; liveOverlay?: boolean; inspected: number | null; inspectedBar?: Bar; contentOffset?: number; oiState?: PreparedChartState; takerState?: PreparedChartState; oiStatus?: ChartSourceStatus; takerStatus?: ChartSourceStatus }) {
   const areaClipId = useId().replaceAll(":", "")
   return measureOperation({ category: 'cpu', name: 'chart.svg.construct', attributes: { candles: bars.length, inspected: inspected !== null } }, () => {
@@ -112,8 +160,8 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
   const active = inspectedBar ?? bars[inspected ?? n - 1]
   const statistics = inspectedBar ? chartStatisticsSamples([inspectedBar], 0) : chartStatisticsSamples(bars, inspected)
   const { height, endHour, intervalMS, gutter, x, firstHour, candleHigh, candleLow, highIndex, lowIndex,
-    oiComplete, takerComplete, oiSamples, takerAvailable, rocAxis, oiAxis,
-    priceY, rsiY, oiY, rocZeroY, lines, rocAreas, bollBands, upWicks, downWicks, upBodies, downBodies, buys, sells, rsiMarkers } = geometry
+    rocAxis, oiAxis,
+    priceY, rsiY, rocZeroY, rocAreas, bollBands, rsiMarkers } = geometry
   const { panels, columns, axisStarts, headerY, right } = geometry.layout
   const contentClip = chartContentClip(geometry.layout, height)
   const rocClip = chartPanelClip(geometry.layout, 'roc', geometry.barPitch)
@@ -131,7 +179,6 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     const marker = !inspecting ? undefined : rsiMarkers.find(marker => marker.hour === active.hour && marker.field === field)
     return `${active[field]?.toFixed(1) ?? '—'}${marker ? ` ${marker.direction === 'up' ? '↑' : '↓'}${marker.levels.join('/')}` : ''}`
   }
-  const lineStroke = (key: keyof Bar, d: string, color: string, dash?: string) => <path data-chart-indicator={key} d={d} fill="none" stroke={color} strokeLinecap="round" strokeLinejoin="round" strokeDasharray={dash} />
   const lineLabel = (x: number, y: number, label: string, color = "var(--muted-foreground)") =>
     <text x={x} y={y} dominantBaseline="middle" fill={color}>{label}</text>
   const panelKeys: readonly Panel[] = geometry.priceOnly ? ['price'] : CHART_PANELS
@@ -204,46 +251,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
       <g transform={`translate(${contentOffset},0)`} data-chart-wheel-content data-chart-wheel-offset={contentOffset}>
     {bars.flatMap((bar, index) => (bar.hour - firstHour) % (12 * intervalMS) === 0 ? panelKeys.map(key => <line key={`${(bar.hour - firstHour) / intervalMS}-${key}`} x1={x[index]} x2={x[index]} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--border)" strokeOpacity="0.22" />) : [])}
     {timeLabels.map(({ bar, index }) => <text data-chart-time-label key={(bar.hour - firstHour) / intervalMS} x={x[index]} y={height - 4} textAnchor={index === 0 ? "start" : index === n - 1 ? "end" : "middle"} fill="var(--muted-foreground)">{hourLabel(bar.hour)}</text>)}
-    {/* Expose contrasting segments within the same 1px stroke for the mandated light green. */}
-    <g clipPath={`url(#${areaClipId}-price)`}>
-    <path d={upWicks} fill="none" stroke="var(--foreground)" />
-    <path d={upWicks} fill="none" stroke="var(--positive)" strokeDasharray="2 3" />
-    <path d={downWicks} fill="none" stroke="var(--negative)" />
-    <path d={upBodies} fill="var(--background)" stroke="var(--foreground)" />
-    <path data-chart-candle-direction="up" data-chart-candle-fill="hollow" d={upBodies} fill="none" stroke="var(--positive)" strokeDasharray="2 3" />
-    <path data-chart-candle-direction="down" data-chart-candle-fill="solid" d={downBodies} fill="var(--negative)" />
-    </g>
-    {!geometry.priceOnly && <g clipPath={`url(#${areaClipId}-taker)`} data-chart-taker={takerComplete ? "complete" : takerAvailable ? "partial" : "empty"} data-chart-taker-state={takerState}>
-      <path data-chart-taker-buy-samples={geometry.buySamples} d={buys} fill="var(--positive)" stroke="var(--foreground)" opacity="0.9" />
-      <path data-chart-taker-sell-samples={geometry.sellSamples} d={sells} fill="var(--negative)" stroke="var(--foreground)" opacity="0.9" />
-      <path d={sells} fill={`url(#${areaClipId}-sell-hatch)`} opacity="0.7" />
-    </g>}
-    <g clipPath={`url(#${areaClipId}-price)`}>
-    {lineStroke("bollUpper", lines.bollUpper, "var(--chart-1)")}
-    {lineStroke("bollMiddle", lines.bollMiddle, "var(--chart-1)")}
-    {lineStroke("bollLower", lines.bollLower, "var(--chart-1)")}
-    {lineStroke("vwap", lines.vwap, "var(--chart-2)", "2 3")}
-    </g>
-    {!geometry.priceOnly && <g clipPath={`url(#${areaClipId}-rsi)`}>
-    {lineStroke("rsi6", lines.rsi6, "var(--chart-1)")}
-    {lineStroke("rsi12", lines.rsi12, "var(--chart-2)", "7 4")}
-    {lineStroke("rsi24", lines.rsi24, "var(--chart-3)", "3 4")}
-    {rsiMarkers.map(marker => <path key={`${marker.field}:${marker.hour}`} data-chart-rsi-crossing={marker.field} data-chart-rsi-direction={marker.direction} data-chart-rsi-levels={marker.levels.join('/')} data-chart-rsi-hour={marker.hour}
-      d={marker.d} fill={`var(--chart-${RSI_FIELDS.indexOf(marker.field) + 1})`} stroke="var(--background)" strokeLinejoin="round">
-      <title>{`${time(marker.hour)} · RSI(${marker.field.slice(3)}) crossed ${marker.direction === 'up' ? 'above' : 'below'} ${marker.levels.join(' and ')} · ${marker.value.toFixed(1)}${marker.confirmed ? '' : ' · Forming candle'}`}</title>
-    </path>)}
-    </g>}
-    {!geometry.priceOnly && <g clipPath={`url(#${areaClipId}-atr)`} data-chart-volatility-panel data-chart-panel-top={panels.atr[0]} data-chart-panel-bottom={panels.atr[1]}>
-      {lineStroke("atrPercent", lines.atrPercent, "var(--chart-3)")}
-      {lineStroke("bbw", lines.bbw, "var(--chart-1)", "7 4")}
-    </g>}
-    {!geometry.priceOnly && <g clipPath={`url(#${areaClipId}-roc)`}>
-    {lineStroke("roc", lines.roc, "var(--chart-1)")}
-    {lineStroke("maroc", lines.maroc, "var(--chart-2)", "7 4")}
-    </g>}
-    {!geometry.priceOnly && <g clipPath={`url(#${areaClipId}-oi)`} data-chart-oi={oiAxis ? oiComplete ? "complete" : "partial" : "empty"} data-chart-oi-state={oiState} data-chart-oi-samples={oiSamples.length}>
-      {oiAxis && <>{lineStroke("oi", lines.oi, "var(--chart-2)")}{!oiComplete && oiSamples.map(sample => <circle key={bars[sample.index].hour} data-chart-oi-sample cx={x[sample.index]} cy={oiY(sample.value)} r="2" fill="var(--chart-2)" />)}</>}
-    </g>}
+    <PlotPaths bars={bars} geometry={geometry} areaClipId={areaClipId} oiState={oiState} takerState={takerState} />
     {inspecting && panelKeys.map(key => <line key={key} x1={inspectionX} x2={inspectionX} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--foreground)" strokeDasharray="3 5" opacity="0.3" />)}
     <g clipPath={`url(#${areaClipId}-price)`}>
     {([[highIndex, candleHigh, "high"], [lowIndex, candleLow, "low"]] as const).map(([index, value, kind]) => {
@@ -389,7 +397,8 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
   const wheelOwnerMatches = Boolean(wheelOwner?.session === wheelSession && wheelOwner.generation === surface?.generation)
   const requestedEndMatches = Boolean(surface && view.requested && view.requested.instId === surface.instId
     && view.requested.timeframe === surface.timeframe && (view.requested.end ?? view.latestEnd) === surface.endHour)
-  const activeWheelFraction = matchesSelection && wheelOwnerMatches && (!view.pending || requestedEndMatches) ? wheelFraction : 0
+  const activeWheelFraction = matchesSelection && wheelOwnerMatches
+    ? chartPresentedWheelFraction(wheelFraction, view.pending && !requestedEndMatches ? requestedEnd : surface?.endHour, surface?.endHour, intervalMS) : 0
   const wheelContentOffset = chartWheelContentOffset(activeWheelFraction, plotGeometry?.barPitch ?? 0,
     Boolean(preparedPlot?.before), Boolean(preparedPlot?.after))
   const navigationId = useRef(instId)

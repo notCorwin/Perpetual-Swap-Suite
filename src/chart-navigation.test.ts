@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { advanceChartWheel, chartWheelIntent, chartZoomDemand, chartZoomWindow, chartRsiNavigationTarget, chartWheelContentOffset, createChartWheelBatch, createChartWheelScheduler } from './chart-navigation.ts'
+import { advanceChartWheel, chartWheelIntent, chartZoomDemand, chartZoomWindow, chartRsiNavigationTarget, chartWheelContentOffset, chartPresentedWheelFraction, createChartWheelBatch, createChartWheelScheduler } from './chart-navigation.ts'
 
 function wheelSchedulerHarness() {
   const microtasks: Array<() => void> = []
@@ -202,4 +202,18 @@ test('zoom reuses coarse history demand between bucket boundaries', () => {
   assert.equal(chartZoomDemand(96), 144)
   assert.equal(chartZoomDemand(139.2), 144)
   assert.equal(chartZoomDemand(288), 288)
+})
+
+
+test('pending history holds the retained frame at its known edge and catches up without snapping back', () => {
+  const interval = 900_000, end = 100 * interval
+  const beforeCrossing = chartPresentedWheelFraction(-0.9, end, end, interval)
+  const pending = chartPresentedWheelFraction(-0.1, end - interval, end, interval)
+  assert.equal(beforeCrossing, -0.9)
+  assert.equal(pending, -1)
+  assert.equal(chartWheelContentOffset(pending, 10, true, false), 10)
+  assert.equal(chartWheelContentOffset(pending, 10, false, false), 0, 'Never invent an unknown adjacent candle.')
+  assert.equal(chartPresentedWheelFraction(-0.1, end - interval, end - interval, interval), -0.1)
+  assert.equal(chartPresentedWheelFraction(0.25, end + 4 * interval, end, interval), 1)
+  assert.equal(chartPresentedWheelFraction(0.25, null, end, interval), 0)
 })

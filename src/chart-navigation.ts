@@ -92,6 +92,12 @@ export function createChartWheelScheduler({ queueMicrotask, requestFrame, cancel
   }
 }
 
+/** Keep a retained frame at its nearest known edge while a requested cursor loads. */
+export function chartPresentedWheelFraction(fraction: number, requestedEnd: number | null | undefined, presentedEnd: number | null | undefined, intervalMS: number) {
+  if (!Number.isFinite(fraction) || requestedEnd == null || presentedEnd == null || !Number.isFinite(intervalMS) || intervalMS <= 0) return 0
+  return Math.max(-1, Math.min(1, fraction + (requestedEnd - presentedEnd) / intervalMS))
+}
+
 /** Return the visible plot translation, limited to sides with a known adjacent bar. */
 export function chartWheelContentOffset(fraction: number, barPitch: number, hasBefore: boolean, hasAfter: boolean) {
   if (!Number.isFinite(fraction) || !Number.isFinite(barPitch) || barPitch <= 0
