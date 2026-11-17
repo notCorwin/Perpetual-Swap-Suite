@@ -978,7 +978,7 @@ test('ranking reads completed local data before any repair and memoizes repeated
     await f.store.appendCandles(Array.from({ length: 7 }, (_, index) => rawCandle(asOf - (7 - index) * fiveMinutes, 100 + index)))
     const read = f.store.candles.bind(f.store)
     f.store.candles = async (...args) => { reads += 1; return read(...args) }
-    f.service.history.ensurePrices = async () => { repairs += 1; throw new Error('Complete local ranking must not wait for network history.') }
+    f.service.history.ensurePriceCoverage = async () => { repairs += 1; throw new Error('Complete local ranking must not wait for network history.') }
     localCatalog(f.service)
     await f.service.updateRanking(instId, { ensure: true })
     const expected = (106 - 103) / 103 * 100
@@ -1028,7 +1028,7 @@ test('a changed lookback with incomplete cache stays unavailable without blockin
     localCatalog(f.service)
     const read = f.store.candles.bind(f.store)
     f.store.candles = async (...args) => { started = true; await readGate; return read(...args) }
-    f.service.history.ensurePrices = async () => ({ rows: [] })
+    f.service.history.ensurePriceCoverage = async () => undefined
     const previous = structuredClone(f.preferences)
     f.preferences.rankingLookback = 60
     await f.service.reconfigure(previous)
@@ -1079,7 +1079,7 @@ test('the exact next 5m boundary clears a ranking without a final WS event and a
   const f = await fixture(), asOf = boundary - fiveMinutes
   try {
     f.service.preparedCharts.setUniverse = () => ({ frames: [] })
-    f.service.history.ensurePrices = async () => ({ rows: [] })
+    f.service.history.ensurePriceCoverage = async () => undefined
     await f.service.persistCandles(instId, Array.from({ length: 7 }, (_, index) => rawCandle(asOf - (7 - index) * fiveMinutes, 100 + index)))
     localCatalog(f.service)
     assert.equal(f.service.listRowsFor()[0].rankingAsOf, asOf)
@@ -1588,9 +1588,9 @@ test('live integration stays in memory and close drains accepted confirmation wh
     const candles = Array.from({ length: 300 }, (_, index) => ({ ...rawCandle(asOf - (301 - index) * fiveMinutes), statisticsVersion: 11, oi: 100, buy: 20, sell: 10 }))
     await f.service.persistCandles(instId, candles)
     await f.service.localChartWindow(instId, '5m')
-    const originalAppend = f.store.appendCandles.bind(f.store)
+    const originalAppend = f.store.appendCandlesWithReceipt.bind(f.store)
     let writes = 0
-    f.store.appendCandles = async (...args) => { writes += 1; return originalAppend(...args) }
+    f.store.appendCandlesWithReceipt = async (...args) => { writes += 1; return originalAppend(...args) }
     f.service.realtime.setSubscriptions([{ instId, timeframe: '5m' }])
     f.service.realtime.start(); socket.open()
     await f.service.realtime.whenIdle()
@@ -1607,7 +1607,7 @@ test('live integration stays in memory and close drains accepted confirmation wh
     assert.equal(f.service.preparedCharts.series.get(`${instId}:5m`).live.close, 106)
     let releaseWrite!: () => void
     let writeStarted = false
-    f.store.appendCandles = async (...args) => {
+    f.store.appendCandlesWithReceipt = async (...args) => {
       writeStarted = true
       await new Promise<void>(resolve => { releaseWrite = resolve })
       return originalAppend(...args)

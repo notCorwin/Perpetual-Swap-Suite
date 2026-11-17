@@ -58,8 +58,8 @@ test('resource background readiness waits for committed LOAD candles after an ex
   let fixture, ready
   try {
     fixture = await seedMarketResources(f.store, f.service, { count: 2, periods: 300 })
-    const append = f.store.appendCandles.bind(f.store)
-    f.store.appendCandles = async (rows, ...args) => {
+    const append = f.store.appendCandlesWithReceipt.bind(f.store)
+    f.store.appendCandlesWithReceipt = async (rows, ...args) => {
       if (rows.some(row => row.instrument === loadInstrument)) { attemptedLoadWrites++; await loadWrite.promise }
       return append(rows, ...args)
     }
@@ -108,8 +108,8 @@ test('resource background readiness times out rather than treating seeded rows a
   let fixture, ready
   try {
     fixture = await seedMarketResources(f.store, f.service, { count: 1, periods: 300 })
-    const append = f.store.appendCandles.bind(f.store)
-    f.store.appendCandles = async (rows, ...args) => {
+    const append = f.store.appendCandlesWithReceipt.bind(f.store)
+    f.store.appendCandlesWithReceipt = async (rows, ...args) => {
       if (rows.some(row => row.instrument === loadInstrument)) await loadWrite.promise
       return append(rows, ...args)
     }

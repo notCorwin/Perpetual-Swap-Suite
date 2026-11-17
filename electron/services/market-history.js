@@ -294,16 +294,24 @@ export class MarketHistory {
     } finally { signal?.removeEventListener('abort', abort) }
   }
 
-  async ensurePrices(instId, timeframe, from, through, priority = 'foreground', signal) {
+  async ensurePriceCoverage(instId, timeframe, from, through, priority = 'foreground', signal) {
     await abortable(this.ready, signal)
     await this.request(instId, timeframe, 'candles', from, through, priority, signal)
+  }
+
+  async ensurePrices(instId, timeframe, from, through, priority = 'foreground', signal) {
+    await this.ensurePriceCoverage(instId, timeframe, from, through, priority, signal)
     return { rows: await abortable(this.store.candles({ instrument: instId, timeframe, from, through }, priority), signal), floor: this.bounds(instId, timeframe).floor }
   }
 
-  async ensureStatistics(instId, timeframe, from, through, priority = 'foreground', signal, source) {
+  async ensureStatisticsCoverage(instId, timeframe, from, through, priority = 'foreground', signal, source) {
     await abortable(this.ready, signal)
     if (source !== undefined && !['oi', 'taker'].includes(source)) throw new TypeError('Unknown statistics source.')
     await Promise.all((source ? [source] : ['oi', 'taker']).map(selected => this.request(instId, timeframe, selected, from, through, priority, signal)))
+  }
+
+  async ensureStatistics(instId, timeframe, from, through, priority = 'foreground', signal, source) {
+    await this.ensureStatisticsCoverage(instId, timeframe, from, through, priority, signal, source)
     return { rows: await abortable(this.store.candles({ instrument: instId, timeframe, from, through }, priority), signal) }
   }
 

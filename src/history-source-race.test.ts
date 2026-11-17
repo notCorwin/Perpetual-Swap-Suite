@@ -69,9 +69,9 @@ test('a latest request from a removed listing cannot write confirmed candles or 
   }
 })
 
-for (const intervening of ['write', 'removal'] as const) test(`${intervening} during the pre-write read fences the old history response`, { timeout: 10_000 }, async () => {
+for (const intervening of ['write', 'removal'] as const) test(`${intervening} during mutation admission fences the old history response`, { timeout: 10_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'perp-history-write-fence-')), store = await MarketStore.open(root)
-  const sourceHeld = deferred(), requested = deferred(), readHeld = deferred(), reading = deferred()
+  const sourceHeld = deferred(), requested = deferred(), writeHeld = deferred(), writing = deferred()
   const timestamp = Math.floor(Date.now() / step) * step - 2 * step
   const service = new MarketService(store, () => DEFAULT_PREFERENCES, async input => {
     const url = new URL(String(input))
@@ -86,23 +86,22 @@ for (const intervening of ['write', 'removal'] as const) test(`${intervening} du
     service.installInstruments(new Map([[instId, instrument]]))
     pending = service.history.ensurePrices(instId, '5m', timestamp, timestamp)
     await requested.promise
-    const candles = store.candles.bind(store)
+    const candles = store.candles.bind(store), append = store.appendCandlesWithReceipt.bind(store)
     let holdNext = true
-    ;(store as any).candles = async (...args: Parameters<typeof store.candles>) => {
-      const result = await candles(...args)
-      if (holdNext && args[0].from === timestamp && args[0].through === timestamp) { holdNext = false; reading.resolve(); await readHeld.promise }
-      return result
+    store.appendCandlesWithReceipt = async (...args) => {
+      if (holdNext && args[0].some(row => row.timestamp === timestamp)) { holdNext = false; writing.resolve(); await writeHeld.promise }
+      return append(...args)
     }
-    sourceHeld.resolve(); await reading.promise
+    sourceHeld.resolve(); await writing.promise
     if (intervening === 'write') {
       await (store as any).writer.request('append', [[{ ...candle(timestamp, 200), writtenAt: 1 }]], 'foreground')
     } else service.installInstruments(new Map())
-    readHeld.resolve()
+    writeHeld.resolve()
     await pending?.catch(() => {})
     const rows = await candles({ instrument: instId, timeframe: '5m', from: timestamp, through: timestamp })
     assert.equal(rows[0]?.close, intervening === 'write' ? 200 : undefined)
   } finally {
-    sourceHeld.resolve(); readHeld.resolve(); await pending?.catch(() => {})
+    sourceHeld.resolve(); writeHeld.resolve(); await pending?.catch(() => {})
     await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true })
   }
 })

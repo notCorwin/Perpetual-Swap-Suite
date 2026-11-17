@@ -94,6 +94,7 @@ const streamingFixture = async (now: number) => {
   }
   f.service.history.ensurePrices = f.ensurePrices
   f.service.history.ensureStatistics = async () => ({ rows: [] })
+  f.service.history.ensureStatisticsCoverage = async () => undefined
   f.service.realtime.start(); socket.open()
   await f.service.realtime.whenIdle()
   assert.equal(f.service.realtime.isSubscribed(instId, '5m'), true)
@@ -108,8 +109,8 @@ test('the confirmed stream closes qualification and chart requests only after it
   const settle = (condition: () => boolean) => waitFor(condition, () => context.mock.timers.tick(0))
   let latest: Promise<unknown> | undefined
   try {
-    const append = f.store.appendCandles.bind(f.store)
-    f.store.appendCandles = async (...args) => { writing.resolve(); await held.promise; return append(...args) }
+    const append = f.store.appendCandlesWithReceipt.bind(f.store)
+    f.store.appendCandlesWithReceipt = async (...args) => { writing.resolve(); await held.promise; return append(...args) }
     context.mock.timers.tick(f.asOf + fiveMinutes - Date.now())
     await settle(() => f.service.candleWaits.size === 1)
     const controller = new AbortController()
@@ -166,9 +167,9 @@ for (const connection of ['connected', 'disconnected'] as const) test(`a failed 
   const f = await streamingFixture(now), held = deferred(), writing = deferred()
   const settle = (condition: () => boolean) => waitFor(condition, () => context.mock.timers.tick(0))
   try {
-    const append = f.store.appendCandles.bind(f.store)
+    const append = f.store.appendCandlesWithReceipt.bind(f.store)
     let writes = 0
-    f.store.appendCandles = async (...args) => {
+    f.store.appendCandlesWithReceipt = async (...args) => {
       if (++writes === 1) { writing.resolve(); await held.promise; throw new Error('Confirmed candle commit failed.') }
       return append(...args)
     }

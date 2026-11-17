@@ -273,12 +273,11 @@ test('reconnect admits every price series while charts retain ownership of stati
   try {
     f.service.listedUniverse = new Set(['BTC-USDT-SWAP', 'ETH-USDT-SWAP'])
     f.store.coverage = async () => ({ first: null, last: null, count: 0 })
-    f.service.history.ensurePrices = async (id: string) => {
+    f.service.history.ensurePriceCoverage = async (id: string) => {
       events.push(`prices:${id}`)
       if (id === 'BTC-USDT-SWAP') await gate.promise
-      return { rows: [] }
     }
-    f.service.history.ensureStatistics = async (id: string) => { events.push(`statistics:${id}`); return { rows: [] } }
+    f.service.history.ensureStatisticsCoverage = async (id: string) => { events.push(`statistics:${id}`) }
     recovery = f.service.reconcileRealtime([{ instId: 'BTC-USDT-SWAP', timeframe: '5m' }, { instId: 'ETH-USDT-SWAP', timeframe: '5m' }])
     await waitFor(() => events.includes('prices:ETH-USDT-SWAP'))
     gate.resolve(); await recovery
@@ -294,13 +293,12 @@ test('failed reconnect recovery drains an already accepted sibling before report
   try {
     f.service.listedUniverse = new Set(['BTC-USDT-SWAP', 'ETH-USDT-SWAP'])
     f.store.coverage = async () => ({ first: null, last: null, count: 0 })
-    f.service.history.ensurePrices = async (id: string) => {
+    f.service.history.ensurePriceCoverage = async (id: string) => {
       if (id === 'BTC-USDT-SWAP') throw new Error('The first recovery source failed.')
       siblingStarted = true; await gate.promise
       siblingWritten = true
-      return { rows: [] }
     }
-    f.service.history.ensureStatistics = async () => { throw new Error('Collector recovery cannot own statistics acquisition.') }
+    f.service.history.ensureStatisticsCoverage = async () => { throw new Error('Collector recovery cannot own statistics acquisition.') }
     const running: Promise<void> = f.service.reconcileRealtime([{ instId: 'BTC-USDT-SWAP', timeframe: '5m' }, { instId: 'ETH-USDT-SWAP', timeframe: '5m' }])
     recovery = running
     void running.then(() => { finished = true }, () => { finished = true })

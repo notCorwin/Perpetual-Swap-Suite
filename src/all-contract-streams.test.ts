@@ -63,7 +63,7 @@ test('a streamed ticker changes every published list price without waiting for h
     assert.equal(f.service.listRowsFor()[0]?.lastPrice, 100)
     let reads = 0
     f.store.candles = async () => { reads += 1; throw new Error('A ticker must not read history.') }
-    f.service.history.ensurePrices = async () => { reads += 1; throw new Error('A ticker must not repair history.') }
+    f.service.history.ensurePrices = f.service.history.ensurePriceCoverage = async () => { reads += 1; throw new Error('A ticker must not repair history.') }
     const before = requests, snapshot = await f.service.snapshot()
     let events = 0
     const unsubscribe = f.service.subscribeMarket(() => { events++ })
@@ -493,7 +493,7 @@ test('a confirmed candle requests its exact statistics slot while subsequent for
     await f.idle()
     assert.deepEqual([...f.service.publicRealtime.subscriptions].filter(([, value]) => value.channel === 'trades').map(([, value]) => value.instId), [focused.instId])
     let finished = false
-    f.service.history.ensureStatistics = async (...args: unknown[]) => { calls.push(args); await gate.promise; finished = true; return { rows: [] } }
+    f.service.history.ensureStatisticsCoverage = async (...args: unknown[]) => { calls.push(args); await gate.promise; finished = true }
     const now = Math.floor(Date.now() / fiveMinutes) * fiveMinutes, closed = now - fiveMinutes
     const raw = (time: number, price: number, volume: number, confirmed = false) => [String(time), '100', '105', '95', String(price), String(volume), String(volume / 100), String(volume), confirmed ? '1' : '0']
     for (const [index, value] of values.entries()) {

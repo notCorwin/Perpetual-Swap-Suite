@@ -34,6 +34,8 @@ export class MarketHistory {
   readonly ready: Promise<this>
   readonly sync: HistorySync
   readonly audit: DataAudit
+  ensurePriceCoverage(instId: string, timeframe: Timeframe, from: number, through: number, priority?: StorePriority, signal?: AbortSignal): Promise<void>
+  ensureStatisticsCoverage(instId: string, timeframe: Timeframe, from: number, through: number, priority?: StorePriority, signal?: AbortSignal, source?: 'oi' | 'taker'): Promise<void>
   ensurePrices(instId: string, timeframe: Timeframe, from: number, through: number, priority?: StorePriority, signal?: AbortSignal): Promise<{ rows: CandleRecord[]; floor?: number }>
   /** OI and Taker are acquired and persisted independently of price rows. Numeric observations remain reusable; direct empty observations revalidate only their expired native-period ranges. */
   ensureStatistics(instId: string, timeframe: Timeframe, from: number, through: number, priority?: StorePriority, signal?: AbortSignal, source?: 'oi' | 'taker'): Promise<{ rows: CandleRecord[] }>

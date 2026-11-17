@@ -61,6 +61,39 @@ test('native price coverage reuses durable rows and repairs only the missing slo
   assert.equal(calls.length, 1)
 })
 
+test('coverage acquisition persists and reuses prices and statistics without materializing candle rows', async t => {
+  const { history, store, calls } = await fixture(t)
+  const read = store.candles.bind(store)
+  let materializations = 0
+  store.candles = async (...args) => { materializations++; return read(...args) }
+  await history.ensurePriceCoverage(instId, '5m', base, base + step)
+  await history.ensureStatisticsCoverage(instId, '5m', base, base + step)
+  assert.equal(calls.length, 3)
+  await history.ensurePriceCoverage(instId, '5m', base, base + step)
+  await history.ensureStatisticsCoverage(instId, '5m', base, base + step)
+  assert.equal(calls.length, 3, 'Unchanged durable coverage must avoid repeated source acquisition.')
+  assert.equal(materializations, 0, 'Coverage-only callers must never construct joined candle rows.')
+  const prices = await history.ensurePrices(instId, '5m', base, base + step)
+  assert.equal(materializations, 1)
+  assert.equal(prices.rows.length, 2)
+  assert.equal(prices.rows[0].oi, 50)
+  const statistics = await history.ensureStatistics(instId, '5m', base, base + step)
+  assert.equal(materializations, 2)
+  assert.equal(statistics.rows[0].buy, 30)
+  assert.equal(calls.length, 3)
+})
+
+test('coverage-only acquisition preserves caller cancellation and source validation', async t => {
+  const { history, store, calls } = await fixture(t)
+  const controller = new AbortController(), reason = new Error('Coverage consumer retired.')
+  controller.abort(reason)
+  store.candles = async () => { throw new Error('Cancelled coverage must never materialize rows.') }
+  await assert.rejects(history.ensurePriceCoverage(instId, '5m', base, base, 'foreground', controller.signal), error => error === reason)
+  await assert.rejects(history.ensureStatisticsCoverage(instId, '5m', base, base, 'foreground', controller.signal), error => error === reason)
+  await assert.rejects(history.ensureStatisticsCoverage(instId, '5m', base, base, 'foreground', undefined, 'invalid' as 'oi'), /Unknown statistics source/)
+  assert.equal(calls.length, 0)
+})
+
 test('durable-only parent inspection still excludes live seeds and outstanding repair ranges', async t => {
   const { history, store } = await fixture(t)
   const interval = intervals['15m'], candles = [row(base, '15m'), row(base + interval, '15m'), row(base + 2 * interval, '15m')]

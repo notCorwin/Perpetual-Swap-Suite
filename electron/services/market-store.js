@@ -493,19 +493,37 @@ export class MarketStore {
       }
     })
   }
-  appendCandles(candles, priority = 'background', { canWrite } = {}) {
+  appendCandles(candles, priority = 'background', options = {}) {
+    return this.appendCandleBatch(candles, priority, options)
+  }
+  appendCandlesWithReceipt(candles, priority = 'background', options = {}) {
+    return this.appendCandleBatch(candles, priority, { ...options, receipt: true })
+  }
+  appendCandleBatch(candles, priority, { canWrite, receipt = false }) {
     return this.operation(async () => {
-      let result = 0
-      if (candles.length > 2_048) {
-        // Validate the entire logical batch before the first bounded transaction.
-        await this.writer.request('validateCandles', [candles], priority)
-        for (let offset = 0; offset < candles.length; offset += 2_048) {
-          const chunk = candles.slice(offset, offset + 2_048)
-          result += await this.writer.request('append', [chunk], priority, canWrite && (() => [chunk.filter(canWrite), { lifetime: canWrite.lifetime }]))
+      const result = receipt ? { submitted: 0, rows: [], previous: [] } : null
+      const rowsByKey = new Map()
+      const rowKey = row => `${row.instrument}:${row.timeframe}:${row.timestamp}`
+      let submitted = 0
+      if (candles.length > 2_048) await this.writer.request('validateCandles', [candles], priority)
+      for (let offset = 0; offset < Math.max(1, candles.length); offset += 2_048) {
+        const chunk = candles.length > 2_048 ? candles.slice(offset, offset + 2_048) : candles
+        const value = await this.writer.request('append', [chunk, { receipt }], priority,
+          canWrite && (() => [chunk.filter(canWrite), { receipt, lifetime: canWrite.lifetime }]))
+        if (receipt) {
+          result.submitted += value.submitted
+          const previous = new Map(value.previous.map(row => [rowKey(row), row]))
+          for (const row of value.rows) {
+            const key = rowKey(row)
+            if (!rowsByKey.has(key) && previous.has(key)) result.previous.push(previous.get(key))
+            rowsByKey.set(key, row)
+          }
         }
-      } else result = await this.writer.request('append', [candles], priority, canWrite && (() => [candles.filter(canWrite), { lifetime: canWrite.lifetime }]))
+        else submitted += value
+      }
       this.writeMetrics.rowsSubmitted += candles.length
-      return result
+      if (receipt) result.rows = [...rowsByKey.values()]
+      return result ?? submitted
     })
   }
   replaceCandles(query, candles, priority = 'background', { canWrite } = {}) {
@@ -520,6 +538,12 @@ export class MarketStore {
     })
   }
   aggregateCandles(query, priority = 'background') {
+    return this.aggregateCandleBatch(query, priority, false)
+  }
+  aggregateCandlesWithReceipt(query, priority = 'background') {
+    return this.aggregateCandleBatch(query, priority, true)
+  }
+  aggregateCandleBatch(query, priority, receipt) {
     return this.operation(() => {
       if (!query || typeof query !== 'object' || !Object.hasOwn(query, 'from') || !Object.hasOwn(query, 'through')) {
         throw new TypeError('Candle aggregation requires an explicit parent range.')
@@ -529,7 +553,7 @@ export class MarketStore {
         || query.invalidateIncomplete !== undefined && typeof query.invalidateIncomplete !== 'boolean') {
         throw new TypeError('Invalid candle aggregation range.')
       }
-      return this.writer.request('aggregateCandles', [{ ...range, invalidateIncomplete: query.invalidateIncomplete === true }], priority)
+      return this.writer.request('aggregateCandles', [{ ...range, invalidateIncomplete: query.invalidateIncomplete === true }, { receipt }], priority)
     })
   }
   appendStatistics(input, priority = 'background') {

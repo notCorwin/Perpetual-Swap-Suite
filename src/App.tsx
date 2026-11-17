@@ -8,7 +8,7 @@ import { MarketChart } from '@/MarketChart'
 import { MarketRowsViewport } from '@/MarketRowsViewport'
 import { WorkspaceViewport } from '@/WorkspaceViewport'
 import { settingsHref, useSettingsSection, type SettingsNavigationState } from '@/settings-navigation'
-import { chartControllers, multiChartControllers, ingestPreparedChart } from '@/chart-controller'
+import { chartCoordinator, multiChartControllers, ingestPreparedChart } from '@/chart-controller'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { reconcileMarketOrder, reconcileMarketRows } from '@/market-snapshot'
 import { SnapshotOrder } from '@/snapshot-order'
@@ -102,13 +102,13 @@ function App() {
     else if (!('unchanged' in snapshot)) setRealtime('Unavailable')
   }, [])
   useLayoutEffect(() => subscribePresentationTransition(update => {
-    if (!update.active) { retainSelection.current = true; chartControllers.forEach(controller => controller.setPresentationActive(false)); return }
+    if (!update.active) { retainSelection.current = true; chartCoordinator.setPresentationActive(false); return }
     if (update.snapshot) {
-      chartControllers.forEach(controller => controller.setPresentationActive(true, update.snapshot!.frames))
+      chartCoordinator.setPresentationActive(true, update.snapshot.frames)
       applyMarket(update.snapshot.market, true)
       committedPreferences.current = update.snapshot.preferences
       setPreferences(update.snapshot.preferences); setPreferencesError(''); setPreferencesLoaded(true)
-    } else chartControllers.forEach(controller => controller.setPresentationActive(true))
+    } else chartCoordinator.setPresentationActive(true)
   }), [applyMarket])
   useLayoutEffect(() => {
     if (!presentation.active) return
@@ -192,7 +192,7 @@ function App() {
   const marketStatus = marketProblem || (connectionProblem ? realtime : !rows.length && status !== 'Live' ? status : status === 'Cached' ? 'Cached' : '')
   const marketStatusDetail = [marketStatus, retainedChart ? 'Current chart remains available' : ''].filter(Boolean).join(' · ')
   const listOrder = candidateIds
-  useEffect(() => { if (ready) chartControllers.forEach(controller => controller.setUniverse(retainedChart && selectedID ? [...candidateIds, selectedID] : candidateIds, timeframe, undefined, controller === chartControllers[0])) }, [ready, candidateIds, timeframe, retainedChart, selectedID])
+  useEffect(() => { if (ready) void chartCoordinator.setUniverse(retainedChart && selectedID ? [...candidateIds, selectedID] : candidateIds, timeframe) }, [ready, candidateIds, timeframe, retainedChart, selectedID])
   const savePreferences = useCallback(async (values: Partial<Preferences>) => {
     const write = ++preferenceWrite.current
     const epoch = getPresentation().epoch

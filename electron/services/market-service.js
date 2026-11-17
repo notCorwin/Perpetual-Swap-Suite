@@ -259,7 +259,6 @@ function candle(instrument, timeframe, value) {
 
 const candleFields = ['instrument', 'timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'baseVolume', 'quoteVolume', 'confirmed']
 const priceRecord = row => Object.fromEntries(candleFields.map(field => [field, row[field] ?? null]))
-const sameCandle = (left, right) => candleFields.every(field => Object.is(left[field] ?? null, right[field] ?? null))
 
 /** Owns market observations and projections; HistorySync owns every historical source task. */
 export class MarketService {
@@ -833,7 +832,7 @@ export class MarketService {
     const key = `${instId}:${lookback}:${asOf}`
     if (this.rankingRepairs.has(key) || this.closing || this.disposed) return
     const through = asOf - FIVE_MINUTES, from = Math.max(0, through - lookback * 60_000)
-    const task = Promise.resolve().then(() => this.history.ensurePrices(instId, '5m', from, through, 'background'))
+    const task = Promise.resolve().then(() => this.history.ensurePriceCoverage(instId, '5m', from, through, 'background'))
       .then(() => {
         this.rankingReads.delete(instId)
         return this.updateRanking(instId, { asOf })
@@ -1200,21 +1199,11 @@ export class MarketService {
 
   async appendChangedCandlesLocked(candles, priority = 'background', canWrite) {
     if (!candles.length) return []
-    const instrument = candles[0].instrument, timeframe = candles[0].timeframe
-    const from = Math.min(...candles.map(value => value.timestamp)), through = Math.max(...candles.map(value => value.timestamp))
-    const existing = await this.store.candles({ instrument, timeframe, from, through }, priority)
-    const byTimestamp = new Map(existing.map(value => [value.timestamp, value]))
-    const changed = candles.filter(value => !sameCandle(byTimestamp.get(value.timestamp) ?? {}, value)).map(priceRecord)
-    if (changed.length) {
-      const originals = new Map(candles.map(row => [row.timestamp, row]))
-      const guard = canWrite && Object.assign(row => canWrite(originals.get(row.timestamp)), { lifetime: canWrite.lifetime })
-      await this.store.appendCandles(changed, priority, { canWrite: guard })
-      const timestamps = new Set(changed.map(row => row.timestamp))
-      const committed = (await this.store.candles({ instrument, timeframe, from, through }, priority)).filter(row => timestamps.has(row.timestamp))
-      this.preparedCharts.observe(committed, byTimestamp)
-      return committed
-    }
-    return changed
+    const originals = new Map(candles.map(row => [row.timestamp, row]))
+    const guard = canWrite && Object.assign(row => canWrite(originals.get(row.timestamp)), { lifetime: canWrite.lifetime })
+    const result = await this.store.appendCandlesWithReceipt(candles.map(priceRecord), priority, { canWrite: guard })
+    if (result.rows.length) this.preparedCharts.observe(result.rows, new Map(result.previous.map(row => [row.timestamp, row])))
+    return result.rows
   }
 
   async persistCandles(instrument, candles, { priority = 'foreground', canWrite } = {}) {
@@ -1255,10 +1244,8 @@ export class MarketService {
 
   async materializePricesLocked(range, priority) {
     if (this.disposed || range.timeframe === '5m') return { changed: 0, complete: 0, invalidated: 0 }
-    const previous = await this.store.candles(range, priority)
-    const result = await this.store.aggregateCandles(range, priority)
+    const { rows, previous, ...result } = await this.store.aggregateCandlesWithReceipt(range, priority)
     if (!result.changed) return result
-    const rows = await this.store.candles(range, priority)
     if (result.invalidated) this.preparedCharts.invalidate(range.instrument, range.timeframe)
     else this.preparedCharts.observe(rows, new Map(previous.map(row => [row.timestamp, row])))
     this.invalidateLiquidityHistory(range.instrument, result.invalidated ? null : rows, range.timeframe)
@@ -1322,7 +1309,7 @@ export class MarketService {
             }
             // OI remains an independently observed stock quantity.
             if (this.statisticsAcquisitionDemand(current.instrument, current.timeframe)) {
-              await this.history.ensureStatistics(current.instrument, current.timeframe, current.timestamp, current.timestamp, 'continuity', this.shutdownController.signal)
+              await this.history.ensureStatisticsCoverage(current.instrument, current.timeframe, current.timestamp, current.timestamp, 'continuity', this.shutdownController.signal)
             }
           } catch (error) {
             if (entry.version === version) throw error
@@ -2000,7 +1987,7 @@ export class MarketService {
       const step = timeframeMilliseconds(timeframe), through = closedBoundary(timeframe) - step
       const coverage = await this.store.coverage(instId, timeframe, 'background')
       const from = Math.max(0, coverage.last === null ? through - step : Math.min(through, coverage.last + step))
-      await this.history.ensurePrices(instId, timeframe, from, through, 'continuity', signal)
+      await this.history.ensurePriceCoverage(instId, timeframe, from, through, 'continuity', signal)
       // Prepared charts own bounded statistics demand for their visible ranges.
       // A collector reconnect must not download statistics for its whole gap.
     }))

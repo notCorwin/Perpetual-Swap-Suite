@@ -33,6 +33,7 @@ export type AggregateCandleQuery = {
 }
 /** `changed` counts price rows written or removed; `complete` counts valid 5m buckets found. */
 export type AggregateCandleResult = { changed: number; complete: number; invalidated: number }
+export type CandleMutationReceipt = { rows: CandleRecord[]; previous: CandleRecord[] }
 export type StatisticsRecord = {
   instrument: string; timeframe: string; timestamp: number; oi: number | null; buy: number | null; sell: number | null
   statisticsVersion: number; statisticsOIExpiresAt: number | null; statisticsTakerExpiresAt: number | null
@@ -77,6 +78,7 @@ export class MarketStore {
   workerThreadIds: { writer: number; readers: number[] }
   subscribe(listener: (change: { instrument: string; timeframe: string; from: number; through: number; priceFrom: number | null; priceThrough: number | null; revision: number; priceRevision: number }) => void): () => void
   appendCandles(candles: CandleRecord[], priority?: StorePriority, options?: { canWrite?: (row: CandleRecord) => boolean }): Promise<number>
+  appendCandlesWithReceipt(candles: CandleRecord[], priority?: StorePriority, options?: { canWrite?: (row: CandleRecord) => boolean }): Promise<CandleMutationReceipt & { submitted: number }>
   appendStatistics(page: StatisticsPage, priority?: StorePriority): Promise<number>
   statistics(query: CandleQuery & { source?: 'oi' | 'taker' }, priority?: StorePriority): Promise<StatisticsRecord[]>
   /** One snapshot of time-independent gaps and absence expiries. */
@@ -86,6 +88,7 @@ export class MarketStore {
   replaceCandles(query: CandleQuery & CandleRange, candles: CandleRecord[], priority?: StorePriority, options?: { canWrite?: (row: CandleRecord) => boolean }): Promise<number>
   /** Fill missing prices from complete 5m buckets; preserve native parent prices and independent statistics. */
   aggregateCandles(query: AggregateCandleQuery, priority?: StorePriority): Promise<AggregateCandleResult>
+  aggregateCandlesWithReceipt(query: AggregateCandleQuery, priority?: StorePriority): Promise<AggregateCandleResult & CandleMutationReceipt>
   inspectCandles(query: CandleQuery & CandleRange, priority?: StorePriority): Promise<CandleInspection>
   getWriteMetrics(): { partitions: number; rowsSubmitted: number; bytesRead: number; bytesWritten: number; durationMS: number }
   getDiagnostics(): { workerThreadIds: { writer: number; readers: number[] }; reads: Record<string, number>; writes: Record<string, number>; candleCache: { entries: number; estimatedBytes: number; pending: number; pendingKeyBytes: number } }

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { ChartController, type ChartTarget, type ChartTransport } from './chart-controller.ts'
+import { ChartController, ChartCoordinator, type ChartTarget, type ChartTransport } from './chart-controller.ts'
 import { PreparedChartStore } from './chart-series-store.ts'
 import { createChartPlotCache } from './chart-render.ts'
 import { attachOperationSink, type OperationEvent } from '../electron/services/operations.js'
@@ -36,6 +36,81 @@ const retryAt = 1_800_000_000_000
 const emptyFailure = (overrides: Partial<PreparedChartResponse> = {}) => prepared(btc, 199, {
   endHour: null, latestEnd: null, bars: [], generation: 3, revision: 10, priceState: 'error',
   priceStatus: { state: 'error', from: 104 * hour, through: 199 * hour, error: 'Cold price source offline', retryAt }, ...overrides,
+})
+
+test('shared chart resume admits each frame once before any slot publishes', async context => {
+  const store = new PreparedChartStore()
+  const controllers: [ChartController, ...ChartController[]] = Array.from({ length: 4 }, () => new ChartController(transport(), store)) as [ChartController, ...ChartController[]]
+  const coordinator = new ChartCoordinator(controllers)
+  await coordinator.setUniverse([btc], '15m')
+  const periods: RadarTimeframe[] = ['1H', '15m', '5m']
+  const closes = periods.map((period, index) => controllers[index + 1].open(btc, period))
+  await settled()
+  coordinator.setPresentationActive(false)
+  let changes = 0
+  const stops = controllers.map(controller => controller.subscribe(() => {
+    changes++
+    for (const period of periods) assert.equal(store.snapshotMeta(btc, period)?.revision, 2, 'Every period is admitted before consumers resume.')
+  }))
+  const ingest = store.ingestLatest.bind(store)
+  const admission = context.mock.method(store, 'ingestLatest', (frame: PreparedChartResponse) => {
+    assert.equal(changes, 0, 'Paused consumers never publish a partially restored barrier.')
+    return ingest(frame)
+  })
+  try {
+    coordinator.setPresentationActive(true, periods.map(period => ({ ...nativePrepared(btc, 1199, period), revision: 2 })))
+    assert.equal(admission.mock.callCount(), 3)
+    assert.equal(changes, 3)
+    for (let index = 0; index < periods.length; index++) assert.equal(controllers[index + 1].getSnapshot().presented?.timeframe, periods[index])
+  } finally { stops.forEach(stop => stop()); closes.forEach(close => close()) }
+  await settled()
+})
+
+test('shared universe has one owner and resume facts survive mounting and other slot focus changes', async context => {
+  const store = new PreparedChartStore()
+  let reads = 0
+  const controllers: [ChartController, ...ChartController[]] = [
+    new ChartController(transport({ universe: async () => { reads++; return { frames: [] } } }), store),
+    new ChartController(transport(), store),
+  ]
+  const coordinator = new ChartCoordinator(controllers)
+  const membership = context.mock.method(store, 'setUniverse')
+  await coordinator.setUniverse([btc], '15m')
+  assert.equal(membership.mock.callCount(), 1)
+  assert.equal(reads, 1)
+  coordinator.setPresentationActive(true, [prepared(btc, 1199)])
+  const closeBTC = controllers[0].open(btc, '1H')
+  assert.equal(controllers[0].getSnapshot().presented?.endHour, 1199 * hour)
+  // One slot can retain a contract after the list and another slot move away.
+  await coordinator.setUniverse([eth], '15m')
+  const closeETH = controllers[1].open(eth, '15m')
+  try {
+    assert.equal(store.window(btc, '1H')?.endHour, 1199 * hour)
+    coordinator.ingestPrepared(prepared(btc, 1200, { revision: 2 }))
+    assert.equal(controllers[0].getSnapshot().presented?.endHour, 1200 * hour)
+  } finally { closeBTC(); closeETH() }
+  await settled()
+})
+
+test('shared admission preserves every slot source failure and stale-reply fences', async () => {
+  const store = new PreparedChartStore()
+  const replies = [deferred<PreparedChartResponse | null>(), deferred<PreparedChartResponse | null>()]
+  const controllers: [ChartController, ...ChartController[]] = [
+    new ChartController(transport({ local: () => replies[0].promise }), store),
+    new ChartController(transport({ local: () => replies[1].promise }), store),
+  ]
+  const coordinator = new ChartCoordinator(controllers)
+  await coordinator.setUniverse([btc], '1H')
+  const closes = controllers.map(controller => controller.open(btc, '1H'))
+  coordinator.setPresentationActive(false)
+  coordinator.setPresentationActive(true, [emptyFailure()])
+  for (const controller of controllers) assert.match(controller.getSnapshot().error, /Cold price source offline/)
+  for (const reply of replies) reply.resolve(prepared(btc, 199, { generation: 2, revision: 999 }))
+  await settled()
+  for (const controller of controllers) assert.match(controller.getSnapshot().error, /Cold price source offline/)
+  coordinator.ingestPrepared(prepared(btc, 199, { generation: 3, revision: 11, priceState: 'ready' }))
+  for (const controller of controllers) assert.equal(controller.getSnapshot().error, '')
+  closes.forEach(close => close())
 })
 
 test('universe hydration reads all resident periods once per membership regardless of selected timeframe or order', async () => {

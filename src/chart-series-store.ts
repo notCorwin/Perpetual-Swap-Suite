@@ -262,6 +262,7 @@ export class PreparedChartStore {
   private renderedUniverse = new Set<string>()
   private focusKey: string | null = null
   private readonly pinned = new Map<string, number>()
+  private ownsLatest(key: string) { return this.universe.has(key) || this.pinned.has(key) }
   private readonly byteSizes = new WeakMap<object, number>()
   private seriesBytes = 0
   private latestBytes = 0
@@ -380,7 +381,7 @@ export class PreparedChartStore {
   oldestHour(instId: string, timeframe: RadarTimeframe) { return this.snapshotMeta(instId, timeframe)?.oldestHour ?? null }
   snapshotMeta(instId: string, timeframe: RadarTimeframe): PreparedChartMeta | null {
     const key = keyFor(instId, timeframe), series = this.access(key), latest = this.latestFrame(key)
-    if (!latest) return series ? this.universe.has(key) ? { ...series.meta, latestEnd: null } : series.meta : null
+    if (!latest) return series ? this.ownsLatest(key) ? { ...series.meta, latestEnd: null } : series.meta : null
     return series ? { ...series.meta, latestEnd: latest.window.endHour } : latest.meta
   }
 
@@ -394,7 +395,10 @@ export class PreparedChartStore {
       const count = this.pinned.get(key)! - 1
       if (count) this.pinned.set(key, count)
       else this.pinned.delete(key)
-      this.mutate(() => this.trimBytes())
+      this.mutate(() => {
+        if (!this.ownsLatest(key)) this.setLatestFrame(key, null)
+        this.trimBytes()
+      })
     }
   }
 
@@ -404,14 +408,14 @@ export class PreparedChartStore {
       if (focusInstId) this.focusKey = keyFor(focusInstId, _timeframe)
       this.renderedUniverse = new Set(instIds.map(instId => keyFor(instId, _timeframe)))
       this.universe = new Set([...instIds, ...(focusInstId ? [focusInstId] : [])].flatMap(instId => RADAR_TIMEFRAMES.map(({ value }) => keyFor(instId, value))))
-      for (const key of this.latestFrames.keys()) if (!this.universe.has(key)) this.setLatestFrame(key, null)
-      for (const key of this.viewportBars.keys()) if (!this.universe.has(key) && !this.pinned.has(key)) {
+      for (const key of this.latestFrames.keys()) if (!this.ownsLatest(key)) this.setLatestFrame(key, null)
+      for (const key of this.viewportBars.keys()) if (!this.ownsLatest(key)) {
         this.viewportBars.delete(key)
         const entry = this.series.get(key)
         if (entry) { entry.windows.clear(); entry.boundaries = null }
       }
       for (const [key, entry] of this.series) {
-        if (!this.universe.has(key) || this.latestFrame(key) || entry.meta.latestEnd === null) continue
+        if (!this.ownsLatest(key) || this.latestFrame(key) || entry.meta.latestEnd === null) continue
         const window = this.seriesWindow(entry, entry.meta.latestEnd)
         if (window) this.setLatestFrame(key, { meta: entry.meta, window })
       }
@@ -437,7 +441,7 @@ export class PreparedChartStore {
   ingestLive(update: PreparedChartLiveUpdate): boolean {
     return this.mutate(() => {
       const key = keyFor(update.instId, update.timeframe), previous = this.latestFrames.get(key)
-      if (!this.universe.has(key) || !previous || update.generation !== this.generations.get(key) || update.generation !== previous.meta.generation
+      if (!this.ownsLatest(key) || !previous || update.generation !== this.generations.get(key) || update.generation !== previous.meta.generation
         || !Number.isSafeInteger(update.revision) || update.revision < previous.meta.revision || update.endHour !== previous.window.endHour) return false
       const incoming = update.liveBar
       if (incoming !== null && (!validLiveBar(incoming, previous.meta.intervalMS) || incoming.hour <= update.endHour)) return false
@@ -465,7 +469,7 @@ export class PreparedChartStore {
       }
       const { instId, timeframe, intervalMS, generation, revision, endHour } = response
       const key = keyFor(instId, timeframe)
-      if (!this.universe.has(key) || !finite(endHour) || endHour !== response.latestEnd || !instId
+      if (!this.ownsLatest(key) || !finite(endHour) || endHour !== response.latestEnd || !instId
         || !['5m', '15m', '1H'].includes(timeframe) || intervalMS !== timeframeMilliseconds(timeframe)
         || !Number.isSafeInteger(revision) || revision < 0 || !Number.isSafeInteger(generation) || generation < 0
         || !this.acceptGeneration(key, generation)) return false
@@ -604,7 +608,7 @@ export class PreparedChartStore {
         changed = true
       }
       current.meta = retainedSourceMeta(current.meta, current.hours.filter(hour => current.bars.get(hour)?.generation === generation), current.liveBar ? current.meta.latestEnd ?? undefined : undefined, Math.max(288, this.count(key)))
-      if (this.universe.has(key)) {
+      if (this.ownsLatest(key)) {
         const previous = this.latestFrame(key)
         // A historical batch can carry a new indicator generation and a fully
         // rebuilt latest window together. Repin that window in the same ingest.
@@ -655,7 +659,7 @@ export class PreparedChartStore {
   window(instId: string, timeframe: RadarTimeframe, end?: number | null): ReadyChartWindow | null {
     const key = keyFor(instId, timeframe), entry = this.access(key), latest = this.latestFrame(key)
     if (latest && (latest.window.windowBars ?? WINDOW_BARS) === this.count(key) && (end === null || end === undefined || end === latest.window.endHour)) return latest.window
-    if ((end === null || end === undefined) && this.universe.has(key) && !entry) return null
+    if ((end === null || end === undefined) && this.ownsLatest(key) && !entry) return null
     const endHour = end ?? entry?.meta.latestEnd
     if (!entry || entry.meta.generation !== this.generations.get(key) || endHour === null || endHour === undefined || !Number.isSafeInteger(endHour)) return null
     return this.seriesWindow(entry, endHour)

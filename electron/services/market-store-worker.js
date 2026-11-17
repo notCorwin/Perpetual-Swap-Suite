@@ -166,11 +166,12 @@ function writeStatistic(series, source, timestamp, first, second, expiresAt, cha
   return true
 }
 
-function append(rows, { replacement, lifetime } = {}) {
+function append(rows, { replacement, lifetime, receipt = false } = {}) {
   if (!Array.isArray(rows)) throw new TypeError('Candles must be an array.')
   rows.forEach(validateCandle)
   const changes = new Map(), seriesCache = new Map(), bounds = new Set(), additions = new Map()
   const unique = new Map(rows.map(row => [`${row.instrument}:${row.timeframe}:${row.timestamp}`, row]))
+  const committed = [], previousRows = [], receiptChanges = new Map(), receiptPrevious = new Map()
   const currentLifetime = () => {
     if (lifetime && Atomics.load(new Int32Array(lifetime.buffer), 0) !== lifetime.epoch) throw Object.assign(new Error('The instrument lifetime was removed before the price commit.'), { name: 'AbortError' })
   }
@@ -184,12 +185,18 @@ function append(rows, { replacement, lifetime } = {}) {
       run('DELETE FROM candles WHERE series_id=? AND timestamp>=? AND timestamp<?', series.id, replacement.from, replacement.through + CANDLE_INTERVALS[replacement.timeframe])
       mutate(changes, series, replacement.from, true); changes.get(series.id).through = replacement.through; changes.get(series.id).priceThrough = replacement.through; bounds.add(series.id)
     }
+    if (receipt) for (const [key, batch] of Map.groupBy(unique.values(), row => `${row.instrument}:${row.timeframe}`)) {
+      const series = ensureSeries(batch[0])
+      seriesCache.set(key, series)
+      for (const previous of receiptCandles(series, batch.map(row => row.timestamp), true)) receiptPrevious.set(`${series.id}:${previous.timestamp}`, previous)
+    }
     for (const row of unique.values()) {
       const key = `${row.instrument}:${row.timeframe}`
       let series = seriesCache.get(key)
       if (!series) { series = ensureSeries(row); seriesCache.set(key, series) }
-      const previous = get('SELECT * FROM candles WHERE series_id=? AND timestamp=?', series.id, row.timestamp)
-      const oldPrice = toPrice(previous), changed = !oldPrice || priceFields.some(field => !Object.is(oldPrice[field], row[field] ?? null))
+      const previous = receipt ? receiptPrevious.get(`${series.id}:${row.timestamp}`)
+        : get('SELECT * FROM candles WHERE series_id=? AND timestamp=?', series.id, row.timestamp)
+      const oldPrice = receipt ? previous : toPrice(previous), changed = !oldPrice || priceFields.some(field => !Object.is(oldPrice[field], row[field] ?? null))
       if (changed) {
         run(`INSERT INTO candles(series_id,timestamp,open,high,low,close,volume,base_volume,quote_volume,written_at,origin)
           VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(series_id,timestamp) DO UPDATE SET open=excluded.open,high=excluded.high,low=excluded.low,
@@ -216,18 +223,25 @@ function append(rows, { replacement, lifetime } = {}) {
         writeStatistic(series, 2, row.timestamp, volumes?.sell ?? null, volumes?.buy ?? null, row.statisticsTakerExpiresAt ?? null, changes,
           { observedAt: row.statisticsTakerObservedAt ?? (row.writtenAt ?? (volumes ? Date.now() : 0)) })
       }
+      if (receipt && changed) {
+        if (previous) previousRows.push(withoutOrigin(previous))
+        let group = receiptChanges.get(series.id)
+        if (!group) { group = { series, timestamps: [] }; receiptChanges.set(series.id, group) }
+        group.timestamps.push(row.timestamp)
+      }
     }
+    for (const { series, timestamps } of receiptChanges.values()) committed.push(...receiptCandles(series, timestamps))
     for (const [id, added] of additions) if (!bounds.has(id)) {
       run('UPDATE series SET candle_count=candle_count+?, first_ts=MIN(COALESCE(first_ts,?),?), last_ts=MAX(COALESCE(last_ts,?),?) WHERE id=?',
         added.count, added.first, added.first, added.last, added.last, id)
     }
     for (const id of bounds) refreshBounds(id)
-    return { result: unique.size, mutations: finishMutations(changes) }
+    return { result: receipt ? { submitted: unique.size, rows: committed, previous: previousRows } : unique.size, mutations: finishMutations(changes) }
   }, currentLifetime)
   } finally { if (fence) { Atomics.store(fence, 1, 0); Atomics.notify(fence, 1) } }
 }
 
-function aggregateCandles(input) {
+function aggregateCandles(input, { receipt = false } = {}) {
   if (!input || typeof input !== 'object' || !Object.hasOwn(input, 'from') || !Object.hasOwn(input, 'through')) {
     throw new TypeError('Candle aggregation requires an explicit parent range.')
   }
@@ -265,11 +279,13 @@ function aggregateCandles(input) {
     let series = identity(query)
     if (!series && aggregates.size) series = ensureSeries(query)
     const existing = series
-      ? new Map(all(`SELECT timestamp,open,high,low,close,volume,base_volume,quote_volume,origin
+      ? new Map(all(receipt ? `SELECT ${mergedProjection},c.origin FROM candles c ${mergedJoins}
+        WHERE c.series_id=? AND c.timestamp>=? AND c.timestamp<=?` : `SELECT timestamp,open,high,low,close,volume,base_volume,quote_volume,origin
         FROM candles WHERE series_id=? AND timestamp>=? AND timestamp<=?`, series.id, query.from, query.through)
-        .map(row => [row.timestamp, row]))
+        .map(row => [row.timestamp, receipt ? { instrument: query.instrument, timeframe: query.timeframe, ...row, confirmed: true } : row]))
       : new Map()
     const changes = new Map()
+    const committed = [], previousRows = [], changedTimestamps = []
     let changed = 0, invalidated = 0, added = 0, firstAdded = null, lastAdded = null
     let deletedFirst = false, deletedLast = false
 
@@ -279,7 +295,7 @@ function aggregateCandles(input) {
         // Default gap fills keep native history. Explicit invalidation on a
         // changed-child range allows a complete canonical aggregate to replace it.
         if (previous && previous.origin !== DERIVED_CANDLE_ORIGIN && !invalidateIncomplete) continue
-        const oldPrice = toPrice(previous)
+        const oldPrice = receipt ? previous : toPrice(previous)
         const priceChanged = !oldPrice || priceFields.some(field => !Object.is(oldPrice[field], aggregate[field] ?? null))
         if (!priceChanged) continue
         run(`INSERT INTO candles(series_id,timestamp,open,high,low,close,volume,base_volume,quote_volume,written_at,origin)
@@ -295,6 +311,10 @@ function aggregateCandles(input) {
         }
         mutate(changes, series, timestamp, true)
         changed += 1
+        if (receipt) {
+          if (previous) previousRows.push(withoutOrigin(previous))
+          changedTimestamps.push(timestamp)
+        }
       } else if (invalidateIncomplete && previous?.origin === DERIVED_CANDLE_ORIGIN) {
         run('DELETE FROM candles WHERE series_id=? AND timestamp=?', series.id, timestamp)
         deletedFirst ||= timestamp === series.first_ts
@@ -302,6 +322,7 @@ function aggregateCandles(input) {
         mutate(changes, series, timestamp, true)
         changed += 1
         invalidated += 1
+        if (receipt) previousRows.push(withoutOrigin(previous))
       }
     }
     if (added || invalidated) {
@@ -313,7 +334,8 @@ function aggregateCandles(input) {
         : lastAdded === null ? series.last_ts : Math.max(series.last_ts ?? lastAdded, lastAdded)
       run('UPDATE series SET candle_count=candle_count+?, first_ts=?, last_ts=? WHERE id=?', added - invalidated, first, last, series.id)
     }
-    return { result: { changed, complete: aggregates.size, invalidated }, mutations: finishMutations(changes) }
+    if (changedTimestamps.length) committed.push(...receiptCandles(series, changedTimestamps))
+    return { result: { changed, complete: aggregates.size, invalidated, ...(receipt ? { rows: committed, previous: previousRows } : {}) }, mutations: finishMutations(changes) }
   })
 }
 
@@ -375,6 +397,13 @@ const mergedProjection = `c.timestamp,c.open,c.high,c.low,c.close,c.volume,c.bas
   CASE WHEN ${takerStale} THEN 0 ELSE COALESCE(t.absence_attempts,0) END AS statisticsTakerAbsenceAttempts,
   8+CASE WHEN o.timestamp IS NULL THEN 0 ELSE 1 END+CASE WHEN t.timestamp IS NULL OR ${takerStale} THEN 0 ELSE 2 END AS statisticsVersion`
 const mergedJoins = 'LEFT JOIN statistics o ON o.series_id=c.series_id AND o.source=1 AND o.timestamp=c.timestamp LEFT JOIN statistics t ON t.series_id=c.series_id AND t.source=2 AND t.timestamp=c.timestamp'
+// Mutation receipts share one canonical projection per series and phase. The
+// timestamp set keeps disjoint writes bounded without scanning intervening history;
+// json_each keeps the prepared statement reusable for every batch size.
+const withoutOrigin = ({ origin: _origin, ...row }) => row
+const receiptCandles = (series, timestamps, origin = false) => all(`SELECT ${mergedProjection}${origin ? ',c.origin' : ''}
+  FROM candles c ${mergedJoins} WHERE c.series_id=? AND c.timestamp IN (SELECT value FROM json_each(?)) ORDER BY c.timestamp`,
+series.id, JSON.stringify(timestamps)).map(row => ({ instrument: series.instrument, timeframe: series.timeframe, ...row, confirmed: true }))
 const candleRows = query => {
   const valid = validateQuery(query), series = identity(valid)
   if (!series) return []

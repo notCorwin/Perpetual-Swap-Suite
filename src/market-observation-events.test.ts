@@ -46,7 +46,7 @@ test('canonical snapshot and prepared frame reads never admit source or calculat
     }
     service.preparedCharts.setUniverse = () => { throw new Error('A read changed the preparation universe.') }
     service.preparedCharts.residentFrames = () => ({ frames: [] })
-    service.history.ensurePrices = service.history.ensureStatistics = () => { throw new Error('A read admitted historical work.') }
+    service.history.ensurePrices = service.history.ensureStatistics = service.history.ensurePriceCoverage = service.history.ensureStatisticsCoverage = () => { throw new Error('A read admitted historical work.') }
     service.store.candles = () => { throw new Error('A read scanned SQLite history.') }
     service.lastRefreshAt = 0
     const first = await service.snapshot()

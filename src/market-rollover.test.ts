@@ -99,6 +99,7 @@ const fixture = async (context: TestContext, { hourly = false, connected = true,
     assert.deepEqual((await service.snapshot()).rows.map(row => row.instId).sort(), [...ids].sort())
     service.history.ensurePrices = ensurePrices
     service.history.ensureStatistics = async () => ({ rows: [] })
+    service.history.ensureStatisticsCoverage = async () => undefined
     const priceRequests: string[] = []
     const get = service.get.bind(service)
     service.get = async (path: string, ...args: unknown[]) => {
@@ -270,8 +271,8 @@ test('a newly committed final that fails the volume threshold removes only its i
 test('an accepted final does not expose the next historical window before its local write commits', async context => {
   const f = await fixture(context), held = deferred(), writing = deferred()
   try {
-    const original = f.historical(ids[0]), append = f.store.appendCandles.bind(f.store)
-    f.store.appendCandles = async (...args) => {
+    const original = f.historical(ids[0]), append = f.store.appendCandlesWithReceipt.bind(f.store)
+    f.store.appendCandlesWithReceipt = async (...args) => {
       if (args[0].some(row => row.instrument === ids[0])) { writing.resolve(); await held.promise }
       return append(...args)
     }
@@ -587,8 +588,8 @@ test('a current-window read racing a new durable close cannot invalidate the una
 test('live-source recovery during an hourly rollover waits for a complete new historical tuple before readmission', async context => {
   const f = await fixture(context, { hourly: true })
   const writing = deferred(), held = deferred()
-  const aggregate = f.store.aggregateCandles.bind(f.store)
-  f.store.aggregateCandles = async (range, priority) => {
+  const aggregate = f.store.aggregateCandlesWithReceipt.bind(f.store)
+  f.store.aggregateCandlesWithReceipt = async (range, priority) => {
     if (range.instrument === ids[0] && range.timeframe === '1H') { writing.resolve(); await held.promise }
     return aggregate(range, priority)
   }
@@ -616,8 +617,8 @@ test('live-source recovery during an hourly rollover waits for a complete new hi
 for (const blocked of ['15m', '1H']) test(`an hourly rollover keeps the complete assessment while its ${blocked} derivation is committing`, async context => {
   const f = await fixture(context, { hourly: true })
   const writing = deferred(), held = deferred()
-  const aggregate = f.store.aggregateCandles.bind(f.store)
-  f.store.aggregateCandles = async (range, priority) => {
+  const aggregate = f.store.aggregateCandlesWithReceipt.bind(f.store)
+  f.store.aggregateCandlesWithReceipt = async (range, priority) => {
     if (range.instrument === ids[0] && range.timeframe === blocked) { writing.resolve(); await held.promise }
     return aggregate(range, priority)
   }

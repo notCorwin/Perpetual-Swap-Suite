@@ -876,6 +876,22 @@ test('window memo LRU remains bounded without changing complete cached values', 
   assert.ok(revisited.bars.every(value => value.confirmed && value.statisticsObserved && value.indicatorsObserved))
 })
 
+test('pins retain excluded latest frames only until their final owner releases them', () => {
+  const store = new PreparedChartStore()
+  const frame = response(bars(104, 96))
+  store.setUniverse([frame.instId], '1H')
+  store.ingestLatest(frame)
+  const release = store.pin(frame.instId, '1H'), releaseSecond = store.pin(frame.instId, '1H')
+  store.setUniverse([], '1H')
+  assert.equal(store.latestSize, 1)
+  assert.equal(store.ingestLatest({ ...frame, revision: 2 }), true, 'Pinned slots continue receiving prices after list exclusion.')
+  release()
+  assert.equal(store.latestSize, 1)
+  releaseSecond()
+  assert.equal(store.latestSize, 0)
+  assert.equal(store.ingestLatest({ ...frame, revision: 3 }), false, 'Releasing a pin does not create permanent universe membership.')
+})
+
 test('the complete navigation universe retains compact latest frames independently of history pressure', () => {
   const store = new PreparedChartStore({ maxSeries: 2 })
   const ids = Array.from({ length: 20 }, (_, index) => `NAV${index}-USDT-SWAP`)

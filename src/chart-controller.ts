@@ -81,9 +81,9 @@ export class ChartController {
   }
 
   setUniverse(instIds: readonly string[], timeframe: RadarTimeframe, focusInstId?: string, hydrate = true) {
-    const ids = [...new Set(instIds.filter(Boolean))]
+    this.setNavigationUniverse(instIds)
+    const ids = this.universeIds
     const key = JSON.stringify(ids.toSorted())
-    this.universeIds = ids
     const focus = focusInstId ?? (this.view.requested?.timeframe === timeframe ? this.view.requested.instId : undefined)
     this.store.setUniverse(ids, timeframe, focus)
     if (!this.presentationActive || !hydrate) return this.universeTask
@@ -100,6 +100,10 @@ export class ChartController {
       if (this.active && this.presentationActive) { this.commit(); void this.pump() }
     }).catch(() => { if (request === this.universeRequest) this.universeKey = '' })
     return this.universeTask
+  }
+
+  setNavigationUniverse(instIds: readonly string[]) {
+    this.universeIds = [...new Set(instIds.filter(Boolean))]
   }
 
   ingestPrepared(response: PreparedChartNotification) {
@@ -393,6 +397,37 @@ export class ChartController {
 
 }
 
+/** Shared facts enter once; each controller retains its own navigation and source lifecycle. */
+export class ChartCoordinator {
+  readonly controllers: readonly [ChartController, ...ChartController[]]
+  constructor(controllers: readonly [ChartController, ...ChartController[]]) {
+    if (controllers.some(controller => controller.store !== controllers[0].store)) throw new Error('Chart controllers must share one chart store.')
+    this.controllers = controllers
+  }
+
+  ingestPrepared(response: PreparedChartNotification) {
+    this.controllers[0].ingestPrepared(response)
+    for (const controller of this.controllers.slice(1)) controller.observeSharedPrepared(response)
+  }
+
+  setUniverse(instIds: readonly string[], timeframe: RadarTimeframe) {
+    for (const controller of this.controllers.slice(1)) controller.setNavigationUniverse(instIds)
+    return this.controllers[0].setUniverse(instIds, timeframe)
+  }
+
+  setPresentationActive(active: boolean, frames: readonly PreparedChartResponse[] = []) {
+    // All consumers stay paused throughout the barrier, including those which
+    // were active before a snapshot arrived. Store notifications cannot expose
+    // a partially admitted collection or start obsolete durable reads.
+    if (!active || frames.length) {
+      for (const controller of this.controllers) controller.setPresentationActive(false)
+    }
+    if (!active) return
+    for (const frame of frames) this.ingestPrepared(frame)
+    for (const controller of this.controllers) controller.setPresentationActive(true)
+  }
+}
+
 const sharedChartStore = new PreparedChartStore()
 let universeRead: Promise<{ frames: PreparedChartResponse[] }> | null = null
 const readUniverse = () => universeRead ??= window.radarDesktop.request({ chartUniverse: {} }).finally(() => { universeRead = null })
@@ -405,9 +440,9 @@ const desktopController = (slot: 'primary' | RadarTimeframe) => new ChartControl
 
 export const chartController = desktopController('primary')
 export const multiChartControllers = { '1H': desktopController('1H'), '15m': desktopController('15m'), '5m': desktopController('5m') }
-export const chartControllers = [chartController, ...Object.values(multiChartControllers)]
+export const chartControllers: [ChartController, ...ChartController[]] = [chartController, ...Object.values(multiChartControllers)]
+export const chartCoordinator = new ChartCoordinator(chartControllers)
 
 export function ingestPreparedChart(response: PreparedChartNotification) {
-  chartController.ingestPrepared(response)
-  for (const controller of Object.values(multiChartControllers)) controller.observeSharedPrepared(response)
+  chartCoordinator.ingestPrepared(response)
 }
