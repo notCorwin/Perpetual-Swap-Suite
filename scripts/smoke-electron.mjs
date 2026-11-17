@@ -9,6 +9,7 @@ import { once } from 'node:events'
 import { inspectApp } from './electron-delivery.mjs'
 import { backgroundTestEnvironment, prepareBackgroundApp } from './electron-test-runtime.mjs'
 import { assertIndicatorLegends, openChart } from './chart-acceptance.mjs'
+import { runNativeMarketAcceptance } from '../tests/support/native-market-suite.mjs'
 
 async function deadline(work, label, milliseconds = 60_000) {
   let timer
@@ -25,7 +26,11 @@ export async function smokeElectron({ app, revision, report: reportPath, operati
   const artifact = await inspectApp(app, revision)
   const prepared = await prepareBackgroundApp({ sourceApp: artifact.app, executableName: 'Perpetual Swap Suite' })
   const userData = await mkdtemp(join(tmpdir(), 'perpetual-swap-package-smoke-'))
-  const report = { app: artifact.app, revision, dirty: artifact.metadata.dirty, operationRecording, checks: [], startedAt: new Date().toISOString(),
+  const nativeUserData = await mkdtemp(join(tmpdir(), 'perpetual-swap-native-smoke-'))
+  const operationDirectory = operationRecording
+    ? process.env.PERPETUAL_SWAP_OPERATION_DIR ?? (reportPath ? join(dirname(resolve(reportPath)), 'smoke-operations') : await mkdtemp(join(tmpdir(), 'perpetual-swap-smoke-operations-')))
+    : undefined
+  const report = { operationDirectory, app: artifact.app, revision, dirty: artifact.metadata.dirty, operationRecording, checks: [], startedAt: new Date().toISOString(),
     verification: { kind: 'background-replica', sourceApp: artifact.app, sourceExecutable: artifact.executable,
       sourceFingerprint: prepared.sourceFingerprint, testedApp: prepared.app, testedExecutable: prepared.executable,
       containerChanges: ['LSBackgroundOnly=true', 'LSUIElement=false', 'test bundle identifiers', 'ad-hoc signature'],
@@ -50,21 +55,22 @@ export async function smokeElectron({ app, revision, report: reportPath, operati
       throw error
     } finally { electron = undefined }
   }
-  const launch = async () => {
+  const launch = async ({ profile = userData, exchangeEnvironment = {} } = {}) => {
     electron = await _electron.launch({
       executablePath: prepared.executable,
-      args: ['--disable-gpu', `--user-data-dir=${userData}`],
+      args: ['--disable-gpu', `--user-data-dir=${profile}`],
       timeout: 45_000,
       env: backgroundTestEnvironment(prepared, {
         ...process.env,
+        ...exchangeEnvironment,
         ELECTRON_RUN_AS_NODE: undefined,
         ELECTRON_RENDERER_URL: undefined,
         PERPETUAL_SWAP_E2E: '1',
         PERPETUAL_SWAP_E2E_LIVE_REFRESH: '0',
         PERPETUAL_SWAP_OPERATION_TRACE: operationRecording ? '1' : '0',
-        PERPETUAL_SWAP_OPERATION_DIR: operationRecording ? join(userData, 'diagnostics') : '',
+        PERPETUAL_SWAP_OPERATION_DIR: operationDirectory ?? '',
         PERPETUAL_SWAP_GPU_TRACE: '0',
-        PERPETUAL_SWAP_USER_DATA: userData,
+        PERPETUAL_SWAP_USER_DATA: profile,
       }),
     })
     page = await electron.firstWindow({ timeout: 30_000 })
@@ -108,11 +114,17 @@ export async function smokeElectron({ app, revision, report: reportPath, operati
     assert.equal(window.sandbox, true)
     const status = await request({ e2e: { action: 'smokeStatus' } })
     assert.equal(status.revision, revision, 'The running main process must report the packaged build revision.')
-    assert.equal(resolve(status.userData), resolve(userData), 'Smoke must use only its isolated user data.')
+    assert.equal(resolve(status.userData), resolve(profile), 'Smoke must use only its isolated user data.')
     assert.ok(status.backendThreadId > 0, 'Market coordination must run outside Electron main.')
-    return status
+    return { electron, page, status }
   }
   try {
+    report.nativeMarket = await runNativeMarketAcceptance({ directory: nativeUserData,
+      launch: exchangeEnvironment => launch({ profile: nativeUserData, exchangeEnvironment }),
+      close: () => close(),
+      onDiagnostic: evidence => { report.nativeMarket = evidence },
+    })
+    report.checks.push('packaged native HTTP/WebSocket → SQLite/workers/IPC/SVG; delayed history, contract/period switches, disconnect/recovery, independent flat indicator values')
     await launch()
     report.checks.push('guarded packaged replica: executable, revision, offscreen window, preload isolation')
     const streamingLiquidity = await deadline(electron.evaluate(async ({ app: desktopApp }) => {
@@ -202,7 +214,7 @@ export async function smokeElectron({ app, revision, report: reportPath, operati
     await close()
     assert.deepEqual(errors, [], 'The packaged renderer must not raise page errors.')
     if (!operationRecording) {
-      const files = await readdir(userData, { recursive: true })
+      const files = (await Promise.all([userData, nativeUserData].map(directory => readdir(directory, { recursive: true })))).flat()
       assert.ok(!files.some(file => /(?:^|\/)(?:Operations|diagnostics)(?:\/|$)|\.health\.json$|\.participant\.json$/.test(file)), 'Restart and shutdown must not create recording files.')
       report.checks.push('recording disabled through requests, chart work, SQLite persistence, restart and shutdown')
     }
@@ -215,7 +227,7 @@ export async function smokeElectron({ app, revision, report: reportPath, operati
     throw error
   } finally {
     try { await close() } finally {
-      await rm(userData, { recursive: true, force: true })
+      await Promise.all([userData, nativeUserData].map(directory => rm(directory, { recursive: true, force: true })))
       report.finishedAt = new Date().toISOString()
       if (reportPath) {
         await mkdir(dirname(resolve(reportPath)), { recursive: true })

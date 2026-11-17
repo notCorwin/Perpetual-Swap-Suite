@@ -8,6 +8,7 @@
     "lint": "oxlint src && node --experimental-strip-types scripts/check-surfaces.ts && node scripts/check-operation-boundaries.mjs",
     "test": "node scripts/test-sandbox.mjs functional",
     "test:all": "node scripts/test-sandbox.mjs all",
+    "test:acceptance": "node scripts/test-acceptance.mjs",
     "test:soak": "node scripts/test-sandbox.mjs soak",
     "app": "npm run electron:package",
     "dev:renderer": "vite --host 127.0.0.1",
