@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { _electron } from 'playwright'
 import {
-  installRequestProbe, measureLatencyCoveredPrefetch, measureMissingWindow, measureOffscreenColdBoundary, offscreenChartWindow, openChart, readRequestProbe, removeRequestProbe, resetRequestProbe,
+  assertChartViewport, assertCompleteChartViewport, chartViewportHours, chartViewportX, installRequestProbe, measureLatencyCoveredPrefetch, measureMissingWindow, measureOffscreenColdBoundary, offscreenChartWindow, openChart, readRequestProbe, removeRequestProbe, resetRequestProbe,
   separateSourceMaintenance, waitForLocalHistory, waitForRendered, wheelBurst,
 } from '../../scripts/chart-acceptance.mjs'
 
@@ -37,8 +37,8 @@ test('cold boundary witnesses prepared target history and validates its selected
   assert.ok(report.preparedTarget.historyBars > 96)
   assert.equal(report.coldTiming.preparedBeforeFinalInput, true, 'The witness must precede target demand.')
   assert.equal(report.preparedTarget.sourceCompletedAt, report.coldTiming.timestamps.nearestCompletedAt)
-  assert.equal(report.observedFieldOracle.priceBars, 96)
-  assert.equal(report.observedFieldOracle.indicatorBars, 96)
+  assert.equal(report.observedFieldOracle.priceBars, report.observedFieldOracle.expectedBars)
+  assert.equal(report.observedFieldOracle.indicatorBars, report.observedFieldOracle.expectedBars)
   assert.equal(report.inputBursts.length, 2)
   assert.equal(report.approachLatency.milestone, 'rendered-window')
   assert.match(report.approachLatency.meaning, /no 100 ms content deadline/)
@@ -154,9 +154,18 @@ test('sub-candle wheel frames move continuously while axes stay fixed and native
     const read = () => page.locator(`svg[data-rendered-inst="${fixture.instId}"]`).evaluate(svg => ({
       end: Number(svg.dataset.renderedEnd),
       offset: Number(svg.querySelector('[data-chart-wheel-content]').dataset.chartWheelOffset),
+      headersInsideSurface: [...svg.querySelectorAll('[data-chart-panel-header]')].every(element => {
+        const bounds = svg.getBoundingClientRect(), rect = element.getBoundingClientRect()
+        return rect.x >= bounds.x - .5 && rect.right <= bounds.right + .5
+      }),
       hud: [...svg.querySelectorAll('[data-chart-price-tick], [data-chart-panel-header]')].map(element => {
         const rect = element.getBoundingClientRect()
-        return [rect.x, rect.y, rect.width, rect.height]
+        if (element.matches('[data-chart-price-tick]')) {
+          const line = element.querySelector('line'), text = element.querySelector('text')
+          return ['tick', ...['x1', 'x2', 'y1', 'y2'].map(name => line.getAttribute(name)),
+            text?.getAttribute('x'), text?.getAttribute('y'), rect.height]
+        }
+        return ['header', rect.x, rect.y, rect.height]
       }),
     }))
     const initial = await read(), offsets = []
@@ -165,7 +174,8 @@ test('sub-candle wheel frames move continuously while axes stay fixed and native
       await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
       const current = await read()
       assert.equal(current.end, startEnd, 'Fractional input must not advance a whole candle prematurely.')
-      assert.deepEqual(current.hud, initial.hud, 'Axis ticks and legends must stay fixed during sub-candle translation.')
+      assert.deepEqual(current.hud, initial.hud, 'Axis coordinates and legend anchors/heights must stay fixed during sub-candle translation.')
+      assert.ok(initial.headersInsideSurface && current.headersInsideSurface, 'Changing legend values must remain inside the chart surface.')
       assert.ok(current.offset > (offsets.at(-1) ?? 0), `Every 3 px input frame must visibly advance chart content: ${JSON.stringify({ current, offsets })}`)
       offsets.push(current.offset)
     }
@@ -173,12 +183,22 @@ test('sub-candle wheel frames move continuously while axes stay fixed and native
     await page.locator('[data-chart-plot]').screenshot({ path: join(root, '.build/chart-scroll-fractional.png') })
     const plotBounds = await page.locator(`svg[data-rendered-inst="${fixture.instId}"]`).boundingBox()
     assert.ok(plotBounds)
+    const viewport = await assertCompleteChartViewport(page, fixture.instId, { endHour: startEnd })
+    const localPointerX = await page.locator(`svg[data-rendered-inst="${fixture.instId}"]`).evaluate(svg => {
+      const rect = svg.getBoundingClientRect()
+      return new DOMPoint(rect.x + .5, rect.y + 50).matrixTransform(svg.getScreenCTM().inverse()).x
+    })
+    const candidates = [viewport.expectedHours[0] - interval, ...viewport.expectedHours, viewport.expectedHours.at(-1) + interval]
+    const contentOffset = (await read()).offset
+    const distance = hour => Math.abs(chartViewportX(viewport, hour) + contentOffset - localPointerX)
+    const expectedInspection = candidates.reduce((nearest, hour) => distance(hour) < distance(nearest) ? hour : nearest)
+    assert.ok(expectedInspection <= viewport.expectedHours[0], 'The fractional left-edge pointer must inspect the first candle or its exposed neighbour.')
     await page.mouse.move(plotBounds.x + .5, plotBounds.y + 50)
     await page.mouse.down()
     await page.waitForFunction(hour => Number(document.querySelector('[data-chart-inspected-hour]')?.dataset.chartInspectedHour) === hour,
-      startEnd - 96 * interval)
+      expectedInspection)
     await page.locator(`svg[data-rendered-inst="${fixture.instId}"]`).dispatchEvent('keydown', { key: 'ArrowLeft', altKey: true })
-    assert.equal(Number(await page.locator('[data-chart-inspected-hour]').getAttribute('data-chart-inspected-hour')), startEnd - 96 * interval,
+    assert.equal(Number(await page.locator('[data-chart-inspected-hour]').getAttribute('data-chart-inspected-hour')), expectedInspection,
       'RSI navigation outward from the exposed left neighbour must stop instead of wrapping to the rightmost crossing.')
     await page.mouse.up()
     await wheelBurst(page, { deltaY: 3 })
@@ -218,6 +238,14 @@ test('sub-candle wheel frames move continuously while axes stay fixed and native
           renderedEnd: Number(svg.dataset.renderedEnd),
           bars: chart.__chartRenderedBars.length,
           lastBar: chart.__chartRenderedBars.at(-1)?.hour,
+          viewport: { intervalMS: chart.__chartSnapshot.intervalMS, endHour: chart.__chartSnapshot.endHour,
+            visibleBars: Number(chart.dataset.chartVisibleBars), barSpacing: Number(chart.dataset.chartBarSpacing),
+            domainStart: Number(svg.dataset.chartDomainStart), domainEnd: Number(svg.dataset.chartDomainEnd),
+            barWidth: Number(svg.dataset.chartBarWidth), plotRight: Number(svg.dataset.chartPlotRight),
+            renderedBars: Number(chart.dataset.chartRenderedBars), targetBars: Number(chart.dataset.chartTargetBars),
+            chartStart: Number(chart.dataset.chartStart), chartEnd: Number(chart.dataset.chartEnd),
+            svgStart: Number(svg.dataset.renderedStart), svgEnd: Number(svg.dataset.renderedEnd),
+            bars: chart.__chartRenderedBars.map(bar => ({ hour: bar.hour })) },
           loading: chart.dataset.chartLoading,
           offsets: [...svg.querySelectorAll('[data-chart-wheel-content]')].map(element => Number(element.dataset.chartWheelOffset)),
         }
@@ -229,7 +257,8 @@ test('sub-candle wheel frames move continuously while axes stay fixed and native
     assert.equal(leading.completedEnd, expectedEnd)
     assert.equal(leading.renderedEnd, expectedEnd, 'The cached target must already be presented at the microtask boundary.')
     assert.equal(leading.lastBar, expectedEnd)
-    assert.equal(leading.bars, 96)
+    assertChartViewport(leading.viewport, { endHour: expectedEnd })
+    assert.equal(leading.bars, chartViewportHours(leading.viewport).length)
     assert.equal(leading.loading, 'false')
     assert.ok(leading.offsets.length > 0 && leading.offsets.every(offset => Math.abs(offset - fractionalStart.offset) < 1e-9),
       `The new window must retain the existing fractional displacement: ${JSON.stringify({ leading, fractionalStart })}`)
@@ -265,7 +294,7 @@ test('sub-candle wheel frames move continuously while axes stay fixed and native
   }
 })
 
-test('cached reserve scrolling keeps one final intent and the canonical 96-bar indicator frame', async () => {
+test('cached reserve scrolling keeps one final intent and the complete canonical indicator viewport', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   await installRequestProbe(electron, fixture.instId)
   try {
@@ -305,24 +334,15 @@ test('cached reserve scrolling keeps one final intent and the canonical 96-bar i
     const expectedEnd = fixture.end - distance * fixture.series[timeframe].intervalMS
     await waitForRendered(page, fixture, timeframe, expectedEnd)
     await waitForRequestQuiescence()
-    const rendered = await page.locator(`[data-chart-inst="${fixture.instId}"]`).evaluate(chart => {
-      const snapshot = chart.__chartSnapshot
-      return { instId: snapshot?.instId, timeframe: snapshot?.timeframe, endHour: snapshot?.endHour,
-        loading: chart.dataset.chartLoading,
-        bars: (chart.__chartRenderedBars ?? snapshot?.bars ?? []).map(bar => ({
-          hour: bar.hour, open: bar.open, high: bar.high, low: bar.low, close: bar.close,
-          vwap: bar.vwap, ema: bar.ema, bollUpper: bar.bollUpper, bollMiddle: bar.bollMiddle, bollLower: bar.bollLower,
-          roc: bar.roc, maroc: bar.maroc, rsi6: bar.rsi6, rsi12: bar.rsi12, rsi24: bar.rsi24,
-          atrPercent: bar.atrPercent, bbw: bar.bbw, oi: bar.oi, buy: bar.buy, sell: bar.sell,
-        })) }
-    })
+    const rendered = await assertCompleteChartViewport(page, fixture.instId, { endHour: expectedEnd })
+    const loading = await page.locator(`[data-chart-inst="${fixture.instId}"]`).getAttribute('data-chart-loading')
     const probe = await readRequestProbe(electron)
 
     assert.equal(rendered.instId, fixture.instId)
     assert.equal(rendered.timeframe, timeframe)
     assert.equal(rendered.endHour, expectedEnd, 'The latest reversed wheel target must win.')
-    assert.equal(rendered.loading, 'false')
-    assert.equal(rendered.bars.length, 96)
+    assert.equal(loading, 'false')
+    assert.equal(rendered.bars.length, rendered.expectedHours.length)
     assert.ok(probe.focusCalls.length > 0, 'Wheel navigation must retain the real backend focus path.')
     assert.equal(probe.focusCalls.findLast(call => call.target?.instId === fixture.instId)?.target.endHour, expectedEnd)
     const overlap = probe.traffic.uniqueOrUnchangedOverlap[timeframe]
@@ -339,11 +359,10 @@ test('cached reserve scrolling keeps one final intent and the canonical 96-bar i
       'Cached chart movement must not download historical market data.')
 
     const oracle = new Map(fixture.series[timeframe].bars.map(bar => [bar.hour, bar]))
-    const intervalMS = fixture.series[timeframe].intervalMS
     const fields = ['open', 'high', 'low', 'close', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower',
       'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
     for (const [index, bar] of rendered.bars.entries()) {
-      assert.equal(bar.hour, expectedEnd - (95 - index) * intervalMS, 'The selected frame must contain 96 contiguous candle slots.')
+      assert.equal(bar.hour, rendered.expectedHours[index], 'The selected frame must contain every native slot in its visible geometric domain.')
       const expected = oracle.get(bar.hour)
       assert.ok(expected, `Unexpected ${timeframe} bar ${bar.hour}.`)
       for (const field of fields) {
@@ -361,7 +380,7 @@ test('cached reserve scrolling keeps one final intent and the canonical 96-bar i
 })
 
 test('real resident reserve covers delayed history delivery before continuous input crosses its boundary', { timeout: 90_000 }, async context => {
-  const fixture = await electron.evaluate(() => globalThis.__marketBackend.probe({ action: 'seedChartScrollBenchmark', instId: 'PREFETCH-USDT-SWAP' }))
+  const fixture = await electron.evaluate(() => globalThis.__marketBackend.probe({ action: 'seedChartScrollBenchmark', instId: 'PREFETCH-USDT-SWAP', stablePriceLabels: true }))
   const report = await measureLatencyCoveredPrefetch(electron, page, fixture, { offscreen: true })
   assert.equal(report.crossedInitialBoundary, true)
   assert.ok(report.observedHistoryDeliveryMS >= 1500)
@@ -376,7 +395,7 @@ test('real resident reserve covers delayed history delivery before continuous in
 })
 
 test('a prefetch validation failure retains complete timing and delivery evidence', { timeout: 90_000 }, async context => {
-  const fixture = await electron.evaluate(() => globalThis.__marketBackend.probe({ action: 'seedChartScrollBenchmark', instId: 'PREFETCH-EVIDENCE-USDT-SWAP' }))
+  const fixture = await electron.evaluate(() => globalThis.__marketBackend.probe({ action: 'seedChartScrollBenchmark', instId: 'PREFETCH-EVIDENCE-USDT-SWAP', stablePriceLabels: true }))
   // Inject paint and delivery-report failures only after the real 768-input
   // phase and deferred probe have completed; the workload is unchanged.
   const failingPage = new Proxy(page, { get(target, key) {

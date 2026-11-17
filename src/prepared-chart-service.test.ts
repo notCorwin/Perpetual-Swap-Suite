@@ -2255,7 +2255,11 @@ test('a delayed historical SQL result reloads a durable correction before mergin
   let reading: Promise<void> | undefined
   try {
     const target = rows[1800].timestamp
-    await focusHistory(pipeline, instId, '15m', target); await finishSeed(pipeline)
+    await focusHistory(pipeline, instId, '15m', target)
+    // Local admission can finish before focus-owned reserve preparation. Drain
+    // that independent reader before counting this explicit read's revision retry.
+    await pipeline.focus.task
+    await finishSeed(pipeline)
     const state = pipeline.series.get(`${instId}:15m`), read = store.candles.bind(store)
     let reads = 0
     store.candles = async (query: any, priority: any) => {

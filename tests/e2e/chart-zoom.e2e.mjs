@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { _electron } from 'playwright'
-import { openChart, waitForTargetSnapshot } from '../../scripts/chart-acceptance.mjs'
+import { assertCompleteChartViewport, openChart } from '../../scripts/chart-acceptance.mjs'
 
 test('trackpad pinch zooms the cached chart around the pointer and keeps wheel history navigation', { timeout: 90_000 }, async () => {
   const userData = await mkdtemp(join(tmpdir(), 'perp-chart-zoom-'))
@@ -25,7 +25,8 @@ test('trackpad pinch zooms the cached chart around the pointer and keeps wheel h
     }))
     assert.ok(initial.visible >= 50 && initial.visible <= 250, 'Default candles use a readable density.')
     assert.ok(initial.visible < initial.prepared, 'Display density is independent from coarse history demand.')
-    assert.equal(initial.rendered, Math.floor(initial.visible), 'The default viewport projects the recent candles without gaps.')
+    const initialInstId = await page.locator('[data-chart-inst]').getAttribute('data-chart-inst')
+    await assertCompleteChartViewport(page, initialInstId, { fullSlots: null })
     const input = async (deltaY, ctrlKey = true, deltaX = 0) => page.locator('[data-chart-plot]').evaluate((plot, options) => {
       const rect = plot.getBoundingClientRect()
       const event = new WheelEvent('wheel', { ...options, bubbles: true, cancelable: true, clientX: rect.left + rect.width * 0.4 })
@@ -137,13 +138,12 @@ test('trackpad pinch zooms the cached chart around the pointer and keeps wheel h
       instId: chart.dataset.chartInst, timeframe: '1H', end: chart.__chartSnapshot.endHour,
     }))
     await openChart(page, fixture)
-    await waitForTargetSnapshot(page, fixture, fixture.timeframe, fixture.end)
     const oracle = await page.locator('[data-chart-inst]').evaluate(chart => ({
       rendered: chart.__chartRenderedBars.length, visible: Number(chart.dataset.chartVisibleBars),
       prepared: Number(chart.dataset.chartTargetBars), cached: chart.__chartSnapshot.bars.length,
     }))
     assert.equal(Math.floor(oracle.visible), 96, 'Fixed timing/oracle fixtures explicitly select a 96-candle display.')
-    assert.equal(oracle.rendered, 96, 'The oracle uses the actual projected candle input.')
+    await assertCompleteChartViewport(page, fixture.instId, { endHour: fixture.end })
     assert.ok(oracle.prepared > oracle.visible && oracle.cached >= oracle.visible, 'The prepared cache may retain additional candles.')
     assert.deepEqual(errors, [])
   } finally {

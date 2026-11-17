@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { _electron } from 'playwright'
+import { selectTimeframe } from '../../scripts/chart-acceptance.mjs'
 import { summarizeOperations } from '../../scripts/operation-report.mjs'
 import { isOperationJournal, readOperationJournal } from '../../electron/services/operation-journal.js'
 
@@ -29,8 +30,9 @@ test('Electron persists actual renderer, graphics and database work across worke
   await request({ e2e: { action: 'seedCandles', candles } })
   await request({ chartWindow: { instId: 'BTC-USDT-SWAP', timeframe: '5m', historyBars: 96 } })
   const fixture = await request({ e2e: { action: 'seedCachedListProjection' } })
-  await page.locator('[aria-label="Chart timeframe"] button').filter({ hasText: /^1H$/i }).click()
   await page.locator(`[aria-label="View ${fixture.instId} chart"]`).click()
+  await page.locator('[aria-label="Chart display mode"]').waitFor({ state: 'visible' })
+  await selectTimeframe(page, '1H')
   await page.locator(`svg[data-rendered-inst="${fixture.instId}"][data-rendered-timeframe="1H"]`).waitFor()
   const capture = await request({ captureChart: { x: 0, y: 0, width: 160, height: 100, output: 'png' } })
   assert.ok(capture.imageDataURL.startsWith('data:image/png;base64,'))

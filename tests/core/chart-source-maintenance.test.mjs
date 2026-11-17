@@ -60,3 +60,18 @@ test('bounded current-window repairs are independent only when their entire sour
   assert.deepEqual(result.historical, ambiguous, 'Potential overlap and unknown source semantics remain subject to no-download assertions.')
   assert.deepEqual(result.historicalExtensions, [])
 })
+
+
+test('current repairs use the observed prepared bucket without hiding overlapping or oversized requests', () => {
+  const intervalMS = 300_000, fixture = { end: 360 * intervalMS, currentWindowBars: 144, series: { '5m': { intervalMS } } }
+  const current = { path: '/market/history-candles', parameters: { bar: '5m', limit: 144, after: fixture.end + 145 * intervalMS } }
+  const rejected = [
+    { ...current, parameters: { ...current.parameters, limit: 145 } },
+    { ...current, parameters: { ...current.parameters, after: fixture.end + 144 * intervalMS } },
+    { ...current, parameters: { ...current.parameters, after: current.parameters.after + 1 } },
+  ]
+  assert.deepEqual(separateSourceMaintenance([current, ...rejected], fixture).currentMaintenance, [current])
+  assert.deepEqual(separateSourceMaintenance([current, ...rejected], fixture).historical, rejected)
+  assert.deepEqual(separateSourceMaintenance([current], { ...fixture, currentWindowBars: undefined }).historical, [current])
+  assert.deepEqual(separateSourceMaintenance([current], { ...fixture, currentWindowBars: Infinity }).historical, [current])
+})

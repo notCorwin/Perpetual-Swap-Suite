@@ -8,7 +8,8 @@ import { requireForegroundTests } from '../../electron/test-presentation.js'
 import { startRendererDiagnostics } from '../../scripts/renderer-diagnostics.mjs'
 import { startProcessWitness } from '../support/process-witness.mjs'
 import { finishAcceptanceResources } from '../support/acceptance-resources.mjs'
-import { assertCompletePaints, foregroundPaintWindow, installRequestProbe, measureLatencyCoveredPrefetch, measureMissingWindow, measureNativeColdBoundary, measureChartIntentLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, waitForLocalHistory, waitForRendered, wheelBurst, withPaintProbe } from '../../scripts/chart-acceptance.mjs'
+import { foregroundPaintWindow, measureLatencyCoveredPrefetch, measureMissingWindow, measureNativeColdBoundary } from '../../scripts/chart-acceptance.mjs'
+import { measureResidentScroll } from '../../scripts/chart-resident-scenario.mjs'
 
 requireForegroundTests()
 
@@ -55,64 +56,20 @@ test('bulk-warmed history updates every renderer target within 100 ms during scr
     assert.equal(restored, foreground.previous.visible, 'The latency test must restore the native window visibility.')
   })
   context.diagnostic(`Native foreground timing window: ${JSON.stringify({ before: foreground.previous, during: foreground.native, environment: foreground.environment, idleFrameCadence: foreground.idleFrameCadence })}`)
-  const fixture = await electron.evaluate(() => globalThis.__marketBackend.probe({ action: 'seedChartScrollBenchmark' }))
-  // Complete the initial durable hydration before holding subsequent disk
-  // deliveries and source maintenance. Resident navigation uses transferred
-  // data independently of either backend preparation or the two read lanes.
-  await installRequestProbe(electron, fixture.instId)
-  try {
-    await openChart(page, fixture)
-    const warmedHistory = new Map()
-    for (const timeframe of fixture.timeframes) {
-      await selectTimeframe(page, timeframe)
-      await waitForRendered(page, fixture, timeframe)
-      warmedHistory.set(timeframe, await waitForLocalHistory(electron, page, fixture, timeframe, { requireIndicators: true }))
-    }
-    context.diagnostic(`Resident history before stalls: ${JSON.stringify(Object.fromEntries(warmedHistory))}`)
-    await electron.evaluate(async () => {
-      globalThis.__chartRequestProbe.holdHistorical = true
-      globalThis.__chartRequestProbe.holdLocal = true
-      await globalThis.__marketBackend.probe({ action: 'sourceHold', hold: true })
-    })
-    for (const timeframe of fixture.timeframes) {
-      await selectTimeframe(page, timeframe)
-      await waitForRendered(page, fixture, timeframe)
-      const residentHistoryBars = warmedHistory.get(timeframe)
-      const before = await readRequestProbe(electron)
-      const paint = await withPaintProbe(page, fixture, { requireMatureData: true, requireWarmStatistics: true }, async () => {
-        const intervalMS = fixture.series[timeframe].intervalMS
-        let distance = 0
-        for (const phase of [
-          { name: 'high velocity', frames: 6, eventsPerFrame: 32, deltaY: 36, candles: 576 },
-          { name: 'reversal', frames: 3, eventsPerFrame: 32, deltaY: -36, candles: -288 },
-          { name: '600-candle jump inside the bounded reserve', deltaY: 7_200, candles: 600 },
-        ]) {
-          const inputs = await wheelBurst(page, phase)
-          const targets = inputs.map((_, index) => fixture.end - (distance + phase.candles / inputs.length * (index + 1)) * intervalMS)
-          distance += phase.candles
-          await waitForRendered(page, fixture, timeframe, targets.at(-1))
-          const latency = await measureChartIntentLatency(page, { inputs, targets })
-          context.diagnostic(JSON.stringify({ timeframe, phase: phase.name, ...latency }))
-          assert.ok(latency.maxInputToRafSampleMS < 100, `${timeframe} ${phase.name} had an intent take ${latency.maxInputToRafSampleMS} ms to reach its exact or coalesced chart target. ${JSON.stringify(latency)}`)
-          assert.ok(latency.latestBurstStartToRafSampleMS < 100, `${timeframe} ${phase.name} took ${latency.latestBurstStartToRafSampleMS} ms from the first wheel input in the latest burst to its renderer RAF sample. ${JSON.stringify(latency)}`)
-        }
-      })
-      assertCompletePaints(paint)
-      assert.equal(paint.pendingFrames, 0, 'Resident navigation must never wait for the held disk deliveries.')
-      const after = await readRequestProbe(electron)
-      const historicalRequests = after.calls.slice(before.calls.length).filter(call => Number.isFinite(call.endHour))
-      assert.ok(historicalRequests.every(call => call.kind === 'history'), 'Resident navigation may issue only observational history reads.')
-      assert.equal(after.legacyWindowCalls, 0)
-      const sources = separateSourceMaintenance(after.sourceRequests.slice(before.sourceCalls), fixture)
-      assert.deepEqual(sources.historical, [], `A warmed ${timeframe} scroll attempted a historical download: ${JSON.stringify(sources.historical)}`)
-      assert.ok(after.maxHistoricalActive <= 2, 'Resident targets must never queue foreground work behind the held disk deliveries.')
-      assert.ok(after.transferredHistoryBars >= residentHistoryBars, 'The fixture must exercise a bulk durable-history transfer.')
-    }
-  } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
+  const fixture = await electron.evaluate(() => globalThis.__marketBackend.probe({ action: 'seedChartScrollBenchmark', stablePriceLabels: true }))
+  await measureResidentScroll(electron, page, fixture, {
+    requireBurstBudget: true,
+    diagnostic: report => context.diagnostic(JSON.stringify(report)),
+    phases: [
+      { name: 'high velocity', frames: 6, eventsPerFrame: 32, deltaY: 36, candles: 576 },
+      { name: 'reversal', frames: 3, eventsPerFrame: 32, deltaY: -36, candles: -288 },
+      { name: '600-candle jump inside the bounded reserve', deltaY: 7_200, candles: 600 },
+    ],
+  })
 })
 
 test('backend history reserve covers 1500 ms of delivery latency before the cold boundary during continuous wheel input', { timeout: 90_000 }, async () => {
-  const fixture = await electron.evaluate(() => globalThis.__marketBackend.probe({ action: 'seedChartScrollBenchmark', instId: 'PREFETCH-USDT-SWAP' }))
+  const fixture = await electron.evaluate(() => globalThis.__marketBackend.probe({ action: 'seedChartScrollBenchmark', instId: 'PREFETCH-USDT-SWAP', stablePriceLabels: true }))
   await measureLatencyCoveredPrefetch(electron, page, fixture)
 })
 

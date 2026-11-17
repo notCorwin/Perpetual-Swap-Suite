@@ -189,7 +189,7 @@ async function probe(input) {
       series: [...pipeline.universe.keys()].map(key => ({ key, compact: state(pipeline.liveStates.get(key)), history: state(pipeline.series.get(key)),
         cached: pipeline.cached(key)?.indicatorState, cachedGeneration: pipeline.cached(key)?.generation })) }
   }
-  if (input.action === 'seedChartScrollBenchmark') return seedChartScrollBenchmark(store, service, { instId: input.instId })
+  if (input.action === 'seedChartScrollBenchmark') return seedChartScrollBenchmark(store, service, { instId: input.instId, stablePriceLabels: input.stablePriceLabels })
   if (input.action === 'coldBoundaryInstall') return coldBoundaryLifecycle(async () => {
     await coldBoundaryFixture?.remove()
     coldBoundaryFixture = null

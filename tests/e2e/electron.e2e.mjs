@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { _electron } from 'playwright'
 import { measureNativeWindowControls } from '../helpers/native-window-controls.mjs'
 import { assertScrollResponsiveness } from '../../scripts/chart-acceptance-metrics.mjs'
-import { assertCompletePaints, assertIndicatorLegends, assertWorkspaceLayout, finishPaintProbe, installRequestProbe, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst, withPaintProbe } from '../../scripts/chart-acceptance.mjs'
+import { assertCompleteChartViewport, assertCompletePaints, assertIndicatorLegends, assertWorkspaceLayout, chartViewportX, finishPaintProbe, installRequestProbe, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst, withPaintProbe } from '../../scripts/chart-acceptance.mjs'
 
 
 const root = new URL('../..', import.meta.url).pathname
@@ -55,10 +55,10 @@ const installPreparedTransform = async options => electron.evaluate(async ({ ipc
     }
     if (options.mode === 'warmup' && Array.isArray(response.bars)) return { ...response, bars: response.bars.map(bar => ({
       ...bar,
-      rsi6: bar.hour >= options.first && bar.hour <= options.warmupThrough ? null : bar.rsi6,
-      rsi12: bar.hour >= options.first && bar.hour <= options.warmupThrough || bar.hour === options.interiorGap ? null : bar.rsi12,
-      atrPercent: bar.hour >= options.first && bar.hour <= options.warmupThrough || bar.hour === options.interiorGap ? null : bar.atrPercent,
-      bbw: bar.hour >= options.first && bar.hour <= options.warmupThrough || bar.hour === options.interiorGap ? null : bar.bbw,
+      rsi6: bar.hour <= options.warmupThrough ? null : bar.rsi6,
+      rsi12: bar.hour <= options.warmupThrough || bar.hour === options.interiorGap ? null : bar.rsi12,
+      atrPercent: bar.hour <= options.warmupThrough || bar.hour === options.interiorGap ? null : bar.atrPercent,
+      bbw: bar.hour <= options.warmupThrough || bar.hour === options.interiorGap ? null : bar.bbw,
     })) }
     const lastConfirmed = response.bars?.find(bar => bar.hour === response.endHour)
     if (lastConfirmed) probe.confirmed.set(`${response.instId}:${response.timeframe}`, lastConfirmed)
@@ -156,7 +156,8 @@ test('native traffic lights align with the renderer toolbar after window resizin
         target.setContentSize(width, 1_000)
         return target.getContentSize()[0]
       }, width)
-      await page.waitForFunction(width => innerWidth === width && Number(document.querySelector('[data-layout="market-workspace"]').dataset.uiScale) === width / 1_600, actualWidth)
+      await page.waitForFunction(width => innerWidth === width, actualWidth)
+      await assertWorkspaceLayout(page)
       const native = await measureNativeWindowControls(electron)
       const row = await page.locator('[data-sidebar-toolbar]').boundingBox()
       const title = await page.getByRole('heading', { name: 'Perpetual Swap Suite', exact: true }).boundingBox()
@@ -170,7 +171,8 @@ test('native traffic lights align with the renderer toolbar after window resizin
     await writeFile(join(root, '.build', 'native-topbar-geometry.json'), `${JSON.stringify(measurements, null, 2)}\n`)
   } finally {
     await electron.evaluate(({ BrowserWindow }, [width, height]) => BrowserWindow.getAllWindows()[0].setContentSize(width, height), previous)
-    await page.waitForFunction(width => innerWidth === width && Number(document.querySelector('[data-layout="market-workspace"]').dataset.uiScale) === width / 1_600, previous[0])
+    await page.waitForFunction(([width, height]) => innerWidth === width && innerHeight === height, previous)
+    await assertWorkspaceLayout(page)
   }
 })
 
@@ -394,20 +396,28 @@ test('ATR% and BBW share the panel between RSI and OI with independent fitted sc
       await waitForRendered(page, fixture, timeframe)
       await page.waitForFunction(() => document.querySelector('[data-chart-inst]')?.__chartSnapshot?.bars.every(bar => Number.isFinite(bar.atrPercent) && Number.isFinite(bar.bbw)))
       const reading = await assertIndicatorLegends(page, { requireFittedVolatility: true })
-      const visible = fixture.series[timeframe].bars.slice(-96)
+      const viewport = await assertCompleteChartViewport(page, fixture.instId, { endHour: fixture.end })
+      const canonical = new Map(fixture.series[timeframe].bars.map(bar => [bar.hour, bar]))
+      const visible = viewport.expectedHours.map(hour => canonical.get(hour))
+      assert.ok(visible.every(Boolean), 'Every geometrically visible candle needs a canonical native value.')
+      const candleX = hour => chartViewportX(viewport, hour)
       const curvePoints = field => reading.legends.find(legend => legend.field === field).curve.match(/[ML][^ML]+/g).map(command => command.slice(1).trim().split(/\s+/).map(Number))
       const visibleRanges = []
       for (const field of ['atrPercent', 'bbw']) {
         const values = visible.map(bar => bar[field]), minimum = Math.min(...values), maximum = Math.max(...values)
-        const points = curvePoints(field), ys = points.map(([, y]) => y), curveTop = Math.min(...ys), curveBottom = Math.max(...ys)
+        const points = visible.map(bar => {
+          const matches = curvePoints(field).filter(([x]) => Math.abs(x - candleX(bar.hour)) <= .06)
+          assert.equal(matches.length, 1, `${field} must draw exactly one sample for candle ${bar.hour}.`)
+          return matches[0]
+        })
+        const ys = points.map(([, y]) => y), curveTop = Math.min(...ys), curveBottom = Math.max(...ys)
         assert.ok(minimum > 0 && maximum > minimum, `${field} fixture must expose a varied positive range to catch a forced zero baseline.`)
         const fittedMinimum = minimum - (reading.volatilityPanel.bottom - curveBottom) / (curveBottom - curveTop) * (maximum - minimum)
         assert.ok(fittedMinimum > 0, `${field} must fit its positive visible range instead of anchoring the hidden scale to zero.`)
         visibleRanges.push([minimum, maximum])
-        assert.equal(points.length, visible.length + 1)
         for (const [index, bar] of visible.entries()) {
           const expectedY = curveBottom - (bar[field] - minimum) / (maximum - minimum) * (curveBottom - curveTop)
-          assert.ok(Math.abs(points[index + 1][1] - expectedY) <= .101,
+          assert.ok(Math.abs(points[index][1] - expectedY) <= .101,
             `${timeframe} ${field} candle ${bar.hour} must follow its own visible native value range.`)
         }
       }
@@ -416,14 +426,15 @@ test('ATR% and BBW share the panel between RSI and OI with independent fitted sc
       const expected = fixture.series[timeframe].bars.at(-1)
       assert.equal(await legendValue('ATR%(14)'), `${expected.atrPercent.toFixed(2)}%`)
       assert.equal(await legendValue('BBW(20,2)'), `${expected.bbw.toFixed(2)}%`)
-      const target = await page.locator('svg[data-rendered-inst]').evaluate(svg => {
+      const hour = viewport.expectedHours[38]
+      const target = await page.locator('svg[data-rendered-inst]').evaluate((svg, { hour, expectedX }) => {
         const commands = svg.querySelector('[data-chart-indicator="atrPercent"]').getAttribute('d').match(/[ML][^ML]+/g)
-        if (commands.length !== 97) throw new Error('The mature ATR% curve must cover all 96 candles and its left-edge extension.')
-        const [x, y] = commands[39].slice(1).trim().split(/\s+/).map(Number)
+        const points = commands.map(command => command.slice(1).trim().split(/\s+/).map(Number))
+        const [x, y] = points.find(([x]) => Math.abs(x - expectedX) <= .06)
         const rect = svg.getBoundingClientRect(), view = svg.viewBox.baseVal
         return { x: rect.x + x / view.width * rect.width, y: rect.y + y / view.height * rect.height,
-          hour: Number(svg.dataset.renderedStart) + 38 * ({ '5m': 300_000, '15m': 900_000, '1H': 3_600_000 })[svg.dataset.renderedTimeframe] }
-      })
+          hour }
+      }, { hour, expectedX: candleX(hour) })
       const inspected = fixture.series[timeframe].bars.find(bar => bar.hour === target.hour)
       assert.ok(inspected)
       await page.mouse.move(target.x, target.y)
@@ -449,7 +460,7 @@ test('the 1600 design workspace keeps both panels and chart selection', async ()
   try {
     for (const width of [1_600, 1_120, 1_920]) {
       await page.setViewportSize({ width, height: 1_000 })
-      await page.waitForFunction(width => Math.abs(Number(document.querySelector('[data-layout="market-workspace"]')?.dataset.uiScale) - width / 1_600) < 1e-5, width)
+      await page.waitForFunction(width => innerWidth === width, width)
       await assertWorkspaceLayout(page)
     }
     assert.equal(await page.getByRole('textbox', { name: 'Search contracts' }).count(), 0)
@@ -579,7 +590,7 @@ test('the paint probe selects the first ready target RAF and retains its mutable
   await page.waitForFunction(instId => {
     const chart = document.querySelector(`[data-chart-inst="${instId}"]`), bars = chart?.__chartRenderedBars ?? chart?.__chartSnapshot?.bars
     const fields = ['vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
-    return bars?.length === 96 && bars.every(bar => bar.indicatorsObserved && fields.every(field => Number.isFinite(bar[field])))
+    return bars?.length >= 96 && bars.length <= 98 && bars.every(bar => bar.indicatorsObserved && fields.every(field => Number.isFinite(bar[field])))
   }, fixture.instId)
   await startPaintProbe(page, fixture, { indicatorValidation: 'deferred-canonical' })
   let report
@@ -638,90 +649,7 @@ test('the paint probe selects the first ready target RAF and retains its mutable
   } finally { if (!report) await finishPaintProbe(page) }
 })
 
-test('the paint probe retains geometry and metadata corruption without a new snapshot', async () => {
-  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
-  await openChart(page, fixture)
-  await startPaintProbe(page, fixture)
-  let report
-  try {
-    const observation = await page.evaluate(async instId => {
-      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
-      const snapshot = chart.__chartSnapshot, probe = window.__chartPaintProbe
-      const svg = chart.querySelector('svg[data-rendered-inst]')
-      const path = svg.querySelector('[data-chart-indicator="rsi12"]')
-      const otherPath = svg.querySelector('path[d]:not([data-chart-indicator])')
-      const oi = svg.querySelector('[data-chart-oi]')
-      const buy = svg.querySelector('[data-chart-taker-buy-samples]')
-      const status = chart.querySelector('[data-chart-status]')
-      const clipPath = svg.querySelector('[data-chart-wheel-content]').parentElement.getAttribute('clip-path')
-      const clipId = clipPath.slice(clipPath.indexOf('#') + 1, clipPath.indexOf(')'))
-      const clip = svg.querySelector(`[id="${CSS.escape(clipId)}"] rect`)
-      const changes = [
-        [path, 'd', 'M0,0', 'curve corruption'],
-        [path, 'd', '', 'missing curve'],
-        [path, 'd', path.getAttribute('d') + ' L99999 0', 'extra sample'],
-        [path, 'd', path.getAttribute('d').replace(/[ML]([\d.e+-]+)[ ,]+([\d.e+-]+)/i, 'M99999 0'), 'wrong sample position'],
-        [path, 'd', 'MNaN 0', 'nonfinite curve'],
-        [clip, 'width', '0', 'clip corruption'],
-        [otherPath, 'd', 'MNaN 0', 'nonfinite path'],
-        [svg, 'data-rendered-start', '-1', 'range corruption'],
-        [svg, 'data-rendered-timeframe', 'wrong', 'identity corruption'],
-        [svg, 'aria-label', 'wrong', 'label corruption'],
-        [chart, 'data-chart-rendered-bars', '-1', 'candle count corruption'],
-        [chart, 'data-chart-completed-end', '-1', 'completed range corruption'],
-        [chart, 'data-chart-candle-state', 'wrong', 'price state corruption'],
-        [oi, 'data-chart-oi-state', 'wrong', 'OI state corruption'],
-        [status, 'data-chart-indicator-input', 'wrong', 'indicator input corruption'],
-        [chart, 'data-chart-oi-samples', '-1', 'published count corruption'],
-        [oi, 'data-chart-oi-samples', '-1', 'OI count corruption'],
-        [buy, 'data-chart-taker-buy-samples', '-1', 'Taker count corruption'],
-      ]
-      const sameSnapshot = () => chart.__chartSnapshot === snapshot
-      let unchangedSnapshot = sameSnapshot(), sharedBars = false, capturedCorruption = false
-      for (const [node, attribute, value, phase] of changes) {
-        if (!node) throw new Error(`The ${phase} fixture is unavailable.`)
-        const original = node.getAttribute(attribute)
-        try {
-          probe.phase = phase
-          node.setAttribute(attribute, value)
-          await Promise.resolve()
-          unchangedSnapshot &&= sameSnapshot()
-          if (phase === 'curve corruption') {
-            const bad = probe.observations.at(-1)
-            capturedCorruption = bad.surface.svg.curves.includes(value)
-            for (let frame = 0; frame < 3; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve))
-            sharedBars = probe.observations.at(-1).bars === bad.bars
-          }
-        } finally {
-          if (original === null) node.removeAttribute(attribute)
-          else node.setAttribute(attribute, original)
-          await Promise.resolve()
-        }
-      }
-      return { unchangedSnapshot, sharedBars, capturedCorruption, errorsBeforeFinish: probe.errors.length,
-        observations: probe.observations.length, captureSamples: probe.validationSamples.length }
-    }, fixture.instId)
-    report = await finishPaintProbe(page)
-    assert.equal(observation.unchangedSnapshot, true, 'DOM mutations must be inspected without a data publication.')
-    assert.equal(observation.capturedCorruption, true)
-    assert.equal(observation.sharedBars, true, 'Unchanged observations must share retained bars.')
-    assert.equal(observation.errorsBeforeFinish, 0, 'Correctness validation must wait until timing has ended.')
-    assert.equal(observation.observations, observation.captureSamples, 'Every timed sample must retain its state.')
-    assert.equal(report.deferredValidationSamples, report.probeCaptureSamples)
-    assert.ok(report.violations.some(error => /curve corruption: .*rsi12 SVG has 1 points/.test(error)), 'Restoring a curve must not erase its earlier corruption.')
-    for (const phase of ['missing curve', 'extra sample', 'wrong sample position', 'nonfinite curve']) assert.ok(report.violations.some(error => error.startsWith(`${phase}:`) && /rsi12 SVG/.test(error)), `Missing ${phase} violation.`)
-    assert.ok(report.violations.some(error => /clip corruption: .* SVG has .* points/.test(error)), 'Clip changes must revalidate unchanged paths.')
-    for (const error of [
-      'Nonfinite SVG geometry.', 'SVG labels and the drawn range disagree.', 'SVG and snapshot timeframes disagree.',
-      'Chart labels disagree with the rendered snapshot.', 'Chart candle-count metadata disagrees with the actual snapshot.',
-      'Chart completed-range metadata disagrees with the snapshot.', 'Published source states disagree with the snapshot.',
-      'Published statistics sample counts disagree with the actual snapshot.', 'The actual OI geometry does not cover the snapshot.',
-      'The actual Taker buy geometry does not cover the snapshot.',
-    ]) assert.ok(report.violations.includes(error), `Missing retained violation: ${error}`)
-  } finally { if (!report) await finishPaintProbe(page) }
-})
-
-test('every retained SVG observation agrees with independent curve checks when paths, clips and bars change', async () => {
+test('DOM capture retains shared SVG evidence when curves, clips and bars change', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   await openChart(page, fixture)
   await startPaintProbe(page, fixture)
@@ -738,12 +666,13 @@ test('every retained SVG observation agrees with independent curve checks when p
       const originalSnapshot = chart.__chartSnapshot, originalBars = chart.__chartRenderedBars
       const bars = (originalBars ?? originalSnapshot.bars).map(bar => ({ ...bar }))
       const snapshot = { ...originalSnapshot, bars }
-      let sharedSVG = false, changedBarsSameSVG = false
+      let sharedSVG = false, changedBarsSameSVG = false, invalidEvidence
       try {
         probe.phase = 'first invalid curve'
         path.setAttribute('d', 'M0,0')
         await Promise.resolve()
         const invalidSVG = probe.observations.at(-1).surface.svg
+        invalidEvidence = invalidSVG
         await new Promise(resolve => requestAnimationFrame(resolve))
         probe.phase = 'repeated invalid curve'
         await new Promise(resolve => requestAnimationFrame(resolve))
@@ -774,43 +703,44 @@ test('every retained SVG observation agrees with independent curve checks when p
         chart.removeAttribute('data-probe-paint-marker')
         await Promise.resolve()
       }
-      // Reference uses the original per-observation array-based calculation,
-      // independently of the validator's cached path summaries.
-      const fields = ['vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi']
-      const errors = new Set()
-      for (const { snapshot, bars, surface, phase, captureFailure } of probe.observations) {
-        if (captureFailure || !snapshot || !surface?.svg || !Array.isArray(bars)) continue
-        const svg = surface.svg, firstAtLeft = bars[0]?.hour === bars.at(-1)?.hour - 95 * snapshot.intervalMS
-        for (const [index, field] of fields.entries()) {
-          const d = svg.curves[index], samples = bars.filter(bar => typeof bar[field] === 'number' && Number.isFinite(bar[field])).length
-          const points = samples + (firstAtLeft && Number.isFinite(bars[0]?.[field]) ? 1 : 0)
-          if (samples > 1 && !d) errors.add(`${phase}: ${snapshot.timeframe} ${snapshot.endHour} lost its ${field} SVG curve with ${samples} known samples.`)
-          const coordinates = [...d.matchAll(/[ML]([\d.e+-]+)[ ,]+([\d.e+-]+)/gi)].map(point => Number(point[1]))
-          if (svg.hasClip) {
-            const right = Number(svg.plotRight), pitch = Number(surface.chart.barSpacing), width = Number(svg.barWidth), end = Number(svg.domainEnd)
-            const center = hour => right - width / 2 + (hour - end) / snapshot.intervalMS * pitch
-            const required = bars.filter(bar => Number.isFinite(bar[field])).map(bar => center(bar.hour))
-            const extras = [center(bars[0].hour - snapshot.intervalMS), center(bars.at(-1).hour + snapshot.intervalMS)]
-            if (Number(svg.domainStart) === bars[0].hour && Number.isFinite(bars[0][field])) extras.push(Number(svg.clipX))
-            const remaining = [...coordinates]
-            const allRequired = required.every(x => { const i = remaining.findIndex(actual => Math.abs(actual - x) <= .06); if (i < 0) return false; remaining.splice(i, 1); return true })
-            const validExtras = remaining.every(x => { const i = extras.findIndex(candidate => Math.abs(candidate - x) <= .06); if (i < 0) return false; extras.splice(i, 1); return true })
-            if (!allRequired || !validExtras || Math.abs(Number(svg.clipX) + Number(svg.clipWidth) - right) > .1) errors.add(`${phase}: ${snapshot.timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.length} points; expected ${samples} visible samples and at most one adjacent sample per side.`)
-          } else if (coordinates.length !== points) errors.add(`${phase}: ${snapshot.timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.length} points for ${points} known positions.`)
+      // Keep the DOM-to-evidence boundary here; the numerical/error matrix
+      // runs against these record fields in chart-paint-validation.test.mjs.
+      const mappings = [
+        [svg, 'data-rendered-start', 'svg', 'start'], [svg, 'data-rendered-timeframe', 'svg', 'timeframe'],
+        [svg, 'aria-label', 'svg', 'label'], [chart, 'data-chart-rendered-bars', 'chart', 'renderedBars'],
+        [chart, 'data-chart-completed-end', 'chart', 'completedEnd'], [chart, 'data-chart-candle-state', 'chart', 'candleState'],
+        [chart, 'data-chart-oi-samples', 'chart', 'oiSamples'],
+        [chart.querySelector('[data-chart-status]'), 'data-chart-indicator-input', 'chart', 'indicatorInput'],
+        [svg.querySelector('[data-chart-oi]'), 'data-chart-oi-state', 'svg', 'oiState'],
+        [svg.querySelector('[data-chart-oi]'), 'data-chart-oi-samples', 'svg', 'oiSamples'],
+        [svg.querySelector('[data-chart-taker-buy-samples]'), 'data-chart-taker-buy-samples', 'svg', 'buySamples'],
+      ]
+      const mappingFailures = []
+      for (const [node, attribute, owner, field] of mappings) {
+        const original = node.getAttribute(attribute)
+        try {
+          node.setAttribute(attribute, 'probe-invalid')
+          await Promise.resolve()
+          if (probe.observations.at(-1).surface[owner][field] !== 'probe-invalid') mappingFailures.push(attribute)
+          if (chart.__chartSnapshot !== originalSnapshot) mappingFailures.push('Snapshot changed during DOM-only capture.')
+        } finally {
+          if (original === null) node.removeAttribute(attribute)
+          else node.setAttribute(attribute, original)
+          await Promise.resolve()
         }
       }
-      return { sharedSVG, changedBarsSameSVG, errors: [...errors].sort(), observations: probe.observations.length }
+      return { sharedSVG, changedBarsSameSVG, mappingFailures, observations: probe.observations.length, errorsBeforeFinish: probe.errors.length,
+        retainedCorruption: probe.observations.some(observation => observation.surface.svg === invalidEvidence && observation.surface.svg.curves.includes('M0,0')) }
     }, fixture.instId)
     report = await finishPaintProbe(page)
-    const actual = report.violations.filter(error => / SVG has | lost its .* SVG curve /.test(error)).sort()
     assert.equal(evidence.sharedSVG, true, 'Repeated RAFs must use the same captured SVG record.')
     assert.equal(evidence.changedBarsSameSVG, true, 'Changing bar evidence must not require a new SVG record.')
-    assert.ok(evidence.errors.some(error => /first invalid curve: .*rsi12 SVG has/.test(error)))
-    assert.ok(evidence.errors.some(error => /repeated invalid curve: .*rsi12 SVG has/.test(error)))
-    assert.ok(evidence.errors.some(error => /changed clip: .* SVG has/.test(error)))
-    assert.ok(evidence.errors.some(error => /no clip: .*rsi12 SVG has/.test(error)))
-    assert.ok(evidence.errors.some(error => /changed bars: .*rsi12 SVG has/.test(error)))
-    assert.deepEqual(actual, evidence.errors, 'Every observed phase must retain the same geometry verdict as independent checks.')
+    assert.equal(evidence.retainedCorruption, true, 'Repairing a DOM path must preserve its captured corruption.')
+    assert.deepEqual(evidence.mappingFailures, [], 'DOM-only metadata changes must reach captured evidence without a new snapshot.')
+    assert.equal(evidence.errorsBeforeFinish, 0, 'Geometry validation must wait until capture stops.')
+    for (const phase of ['first invalid curve', 'repeated invalid curve', 'changed clip', 'no clip', 'changed bars']) {
+      assert.ok(report.violations.some(error => error.startsWith(`${phase}:`) && / SVG has /.test(error)), phase)
+    }
     assert.ok(report.deferredValidationSamples >= evidence.observations)
     assert.equal(report.deferredValidationSamples + report.failedCaptureSamples, report.probeCaptureSamples)
   } finally { if (!report) await finishPaintProbe(page) }
@@ -924,10 +854,12 @@ test('prepared resident indicators and statistics stay drawn through rapid scrol
       // Establish a complete canonical starting frame. The regression concerns
       // losing mature data during navigation, not first-time indicator seeding.
       await page.waitForFunction(({ timeframe, fields }) => {
-        const snapshot = document.querySelector('[data-chart-inst]')?.__chartSnapshot
-        return snapshot?.timeframe === timeframe && snapshot.bars.length === 96
-          && snapshot.bars.every(bar => [...fields, 'oi', 'buy', 'sell'].every(field => Number.isFinite(bar[field])))
+        const chart = document.querySelector('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
+        const bars = chart?.__chartRenderedBars ?? snapshot?.bars
+        return snapshot?.timeframe === timeframe && bars?.length >= 96 && bars.length <= 98
+          && bars.every(bar => [...fields, 'oi', 'buy', 'sell'].every(field => Number.isFinite(bar[field])))
       }, { timeframe, fields: indicatorFields }, { timeout: 20_000 })
+      await assertCompleteChartViewport(page, fixture.instId, { endHour: fixture.end })
       const resident = await waitForLocalHistory(electron, page, fixture, timeframe, { requireIndicators: true })
       assert.ok(resident >= 96 + 972, 'Every measured target must lie inside the fully calculated resident reserve.')
       await waitForRendered(page, fixture, timeframe)
@@ -962,7 +894,7 @@ test('prepared resident indicators and statistics stay drawn through rapid scrol
       await waitForRendered(page, fixture, timeframe)
       await settle()
       const paint = await finishPaintProbe(page)
-      const incomplete = paint.quality.filter(frame => frame.indicators !== 96 || frame.oi !== 96 || frame.taker !== 96)
+      const incomplete = paint.quality.filter(frame => frame.indicators !== frame.bars || frame.oi !== frame.bars || frame.taker !== frame.bars)
       if (incomplete.length) context.diagnostic(`Incomplete local paints: ${JSON.stringify({ timeframe, frames: incomplete })}`)
       assertCompletePaints(paint)
       assert.ok(paint.commits.some(commit => commit.end === historicalEnd), 'The probe must inspect the deep historical viewport.')
@@ -976,7 +908,7 @@ for (const mode of ['gap', 'prepend']) test(`first historical acquisition preser
   const probe = value => electron.evaluate((_, value) => globalThis.__marketBackend.probe(value), value)
   const fixture = await probe({ action: 'acquisitionInstall', timeframe: '15m', mode })
   const fields = ['vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
-  const desired = fixture.series[fixture.timeframe].bars.filter(bar => bar.hour >= fixture.targetEnd - 95 * fixture.intervalMS && bar.hour <= fixture.targetEnd)
+  let desired
   const settle = () => page.evaluate(async () => { for (let frame = 0; frame < 8; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
   try {
     await openChart(page, fixture)
@@ -987,10 +919,15 @@ for (const mode of ['gap', 'prepend']) test(`first historical acquisition preser
     await probe({ action: 'acquisitionStep', source: 'prefix' })
     await waitForRendered(page, fixture, fixture.timeframe, fixture.targetEnd)
     await page.waitForFunction(({ targetEnd, fields }) => {
-      const snapshot = document.querySelector('[data-chart-inst]')?.__chartSnapshot
-      return snapshot?.endHour === targetEnd && snapshot.bars.length === 96
-        && snapshot.bars.every(bar => fields.every(field => Number.isFinite(bar[field])))
+      const chart = document.querySelector('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
+      const bars = chart?.__chartRenderedBars ?? snapshot?.bars
+      return snapshot?.endHour === targetEnd && bars?.length >= 96 && bars.length <= 98
+        && bars.every(bar => fields.every(field => Number.isFinite(bar[field])))
     }, { targetEnd: fixture.targetEnd, fields }, { timeout: 20_000 })
+    const viewport = await assertCompleteChartViewport(page, fixture.instId, { endHour: fixture.targetEnd })
+    const canonical = new Map(fixture.series[fixture.timeframe].bars.map(bar => [bar.hour, bar]))
+    desired = viewport.expectedHours.map(hour => canonical.get(hour))
+    assert.ok(desired.every(Boolean), 'The acquired viewport must be covered by canonical source candles.')
     const firstEMA = await page.evaluate(() => document.querySelector('[data-chart-inst]').__chartSnapshot.bars.at(-1).ema)
     if (mode === 'prepend') assert.ok(Math.abs(firstEMA - desired.at(-1).ema) > 1e-6,
       'The absent earlier prefix must actually change the recursive result, so retaining a stale curve cannot pass this test.')
@@ -1011,7 +948,7 @@ for (const mode of ['gap', 'prepend']) test(`first historical acquisition preser
     // A changed prefix invalidates recursive curves until exact replacements
     // arrive. Prices keep the selected cursor and independent statistics stay.
     await page.waitForFunction(({ desired, fields }) => {
-      const bars = document.querySelector('[data-chart-inst]')?.__chartSnapshot?.bars
+      const chart = document.querySelector('[data-chart-inst]'), bars = chart?.__chartRenderedBars ?? chart?.__chartSnapshot?.bars
       return bars?.length === desired.length && bars.every((bar, index) => bar.hour === desired[index].hour
         && fields.every(field => Number.isFinite(bar[field]) && Math.abs(bar[field] - desired[index][field]) <= Math.max(1, Math.abs(desired[index][field])) * 1e-10))
     }, { desired, fields }, { timeout: 20_000 })
@@ -1019,7 +956,7 @@ for (const mode of ['gap', 'prepend']) test(`first historical acquisition preser
     const paint = await finishPaintProbe(page)
     context.diagnostic(`First acquisition ${mode}: ${JSON.stringify({ sourceCounts, paints: paint.paints, quality: paint.quality })}`)
     assertCompletePaints(paint)
-    assert.ok(paint.quality.every(frame => frame.oi === 96 && frame.taker === 96 && (mode === 'prepend' || frame.indicators === 96)),
+    assert.ok(paint.quality.every(frame => frame.oi === frame.bars && frame.taker === frame.bars && (mode === 'prepend' || frame.indicators === frame.bars)),
       'Independent statistics and unchanged indicator inputs must remain available while a changed recursive prefix rebuilds.')
     assert.ok(paint.commits.every(commit => commit.end === fixture.targetEnd), 'Canonical page writes must not cancel or replace the requested wheel cursor.')
   } finally {
@@ -1101,7 +1038,7 @@ test('a late durable history response cannot overwrite a more recently selected 
   } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
 })
 
-test('the live price overlay follows its actual price without changing the 96 completed candles', async () => {
+test('the live price overlay follows its actual price without changing the completed candle viewport', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   const visible = fixture.series[fixture.timeframe].bars.slice(-96)
   const prices = visible.flatMap(bar => ['low', 'high', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower'].map(field => bar[field]))
@@ -1117,13 +1054,15 @@ test('the live price overlay follows its actual price without changing the 96 co
     await wheelBurst(page, { deltaY: 12 })
     await waitForRendered(page, fixture, fixture.timeframe, historicalEnd)
     await page.waitForFunction(({ end, intervalMS }) => {
-      const bars = document.querySelector('[data-chart-inst]')?.__chartSnapshot?.bars
+      const chart = document.querySelector('[data-chart-inst]'), bars = chart?.__chartRenderedBars ?? chart?.__chartSnapshot?.bars
       return bars?.length >= 96 && bars.every((bar, index) =>
         bar.confirmed && bar.hour === end - (bars.length - 1 - index) * intervalMS)
     }, { end: historicalEnd, intervalMS: fixture.intervalMS })
+    await assertCompleteChartViewport(page, fixture.instId, { endHour: historicalEnd })
     await wheelBurst(page, { deltaY: -12 })
     await waitForRendered(page, fixture)
     await page.waitForFunction(() => Boolean(document.querySelector('[data-chart-inst]')?.__chartSnapshot?.liveBar))
+    await assertCompleteChartViewport(page, fixture.instId, { endHour: fixture.end })
     await startPaintProbe(page, fixture)
     const overlay = await page.evaluate(() => {
       const chart = document.querySelector('[data-chart-inst]')
@@ -1329,46 +1268,51 @@ test('known RSI, ATR% and BBW segments remain visible through indicator warm-up 
   const interiorGap = first + 50 * fixture.intervalMS
   fixture.series[fixture.timeframe].bars = fixture.series[fixture.timeframe].bars.map(bar => ({
     ...bar,
-    rsi6: bar.hour >= first && bar.hour <= warmupThrough ? null : bar.rsi6,
-    rsi12: bar.hour >= first && bar.hour <= warmupThrough || bar.hour === interiorGap ? null : bar.rsi12,
-    atrPercent: bar.hour >= first && bar.hour <= warmupThrough || bar.hour === interiorGap ? null : bar.atrPercent,
-    bbw: bar.hour >= first && bar.hour <= warmupThrough || bar.hour === interiorGap ? null : bar.bbw,
+    rsi6: bar.hour <= warmupThrough ? null : bar.rsi6,
+    rsi12: bar.hour <= warmupThrough || bar.hour === interiorGap ? null : bar.rsi12,
+    atrPercent: bar.hour <= warmupThrough || bar.hour === interiorGap ? null : bar.atrPercent,
+    bbw: bar.hour <= warmupThrough || bar.hour === interiorGap ? null : bar.bbw,
   }))
   await installPreparedTransform({ mode: 'warmup', instId: fixture.instId, timeframe: fixture.timeframe, first, warmupThrough, interiorGap })
   try {
     await openChart(page, fixture)
-    await startPaintProbe(page, fixture)
-    const paths = await page.evaluate(() => {
-      const svg = document.querySelector('svg[data-rendered-inst]')
-      const path = key => svg.querySelector(`[data-chart-indicator="${key}"]`)?.getAttribute('d') ?? ''
-      const rsi6 = path('rsi6'), rsi12 = path('rsi12'), rsi24 = path('rsi24'), atrPercent = path('atrPercent'), bbw = path('bbw')
-      const rsi6Label = [...svg.querySelectorAll('text')].find(node => node.textContent === 'RSI(6)')
-      const commands = value => value.match(/[ML][^ML]+/g) ?? []
-      const x = command => Number.parseFloat(command.slice(1))
-      return {
-        rsi6, rsi12, atrPercent, bbw, rsi6Legend: rsi6Label?.parentElement?.querySelectorAll('text')[1]?.textContent,
-        rsi6Points: commands(rsi6).length, rsi12Points: commands(rsi12).length,
-        rsi6Segments: (rsi6.match(/M/g) ?? []).length, rsi12Segments: (rsi12.match(/M/g) ?? []).length,
-        atrPoints: commands(atrPercent).length, bbwPoints: commands(bbw).length,
-        atrSegments: (atrPercent.match(/M/g) ?? []).length, bbwSegments: (bbw.match(/M/g) ?? []).length,
-        firstKnownX: commands(rsi6).length ? x(commands(rsi6)[0]) : null,
-        expectedFirstKnownX: commands(rsi24).length >= 8 ? x(commands(rsi24)[7]) : null,
-      }
+    const viewport = await assertCompleteChartViewport(page, fixture.instId, { endHour: fixture.end })
+    const canonical = new Map(fixture.series[fixture.timeframe].bars.map(bar => [bar.hour, bar]))
+    const visible = viewport.expectedHours.map(hour => canonical.get(hour))
+    assert.ok(visible.every(Boolean), 'Warm-up geometry must retain every canonical viewport slot.')
+    const paint = await withPaintProbe(page, fixture, {}, async () => {
+      const paths = await page.evaluate(() => {
+        const svg = document.querySelector('svg[data-rendered-inst]')
+        const path = key => svg.querySelector(`[data-chart-indicator="${key}"]`)?.getAttribute('d') ?? ''
+        const rsi6 = path('rsi6'), rsi12 = path('rsi12'), atrPercent = path('atrPercent'), bbw = path('bbw')
+        const rsi6Label = [...svg.querySelectorAll('text')].find(node => node.textContent === 'RSI(6)')
+        const commands = value => value.match(/[ML][^ML]+/g) ?? []
+        const x = command => Number.parseFloat(command.slice(1))
+        return {
+          rsi6, rsi12, atrPercent, bbw, rsi6Legend: rsi6Label?.parentElement?.querySelectorAll('text')[1]?.textContent,
+          rsi6Points: commands(rsi6).length, rsi12Points: commands(rsi12).length,
+          rsi6Segments: (rsi6.match(/M/g) ?? []).length, rsi12Segments: (rsi12.match(/M/g) ?? []).length,
+          atrPoints: commands(atrPercent).length, bbwPoints: commands(bbw).length,
+          atrSegments: (atrPercent.match(/M/g) ?? []).length, bbwSegments: (bbw.match(/M/g) ?? []).length,
+          firstKnownX: commands(rsi6).length ? x(commands(rsi6)[0]) : null,
+        }
+      })
+      assert.ok(paths.rsi6.length > 0, 'Initial warm-up nulls must not hide the later known RSI values.')
+      assert.equal(paths.rsi6Points, visible.filter(bar => Number.isFinite(bar.rsi6)).length)
+      assert.equal(paths.rsi6Segments, 1)
+      assert.equal(paths.rsi6Legend, fixture.series[fixture.timeframe].bars.at(-1).rsi6.toFixed(1), 'The latest known RSI reading must remain visible in its legend.')
+      assert.ok(Math.abs(paths.firstKnownX - chartViewportX(viewport, visible.find(bar => Number.isFinite(bar.rsi6)).hour)) <= .06,
+        'The known curve must begin at the first known native candle rather than extend over warm-up samples.')
+      assert.equal(paths.rsi12Points, visible.filter(bar => Number.isFinite(bar.rsi12)).length)
+      assert.equal(paths.rsi12Segments, 2, 'The curve must start a new segment after an interior missing sample.')
+      assert.equal(paths.atrPoints, visible.filter(bar => Number.isFinite(bar.atrPercent)).length)
+      assert.equal(paths.bbwPoints, visible.filter(bar => Number.isFinite(bar.bbw)).length)
+      assert.equal(paths.atrSegments, 2, 'ATR% must preserve known segments around a missing native candle.')
+      assert.equal(paths.bbwSegments, 2, 'BBW must preserve known segments around a missing native candle.')
+      assert.doesNotMatch(paths.rsi6 + paths.rsi12 + paths.atrPercent + paths.bbw, /NaN|Infinity|undefined/)
+      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)))
     })
-    assert.ok(paths.rsi6.length > 0, 'Six initial nulls must not hide the following 90 known RSI values.')
-    assert.equal(paths.rsi6Points, 90)
-    assert.equal(paths.rsi6Segments, 1)
-    assert.equal(paths.rsi6Legend, fixture.series[fixture.timeframe].bars.at(-1).rsi6.toFixed(1), 'The latest known RSI reading must remain visible in its legend.')
-    assert.equal(paths.firstKnownX, paths.expectedFirstKnownX, 'The known curve must begin at candle 7 rather than extend over warm-up samples.')
-    assert.equal(paths.rsi12Points, 89)
-    assert.equal(paths.rsi12Segments, 2, 'The curve must start a new segment after an interior missing sample.')
-    assert.equal(paths.atrPoints, 89)
-    assert.equal(paths.bbwPoints, 89)
-    assert.equal(paths.atrSegments, 2, 'ATR% must preserve known segments around a missing native candle.')
-    assert.equal(paths.bbwSegments, 2, 'BBW must preserve known segments around a missing native candle.')
-    assert.doesNotMatch(paths.rsi6 + paths.rsi12 + paths.atrPercent + paths.bbw, /NaN|Infinity|undefined/)
-    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)))
-    assertCompletePaints(await finishPaintProbe(page))
+    assertCompletePaints(paint)
   } finally {
     await removePreparedTransform()
   }

@@ -94,7 +94,7 @@ export async function seedCachedListProjection(store, marketService) {
 // A dense, fully local chart fixture for renderer benchmarks. It writes the
 // same durable rows that the production chart uses; no synthetic IPC response
 // or network timing is involved.
-export async function seedChartScrollBenchmark(store, marketService, { instId = 'SOL-USDT-SWAP', unavailableStatistics = false } = {}) {
+export async function seedChartScrollBenchmark(store, marketService, { instId = 'SOL-USDT-SWAP', unavailableStatistics = false, stablePriceLabels = false } = {}) {
   const timeframe = '1H'
   const alternateTimeframe = '15m'
   const timeframes = ['5m', '15m', '1H']
@@ -108,8 +108,11 @@ export async function seedChartScrollBenchmark(store, marketService, { instId = 
       const timestamp = start + index * intervalMS
       const trend = 135 + index * .018
       const wave = Math.sin(index / 9) * 1.6 + Math.cos(index / 23) * .7
-      const open = trend + wave
-      const close = open + Math.sin(index / 4) * .42
+      // Fixed decimal source precision keeps the benchmark's current-price
+      // gutter stable as it crosses history; it does not change formatting.
+      const price = value => stablePriceLabels ? Number(`${value.toFixed(2)}1`) : value
+      const open = price(trend + wave)
+      const close = price(trend + wave + Math.sin(index / 4) * .42)
       const volume = 4_000 + index % 600
       return {
         instrument: instId, timeframe: frame, timestamp,
@@ -127,8 +130,9 @@ export async function seedChartScrollBenchmark(store, marketService, { instId = 
   // so a later page cannot silently change the value at an existing timestamp.
   const intervals = { '5m': FIVE_MINUTES, '15m': 3 * FIVE_MINUTES, '1H': HOUR }
   const candlesByFrame = Object.fromEntries(timeframes.map(frame => [frame, buildCandles(frame, intervals[frame])]))
+  if (unavailableStatistics) candlesByFrame[timeframe] = candlesByFrame[timeframe].map(row => ({ ...row, oi: null, buy: null, sell: null }))
   const hourly = candlesByFrame[timeframe]
-  for (const frame of timeframes) await persistNativeFixture(store, marketService, candlesByFrame[frame].map(row => unavailableStatistics && frame === timeframe ? { ...row, oi: null, buy: null, sell: null } : row))
+  for (const frame of timeframes) await persistNativeFixture(store, marketService, candlesByFrame[frame])
   const series = Object.fromEntries(timeframes.map(frame => [frame, {
     intervalMS: intervals[frame], start: candlesByFrame[frame][0].timestamp, end,
     bars: barsWithIndicators(candlesByFrame[frame], intervals[frame]),
@@ -146,7 +150,7 @@ export async function seedChartScrollBenchmark(store, marketService, { instId = 
   marketService.error = ''
   marketService.lastRefreshAt = savedAt
   marketService.markChartDataChanged(instId)
-  return { instId, timeframe, alternateTimeframe, timeframes, intervalMS: HOUR, end, start: hourly[0].timestamp, periods, series }
+  return { instId, timeframe, alternateTimeframe, timeframes, intervalMS: HOUR, end, start: hourly[0].timestamp, periods, stablePriceLabels, series }
 }
 
 // Model successful empty source observations: prices exist,
@@ -154,8 +158,6 @@ export async function seedChartScrollBenchmark(store, marketService, { instId = 
 export async function seedHistoricalStatisticsBoundary(store, marketService) {
   const fixture = await seedChartScrollBenchmark(store, marketService, { instId: 'EMPTY-USDT-SWAP', unavailableStatistics: true })
   marketService.markChartDataChanged(fixture.instId)
-  fixture.series[fixture.timeframe].bars = fixture.series[fixture.timeframe].bars.map(bar => bar.hour >= fixture.end - 95 * HOUR
-    ? { ...bar, oi: null, buy: null, sell: null } : bar)
   return fixture
 }
 

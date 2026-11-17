@@ -9,7 +9,7 @@ test('a different native timeframe or instrument cannot acknowledge a scroll tar
   }
 })
 import { accountChartIntents, assertColdBoundaryResponsiveness, assertColdBoundaryTiming, assertNavigationResponsiveness, assertScrollResponsiveness, assertWarmStatistics, coldBoundaryTiming, collectAcceptanceChecks, summarizeLatencySamples } from '../../scripts/chart-acceptance-metrics.mjs'
-import { measureChartIntentLatency } from '../../scripts/chart-acceptance.mjs'
+import { assertChartViewport, chartViewportHours, measureChartIntentLatency } from '../../scripts/chart-acceptance.mjs'
 
 const coldTimes = () => ({ rendererTimeOrigin: 1_000_000, approachInputAt: 1_000, finalInputAt: 2_000,
   firstTargetRAFAt: 2_020, readyTargetRAFAt: 2_080, nearestStartedAt: 1_000_500,
@@ -251,4 +251,23 @@ test('intent accounting rejects malformed commit timestamps instead of coalescin
   assert.throws(() => accountChartIntents([{ instId: 'BTC', timeframe: '5m', at: 10, target: 1_000 }], [
     { instId: 'BTC', timeframe: '5m', at: 12, rafSampledAt: Number.NaN, end: 1_000 },
   ]), /finite target and ordered commit\/RAF timestamps/)
+})
+
+
+test('visible-domain slots include partial edge bodies and reject incomplete or duplicate ranges', () => {
+  const geometry = { domainStart: 0, domainEnd: 300, barWidth: 6.8, barSpacing: 10, intervalMS: 100 }
+  assert.deepEqual(chartViewportHours(geometry), [0, 100, 200, 300])
+  assert.deepEqual(chartViewportHours({ ...geometry, domainStart: 50, domainEnd: 350 }), [0, 100, 200, 300, 400])
+  assert.deepEqual(chartViewportHours({ ...geometry, domainStart: 75, domainEnd: 350 }), [100, 200, 300, 400])
+  assert.deepEqual(chartViewportHours({ ...geometry, domainStart: 50, domainEnd: 325 }), [0, 100, 200, 300])
+  assert.deepEqual(chartViewportHours({ ...geometry, domainStart: 68, domainEnd: 332 }), [100, 200, 300])
+  const reading = { ...geometry, visibleBars: 4, bars: [0, 100, 200, 300].map(hour => ({ hour })), renderedBars: 4,
+    targetBars: 96, chartStart: 0, svgStart: 0, chartEnd: 300, svgEnd: 300 }
+  assert.doesNotThrow(() => assertChartViewport(reading, { fullSlots: 4 }))
+  for (const hours of [[100, 200, 300], [0, 100, 300], [0, 100, 100, 300]]) {
+    assert.throws(() => assertChartViewport({ ...reading, bars: hours.map(hour => ({ hour })), renderedBars: hours.length }, { fullSlots: 4 }), /every native slot/)
+  }
+  for (const invalid of [{ domainStart: NaN }, { domainEnd: Infinity }, { barSpacing: 0 }, { intervalMS: -1 }]) {
+    assert.throws(() => chartViewportHours({ ...geometry, ...invalid }), /finite and ordered/)
+  }
 })

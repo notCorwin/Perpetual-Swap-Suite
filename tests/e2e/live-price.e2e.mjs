@@ -4,6 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
+import { installChartPriceReader } from '../helpers/chart-price-label.mjs'
 import { MarketStore } from '../../electron/services/market-store.js'
 import { MetadataStore, DEFAULT_PREFERENCES } from '../../electron/services/metadata-store.js'
 import { createNativeExchange, nativeIntervals } from '../helpers/native-exchange.mjs'
@@ -26,7 +27,7 @@ test('native WebSocket prices reach the selected SVG and survive delayed durable
     const label = svg?.querySelector('[data-chart-price-label-value]')?.textContent ?? ''
     return { chartInstId: chart?.getAttribute('data-chart-inst'), chartTimeframe: chart?.getAttribute('data-chart-timeframe'),
       svgInstId: svg?.getAttribute('data-rendered-inst'), svgTimeframe: svg?.getAttribute('data-rendered-timeframe'),
-      svgEnd: Number(svg?.getAttribute('data-rendered-end')), label, labelPrice: Number(label.split(/\s/)[0].replaceAll(',', '')),
+      svgEnd: Number(svg?.getAttribute('data-rendered-end')), label, labelPrice: window.__chartPriceLabel(label),
       snapshot: snapshot ? { instId: snapshot.instId, timeframe: snapshot.timeframe, endHour: snapshot.endHour,
         liveHour: snapshot.liveBar?.hour, livePrice: snapshot.liveBar?.close, confirmed: snapshot.liveBar?.confirmed,
         priceObservedAt: snapshot.priceObservedAt, realtimeState: snapshot.realtimeState, generation: snapshot.generation,
@@ -43,7 +44,7 @@ test('native WebSocket prices reach the selected SVG and survive delayed durable
         const workspace = document.querySelector('[data-chart-workspace]')
         const chart = workspace?.querySelector('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
         const svg = chart?.querySelector('svg[data-rendered-inst]')
-        const price = Number((svg?.querySelector('[data-chart-price-label-value]')?.textContent ?? '').split(/\s/)[0].replaceAll(',', ''))
+        const price = window.__chartPriceLabel(svg?.querySelector('[data-chart-price-label-value]')?.textContent)
         return snapshot?.instId === expected.instId && snapshot.timeframe === expected.timeframe
           && snapshot.liveBar?.hour === expected.hour && snapshot.liveBar.close === expected.close && price === expected.close
           && svg?.getAttribute('data-rendered-inst') === expected.instId && svg.getAttribute('data-rendered-timeframe') === expected.timeframe
@@ -109,6 +110,7 @@ test('native WebSocket prices reach the selected SVG and survive delayed durable
         PERPETUAL_SWAP_USER_DATA: directory, ...exchange.environment } })
     page = await electron.firstWindow()
     await page.waitForLoadState('domcontentloaded')
+    await installChartPriceReader(page)
     await page.getByRole('heading', { name: 'Perpetual Swap Suite', exact: true }).waitFor()
     const presentation = await electron.evaluate(({ BrowserWindow }) => {
       const window = BrowserWindow.getAllWindows()[0]

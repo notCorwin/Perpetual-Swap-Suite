@@ -155,6 +155,9 @@ jobs:
         run: |
           mkdir -p artifacts/build
           node scripts/build-artifact-reuse.mjs build --manifest artifacts/build/renderer.json -- npm run build 2>&1 | tee artifacts/build/renderer-build.log
+      - name: Verify long app idle and resume without taking focus
+        if: ${{ !cancelled() && steps.renderer-build.outcome == 'success' }}
+        run: npm run test:soak -- --reuse-build-manifest artifacts/build/renderer.json --output artifacts/sandbox
       - name: Run the fixed-rate full-market soak
         if: ${{ !cancelled() && steps.renderer-build.outcome == 'success' }}
         env:

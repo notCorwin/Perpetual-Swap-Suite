@@ -33,11 +33,11 @@ const desktopCoverage = {
 
 /** Standard suites must exercise their known app boundaries, beyond loader I/O. */
 export function sandboxCoverage(mode, { allowEmpty = false, requireCategories = [], requireRoles = [], requireOperations = [], graphicsPolicy, graphicsProvider } = {}) {
-  const contracts = mode === 'all' ? [coreCoverage, desktopCoverage]
-    : mode === 'core' ? [coreCoverage] : ['e2e', 'foreground'].includes(mode) ? [desktopCoverage] : []
+  const contracts = ['functional', 'all'].includes(mode) ? [coreCoverage, desktopCoverage]
+    : mode === 'core' ? [coreCoverage] : ['e2e', 'foreground', 'soak'].includes(mode) ? [desktopCoverage] : []
   const coverage = { allowEmpty, requireCategories, requireRoles, requireOperations }
   for (const key of ['requireCategories', 'requireRoles', 'requireOperations']) coverage[key] = [...new Set([...contracts.flatMap(contract => contract[key]), ...coverage[key]])]
-  if (mode === 'e2e' || mode === 'all') {
+  if (['e2e', 'functional', 'all'].includes(mode)) {
     coverage.requireCategories = [...new Set([...coverage.requireCategories, 'network'])]
     coverage.requireRoles = [...new Set([...coverage.requireRoles, 'electron-network-fixture'])]
     coverage.requireOperations.push('chart.capture', { name: 'fetch.request', source: 'native' }, { name: 'websocket.receive', source: 'native' })
@@ -71,18 +71,18 @@ export async function sandboxCommands(mode, args = [], { reuseBuildManifest, roo
     // Node, and install recording before any application module is imported.
     return [basename(args[0]).replace(/\.exe$/, '') === 'node' || resolve(args[0]) === process.execPath ? node(args.slice(1)) : args]
   }
-  if (!['core', 'e2e', 'gpu', 'foreground', 'all'].includes(mode) || args.length) throw new Error('Usage: node scripts/test-sandbox.mjs core|e2e|gpu|foreground|all|command [--desktop] [--foreground] [--allow-network] [--gpu-trace] [--require-gpu] [--metal] [--require-gpu-hardware-timing] [--allow-empty] [--require-category CATEGORY] [--require-role ROLE] [--scenario LABEL] [--output PATH] [--reuse-build-manifest PATH] [-- COMMAND ARGS...]')
-  if (reuseBuildManifest && !['e2e', 'gpu', 'foreground'].includes(mode)) {
-    throw new Error('--reuse-build-manifest is supported only by a single renderer-consuming suite: e2e, gpu, or foreground.')
+  if (!['core', 'functional', 'e2e', 'gpu', 'foreground', 'soak', 'all'].includes(mode) || args.length) throw new Error('Usage: node scripts/test-sandbox.mjs core|functional|e2e|gpu|foreground|soak|all|command [--desktop] [--foreground] [--allow-network] [--gpu-trace] [--require-gpu] [--metal] [--require-gpu-hardware-timing] [--allow-empty] [--require-category CATEGORY] [--require-role ROLE] [--scenario LABEL] [--output PATH] [--reuse-build-manifest PATH] [-- COMMAND ARGS...]')
+  if (reuseBuildManifest && !['e2e', 'gpu', 'foreground', 'soak'].includes(mode)) {
+    throw new Error('--reuse-build-manifest is supported only by a single renderer-consuming suite: e2e, gpu, foreground, or soak.')
   }
   const commands = []
   // Each core file may own SQLite and indicator worker trees. Unbounded file
   // parallelism oversubscribes those workers and the real-Electron workload.
-  if (mode === 'core' || mode === 'all') commands.push(node(['--experimental-strip-types', '--test-concurrency=2', '--test', ...await testFiles('src', '.test.ts', root), ...await testFiles('tests/core', '.test.mjs', root)]))
+  if (['core', 'functional', 'all'].includes(mode)) commands.push(node(['--experimental-strip-types', '--test-concurrency=2', '--test', ...await testFiles('src', '.test.ts', root), ...await testFiles('tests/core', '.test.mjs', root), ...await testFiles('scripts', '.test.mjs', root)]))
   if (mode !== 'core') {
     if (reuseBuildManifest) await verifyBuildReuseManifest({ root, manifestPath: reuseBuildManifest })
     else commands.push(npm(['run', 'build']))
-    if (mode !== 'gpu') commands.push(node(['--test-concurrency=1', '--test', ...await testFiles('tests/e2e', mode === 'foreground' ? '.foreground.mjs' : '.e2e.mjs', root)]))
+    if (mode !== 'gpu') commands.push(node(['--test-concurrency=1', '--test', ...await testFiles(mode === 'soak' ? 'tests/soak' : 'tests/e2e', mode === 'soak' ? '.soak.mjs' : mode === 'foreground' ? '.foreground.mjs' : '.e2e.mjs', root)]))
     if (mode === 'gpu' || mode === 'all') commands.push(node(['--test-concurrency=1', '--test', ...await testFiles('tests/e2e', '.gpu.mjs', root)]))
   }
   return commands
@@ -116,7 +116,7 @@ export async function runSandbox({ mode = 'core', args = [], output, allowNetwor
   const commands = await sandboxCommands(mode, args, { reuseBuildManifest })
   // Prepare once before any command can import Playwright/Electron. Never ask
   // electron/index.js to download or resolve an unprotected runtime here.
-  const guardedRuntime = presentation === 'background' && process.platform === 'darwin' && (['e2e', 'gpu', 'all'].includes(mode) || mode === 'command' && desktop)
+  const guardedRuntime = presentation === 'background' && process.platform === 'darwin' && (['functional', 'e2e', 'gpu', 'soak', 'all'].includes(mode) || mode === 'command' && desktop)
     ? await prepareTestElectron() : undefined
   const id = `${new Date().toISOString().replaceAll(':', '').replaceAll('.', '')}-${randomUUID().slice(0, 8)}`
   const directory = output ? resolve(output, id) : join(projectRoot, '.build/sandbox', id)

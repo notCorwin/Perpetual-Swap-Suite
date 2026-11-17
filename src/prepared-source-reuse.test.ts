@@ -89,6 +89,11 @@ test('failure status and retry gates use only unresolved coverage of the same se
   const end = Math.floor(now / interval) * interval - interval
   const { pipeline } = fixture([candle(end, { oi: null, statisticsVersion: 0 })], { ensureStatistics() {} })
   try {
+    // Indefinite retry gates belong to a live consumer; a local read alone
+    // admits cached facts without establishing focus or source demand.
+    pipeline.prepareFocus = async () => null
+    pipeline.setFocus({ instId, timeframe: '15m' }, 'source-retry-owner')
+    await pipeline.focus.task
     await pipeline.local(instId, '15m')
     const state = pipeline.state(instId, '15m'), retryAt = now + 5000
     const failure = { seriesKey: state.key, source: 'oi', from: end, through: end, failedAt: now,
@@ -106,6 +111,10 @@ test('failure status and retry gates use only unresolved coverage of the same se
     assert.equal(pipeline.sourceBlocked(state, 'oi', end, end), true)
     pipeline.sourceEpoch += 1
     assert.equal(pipeline.sourceBlocked(state, 'oi', end, end), false)
+    pipeline.sourceAttempts.set('oi', { ...failure, retryAt: undefined, sourceEpoch: pipeline.sourceEpoch })
+    assert.equal(pipeline.sourceBlocked(state, 'oi', end, end), true)
+    pipeline.setFocus(null, 'retired-source-retry-owner')
+    assert.equal(pipeline.sourceBlocked(state, 'oi', end, end), false, 'Retiring the consumer releases its indefinite retry gate.')
     await pipeline.observeStatistics(instId, '15m', end, end, 'interactive', [candle(end)], 'oi')
     assert.equal(pipeline.sourceStatus(state, 'oi', end, end, 'loading').state, 'loading')
     assert.equal(pipeline.sourceBlocked(state, 'oi', end, end), false)

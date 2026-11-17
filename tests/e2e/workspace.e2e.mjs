@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
-import { assertWorkspaceLayout, selectTimeframe } from '../../scripts/chart-acceptance.mjs'
+import { assertWorkspaceLayout, selectTimeframe, captureChartViewport, chartViewportHours, chartViewportX, assertChartViewport, assertCompleteChartViewport } from '../../scripts/chart-acceptance.mjs'
 
 const root = new URL('../..', import.meta.url).pathname
 const userData = await mkdtemp(join(tmpdir(), 'perp-workspace-e2e-'))
@@ -280,18 +280,27 @@ const backToMarkets = async () => {
   await settingsPage().waitFor({ state: 'hidden' })
   await page.locator('[data-market-status-row]').waitFor({ state: 'visible' })
 }
-const vwapCandleTarget = async (slot, fixture) => {
-  const target = await page.locator('svg[data-rendered-inst]').evaluate((svg, { slot, intervalMS }) => {
-    const commands = svg.querySelector('[data-chart-indicator="vwap"]').getAttribute('d').match(/[ML][^ML]+/g)
-    if (commands.length !== Number(svg.closest('[data-chart-rendered-bars]').dataset.chartRenderedBars) + 1) throw new Error('The fixture must draw its visible VWAP samples and their leading left-edge extension.')
-    const x = Number.parseFloat(commands[slot + 1].slice(1))
-    const rect = svg.getBoundingClientRect()
-    return { x: rect.x + x / svg.viewBox.baseVal.width * rect.width, y: rect.y + rect.height * .1,
-      hour: Number(svg.dataset.renderedStart) + slot * intervalMS }
-  }, { slot, intervalMS: fixture.intervalMS })
-  const expected = [...fixture.bars, ...(fixture.liveBar ? [fixture.liveBar] : [])].find(bar => bar.hour === target.hour)
+const vwapCandleTarget = async (position, fixture) => {
+  const viewport = await assertCompleteChartViewport(page, fixture.instId, { fullSlots: null })
+  const clip = await page.locator('svg[data-rendered-inst] clipPath[id$="-content"] rect').evaluate(rect => ({
+    left: Number(rect.getAttribute('x')), width: Number(rect.getAttribute('width')),
+  }))
+  const fullHours = viewport.expectedHours.filter(hour => {
+    const center = chartViewportX(viewport, hour)
+    return center - viewport.barWidth / 2 >= clip.left - .01 && center + viewport.barWidth / 2 <= clip.left + clip.width + .01
+  })
+  assert.ok(fullHours.length > 2, 'Pointer fixtures must contain fully visible candle bodies.')
+  const hour = position === 'first' ? fullHours[0] : position === 'middle' ? fullHours[Math.floor(fullHours.length / 2)]
+    : position === 'previous' ? fullHours.at(-2) : fullHours.at(-1)
+  const target = await page.locator('svg[data-rendered-inst]').evaluate((svg, x) => {
+    const point = svg.createSVGPoint()
+    point.x = x; point.y = svg.viewBox.baseVal.height * .1
+    const screen = point.matrixTransform(svg.getScreenCTM())
+    return { x: screen.x, y: screen.y }
+  }, chartViewportX(viewport, hour))
+  const expected = [...fixture.bars, ...(fixture.liveBar ? [fixture.liveBar] : [])].find(bar => bar.hour === hour)
   assert.ok(expected, 'The drawn candle must have an independent desktop-fixture observation.')
-  return { ...target, close: expected.close }
+  return { ...target, hour, close: expected.close }
 }
 const clickByRect = async locator => {
   await locator.scrollIntoViewIfNeeded()
@@ -538,7 +547,9 @@ test('chart legends remain inside the plot with analysis open at the minimum win
       const bounds = label.getBoundingClientRect()
       return { left: bounds.left, right: bounds.right }
     }))
-    assert.ok(timeLabels.length >= 2, 'The time axis must retain context and its newest label.')
+    assert.ok(timeLabels.length >= 1, 'The narrow time axis must retain its newest label.')
+    const latest = await assertCompleteChartViewport(page, 'BETA-USDT-SWAP', { fullSlots: null })
+    assert.equal(await page.locator('[data-chart-time-label]').last().textContent(), new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false }).format(latest.expectedHours.at(-1)))
     assert.ok(timeLabels.every((label, index) => index === 0 || label.left >= timeLabels[index - 1].right), 'Time labels must not overlap.')
     if (process.env.PERPETUAL_SWAP_ANALYSIS_SCREENSHOT) await page.screenshot({ path: process.env.PERPETUAL_SWAP_ANALYSIS_SCREENSHOT })
   } finally {
@@ -564,7 +575,7 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
     globalThis.__workspaceFixture.sendChart(frame)
   })
   await page.waitForFunction(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.liveBar?.close === 133)
-  assert.equal(Number(await chart.getAttribute('data-chart-rendered-bars')), 96)
+  await assertCompleteChartViewport(page, 'BETA-USDT-SWAP', { fullSlots: null })
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), before + 1, 'Only the fixture read may be added; the pushed candle must not trigger another renderer read.')
   const liveUpdate = await page.evaluate(() => {
     const snapshot = document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]').__chartSnapshot
@@ -577,7 +588,7 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
   await electron.evaluate(({ BrowserWindow }, update) => globalThis.__workspaceFixture.sendChart(update), liveUpdate)
   await page.waitForFunction(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.liveBar?.close === 135)
   assert.match(await chart.locator('[aria-live="off"]').textContent(), /Close\s+135/)
-  assert.match(await chart.locator('svg[data-rendered-inst] [data-chart-price-label-value]').textContent(), /^135 /)
+  assert.match(await chart.locator('svg[data-rendered-inst] [data-chart-price-label-value]').textContent(), /^Price 135 /)
   assert.equal(await page.evaluate(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]').__chartSnapshot.bars === globalThis.__completedSubscriptionBars), true)
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), reads, 'Live-only subscriptions must reuse the completed frame without a follow-up read.')
 })
@@ -603,9 +614,9 @@ test('contract precision updates pad current quotes while preserving historical 
       return frame
     })
     await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '100.1200')
-    await waitForLabel('100.1200 ↑')
+    await waitForLabel('Price 100.1200 ↑')
     assert.equal(await close.textContent(), '100.1200')
-    assert.equal(await chart.locator('[data-chart-legend="VWAP(14)"]').locator('..').locator('text').nth(1).textContent(), '100.12346', 'Indicators retain their independent significant-digit display.')
+    assert.equal(await chart.locator('[data-chart-legend="VWAP(14)"]').locator('..').locator('[data-chart-legend-value]').textContent(), '100.12346', 'Indicators retain their independent significant-digit display.')
     const baseline = await page.evaluate(() => {
       const chart = document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')
       globalThis.__precisionBars = chart.__chartSnapshot.bars
@@ -619,7 +630,7 @@ test('contract precision updates pad current quotes while preserving historical 
       state.revision += 1; state.notify()
     })
     await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '100.12000000')
-    await waitForLabel('100.12000000 ↑')
+    await waitForLabel('Price 100.12000000 ↑')
     assert.equal(await close.textContent(), '100.12000000')
     const layout = await chart.evaluate(chart => {
       const label = chart.querySelector('[data-chart-price-label-value]').getBoundingClientRect()
@@ -633,12 +644,12 @@ test('contract precision updates pad current quotes while preserving historical 
     assert.equal(layout.historicalClose, 100.123456789)
     assert.equal(layout.vwap, 100.123456789)
     assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), reads, 'Precision updates must not request chart data again.')
-    const target = await vwapCandleTarget(94, frame)
+    const target = await vwapCandleTarget('previous', frame)
     await page.mouse.move(target.x, target.y)
     await page.mouse.down()
     await page.waitForFunction(() => document.querySelector('[data-chart-ohlc="close"] span[title]')?.textContent === '100.123456789')
     await page.mouse.up()
-    await waitForLabel('100.12000000 ↑')
+    await waitForLabel('Price 100.12000000 ↑')
   } finally {
     await page.mouse.up()
     const generation = await electron.evaluate(async () => {
@@ -713,7 +724,7 @@ test('chart source updates stay outside the plot without resizing its viewport a
   }
 })
 
-test('pointer inspection selects the drawn first, middle, and latest candle before and after a forming candle shifts the window', async () => {
+test('pointer inspection selects the first fully visible, middle, and latest candle before and after a forming candle shifts the window', async () => {
   await selectTimeframe(page, '15m')
   const publish = forming => electron.evaluate(async ({ ipcMain, BrowserWindow }, forming) => {
     const state = globalThis.__workspaceFixture
@@ -732,11 +743,10 @@ test('pointer inspection selects the drawn first, middle, and latest candle befo
     for (const forming of [false, true]) {
       const frame = await publish(forming)
       await waitForFrame(frame)
-      for (const slot of [0, 24, 95]) {
+      for (const slot of ['first', 'middle', 'last']) {
         const target = await vwapCandleTarget(slot, frame)
-        const fixtureIndex = slot + Number(forming)
-        assert.equal(target.hour, frame.bars[0].hour + fixtureIndex * frame.intervalMS)
-        assert.equal(target.close, fixtureIndex === 96 ? 137 : 100 + fixtureIndex * .01)
+        const fixtureBar = [...frame.bars, ...(frame.liveBar ? [frame.liveBar] : [])].find(bar => bar.hour === target.hour)
+        assert.equal(target.close, fixtureBar.close)
         await page.mouse.move(target.x, target.y)
         await page.mouse.down()
         await page.waitForFunction(() => document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
@@ -760,9 +770,9 @@ test('RSI crossings retain a flat panel and expose the sampled candle and time a
     state.chartGeneration += 1
     const frame = await globalThis.__workspaceFixture.request(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
     if (custom) frame.bars = frame.bars.map((bar, index) => ({ ...bar,
-      rsi6: index === 20 ? 29 : index === 21 ? 31 : index === 40 ? 69 : index === 41 ? 71 : 50,
-      rsi12: index === 60 ? 71 : index === 61 ? 69 : 55,
-      rsi24: index === 80 ? 29 : index === 81 ? 31 : 60,
+      rsi6: index === frame.bars.length - 17 ? 29 : index === frame.bars.length - 16 ? 31 : index === frame.bars.length - 13 ? 69 : index === frame.bars.length - 12 ? 71 : 50,
+      rsi12: index === frame.bars.length - 9 ? 71 : index === frame.bars.length - 8 ? 69 : 55,
+      rsi24: index === frame.bars.length - 5 ? 29 : index === frame.bars.length - 4 ? 31 : 60,
     }))
     globalThis.__workspaceFixture.sendChart(frame)
     return frame
@@ -772,12 +782,7 @@ test('RSI crossings retain a flat panel and expose the sampled candle and time a
       await page.emulateMedia({ colorScheme })
       await page.setViewportSize({ width, height: width === 800 ? 572 : 1000 })
       await page.waitForFunction(width => document.querySelector('[data-layout="market-workspace"]').getBoundingClientRect().width === width, width)
-      await page.waitForFunction(() => {
-        const chart = document.querySelector('[data-chart-inst]')
-        const width = chart.querySelector('[data-chart-plot]').clientWidth
-        const count = Math.min(288, 96 + Math.max(0, Math.floor((width - 720) / 240)) * 48)
-        return Number(chart.dataset.chartTargetBars) === count && Number(chart.dataset.chartRenderedBars) > 0
-      })
+      await assertCompleteChartViewport(page, 'BETA-USDT-SWAP', { fullSlots: null })
       const frame = await publish(true)
       await page.waitForFunction(generation => document.querySelector('[data-chart-inst]')?.__chartSnapshot?.generation === generation, frame.generation)
       const svg = page.locator('svg[data-rendered-inst="BETA-USDT-SWAP"]')
@@ -787,7 +792,7 @@ test('RSI crossings retain a flat panel and expose the sampled candle and time a
           const scale = Number(document.querySelector('[data-ui-scale]')?.dataset.uiScale)
           if (!svg || !scale) return false
           const rect = svg.getBoundingClientRect(), bounds = svg.viewBox.baseVal
-          if (Math.abs(rect.right - width) >= .5 || Math.abs(rect.width - bounds.width * scale) >= .5 || Math.abs(rect.height - bounds.height * scale) >= .5) return false
+          if (rect.right > width + .5 || Math.abs(rect.width - bounds.width * scale) >= .5 || Math.abs(rect.height - bounds.height * scale) >= .5) return false
           const marker = svg.querySelector(`[data-chart-rsi-crossing="rsi6"][data-chart-rsi-hour="${hour}"]`)
           if (!marker) return false
           const [, x, y] = marker.getAttribute('d').match(/^M([\d.-]+) ([\d.-]+)/)
@@ -798,7 +803,7 @@ test('RSI crossings retain a flat panel and expose the sampled candle and time a
           point.x -= 3; point.y += 4.5
           const corner = point.matrixTransform(matrix)
           return { x: center.x, y: center.y, cornerX: corner.x, cornerY: corner.y }
-        }, { hour: frame.bars[21].hour, width })
+        }, { hour: frame.bars.at(-16).hour, width })
         try { return await handle.jsonValue() } finally { await handle.dispose() }
       }
       const point = await markerPoint()
@@ -811,17 +816,17 @@ test('RSI crossings retain a flat panel and expose the sampled candle and time a
       assert.equal(appearance.retiredFill, '')
       assert.equal(appearance.seriesWidth, '1px')
       for (const field of ['rsi6', 'rsi12', 'rsi24']) assert.ok(await svg.locator(`[data-chart-rsi-crossing="${field}"]`).count() > 0)
-      const marker = svg.locator(`[data-chart-rsi-crossing="rsi6"][data-chart-rsi-hour="${frame.bars[21].hour}"]`)
+      const marker = svg.locator(`[data-chart-rsi-crossing="rsi6"][data-chart-rsi-hour="${frame.bars.at(-16).hour}"]`)
       assert.equal(await marker.getAttribute('data-chart-rsi-direction'), 'up')
       assert.equal(await marker.getAttribute('data-chart-rsi-levels'), '30')
       await page.mouse.move(point.x, point.y)
       await page.waitForFunction(hour => document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes(
-        new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false }).format(hour)), frame.bars[21].hour)
-      assert.equal(Number(await page.locator('[data-chart-ohlc="close"] span[title]').getAttribute('title')), frame.bars[21].close)
+        new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false }).format(hour)), frame.bars.at(-16).hour)
+      assert.equal(Number(await page.locator('[data-chart-ohlc="close"] span[title]').getAttribute('title')), frame.bars.at(-16).close)
       assert.match(await svg.locator('[data-chart-panel-header="rsi"]').textContent(), /31\.0 ↑30/)
       const corner = await markerPoint()
       await page.mouse.move(corner.cornerX, corner.cornerY)
-      assert.equal(Number(await page.locator('[data-chart-ohlc="close"] span[title]').getAttribute('title')), frame.bars[21].close, 'Hovering a triangle corner must inspect that triangle\'s candle.')
+      assert.equal(Number(await page.locator('[data-chart-ohlc="close"] span[title]').getAttribute('title')), frame.bars.at(-16).close, 'Hovering a triangle corner must inspect that triangle\'s candle.')
       assert.equal(await svg.locator('[data-chart-inspected-time]').count(), 1)
       const labelBounds = await svg.locator('[data-chart-inspected-time] rect').evaluate(rect => ({ x: Number(rect.getAttribute('x')), end: Number(rect.getAttribute('x')) + Number(rect.getAttribute('width')),
         right: Number(rect.ownerSVGElement.querySelector('[data-chart-rsi-threshold]').getAttribute('x2')) }))
@@ -829,9 +834,9 @@ test('RSI crossings retain a flat panel and expose the sampled candle and time a
       if (process.env.PERPETUAL_SWAP_UI_SCREENSHOTS) await page.screenshot({ path: join(process.env.PERPETUAL_SWAP_UI_SCREENSHOTS, `rsi-${colorScheme}-${width}.png`) })
       await svg.focus()
       await page.keyboard.press('Alt+ArrowLeft')
-      assert.equal(Number(await page.locator('[data-chart-ohlc="close"] span[title]').getAttribute('title')), frame.bars[20].close)
+      assert.equal(Number(await page.locator('[data-chart-ohlc="close"] span[title]').getAttribute('title')), frame.bars.at(-17).close)
       await page.keyboard.press('Alt+ArrowRight')
-      assert.equal(Number(await page.locator('[data-chart-ohlc="close"] span[title]').getAttribute('title')), frame.bars[21].close)
+      assert.equal(Number(await page.locator('[data-chart-ohlc="close"] span[title]').getAttribute('title')), frame.bars.at(-16).close)
       await page.keyboard.press('Escape')
       assert.equal(await svg.locator('[data-chart-inspected-time]').count(), 0)
     }
@@ -996,7 +1001,7 @@ test('selection persists while six width/DPR combinations share page, pointer, a
         return chart?.dataset.chartLoading === 'false' && Number(chart.dataset.chartRenderedBars) > 0
       })
       const currentFixture = await electron.evaluate(() => globalThis.__workspaceFixture.request(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } }))
-      const target = await vwapCandleTarget(24, currentFixture)
+      const target = await vwapCandleTarget('middle', currentFixture)
       await page.mouse.move(target.x, target.y)
       await page.mouse.down()
       await page.waitForFunction(() => document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
@@ -1737,7 +1742,7 @@ test('missing recent candles remain visible with repair status until the complet
     }
     state.chartOverride = frame
     globalThis.__workspaceFixture.sendChart(frame)
-    return { generation: frame.generation, endHour: frame.endHour, liveHour: frame.liveBar.hour }
+    return { generation: frame.generation, endHour: frame.endHour, liveHour: frame.liveBar.hour, hours: [...frame.bars.map(bar => bar.hour), frame.liveBar.hour] }
   }, phase)
   const waitForFrame = frame => page.waitForFunction(({ generation, endHour, liveHour }) => {
     const chart = document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]'), snapshot = chart?.__chartSnapshot
@@ -1758,14 +1763,18 @@ test('missing recent candles remain visible with repair status until the complet
       assert.doesNotMatch(await status.textContent(), /Chart ready/)
       assert.equal(await chart.getAttribute('data-chart-incomplete'), 'true')
       assert.equal(await chart.locator('svg[data-rendered-inst]').isVisible(), true, 'Actual prices remain visible while missing slots repair.')
-      assert.ok(Number(await chart.getAttribute('data-chart-rendered-bars')) >= 95)
-      assert.match(await chart.locator('svg[data-rendered-inst] [data-chart-price-label-value]').textContent(), /^133 /, 'The current forming price remains visible across the historical gap.')
+      const viewport = await chart.evaluate(captureChartViewport)
+      const available = new Set(frame.hours)
+      assert.deepEqual(viewport.bars.map(bar => bar.hour), chartViewportHours(viewport).filter(hour => available.has(hour)),
+        'While history is incomplete, draw exactly the source candles intersecting the viewport without inventing missing prices.')
+      assert.ok(viewport.bars.some(bar => bar.hour === frame.liveHour))
+      assert.match(await chart.locator('svg[data-rendered-inst] [data-chart-price-label-value]').textContent(), /^Price 133 /, 'The current forming price remains visible across the historical gap.')
     }
     await waitForFrame(await publish('repaired'))
     await page.waitForFunction(() => !document.querySelector('[data-chart-status]')?.textContent.trim())
     assert.equal(await chart.getAttribute('data-chart-candle-state'), 'ready')
     assert.equal(await chart.getAttribute('data-chart-incomplete'), 'false')
-    assert.equal(await chart.getAttribute('data-chart-rendered-bars'), '96')
+    await assertCompleteChartViewport(page, 'BETA-USDT-SWAP', { fullSlots: null })
     assert.doesNotMatch(await status.textContent(), /missing price history|stale; repairing/)
   } finally {
     await electron.evaluate(() => {
@@ -1824,6 +1833,22 @@ test('failed and unavailable chart sources preserve qualified rows and report di
   }
 })
 
+const completeStackedViewports = async () => {
+  const charts = page.locator('[data-chart-inst]')
+  const readings = []
+  for (let index = 0; index < await charts.count(); index++) readings.push(assertChartViewport(await charts.nth(index).evaluate(captureChartViewport), { fullSlots: null }))
+  return readings
+}
+
+const waitForWorkspaceSize = async width => {
+  await page.waitForFunction(width => innerWidth === width && document.querySelector('[data-layout="market-workspace"]').getBoundingClientRect().width === width
+    && [...document.querySelectorAll('[data-chart-workspace]')].every(chart => {
+    const svg = chart.querySelector('svg[data-rendered-inst]'), plot = chart.querySelector('[data-chart-plot]')
+    return svg && Math.abs(svg.viewBox.baseVal.width - plot.clientWidth) < 1 && Math.abs(svg.viewBox.baseVal.height - plot.clientHeight) < 1
+  }), width)
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+}
+
 test('larger windows retain control density while showing more rows and candles in every stacked timeframe', async () => {
   const publish = values => electron.evaluate((_electron, values) => {
     const state = globalThis.__workspaceFixture
@@ -1846,32 +1871,40 @@ test('larger windows retain control density while showing more rows and candles 
       const initial = globalThis.__workspaceFixture.initialRows
       return [...initial, ...Array.from({ length: 80 }, (_, index) => ({ ...initial[0], instId: `MARKET${index}-USDT-SWAP`, rankingChange: .01 }))]
     }) })
-    await page.waitForFunction(() => document.querySelectorAll('[data-chart-rendered-bars="96"]').length === 3)
+    await waitForWorkspaceSize(1200)
+    const normalViews = await completeStackedViewports()
     const normal = await measure()
     await client.send('Emulation.setDeviceMetricsOverride', { width: 1510, height: 1000, deviceScaleFactor: 1, mobile: false })
-    await page.waitForFunction(() => document.querySelectorAll('[data-chart-rendered-bars="192"]').length === 3)
+    await waitForWorkspaceSize(1510)
+    const expandedViews = await completeStackedViewports()
     await assertWorkspaceLayout(page)
     const expanded = await measure()
     assert.equal(expanded.rowHeight, normal.rowHeight)
     assert.equal(expanded.fontSize, normal.fontSize)
     assert.ok(expanded.listWidth >= normal.listWidth && expanded.listWidth <= 420)
     assert.ok(expanded.visibleRows > normal.visibleRows, `${JSON.stringify({ normal, expanded })}`)
-    assert.deepEqual(expanded.candles, [192, 192, 192])
+    assert.equal(expandedViews.length, 3)
+    assert.ok(expandedViews.every((view, index) => view.expectedHours.length > normalViews[index].expectedHours.length))
+    assert.deepEqual(expandedViews.map(view => view.barSpacing), normalViews.map(view => view.barSpacing), 'Resizing preserves the chosen candle pitch.')
     const focusCount = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartFocus).length)
     await client.send('Emulation.setDeviceMetricsOverride', { width: 1520, height: 1000, deviceScaleFactor: 1, mobile: false })
     await page.waitForFunction(() => innerWidth === 1520)
     assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartFocus).length), focusCount,
       'Resizing inside a density band must reuse the same data demand.')
-    for (const [width, height, count] of [[1710, 1008, 192], [1600, 1000, 192], [2600, 1300, 288]]) {
+    for (const [width, height] of [[1710, 1008], [1600, 1000], [2600, 1300]]) {
       await client.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false })
-      await page.waitForFunction(count => document.querySelectorAll(`[data-chart-rendered-bars="${count}"]`).length === 3, count)
+      await waitForWorkspaceSize(width)
+      const views = await completeStackedViewports()
+      assert.ok(views.every(view => view.barSpacing === normalViews[0].barSpacing))
+      assert.ok(views.every(view => view.expectedHours.length > normalViews[0].expectedHours.length))
       await assertWorkspaceLayout(page)
       const resized = await measure()
       assert.equal(resized.rowHeight, normal.rowHeight)
       assert.equal(resized.fontSize, normal.fontSize)
     }
     await client.send('Emulation.setDeviceMetricsOverride', { width: 1200, height: 800, deviceScaleFactor: 1, mobile: false })
-    await page.waitForFunction(() => document.querySelectorAll('[data-chart-rendered-bars="96"]').length === 3)
+    await waitForWorkspaceSize(1200)
+    assert.deepEqual((await completeStackedViewports()).map(view => view.expectedHours.length), normalViews.map(view => view.expectedHours.length))
   } finally {
     await client.send('Emulation.clearDeviceMetricsOverride')
     await client.detach()
@@ -1923,19 +1956,9 @@ test('compact density reserves at least eighty percent of each stacked chart for
     const readings = []
     for (const width of [1200, 1710]) {
       await page.setViewportSize({ width, height: width === 1200 ? 1007 : 1008 })
-      await page.waitForFunction(width => {
-        const root = document.querySelector('[data-layout="market-workspace"]')
-        const charts = [...document.querySelectorAll('[data-chart-workspace]')]
-        return root.getBoundingClientRect().width === width && charts.length === 3 && charts.every(chart => {
-          const surface = chart.querySelector('[data-chart-inst]')
-          const svg = chart.querySelector('svg[data-rendered-inst]'), plot = chart.querySelector('[data-chart-plot]')
-          const count = Math.min(288, 96 + Math.max(0, Math.floor((plot.clientWidth - 720) / 240)) * 48)
-          return svg && Number(surface?.dataset.chartRenderedBars) === count && Number(surface?.dataset.chartTargetBars) === count
-            && Math.abs(svg.viewBox.baseVal.width - plot.clientWidth) < 1
-            && Math.abs(svg.viewBox.baseVal.height - plot.clientHeight) < 1
-            && svg.querySelector('clipPath[id$="-price"] rect')
-        })
-      }, width)
+      await waitForWorkspaceSize(width)
+      const viewports = await completeStackedViewports()
+      assert.equal(viewports.length, 3)
       const reading = await page.evaluate(() => ({ width: innerWidth,
         sidebar: document.querySelector('[data-market-list]').getBoundingClientRect().width,
         rowHeight: document.querySelector('[data-market-index]').getBoundingClientRect().height,

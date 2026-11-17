@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { _electron } from 'playwright'
+import { installChartPriceReader } from '../helpers/chart-price-label.mjs'
 
 test('qualified rows stay stable while one SVG surface handles canonical frames, corrections and resize', { timeout: 90_000 }, async () => {
   const userData = await mkdtemp(join(tmpdir(), 'perp-chart-prerender-'))
@@ -14,6 +15,7 @@ test('qualified rows stay stable while one SVG surface handles canonical frames,
       env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_USER_DATA: userData } })
     const page = await electron.firstWindow()
     await page.waitForLoadState('domcontentloaded')
+    await installChartPriceReader(page)
     const pageErrors = []
     page.on('pageerror', error => pageErrors.push(error.message))
     // Withhold chart delivery before the first fixture frame can be ingested.
@@ -231,7 +233,7 @@ test('qualified rows stay stable while one SVG surface handles canonical frames,
       return new Promise(resolve => requestAnimationFrame(() => {
         const chart = document.querySelector('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
         const svg = chart?.querySelector('svg[data-rendered-inst]')
-        const labelPrice = Number(svg?.querySelector('[data-chart-price-label-value]')?.textContent.split(/\s/)[0].replaceAll(',', ''))
+        const labelPrice = window.__chartPriceLabel(svg?.querySelector('[data-chart-price-label-value]')?.textContent)
         resolve({ price, currentInst: snapshot?.instId, livePrice: snapshot?.liveBar?.close, labelPrice,
           currentAtNextFrame: snapshot?.instId === instId && snapshot.liveBar?.close === price
           && snapshot.bars.length === 96 && snapshot.bars.every(bar => bar.confirmed)

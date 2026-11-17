@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { requireForegroundTests } from '../electron/test-presentation.js'
 import { barsWithIndicators } from '../electron/services/indicators.js'
+import { validChartWindowBars } from '../electron/chart-viewport.js'
 import { startRendererCPUCounter } from './renderer-cpu-counter.mjs'
 import { accountChartIntents, assertColdBoundaryResponsiveness, assertColdBoundaryTiming, assertScrollResponsiveness, assertWarmStatistics, coldBoundaryTiming, collectAcceptanceChecks, summarizeLatencySamples } from './chart-acceptance-metrics.mjs'
 
@@ -123,7 +124,8 @@ export async function waitForTargetSnapshot(page, fixture, timeframe, end) {
       && Number(svg.getAttribute('data-rendered-end')) === end
       && Number(chart.getAttribute('data-chart-completed-end')) === end
       && Number(chart.getAttribute('data-chart-rendered-bars')) > 0
-      && Number(chart.getAttribute('data-chart-rendered-bars')) === Math.floor(Number(chart.getAttribute('data-chart-visible-bars')))
+      && Number(chart.getAttribute('data-chart-rendered-bars')) >= Math.floor(Number(chart.getAttribute('data-chart-visible-bars')))
+      && Number(chart.getAttribute('data-chart-rendered-bars')) <= Math.floor(Number(chart.getAttribute('data-chart-visible-bars'))) + 2
       && Number(chart.getAttribute('data-chart-target-bars')) >= Number(chart.getAttribute('data-chart-visible-bars'))
   }, { instId: fixture.instId, timeframe, end }, { timeout: 20_000 })
 }
@@ -250,6 +252,57 @@ export async function assertIndicatorLegends(page, { requireFittedVolatility = f
   return reading
 }
 
+// Serializable DOM capture; domain assertions run after timing, outside RAF.
+export function captureChartViewport(chart) {
+  const svg = chart.querySelector('svg[data-rendered-inst]'), snapshot = chart.__chartSnapshot
+  return {
+    instId: snapshot?.instId, timeframe: snapshot?.timeframe, intervalMS: snapshot?.intervalMS, endHour: snapshot?.endHour,
+    visibleBars: Number(chart.dataset.chartVisibleBars), barSpacing: Number(chart.dataset.chartBarSpacing),
+    domainStart: Number(svg?.dataset.chartDomainStart), domainEnd: Number(svg?.dataset.chartDomainEnd),
+    barWidth: Number(svg?.dataset.chartBarWidth), plotRight: Number(svg?.dataset.chartPlotRight),
+    renderedBars: Number(chart.dataset.chartRenderedBars), targetBars: Number(chart.dataset.chartTargetBars),
+    chartStart: Number(chart.dataset.chartStart), chartEnd: Number(chart.dataset.chartEnd),
+    svgStart: Number(svg?.dataset.renderedStart), svgEnd: Number(svg?.dataset.renderedEnd),
+    bars: chart.__chartRenderedBars ?? snapshot?.bars ?? [],
+  }
+}
+
+// Candle bodies intersect the continuous domain at either edge. Derive slots
+// from geometry, independently of the bars supplied by the production store.
+export function chartViewportHours({ domainStart, domainEnd, barWidth, barSpacing, intervalMS }) {
+  assert.ok([domainStart, domainEnd, barWidth, barSpacing, intervalMS].every(Number.isFinite)
+    && domainStart <= domainEnd && barWidth > 0 && barSpacing > 0 && intervalMS > 0, 'Chart domain geometry must be finite and ordered.')
+  const padding = barWidth / barSpacing * intervalMS
+  const first = Math.floor((domainStart - padding) / intervalMS) + 1
+  const last = Math.ceil((domainEnd + padding) / intervalMS) - 1
+  assert.ok(last >= first && last - first < 10000, 'Chart domain must contain a bounded native candle range.')
+  return Array.from({ length: last - first + 1 }, (_, index) => (first + index) * intervalMS)
+}
+
+export function chartViewportX(reading, hour) {
+  assert.ok(Number.isFinite(hour) && Number.isFinite(reading.plotRight), 'Candle coordinates require finite geometry.')
+  return reading.plotRight - reading.barWidth / 2 + (hour - reading.domainEnd) / reading.intervalMS * reading.barSpacing
+}
+
+export function assertChartViewport(reading, { fullSlots = 96, endHour } = {}) {
+  const expectedHours = chartViewportHours(reading)
+  assert.ok(Number.isFinite(reading.visibleBars) && reading.visibleBars > 0, 'The chart must publish its continuous visible span.')
+  if (fullSlots !== null) assert.equal(Math.floor(reading.visibleBars), fullSlots, 'The full-slot workload must match its calibrated viewport.')
+  const full = fullSlots ?? Math.floor(reading.visibleBars)
+  assert.ok(expectedHours.length >= full && expectedHours.length <= full + 2, 'Only the two edge candles may be partially visible.')
+  assert.deepEqual(reading.bars.map(bar => bar.hour), expectedHours, 'The chart must draw every native slot intersecting its independent geometric domain.')
+  assert.equal(reading.renderedBars, expectedHours.length)
+  assert.ok(reading.targetBars >= expectedHours.length, 'Prepared demand must cover the entire geometric viewport.')
+  assert.equal(reading.chartStart, expectedHours[0]); assert.equal(reading.svgStart, expectedHours[0])
+  assert.equal(reading.chartEnd, expectedHours.at(-1)); assert.equal(reading.svgEnd, expectedHours.at(-1))
+  if (endHour !== undefined) assert.equal(reading.endHour, endHour)
+  return { ...reading, expectedHours }
+}
+
+export async function assertCompleteChartViewport(page, instId, options) {
+  return assertChartViewport(await page.locator(`[data-chart-inst="${instId}"]`).evaluate(captureChartViewport), options)
+}
+
 export async function openChart(page, fixture, timeframe = fixture.timeframe, { liveOverlay = false } = {}) {
   // These timing/oracle fixtures use a fixed 96-candle workload. Responsive
   // width and density coverage belongs to the workspace resize acceptance.
@@ -272,12 +325,15 @@ export async function openChart(page, fixture, timeframe = fixture.timeframe, { 
       span: Number(chart.dataset.chartVisibleBars), spacing: Number(chart.dataset.chartBarSpacing),
       scale: Number(document.querySelector('[data-layout="market-workspace"]').dataset.uiScale),
     }))
-    if (Math.floor(state.span) === 96) break
+    if (Math.abs(state.span - 96.5) <= .05) break
     const viewport = page.viewportSize()
     await page.setViewportSize({ ...viewport, width: Math.round(viewport.width + (96.5 - state.span) * state.spacing * state.scale) })
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
   }
   await waitForRendered(page, fixture, timeframe)
+  const targetBars = Number(await page.locator(`[data-chart-inst="${fixture.instId}"]`).getAttribute('data-chart-target-bars'))
+  assert.ok(validChartWindowBars(targetBars), 'The selected chart must publish a supported prepared demand bucket.')
+  fixture.currentWindowBars = Math.max(fixture.currentWindowBars ?? 96, targetBars)
   if (!liveOverlay) {
     const count = Number(await page.locator(`[data-chart-inst="${fixture.instId}"]`).getAttribute('data-chart-rendered-bars'))
     assert.ok(count >= 96 && count <= 98, `Expected 96 full slots plus partially visible candles; got ${count}.`)
@@ -430,7 +486,7 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
         candleState: chart.dataset.chartCandleState, statisticsState: chart.dataset.chartStatisticsState, statisticsEnd: chart.dataset.chartStatisticsEnd,
         oiState: chart.dataset.chartOiState, takerState: chart.dataset.chartTakerState, incomplete: chart.dataset.chartIncomplete,
         oiSamples: chart.dataset.chartOiSamples, takerSamples: chart.dataset.chartTakerSamples,
-        indicatorState: status?.getAttribute('data-chart-indicator-state'), indicatorInput: status?.getAttribute('data-chart-indicator-input'), status: status?.textContent,
+        indicatorState: status?.getAttribute('data-chart-indicator-state'), indicatorStale: status?.getAttribute('data-chart-indicator-stale'), indicatorInput: status?.getAttribute('data-chart-indicator-input'), status: status?.textContent,
       })
       const svg = chart.querySelector('svg[data-rendered-inst]')
       if (!svg) {
@@ -644,201 +700,235 @@ export async function withPaintProbe(page, fixture, options, measure) {
   return paint
 }
 
-async function validateStoppedPaintProbe(page, { readyTarget, includeRequestCommits, includeTimingEvidence, series, oracleTransfer }) {
-  const report = await page.evaluate(({ readyTarget, includeRequestCommits, includeTimingEvidence, series }) => {
-    const probe = window.__chartPaintProbe
-    if (!probe || probe.active) throw new Error('Paint validation requires the stopped capture.')
+// Runs after capture stops; the same immutable observations are validated in
+// Electron and in deterministic core regression tests without a browser.
+export function validateStoppedPaintCapture({ readyTarget = null, includeRequestCommits = false, includeTimingEvidence = false, series }) {
+  const probe = window.__chartPaintProbe
+  if (!probe || probe.active) throw new Error('Paint validation requires the stopped capture.')
 
-    const validationStartedAt = performance.now()
-    const fields = ['open', 'high', 'low', 'close', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
-    const indicatorFields = fields.slice(4, -3), statisticFields = ['oi', 'buy', 'sell']
-    const curveFields = ['vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi']
-    const { instId, requireMatureData, requireWarmStatistics, indicatorValidation } = probe
-    const oracles = Object.fromEntries(Object.entries(series).map(([frame, entry]) => [frame, new Map(entry.bars.map(bar => [bar.hour, bar]))]))
-    const expectedGeometry = new WeakMap(), svgGeometry = new WeakMap(), known = new Map(), seenErrors = new Set(probe.errors)
-    const fail = message => { if (!seenErrors.has(message)) { seenErrors.add(message); probe.errors.push(message) } }
-    // The capture owns immutable SVG records, including curves and clip bounds.
-    // Many RAFs share one record: parse each path once, but compare its counts
-    // with every observation's bars and report that observation's phase.
-    const curveGeometry = (svg, index) => {
-      let curves = svgGeometry.get(svg)
-      if (!curves) { curves = []; svgGeometry.set(svg, curves) }
-      if (curves[index]) return curves[index]
-      const left = Number(svg.clipX), right = left + Number(svg.clipWidth)
-      let count = 0, inside = 0, before = 0, after = 0, atLeft = false, xs = []
-      for (const point of svg.curves[index].matchAll(/[ML]([\d.e+-]+)[ ,]+([\d.e+-]+)/gi)) {
-        const x = Number(point[1])
-        count += 1
-        xs.push(x)
-        if (x >= left - .05 && x <= right + .05) { inside += 1; if (Math.abs(x - left) <= .05) atLeft = true }
-        if (x < left - .05) before += 1
-        if (x > right + .05) after += 1
+  const validationStartedAt = performance.now()
+  const fields = ['open', 'high', 'low', 'close', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
+  const indicatorFields = fields.slice(4, -3), statisticFields = ['oi', 'buy', 'sell']
+  const curveFields = ['vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi']
+  const { instId, requireMatureData, requireWarmStatistics, indicatorValidation } = probe
+  const oracles = Object.fromEntries(Object.entries(series).map(([frame, entry]) => [frame, new Map(entry.bars.map(bar => [bar.hour, bar]))]))
+  const expectedGeometry = new WeakMap(), svgGeometry = new WeakMap(), known = new Map(), seenErrors = new Set(probe.errors)
+  const fail = message => { if (!seenErrors.has(message)) { seenErrors.add(message); probe.errors.push(message) } }
+  // The capture owns immutable SVG records, including curves and clip bounds.
+  // Many RAFs share one record: parse each path once, but compare its counts
+  // with every observation's bars and report that observation's phase.
+  const curveGeometry = (svg, index) => {
+    let curves = svgGeometry.get(svg)
+    if (!curves) { curves = []; svgGeometry.set(svg, curves) }
+    if (curves[index]) return curves[index]
+    const left = Number(svg.clipX), right = left + Number(svg.clipWidth)
+    let count = 0, inside = 0, before = 0, after = 0, atLeft = false, xs = []
+    for (const point of svg.curves[index].matchAll(/[ML]([\d.e+-]+)[ ,]+([\d.e+-]+)/gi)) {
+      const x = Number(point[1])
+      count += 1
+      xs.push(x)
+      if (x >= left - .05 && x <= right + .05) { inside += 1; if (Math.abs(x - left) <= .05) atLeft = true }
+      if (x < left - .05) before += 1
+      if (x > right + .05) after += 1
+    }
+    return curves[index] = { count, inside, before, after, atLeft, xs }
+  }
+  let deferredValidationSamples = 0, failedCaptureSamples = 0, readyFrame = null, committedIndicatorViewport = null
+  for (const { at, frame, snapshot, bars, surface, phase, newPaint, pendingWindowIndex, captureFailure } of probe.observations) {
+    if (captureFailure) { failedCaptureSamples += 1; continue }
+    deferredValidationSamples += 1
+    try {
+      if (pendingWindowIndex !== null) probe.pendingWindows[pendingWindowIndex].observedIndicators = bars?.filter(bar => bar.indicatorsObserved).length
+      const chart = surface.chart, svg = surface.svg
+      if (!snapshot || !svg) { fail('The current chart SVG disappeared.'); continue }
+      const { timeframe } = snapshot
+      const viewportKey = `${snapshot.instId}:${timeframe}:${snapshot.intervalMS}:${snapshot.endHour}:${snapshot.windowBars ?? 96}`
+      if (committedIndicatorViewport && (committedIndicatorViewport.key !== viewportKey || !Array.isArray(bars)
+        || bars.length !== committedIndicatorViewport.bars.length
+        || bars.some((bar, index) => bar.hour !== committedIndicatorViewport.bars[index].hour))) committedIndicatorViewport = null
+      if (!['loading', 'ready', 'unavailable'].includes(snapshot.indicatorState)) committedIndicatorViewport = null
+      const previousIndicators = committedIndicatorViewport?.bars
+      const staleIndicators = chart.indicatorStale === 'true'
+      if (staleIndicators) {
+        if (snapshot.indicatorState !== 'loading' || !previousIndicators || !Array.isArray(bars)
+          || bars.length !== previousIndicators.length || bars.some((bar, index) => bar.hour !== previousIndicators[index].hour
+            || indicatorFields.some(field => !Object.is(bar[field], previousIndicators[index][field])))) {
+          fail(`${phase}: Retained indicators must match the previous committed viewport and explicitly report loading/stale.`)
+        }
+      } else if (Array.isArray(bars) && bars.every(bar => bar.indicatorsObserved
+        || snapshot.indicatorState === 'unavailable' && indicatorFields.every(field => bar[field] === null)) && ['ready', 'unavailable'].includes(snapshot.indicatorState)) {
+        committedIndicatorViewport = { key: viewportKey, bars }
       }
-      return curves[index] = { count, inside, before, after, atLeft, xs }
-    }
-    let deferredValidationSamples = 0, failedCaptureSamples = 0, readyFrame = null
-    for (const { at, frame, snapshot, bars, surface, phase, newPaint, pendingWindowIndex, captureFailure } of probe.observations) {
-      if (captureFailure) { failedCaptureSamples += 1; continue }
-      deferredValidationSamples += 1
-      try {
-        if (pendingWindowIndex !== null) probe.pendingWindows[pendingWindowIndex].observedIndicators = bars?.filter(bar => bar.indicatorsObserved).length
-        const chart = surface.chart, svg = surface.svg
-        if (!snapshot || !svg) { fail('The current chart SVG disappeared.'); continue }
-        const { timeframe } = snapshot
-        if (readyTarget && !readyFrame && frame && Number.isFinite(at) && at >= readyTarget.afterAt
-          && snapshot.instId === readyTarget.instId && timeframe === readyTarget.timeframe && snapshot.endHour === readyTarget.endHour
-          && snapshot.intervalMS === readyTarget.intervalMS
-          && Number(chart.requestedEnd) === readyTarget.endHour && Number(chart.completedEnd) === readyTarget.endHour
-          && svg.instId === readyTarget.instId && svg.timeframe === readyTarget.timeframe && Number(svg.end) === readyTarget.endHour
-          && Array.isArray(bars) && bars.length >= 96 && bars.length <= 98
-          && bars.some(bar => bar.hour === readyTarget.endHour)
-          && bars.every((bar, index) => (!index || bar.hour - bars[index - 1].hour === readyTarget.intervalMS) && bar.confirmed && bar.priceComplete !== false
-            && bar.indicatorsObserved && ['open', 'high', 'low', 'close', ...indicatorFields].every(field => Number.isFinite(bar[field])))) {
-          // Retain just this one already-captured frame for the post-timing
-          // SQLite oracle. SVG validation below uses the same observation.
-          readyFrame = { at, frame: true, snapshot: { ...snapshot, bars: undefined }, bars }
-        }
-        if (Array.isArray(bars)) {
-          if (Number(chart.renderedBars) !== bars.length || Math.floor(Number(chart.visibleBars)) !== 96 || Number(chart.targetBars) < 96) fail('Chart candle-count metadata disagrees with the actual snapshot.')
-          if (Number(svg.start) !== bars[0]?.hour || Number(svg.end) !== bars.at(-1)?.hour) fail('SVG labels and the drawn range disagree.')
-          if (Number(chart.start) !== bars[0]?.hour || Number(chart.end) !== bars.at(-1)?.hour) fail('Header and actual plot refer to different ranges.')
-          if (Number(chart.completedEnd) !== snapshot.endHour || Number(chart.statisticsEnd) !== snapshot.endHour) fail('Chart completed-range metadata disagrees with the snapshot.')
-          if (chart.label !== `${snapshot.instId} chart` || !svg.label?.startsWith(`${snapshot.instId} ${bars.length}-candle ${String(timeframe ?? '').toLowerCase()} chart.`)) fail('Chart labels disagree with the rendered snapshot.')
-          const requestedEnd = Number(chart.requestedEnd)
-          if (chart.loading === 'false' && requestedEnd > 0 && requestedEnd !== snapshot.endHour) fail('The chart claims completion for a different requested range.')
-          let expected = expectedGeometry.get(bars)
-          if (!expected || expected.intervalMS !== snapshot.intervalMS) {
-            const firstAtLeft = bars[0]?.hour === bars.at(-1)?.hour - 95 * snapshot.intervalMS
-            expected = { intervalMS: snapshot.intervalMS, curves: new Map(curveFields.map(field => {
-              const samples = bars.filter(bar => typeof bar[field] === 'number' && Number.isFinite(bar[field])).length
-              return [field, { samples, points: samples + (firstAtLeft && Number.isFinite(bars[0]?.[field]) ? 1 : 0) }]
-            })) }
-            expectedGeometry.set(bars, expected)
-          }
-          for (let index = 0; index < curveFields.length; index += 1) {
-            const field = curveFields[index], d = svg.curves[index]
-            const { samples, points: expectedPoints } = expected.curves.get(field)
-            if (samples > 1 && !d) fail(`${phase}: ${timeframe} ${snapshot.endHour} lost its ${field} SVG curve with ${samples} known samples.`)
-            const coordinates = curveGeometry(svg, index)
-            if (svg.hasClip) {
-              const padding = expectedPoints > samples && coordinates.atLeft ? 1 : 0
-              const pitch = Number(chart.barSpacing), right = Number(svg.plotRight), width = Number(svg.barWidth), end = Number(svg.domainEnd)
-              const center = hour => right - width / 2 + (hour - end) / snapshot.intervalMS * pitch
-              const required = bars.filter(bar => Number.isFinite(bar[field])).map(bar => center(bar.hour))
-              const candidates = [center(bars[0].hour - snapshot.intervalMS), center(bars.at(-1).hour + snapshot.intervalMS)]
-              if (Number(svg.domainStart) === bars[0].hour && Number.isFinite(bars[0][field])) candidates.push(Number(svg.clipX))
-              const remaining = [...coordinates.xs]
-              const take = x => { const i = remaining.findIndex(actual => Math.abs(actual - x) <= .06); if (i < 0) return false; remaining.splice(i, 1); return true }
-              const allRequired = required.every(take)
-              const validExtras = remaining.every(x => { const i = candidates.findIndex(candidate => Math.abs(candidate - x) <= .06); if (i < 0) return false; candidates.splice(i, 1); return true })
-              if (!allRequired || !validExtras || Math.abs(Number(svg.clipX) + Number(svg.clipWidth) - right) > .1) fail(`${phase}: ${timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.count} points; expected ${samples} visible samples and at most one adjacent sample per side.`)
-            } else if (coordinates.count !== expectedPoints) fail(`${phase}: ${timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.count} points for ${expectedPoints} known positions.`)
-            if (/NaN|Infinity|undefined/.test(d)) fail('Nonfinite SVG geometry.')
-          }
-          if (requireMatureData) {
-            for (let index = 0; index < curveFields.length - 1; index += 1) if (!svg.curves[index]) fail(`${phase}: ${timeframe} ${snapshot.endHour} has no ${curveFields[index]} SVG curve for mature local history.`)
-            const expectsOI = bars.some(bar => Number.isFinite(oracles[timeframe]?.get(bar.hour)?.oi))
-            const expectsTaker = bars.some(bar => Number.isFinite(oracles[timeframe]?.get(bar.hour)?.buy) && Number.isFinite(oracles[timeframe]?.get(bar.hour)?.sell))
-            if ((requireWarmStatistics ? expectsOI : bars.some(bar => bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1)))
-              && svg.oi !== 'complete') fail(`${phase}: ${timeframe} ${snapshot.endHour} lost complete observed OI geometry.`)
-            if ((requireWarmStatistics ? expectsTaker : bars.some(bar => bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2)))
-              && svg.taker !== 'complete') fail(`${phase}: ${timeframe} ${snapshot.endHour} lost complete observed Taker geometry.`)
-          }
-          const oiCount = bars.filter(bar => bar.oi !== null).length
-          const takerCount = bars.filter(bar => bar.buy !== null && bar.sell !== null).length
-          const buyRectangles = bars.filter(bar => bar.buy !== null && bar.buy > 0).length
-          const sellRectangles = bars.filter(bar => bar.sell !== null && bar.sell > 0).length
-          if (Number(chart.oiSamples) !== oiCount || Number(chart.takerSamples) !== takerCount) fail('Published statistics sample counts disagree with the actual snapshot.')
-          if (Number(svg.oiSamples) !== oiCount) fail('The actual OI geometry does not cover the snapshot.')
-          if (Number(svg.buySamples) !== buyRectangles) fail('The actual Taker buy geometry does not cover the snapshot.')
-          if (Number(svg.sellSamples) !== sellRectangles) fail('The actual Taker sell geometry does not cover the snapshot.')
-        }
-        if (snapshot.instId !== instId || chart.instId !== instId || svg.instId !== instId) fail('Mixed instrument in the rendered surface.')
-        if (svg.timeframe !== timeframe) fail('SVG and snapshot timeframes disagree.')
-        const oiState = snapshot.oiState ?? 'ready', takerState = snapshot.takerState ?? 'ready', priceState = snapshot.priceState ?? 'loading'
-        const statisticsState = oiState === 'error' || takerState === 'error' ? 'error' : oiState === 'loading' || takerState === 'loading' ? 'loading'
-          : oiState === 'unavailable' || takerState === 'unavailable' ? 'unavailable' : 'ready'
-        const incomplete = priceState !== 'ready' || snapshot.indicatorState !== 'ready' || oiState !== 'ready' || takerState !== 'ready'
-        if (chart.candleState !== priceState || chart.indicatorState !== (snapshot.indicatorState ?? null)
-          || chart.indicatorInput !== (snapshot.indicatorStatus?.inputVersion ?? null)
-          || chart.oiState !== oiState || chart.takerState !== takerState || chart.statisticsState !== statisticsState
-          || chart.incomplete !== String(incomplete) || svg.oiState !== oiState || svg.takerState !== takerState) fail('Published source states disagree with the snapshot.')
-        for (const d of svg.pathData) if (/NaN|Infinity|undefined/.test(d)) fail('Nonfinite SVG geometry.')
-        if (!newPaint) continue
-        if (!Array.isArray(bars)) { fail('The rendered snapshot has no bars.'); continue }
-        probe.quality.push({ phase, end: snapshot.endHour, timeframe, indicators: bars.filter(bar => indicatorFields.every(field => Number.isFinite(bar[field]))).length,
-          oi: bars.filter(bar => Number.isFinite(bar.oi)).length, taker: bars.filter(bar => Number.isFinite(bar.buy) && Number.isFinite(bar.sell)).length })
-        if (bars.length < 96 || bars.length > 98) fail(`Rendered ${bars.length} bars for ${timeframe}; expected 96 full slots plus partially visible candles.`)
-        const intervalMS = series[timeframe]?.intervalMS
-        for (let index = 0; index < bars.length; index += 1) {
-          const bar = bars[index]
-          if (!bar.confirmed) continue // Forming values are checked against the live payload, independently of the closed-bar oracle.
-          const expected = oracles[timeframe]?.get(bar.hour)
-          if (!expected) { fail(`Unexpected ${timeframe} timestamp ${bar.hour}.`); continue }
-          if (index && bar.hour - bars[index - 1].hour !== intervalMS) fail(`Noncontiguous ${timeframe} candles at ${bar.hour}.`)
-          const key = `${timeframe}:${snapshot.generation}:${bar.hour}`, previous = known.get(key)
-          const samePrice = previous && ['open', 'high', 'low', 'close'].every(field => previous[field] === bar[field])
-          if (samePrice) for (const field of [...indicatorFields, ...statisticFields]) {
-            if (Number.isFinite(previous[field]) && !Number.isFinite(bar[field])) fail(`${phase}: ${key} downgraded previously drawn ${field} from ${previous[field]} to ${bar[field]} without a price change.`)
-          }
-          known.set(key, { ...bar })
-          const expectedOI = Number.isFinite(expected.oi)
-          const expectedTaker = Number.isFinite(expected.buy) && Number.isFinite(expected.sell)
-          if (requireWarmStatistics && expectedOI && !(bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1))) fail(`${phase}: ${key} has fixture-known OI but it is not observed in the warm-statistics contract.`)
-          if (requireWarmStatistics && expectedTaker && !(bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2))) fail(`${phase}: ${key} has fixture-known Taker values but they are not observed in the warm-statistics contract.`)
-          if (!bar.indicatorsObserved) for (const field of indicatorFields) {
-            if (bar[field] !== null) fail(`${phase}: ${key} retained ${field} without an observed calculation for its canonical generation.`)
-          }
-          for (const field of fields.filter(field => {
-            if (['open', 'high', 'low', 'close'].includes(field)) return true
-            if (field === 'oi') return (requireWarmStatistics && Number.isFinite(expected.oi))
-              || (bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1))
-            if (field === 'buy' || field === 'sell') return (requireWarmStatistics && Number.isFinite(expected[field]))
-              || (bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2))
-            if (requireMatureData && Number.isFinite(expected[field])) return true
-            return bar.indicatorsObserved
-          })) {
-            const actual = bar[field], wanted = expected[field]
-            // A new canonical prefix can legitimately change recursive values and
-            // its warmup boundary. Deferred mode checks exact local inputs after
-            // replay settles; it never substitutes the unseen provider archive.
-            if (indicatorValidation !== 'fixture' && indicatorFields.includes(field)) {
-              if (!Number.isFinite(actual) && !(indicatorValidation === 'deferred-canonical' && actual === null)) {
-                fail(`${phase}: ${timeframe} ${bar.hour} ${field} retracted to ${actual} during prefix acquisition.`)
-              }
-              continue
-            }
-            if (wanted === null) {
-              if (actual !== null) fail(`${timeframe} ${bar.hour} ${field}: expected missing, got ${actual}.`)
-            } else if (typeof actual !== 'number' || !Number.isFinite(actual)
-              || Math.abs(actual - wanted) > Math.max(1, Math.abs(wanted)) * 1e-10) {
-              fail(`${timeframe} ${bar.hour} ${field}: expected ${wanted}, got ${actual}.`)
-            }
-          }
-        }
-      } catch (error) {
-        fail(`${phase}: Paint validation failed: ${error?.message ?? String(error)}`)
+      if (readyTarget && !readyFrame && frame && Number.isFinite(at) && at >= readyTarget.afterAt
+        && snapshot.instId === readyTarget.instId && timeframe === readyTarget.timeframe && snapshot.endHour === readyTarget.endHour
+        && snapshot.intervalMS === readyTarget.intervalMS && chart.indicatorStale !== 'true'
+        && Number(chart.requestedEnd) === readyTarget.endHour && Number(chart.completedEnd) === readyTarget.endHour
+        && svg.instId === readyTarget.instId && svg.timeframe === readyTarget.timeframe && Number(svg.end) === readyTarget.endHour
+        && Array.isArray(bars) && bars.length >= 96 && bars.length <= 98
+        && bars.some(bar => bar.hour === readyTarget.endHour)
+        && bars.every((bar, index) => (!index || bar.hour - bars[index - 1].hour === readyTarget.intervalMS) && bar.confirmed && bar.priceComplete !== false
+          && bar.indicatorsObserved && ['open', 'high', 'low', 'close', ...indicatorFields].every(field => Number.isFinite(bar[field])))) {
+        // Retain just this one already-captured frame for the post-timing
+        // SQLite oracle. SVG validation below uses the same observation.
+        readyFrame = { at, frame: true, snapshot: { ...snapshot, bars: undefined }, bars,
+          viewport: { intervalMS: snapshot.intervalMS, endHour: snapshot.endHour,
+            visibleBars: Number(chart.visibleBars), barSpacing: Number(chart.barSpacing),
+            domainStart: Number(svg.domainStart), domainEnd: Number(svg.domainEnd), barWidth: Number(svg.barWidth), plotRight: Number(svg.plotRight),
+            renderedBars: Number(chart.renderedBars), targetBars: Number(chart.targetBars),
+            chartStart: Number(chart.start), chartEnd: Number(chart.end), svgStart: Number(svg.start), svgEnd: Number(svg.end) } }
       }
+      if (Array.isArray(bars)) {
+        // This validator is serialized without module imports. Check the same
+        // independent body/domain intersections used by chartViewportHours.
+        const padding = Number(svg.barWidth) / Number(chart.barSpacing) * snapshot.intervalMS
+        const firstSlot = Math.floor((Number(svg.domainStart) - padding) / snapshot.intervalMS) + 1
+        const lastSlot = Math.ceil((Number(svg.domainEnd) + padding) / snapshot.intervalMS) - 1
+        if (![firstSlot, lastSlot].every(Number.isFinite) || bars.length !== lastSlot - firstSlot + 1
+          || bars.some((bar, index) => bar.hour !== (firstSlot + index) * snapshot.intervalMS)) fail('The rendered bars do not cover every native slot in the geometric viewport.')
+        if (Number(chart.renderedBars) !== bars.length || Math.floor(Number(chart.visibleBars)) !== 96 || Number(chart.targetBars) < 96) fail(`Chart candle-count metadata disagrees with the actual snapshot: ${JSON.stringify({ renderedBars: chart.renderedBars, actualBars: bars.length, visibleBars: chart.visibleBars, targetBars: chart.targetBars })}`)
+        if (Number(svg.start) !== bars[0]?.hour || Number(svg.end) !== bars.at(-1)?.hour) fail('SVG labels and the drawn range disagree.')
+        if (Number(chart.start) !== bars[0]?.hour || Number(chart.end) !== bars.at(-1)?.hour) fail('Header and actual plot refer to different ranges.')
+        if (Number(chart.completedEnd) !== snapshot.endHour || Number(chart.statisticsEnd) !== snapshot.endHour) fail('Chart completed-range metadata disagrees with the snapshot.')
+        if (chart.label !== `${snapshot.instId} chart` || !svg.label?.startsWith(`${snapshot.instId} ${bars.length}-candle ${String(timeframe ?? '').toLowerCase()} chart.`)) fail('Chart labels disagree with the rendered snapshot.')
+        const requestedEnd = Number(chart.requestedEnd)
+        if (chart.loading === 'false' && requestedEnd > 0 && requestedEnd !== snapshot.endHour) fail('The chart claims completion for a different requested range.')
+        let expected = expectedGeometry.get(bars)
+        if (!expected || expected.intervalMS !== snapshot.intervalMS) {
+          const firstAtLeft = bars[0]?.hour === bars.at(-1)?.hour - 95 * snapshot.intervalMS
+          expected = { intervalMS: snapshot.intervalMS, curves: new Map(curveFields.map(field => {
+            const samples = bars.filter(bar => typeof bar[field] === 'number' && Number.isFinite(bar[field])).length
+            return [field, { samples, points: samples + (firstAtLeft && Number.isFinite(bars[0]?.[field]) ? 1 : 0) }]
+          })) }
+          expectedGeometry.set(bars, expected)
+        }
+        for (let index = 0; index < curveFields.length; index += 1) {
+          const field = curveFields[index], d = svg.curves[index]
+          const { samples, points: expectedPoints } = expected.curves.get(field)
+          if (samples > 1 && !d) fail(`${phase}: ${timeframe} ${snapshot.endHour} lost its ${field} SVG curve with ${samples} known samples.`)
+          const coordinates = curveGeometry(svg, index)
+          if (svg.hasClip) {
+            const padding = expectedPoints > samples && coordinates.atLeft ? 1 : 0
+            const pitch = Number(chart.barSpacing), right = Number(svg.plotRight), width = Number(svg.barWidth), end = Number(svg.domainEnd)
+            const center = hour => right - width / 2 + (hour - end) / snapshot.intervalMS * pitch
+            const required = bars.filter(bar => Number.isFinite(bar[field])).map(bar => center(bar.hour))
+            const candidates = [center(bars[0].hour - snapshot.intervalMS), center(bars.at(-1).hour + snapshot.intervalMS)]
+            if (Number(svg.domainStart) === bars[0].hour && Number.isFinite(bars[0][field])) candidates.push(Number(svg.clipX))
+            const remaining = [...coordinates.xs]
+            const take = x => { const i = remaining.findIndex(actual => Math.abs(actual - x) <= .06); if (i < 0) return false; remaining.splice(i, 1); return true }
+            const allRequired = required.every(take)
+            const validExtras = remaining.every(x => { const i = candidates.findIndex(candidate => Math.abs(candidate - x) <= .06); if (i < 0) return false; candidates.splice(i, 1); return true })
+            if (!allRequired || !validExtras || Math.abs(Number(svg.clipX) + Number(svg.clipWidth) - right) > .1) fail(`${phase}: ${timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.count} points; expected ${samples} visible samples and at most one adjacent sample per side.`)
+          } else if (coordinates.count !== expectedPoints) fail(`${phase}: ${timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.count} points for ${expectedPoints} known positions.`)
+          if (/NaN|Infinity|undefined/.test(d)) fail('Nonfinite SVG geometry.')
+        }
+        if (requireMatureData) {
+          for (let index = 0; index < curveFields.length - 1; index += 1) if (!svg.curves[index]) fail(`${phase}: ${timeframe} ${snapshot.endHour} has no ${curveFields[index]} SVG curve for mature local history.`)
+          const expectsOI = bars.some(bar => Number.isFinite(oracles[timeframe]?.get(bar.hour)?.oi))
+          const expectsTaker = bars.some(bar => Number.isFinite(oracles[timeframe]?.get(bar.hour)?.buy) && Number.isFinite(oracles[timeframe]?.get(bar.hour)?.sell))
+          if ((requireWarmStatistics ? expectsOI : bars.some(bar => bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1)))
+            && svg.oi !== 'complete') fail(`${phase}: ${timeframe} ${snapshot.endHour} lost complete observed OI geometry.`)
+          if ((requireWarmStatistics ? expectsTaker : bars.some(bar => bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2)))
+            && svg.taker !== 'complete') fail(`${phase}: ${timeframe} ${snapshot.endHour} lost complete observed Taker geometry.`)
+        }
+        const oiCount = bars.filter(bar => bar.oi !== null).length
+        const takerCount = bars.filter(bar => bar.buy !== null && bar.sell !== null).length
+        const buyRectangles = bars.filter(bar => bar.buy !== null && bar.buy > 0).length
+        const sellRectangles = bars.filter(bar => bar.sell !== null && bar.sell > 0).length
+        if (Number(chart.oiSamples) !== oiCount || Number(chart.takerSamples) !== takerCount) fail('Published statistics sample counts disagree with the actual snapshot.')
+        if (Number(svg.oiSamples) !== oiCount) fail('The actual OI geometry does not cover the snapshot.')
+        if (Number(svg.buySamples) !== buyRectangles) fail('The actual Taker buy geometry does not cover the snapshot.')
+        if (Number(svg.sellSamples) !== sellRectangles) fail('The actual Taker sell geometry does not cover the snapshot.')
+      }
+      if (snapshot.instId !== instId || chart.instId !== instId || svg.instId !== instId) fail('Mixed instrument in the rendered surface.')
+      if (svg.timeframe !== timeframe) fail('SVG and snapshot timeframes disagree.')
+      const oiState = snapshot.oiState ?? 'ready', takerState = snapshot.takerState ?? 'ready', priceState = snapshot.priceState ?? 'loading'
+      const statisticsState = oiState === 'error' || takerState === 'error' ? 'error' : oiState === 'loading' || takerState === 'loading' ? 'loading'
+        : oiState === 'unavailable' || takerState === 'unavailable' ? 'unavailable' : 'ready'
+      const incomplete = priceState !== 'ready' || snapshot.indicatorState !== 'ready' || oiState !== 'ready' || takerState !== 'ready'
+      if (chart.candleState !== priceState || chart.indicatorState !== (snapshot.indicatorState ?? null)
+        || chart.indicatorInput !== (snapshot.indicatorStatus?.inputVersion ?? null)
+        || chart.oiState !== oiState || chart.takerState !== takerState || chart.statisticsState !== statisticsState
+        || chart.incomplete !== String(incomplete) || svg.oiState !== oiState || svg.takerState !== takerState) fail('Published source states disagree with the snapshot.')
+      for (const d of svg.pathData) if (/NaN|Infinity|undefined/.test(d)) fail('Nonfinite SVG geometry.')
+      if (!newPaint) continue
+      if (!Array.isArray(bars)) { fail('The rendered snapshot has no bars.'); continue }
+      probe.quality.push({ phase, end: snapshot.endHour, timeframe, bars: bars.length, indicators: bars.filter(bar => indicatorFields.every(field => Number.isFinite(bar[field]))).length,
+        oi: bars.filter(bar => Number.isFinite(bar.oi)).length, taker: bars.filter(bar => Number.isFinite(bar.buy) && Number.isFinite(bar.sell)).length })
+      if (bars.length < 96 || bars.length > 98) fail(`Rendered ${bars.length} bars for ${timeframe}; expected 96 full slots plus partially visible candles.`)
+      const intervalMS = series[timeframe]?.intervalMS
+      for (let index = 0; index < bars.length; index += 1) {
+        const bar = bars[index]
+        if (!bar.confirmed) continue // Forming values are checked against the live payload, independently of the closed-bar oracle.
+        const expected = oracles[timeframe]?.get(bar.hour)
+        if (!expected) { fail(`Unexpected ${timeframe} timestamp ${bar.hour}.`); continue }
+        if (index && bar.hour - bars[index - 1].hour !== intervalMS) fail(`Noncontiguous ${timeframe} candles at ${bar.hour}.`)
+        const key = `${timeframe}:${snapshot.generation}:${bar.hour}`, previous = known.get(key)
+        const samePrice = previous && ['open', 'high', 'low', 'close'].every(field => previous[field] === bar[field])
+        if (samePrice) for (const field of [...indicatorFields, ...statisticFields]) {
+          if (Number.isFinite(previous[field]) && !Number.isFinite(bar[field])) fail(`${phase}: ${key} downgraded previously drawn ${field} from ${previous[field]} to ${bar[field]} without a price change.`)
+        }
+        known.set(key, { ...bar })
+        const expectedOI = Number.isFinite(expected.oi)
+        const expectedTaker = Number.isFinite(expected.buy) && Number.isFinite(expected.sell)
+        if (requireWarmStatistics && expectedOI && !(bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1))) fail(`${phase}: ${key} has fixture-known OI but it is not observed in the warm-statistics contract.`)
+        if (requireWarmStatistics && expectedTaker && !(bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2))) fail(`${phase}: ${key} has fixture-known Taker values but they are not observed in the warm-statistics contract.`)
+        if (!bar.indicatorsObserved && !staleIndicators) for (const field of indicatorFields) {
+          if (bar[field] !== null) fail(`${phase}: ${key} retained ${field} without an observed calculation for its canonical generation.`)
+        }
+        for (const field of fields.filter(field => {
+          if (['open', 'high', 'low', 'close'].includes(field)) return true
+          if (field === 'oi') return (requireWarmStatistics && Number.isFinite(expected.oi))
+            || (bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1))
+          if (field === 'buy' || field === 'sell') return (requireWarmStatistics && Number.isFinite(expected[field]))
+            || (bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2))
+          if (staleIndicators) return false
+          if (requireMatureData && Number.isFinite(expected[field])) return true
+          return bar.indicatorsObserved
+        })) {
+          const actual = bar[field], wanted = expected[field]
+          // A new canonical prefix can legitimately change recursive values and
+          // its warmup boundary. Deferred mode checks exact local inputs after
+          // replay settles; it never substitutes the unseen provider archive.
+          if (indicatorValidation !== 'fixture' && indicatorFields.includes(field)) {
+            if (!Number.isFinite(actual) && !(indicatorValidation === 'deferred-canonical' && actual === null)) {
+              fail(`${phase}: ${timeframe} ${bar.hour} ${field} retracted to ${actual} during prefix acquisition.`)
+            }
+            continue
+          }
+          if (wanted === null) {
+            if (actual !== null) fail(`${timeframe} ${bar.hour} ${field}: expected missing, got ${actual}.`)
+          } else if (typeof actual !== 'number' || !Number.isFinite(actual)
+            || Math.abs(actual - wanted) > Math.max(1, Math.abs(wanted)) * 1e-10) {
+            fail(`${timeframe} ${bar.hour} ${field}: expected ${wanted}, got ${actual}.`)
+          }
+        }
+      }
+    } catch (error) {
+      fail(`${phase}: Paint validation failed: ${error?.message ?? String(error)}`)
     }
-    const deferredValidationMS = performance.now() - validationStartedAt
-    delete window.__chartPaintProbe
-    return {
-      frames: probe.frames, pendingFrames: probe.pendingFrames, pendingWindows: probe.pendingWindows, paints: probe.paints, minimumBars: probe.minimumBars,
-      violations: probe.errors, commits: probe.commits, quality: probe.quality, scheduler: probe.scheduler,
-      frameGaps: probe.frameGaps,
-      droppedFrames: probe.frameGaps.filter(gap => gap > 25).length,
-      probeValidationSamples: probe.validationSamples.length,
-      totalProbeValidationMS: Number(probe.validationSamples.reduce((sum, sample) => sum + sample.durationMS, 0).toFixed(3)),
-      validationDurations: probe.validationSamples.map(sample => sample.durationMS),
-      deferredValidationSamples, failedCaptureSamples, totalDeferredValidationMS: Number(deferredValidationMS.toFixed(3)),
-      cpuMarkerCostMS: probe.cpuMarkerCostMS,
-      ...(readyTarget || includeTimingEvidence ? { firstFrameAt: probe.firstFrameAt ?? null, frameSamples: probe.frameSamples, inputBursts: probe.inputBursts,
-        observationSamples: probe.observations.map(({ at, frame, phase, captureFailure }) => ({ at, frame, phase, captureFailure: Boolean(captureFailure) })) } : {}),
-      ...(readyTarget ? { readyFrame } : {}),
-      ...(includeRequestCommits ? { requestCommits: probe.requestCommits } : {}),
-      ...(includeTimingEvidence ? { captureTimings: probe.validationSamples } : {}),
-    }
-  }, { readyTarget, includeRequestCommits, includeTimingEvidence, series })
+  }
+  const deferredValidationMS = performance.now() - validationStartedAt
+  delete window.__chartPaintProbe
+  return {
+    frames: probe.frames, pendingFrames: probe.pendingFrames, pendingWindows: probe.pendingWindows, paints: probe.paints, minimumBars: probe.minimumBars,
+    violations: probe.errors, commits: probe.commits, quality: probe.quality, scheduler: probe.scheduler,
+    frameGaps: probe.frameGaps,
+    droppedFrames: probe.frameGaps.filter(gap => gap > 25).length,
+    probeValidationSamples: probe.validationSamples.length,
+    totalProbeValidationMS: Number(probe.validationSamples.reduce((sum, sample) => sum + sample.durationMS, 0).toFixed(3)),
+    validationDurations: probe.validationSamples.map(sample => sample.durationMS),
+    deferredValidationSamples, failedCaptureSamples, totalDeferredValidationMS: Number(deferredValidationMS.toFixed(3)),
+    cpuMarkerCostMS: probe.cpuMarkerCostMS,
+    ...(readyTarget || includeTimingEvidence ? { firstFrameAt: probe.firstFrameAt ?? null, frameSamples: probe.frameSamples, inputBursts: probe.inputBursts,
+      observationSamples: probe.observations.map(({ at, frame, phase, captureFailure }) => ({ at, frame, phase, captureFailure: Boolean(captureFailure) })) } : {}),
+    ...(readyTarget ? { readyFrame } : {}),
+    ...(includeRequestCommits ? { requestCommits: probe.requestCommits } : {}),
+    ...(includeTimingEvidence ? { captureTimings: probe.validationSamples } : {}),
+  }
+}
+
+async function validateStoppedPaintProbe(page, { readyTarget, includeRequestCommits, includeTimingEvidence, series, oracleTransfer }) {
+  const report = await page.evaluate(validateStoppedPaintCapture, { readyTarget, includeRequestCommits, includeTimingEvidence, series })
   const frameGaps = summarizeLatencySamples(report.frameGaps)
   const capture = summarizeLatencySamples(report.validationDurations)
   delete report.frameGaps
@@ -1021,18 +1111,23 @@ export async function waitForLocalHistory(electron, page, fixture, timeframe = f
       const bars = chart?.__chartRenderedBars ?? snapshot?.bars
       const fields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
       return snapshot?.instId === instId && snapshot.timeframe === timeframe && snapshot.endHour === end
-        && snapshot.indicatorState === 'ready' && chart.dataset.chartLoading === 'false' && bars?.length === 96
+        && snapshot.indicatorState === 'ready' && chart.dataset.chartLoading === 'false'
+        && Math.floor(Number(chart.dataset.chartVisibleBars)) === 96 && bars?.length >= 96 && bars.length <= 98
         && bars.every(bar => bar.indicatorsObserved && fields.every(field => Number.isFinite(bar[field])))
     }, { instId: fixture.instId, timeframe, end: warmEnd }, { timeout: Math.max(1, deadline - Date.now()) })
   }
   await page.evaluate(async () => { for (let frame = 0; frame < 2; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
+  await assertCompleteChartViewport(page, fixture.instId, { endHour: warmEnd })
   await wheelBurst(page, { deltaY: -12 })
   await waitForRendered(page, fixture, timeframe)
+  await assertCompleteChartViewport(page, fixture.instId, { endHour: fixture.end })
   return resident
 }
 
 export function separateSourceMaintenance(sourceRequests, fixture) {
   const historical = [], historicalExtensions = [], currentMaintenance = []
+  const observedWindowBars = fixture.currentWindowBars ?? 96
+  const currentWindowBars = validChartWindowBars(observedWindowBars) ? observedWindowBars : 96
   for (const request of sourceRequests) {
     const parameters = request.parameters ?? {}
     const after = Number(parameters.after), limit = Number(parameters.limit)
@@ -1042,7 +1137,7 @@ export function separateSourceMaintenance(sourceRequests, fixture) {
     // Ranking and selected-chart repairs request at most one current viewport.
     // Exclude them only when every possible returned slot is later than the
     // fixture. An overlapping, unbounded or ambiguous cursor still fails.
-    const currentCandles = request.path === '/market/history-candles' && Number.isSafeInteger(limit) && limit > 0 && limit <= 96
+    const currentCandles = request.path === '/market/history-candles' && Number.isSafeInteger(limit) && limit > 0 && limit <= currentWindowBars
       && Number.isFinite(intervalMS) && intervalMS > 0 && Number.isSafeInteger(after) && after % intervalMS === 0
       && parameters.before == null && after - limit * intervalMS > fixture.end
     const begin = Number(parameters.begin), end = Number(parameters.end)
@@ -1085,7 +1180,7 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
       extendHistory: initialHistoryBars === null, deliveredFloors: new Map(), delayFloors: new Map(), extensions: [], pendingPushes: new Map(), timers: new Set(), closed: false,
     }
     const rememberHistory = response => {
-      if (response?.instId !== instId || !['5m', '15m', '1H'].includes(response.timeframe) || !Array.isArray(response.bars) || response.bars.length <= 96) return
+      if (response?.instId !== instId || !['5m', '15m', '1H'].includes(response.timeframe) || !Array.isArray(response.bars) || response.bars.length <= (response.windowBars ?? 96)) return
       const previous = probe.historyFrames.get(response.timeframe)
       if (previous && (previous.generation > response.generation || previous.generation === response.generation && previous.revision > response.revision)) return
       probe.historyFrames.set(response.timeframe, {
@@ -1148,7 +1243,7 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
       if (response?.instId === instId && Array.isArray(response.bars)) {
         probe.preparedPushes += 1
         probe.preparedPushBars += response.bars.length
-        if (response.bars.length > 96) {
+        if (response.bars.length > (response.windowBars ?? 96)) {
           probe.fullHistoryPushes += 1
           probe.fullHistoryPushBars += response.bars.length
           const shape = [response.timeframe, response.generation, response.revision, response.endHour,
@@ -1349,6 +1444,9 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture, { o
     // already delivered facts gives the backend a false view of client runway.
     await waitForLocalHistory(electron, page, fixture, fixture.timeframe, { requireIndicators: true })
     await waitForRendered(page, fixture)
+    const initialViewport = await assertCompleteChartViewport(page, fixture.instId, { endHour: fixture.end })
+    const viewportBars = initialViewport.expectedHours.length
+    phaseData.viewportBars = viewportBars
     const initial = await readRequestProbe(electron)
     const admitted = initial.historyFrames[fixture.timeframe]
     phaseData.initial = initial
@@ -1357,7 +1455,7 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture, { o
     const initialHistoryBars = (fixture.end - admitted.first) / fixture.intervalMS + 1
     assert.equal(initialHistoryBars, admitted.bars, 'The initial delivered reserve must contain every native candle slot.')
     assert.ok(initialHistoryBars > 96 && initialHistoryBars <= 1536)
-    assert.ok(frames * candlesPerFrame > initialHistoryBars - 95, 'The gesture must cross the actual delivered boundary.')
+    assert.ok(frames * candlesPerFrame > initialHistoryBars - viewportBars + 1, 'The gesture must cross the actual delivered boundary.')
     const timeOrigin = await page.evaluate(() => performance.timeOrigin)
     phaseData.rendererTimeOrigin = timeOrigin
     phaseData.initialHistoryBars = initialHistoryBars
@@ -1388,9 +1486,9 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture, { o
     const responseTime = first ? first.completedAt - timeOrigin : null
     const observedDeliveryMS = first ? first.completedAt - first.readCompletedAt : null
     const initialFirst = fixture.end - (initialHistoryBars - 1) * fixture.intervalMS
-    const crossingIndex = Math.ceil((initialHistoryBars - 95) / candlesPerFrame) - 1
+    const crossingIndex = Math.ceil((initialHistoryBars - viewportBars + 1) / candlesPerFrame) - 1
     const inputsAtRequest = first ? inputs.filter(input => input <= requestTime).length : null
-    const runwayAtRequest = first ? initialHistoryBars - 96 - inputsAtRequest * candlesPerFrame : null
+    const runwayAtRequest = first ? initialHistoryBars - viewportBars - inputsAtRequest * candlesPerFrame : null
     const delayedReads = requests.calls.filter(call => call.delayedExtension)
     const readBudget = 2 * (Math.ceil((inputs.at(-1) - inputs[0]) / historicalDelayMS) + 1)
     const sources = separateSourceMaintenance(requests.sourceRequests, fixture)
@@ -1426,7 +1524,7 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture, { o
         ? { presentation: 'offscreen', wallTime: 'input-to-renderer-RAF values are diagnostics; no native display deadline is inferred', frames: 'all renderer RAF and pending-frame assertions remain enforced' }
         : { presentation: 'native foreground', wallTime: '100 ms maximum intent-to-renderer-RAF deadline enforced', frames: 'all renderer RAF and pending-frame assertions remain enforced' },
       nativePaintMeasured: false, foregroundRafObservationMeasured: !offscreen,
-      initialHistoryBars, initialHistoryFirst: admitted.first, historicalDelayMS, continuousWheelFrames: frames,
+      viewportBars, initialHistoryBars, initialHistoryFirst: admitted.first, historicalDelayMS, continuousWheelFrames: frames,
       scrolledCandles: frames * candlesPerFrame, crossedInitialBoundary: true,
       runwayAtRequest, deliveredHistoryBars: first.bars, observedHistoryDeliveryMS: observedDeliveryMS,
       prefetchStartedDuringGesture: true, prefetchCompletedDuringGesture: true,
@@ -1472,7 +1570,7 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture, { o
         const requestTime = first.startedAt - phaseData.rendererTimeOrigin
         const inputsAtRequest = observedInputs.filter(input => input <= requestTime).length
         phaseData.runway = { requestTime, responseTime: Number.isFinite(first.completedAt) ? first.completedAt - phaseData.rendererTimeOrigin : null,
-          inputsAtRequest, runwayAtRequest: phaseData.initialHistoryBars - 96 - inputsAtRequest * candlesPerFrame,
+          inputsAtRequest, runwayAtRequest: phaseData.initialHistoryBars - phaseData.viewportBars - inputsAtRequest * candlesPerFrame,
           deliveryPending: first.completedAt === null }
       }
     }
@@ -1734,16 +1832,9 @@ async function readColdWindowState(page, instId) {
 
 async function assertColdCanonicalViewport(electron, page, fixture, endHour, capturedFrame = null) {
   const timeframe = fixture.timeframe
-  const recovered = capturedFrame ? { endHour: capturedFrame.snapshot.endHour, bars: capturedFrame.bars } : await page.locator(`[data-chart-inst="${fixture.instId}"]`).evaluate(chart => {
-    const snapshot = chart.__chartSnapshot
-    return { endHour: snapshot?.endHour, bars: (chart.__chartRenderedBars ?? snapshot?.bars ?? []).map(bar => ({
-      ...bar,
-      oiObserved: bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1),
-      takerObserved: bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2),
-    })) }
-  })
-  assert.equal(recovered.endHour, endHour)
-  assert.ok(recovered.bars.length >= 96 && recovered.bars.length <= 98)
+  const recovered = capturedFrame
+    ? assertChartViewport({ ...capturedFrame.viewport, bars: capturedFrame.bars }, { endHour })
+    : await assertCompleteChartViewport(page, fixture.instId, { endHour })
   // The cold fixture's full provider history is intentionally not all present
   // in SQLite. Build this oracle from every candle actually available after
   // the nearest page is committed, so recursive seeds and missing-period
@@ -1775,8 +1866,6 @@ async function assertColdCanonicalViewport(electron, page, fixture, endHour, cap
       for (const field of indicatorFieldsObserved) assertCanonical(bar[field], expected, field)
     } else {
       assert.fail(`${timeframe} ${bar.hour} did not finish its local canonical indicator calculation.`)
-      for (const field of indicatorFieldsObserved) assert.equal(bar[field], null,
-        `${timeframe} ${bar.hour} must not retain an old ${field} curve while that indicator is unobserved.`)
     }
     const oiObserved = bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1)
     const takerObserved = bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2)
@@ -1791,7 +1880,7 @@ async function assertColdCanonicalViewport(electron, page, fixture, endHour, cap
     }
   }
   const expectedIndicatorState = recovered.bars.every(bar => indicatorFieldsObserved.every(field => Number.isFinite(oracle.get(bar.hour)?.[field]))) ? 'ready' : 'unavailable'
-  return { priceBars: recovered.bars.length, indicatorBars: observedIndicatorBars, oiBars: observedOIBars, takerBars: observedTakerBars, expectedIndicatorState,
+  return { expectedBars: recovered.expectedHours.length, expectedHours: recovered.expectedHours, priceBars: recovered.bars.length, indicatorBars: observedIndicatorBars, oiBars: observedOIBars, takerBars: observedTakerBars, expectedIndicatorState,
     checksCanonicalValues: true, unobservedFieldsRemainNull: true }
 }
 
@@ -1832,6 +1921,10 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m', offscreen
       await cdp.send('Performance.enable')
       beforeMetrics = Object.fromEntries((await cdp.send('Performance.getMetrics')).metrics.map(metric => [metric.name, metric.value]))
     }
+    await page.waitForFunction(instId => {
+      const chart = document.querySelector(`[data-chart-inst="${instId}"]`), status = chart?.querySelector('[data-chart-status]')
+      return ['ready', 'unavailable'].includes(chart?.__chartSnapshot?.indicatorState) && status?.dataset.chartIndicatorStale !== 'true'
+    }, fixture.instId)
     await startPaintProbe(page, fixture, { indicatorValidation: 'finite' })
     paintStarted = true
     const approachDistance = fixture.initialHistoryBars - 96 - 256
@@ -1857,7 +1950,7 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m', offscreen
       loading: chart.dataset.chartLoading === 'true', incomplete: chart.dataset.chartIncomplete === 'true',
       renderedBars: Number(chart.dataset.chartRenderedBars), end: Number(chart.dataset.chartCompletedEnd),
     }))
-    assert.equal(initialTarget.renderedBars, 96)
+    await assertCompleteChartViewport(page, fixture.instId, { endHour: fixture.targetEnd })
     assert.equal(initialTarget.end, fixture.targetEnd)
     // Wait only for constant-time published readiness metadata. The exact
     // 96-bar and indicator checks run on retained RAF observations after the
@@ -1866,7 +1959,8 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m', offscreen
       const observation = window.__chartPaintProbe?.lastFrame, snapshot = observation?.snapshot
       return observation?.at >= afterAt && snapshot?.instId === instId && snapshot.timeframe === timeframe
         && snapshot.endHour === targetEnd && snapshot.priceState === 'ready' && snapshot.indicatorState === 'ready'
-        && observation.bars?.length === 96
+        && Math.floor(Number(observation.surface?.chart?.visibleBars)) === 96
+        && observation.bars?.length >= 96 && observation.bars.length <= 98
     }, { instId: fixture.instId, timeframe, targetEnd: fixture.targetEnd, afterAt: inputs.at(-1) }, { timeout: 10_000 })
     const latency = await measureChartIntentLatency(page, { inputs, targets: [fixture.targetEnd], requireForeground: false })
     phaseData.finalLatency = latency

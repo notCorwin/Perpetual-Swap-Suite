@@ -4,13 +4,15 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
 import { requireForegroundTests } from '../electron/test-presentation.js'
-import { assertCompletePaints, finishPaintProbe, foregroundPaintWindow, installRequestProbe, measureLatencyCoveredPrefetch, measureNativeColdBoundary, measureChartIntentLatency, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForLocalHistory, waitForRendered, wheelBurst } from './chart-acceptance.mjs'
+import { assertCompletePaints, finishPaintProbe, foregroundPaintWindow, installRequestProbe, measureLatencyCoveredPrefetch, measureNativeColdBoundary, openChart, readRequestProbe, releaseRequestProbe, removeRequestProbe, selectTimeframe, separateSourceMaintenance, startPaintProbe, waitForRendered, wheelBurst } from './chart-acceptance.mjs'
+
+import { measureResidentScroll } from './chart-resident-scenario.mjs'
 
 requireForegroundTests()
 
 const root = new URL('..', import.meta.url).pathname
 
-async function withBenchmarkApp(run) {
+async function withBenchmarkApp(run, { stablePriceLabels = true } = {}) {
   const userData = await mkdtemp(join(tmpdir(), 'perp-radar-chart-scroll-'))
   let electron
   try {
@@ -20,7 +22,9 @@ async function withBenchmarkApp(run) {
     })
     const page = await electron.firstWindow()
     await page.waitForLoadState('domcontentloaded')
-    const fixture = await page.evaluate(() => window.radarDesktop.request({ e2e: { action: 'seedChartScrollBenchmark' } }))
+    const fixture = stablePriceLabels
+      ? await electron.evaluate(() => globalThis.__marketBackend.probe({ action: 'seedChartScrollBenchmark', stablePriceLabels: true }))
+      : await page.evaluate(() => window.radarDesktop.request({ e2e: { action: 'seedChartScrollBenchmark' } }))
     return await run(electron, page, fixture)
   } finally {
     await electron?.close()
@@ -29,85 +33,19 @@ async function withBenchmarkApp(run) {
 }
 
 const performanceReport = await withBenchmarkApp(async (electron, page, fixture) => {
-  const timeframes = []
-  let sourceRequests = []
   const foreground = await foregroundPaintWindow(electron, page)
   try {
-    await installRequestProbe(electron, fixture.instId)
-    await openChart(page, fixture)
-    const warmedHistory = new Map()
-    for (const timeframe of fixture.timeframes) {
-      await selectTimeframe(page, timeframe)
-      await waitForRendered(page, fixture, timeframe)
-      warmedHistory.set(timeframe, await waitForLocalHistory(electron, page, fixture, timeframe, { requireIndicators: true }))
-    }
-    await electron.evaluate(async () => {
-      globalThis.__chartRequestProbe.holdHistorical = true
-      globalThis.__chartRequestProbe.holdLocal = true
-      await globalThis.__marketBackend.probe({ action: 'sourceHold', hold: true })
-    })
-    for (const timeframe of fixture.timeframes) {
-      await selectTimeframe(page, timeframe)
-      await waitForRendered(page, fixture, timeframe)
-      const residentHistoryBars = warmedHistory.get(timeframe)
-      const beforeScrolling = await readRequestProbe(electron)
-      await startPaintProbe(page, fixture, { requireMatureData: true, requireWarmStatistics: true })
-      const intervalMS = fixture.series[timeframe].intervalMS
-      const phases = []
-      let distance = 0
-      const sweep = async (name, options, candles) => {
-        assert.ok(distance + candles <= residentHistoryBars - 96, 'A warm phase must stay within complete resident viewports.')
-        const startingDistance = distance
-        const inputs = await wheelBurst(page, options)
-        distance += candles
-        const end = fixture.end - distance * intervalMS
-        await waitForRendered(page, fixture, timeframe, end)
-        const observation = await measureChartIntentLatency(page, { inputs, targets: inputs.map((_, index) => fixture.end - (startingDistance + candles / inputs.length * (index + 1)) * intervalMS) })
-        assert.ok(observation.maxInputToRafSampleMS < 100, `Warm ${timeframe} ${name} had an intent take ${observation.maxInputToRafSampleMS} ms to reach its exact or coalesced chart target.`)
-        phases.push({
-          name, frames: options.frames ?? 1, eventsPerFrame: options.eventsPerFrame ?? 1,
-          candles, end, ...observation,
-        })
-      }
-      await sweep('resident', { frames: 18, eventsPerFrame: 3, deltaY: 12 }, 54)
-      await sweep('high-velocity', { frames: 12, eventsPerFrame: 32, deltaY: 24 }, 768)
-      await sweep('reversal', { frames: 6, eventsPerFrame: 32, deltaY: -24 }, -384)
-      await sweep('one-frame-600-candle-jump', { deltaY: 7_200 }, 600)
-      await sweep('horizontal-reversal', { deltaX: 2_400, deltaY: 0 }, -200)
-      await sweep('line-mode', { deltaY: -9, deltaMode: 1 }, -12)
-      const paint = await finishPaintProbe(page)
-      assertCompletePaints(paint)
-      assert.equal(paint.pendingFrames, 0, 'Resident navigation must never wait for held disk deliveries.')
-      const requests = await readRequestProbe(electron)
-      const scrollingRequests = requests.calls.slice(beforeScrolling.calls.length)
-      const historicalRequests = scrollingRequests.filter(call => Number.isFinite(call.endHour))
-      const scrollingSourceRequests = requests.sourceRequests.slice(beforeScrolling.sourceCalls)
-      const sources = separateSourceMaintenance(scrollingSourceRequests, fixture)
-      assert.ok(historicalRequests.every(call => call.kind === 'history'), 'Resident navigation may issue only observational history reads.')
-      assert.equal(requests.legacyWindowCalls, 0)
-      assert.deepEqual(sources.historical, [], `Warm scrolling must not download fixture history: ${JSON.stringify(sources.historical)}`)
-      assert.ok(requests.maxHistoricalActive <= 2, 'Resident targets must stay independent of the held disk deliveries lane.')
-      timeframes.push({
-        timeframe, phases, ...paint, commits: paint.commits.length,
-        preparedRequests: historicalRequests.length,
-        stalledSpeculativePreparation: requests.held,
-        heldLatestRefreshRequests: scrollingRequests.length - historicalRequests.length,
-        localHistoryReads: requests.historyCalls.filter(call => call.timeframe === timeframe).length,
-        transferredHistoryBars: requests.historyResponses.filter(response => response.timeframe === timeframe).reduce((total, response) => total + response.bars, 0),
-        residentHistoryBars,
-        maxConcurrentRequests: requests.maxActive,
-        sourceRequests: scrollingSourceRequests,
-        currentMaintenanceRequests: sources.currentMaintenance,
-        repeatedSourceDownloads: sources.historical.length,
-      })
-    }
-    sourceRequests = (await readRequestProbe(electron)).sourceRequests
-  } finally {
-    try { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
-    finally { await foreground.restore() }
-  }
-  return { foregroundWindow: foreground.native, environment: foreground.environment, idleFrameCadence: foreground.idleFrameCadence, nativePeriods: fixture.timeframes, persistedPeriodsPerTimeframe: fixture.periods,
-    sourceRequests, currentMaintenanceRequests: separateSourceMaintenance(sourceRequests, fixture).currentMaintenance, timeframes }
+    const resident = await measureResidentScroll(electron, page, fixture, { phases: [
+      { name: 'resident', frames: 18, eventsPerFrame: 3, deltaY: 12, candles: 54 },
+      { name: 'high-velocity', frames: 12, eventsPerFrame: 32, deltaY: 24, candles: 768 },
+      { name: 'reversal', frames: 6, eventsPerFrame: 32, deltaY: -24, candles: -384 },
+      { name: 'one-frame-600-candle-jump', deltaY: 7_200, candles: 600 },
+      { name: 'horizontal-reversal', deltaX: 2_400, deltaY: 0, candles: -200 },
+      { name: 'line-mode', deltaY: -9, deltaMode: 1, candles: -12 },
+    ] })
+    return { foregroundWindow: foreground.native, environment: foreground.environment, idleFrameCadence: foreground.idleFrameCadence,
+      nativePeriods: fixture.timeframes, persistedPeriodsPerTimeframe: fixture.periods, ...resident }
+  } finally { await foreground.restore() }
 })
 
 const delayedHistory = await withBenchmarkApp(async (electron, page, fixture) => {
@@ -157,7 +95,7 @@ const delayedHistory = await withBenchmarkApp(async (electron, page, fixture) =>
   } finally { await releaseRequestProbe(electron); await removeRequestProbe(electron) }
 })
 
-const latencyCoveredPrefetch = await withBenchmarkApp(measureLatencyCoveredPrefetch)
+const latencyCoveredPrefetch = await withBenchmarkApp(measureLatencyCoveredPrefetch, { stablePriceLabels: true })
 const nativeColdBoundary = await withBenchmarkApp((electron, page) => measureNativeColdBoundary(electron, page))
 
 console.log(JSON.stringify({

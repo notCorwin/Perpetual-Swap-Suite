@@ -25,13 +25,20 @@ test('dedicated GPU discovery and policies cannot silently weaken or enter funct
   assert.ok(!gpu.requireRoles.includes('prepared-chart'), 'Confirmed unsupported hosts do not require workers they never exercised.')
   assert.deepEqual(sandboxCoverage('all').graphics, gpu.graphics)
   assert.equal(sandboxCoverage('e2e').graphics, undefined)
+  assert.equal(sandboxCoverage('functional').graphics, undefined)
+  assert.deepEqual(sandboxCoverage('soak').requireRoles, sandboxCoverage('foreground').requireRoles)
   assert.deepEqual(sandboxCoverage('gpu', { graphicsPolicy: 'require-hardware-timing', graphicsProvider: 'metal' }).graphics,
     { policy: 'require-hardware-timing', provider: 'metal' })
   assert.throws(() => sandboxCoverage('gpu', { graphicsPolicy: 'require-hardware-timing' }), /requires --metal/)
   assert.throws(() => sandboxCoverage('e2e', { graphicsProvider: 'metal' }), /gpu or all/)
-  const dedicated = await sandboxCommands('gpu'), functional = await sandboxCommands('e2e'), all = await sandboxCommands('all')
+  const dedicated = await sandboxCommands('gpu'), functional = await sandboxCommands('functional'), all = await sandboxCommands('all')
   assert.ok(dedicated.at(-1).some(value => value.endsWith('graphics.gpu.mjs')))
-  assert.ok(!functional.flat().some(value => value.endsWith('.gpu.mjs')))
+  assert.ok(!functional.flat().some(value => value.endsWith('.gpu.mjs') || value.endsWith('.soak.mjs') || value.endsWith('.foreground.mjs')))
+  assert.ok(functional[0].includes('scripts/app-idle-helpers.test.mjs'))
+  assert.ok(functional.at(-1).includes('tests/e2e/app-idle.e2e.mjs'))
+  assert.equal(functional.filter(command => command.join(' ').includes('npm run build')).length, 1)
+  const soak = await sandboxCommands('soak')
+  assert.deepEqual(soak.at(-1).filter(value => value.startsWith('tests/')), ['tests/soak/app-idle.soak.mjs'])
   assert.ok(all.at(-1).some(value => value.endsWith('graphics.gpu.mjs')))
   assert.equal(all.filter(command => command.join(' ').includes('npm run build')).length, 1)
 })
@@ -43,6 +50,7 @@ test('renderer suites reuse only a currently valid build manifest and reject sta
     await mkdir(join(root, 'src'), { recursive: true })
     await mkdir(join(root, 'dist'), { recursive: true })
     await mkdir(join(root, 'tests/e2e'), { recursive: true })
+    await mkdir(join(root, 'tests/soak'), { recursive: true })
     await writeFile(join(root, 'package.json'), '{"scripts":{"build":"vite build"}}\n')
     await writeFile(join(root, 'package-lock.json'), '{"lockfileVersion":3}\n')
     await writeFile(join(root, '.nvmrc'), '24.22.0\n')
@@ -50,6 +58,7 @@ test('renderer suites reuse only a currently valid build manifest and reject sta
     await writeFile(join(root, 'dist/index.html'), '<main></main>\n')
     await writeFile(join(root, 'tests/e2e/fixture.e2e.mjs'), 'export {}\n')
     await writeFile(join(root, 'tests/e2e/fixture.gpu.mjs'), 'export {}\n')
+    await writeFile(join(root, 'tests/soak/fixture.soak.mjs'), 'export {}\n')
     await writeBuildReuseManifest({ root, manifestPath })
 
     const e2e = await sandboxCommands('e2e', [], { root, reuseBuildManifest: manifestPath })
@@ -58,6 +67,9 @@ test('renderer suites reuse only a currently valid build manifest and reject sta
     assert.equal(gpu.length, 1, 'A valid manifest lets GPU consume the same renderer build without a second build command.')
     assert.ok(e2e[0].includes('tests/e2e/fixture.e2e.mjs'))
     assert.ok(gpu[0].includes('tests/e2e/fixture.gpu.mjs'))
+    const soak = await sandboxCommands('soak', [], { root, reuseBuildManifest: manifestPath })
+    assert.equal(soak.length, 1)
+    assert.ok(soak[0].includes('tests/soak/fixture.soak.mjs'))
     assert.ok(!e2e.flat().includes('build') && !gpu.flat().includes('build'))
 
     await writeFile(join(root, 'dist/index.html'), '<main>changed</main>\n')
@@ -213,7 +225,7 @@ test('standard suites reject incidental filesystem recording while custom I/O co
   const directory = await mkdtemp(join(tmpdir(), 'operation-standard-coverage-'))
   try {
     await recording(directory, [event({ category: 'io', name: 'fs.readFileSync' })])
-    for (const mode of ['core', 'e2e', 'foreground', 'all']) {
+    for (const mode of ['core', 'functional', 'e2e', 'foreground', 'soak', 'all']) {
       const coverage = sandboxCoverage(mode)
       const report = await summarizeOperations(directory, coverage)
       assert.ok(report.coverage.substantiveOperations > 0)
@@ -236,7 +248,7 @@ test('standard suites reject incidental filesystem recording while custom I/O co
     assert.ok(!sandboxCoverage('foreground').requireCategories.includes('network'))
     assert.ok(sandboxCoverage('e2e').requireOperations.some(value => value.name === 'fetch.request' && value.source === 'native'))
     assert.ok(sandboxCoverage('e2e').requireOperations.some(value => value.name === 'websocket.receive' && value.source === 'native'))
-    const combined = sandboxCoverage('all')
+    const combined = sandboxCoverage('functional')
     for (const mode of ['core', 'e2e']) for (const key of ['requireCategories', 'requireRoles', 'requireOperations']) {
       assert.ok(sandboxCoverage(mode)[key].every(value => combined[key].some(known => JSON.stringify(known) === JSON.stringify(value))), `${mode} ${key}`)
     }

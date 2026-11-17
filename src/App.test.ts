@@ -36,8 +36,7 @@ const logic = stripTypeScriptTypes([
 
 function fixture(snapshotFailure = false) {
   const slots: Slot[] = [], effects: (() => void)[] = []
-  let cursor = 0, dirty = true, rendered: View, timers = 0, now = 0
-  const pendingTimers = new Map<number, { callback: () => void; at: number }>()
+  let cursor = 0, dirty = true, rendered: View, timers = 0
   const snapshotRequests: { sinceRevision: number; serviceSession?: string }[] = []
   const universeRequests: unknown[][] = []
   const state = {
@@ -49,8 +48,8 @@ function fixture(snapshotFailure = false) {
     beforeSnapshot: undefined as undefined | (() => Promise<void>),
   }
   const window = Object.assign(new EventTarget(), {
-    setTimeout(callback: () => void, delay: number) { const id = ++timers; pendingTimers.set(id, { callback, at: now + delay }); return id },
-    clearTimeout(id: number) { pendingTimers.delete(id) },
+    setTimeout() { return ++timers },
+    clearTimeout() {},
     radarDesktop: { async request(command: {
       preferences?: { action: string; values?: Partial<Preferences> }
       snapshot?: { sinceRevision: number; serviceSession?: string }
@@ -81,7 +80,6 @@ function fixture(snapshotFailure = false) {
   const environment = {
     lazy,
     window, document, DEFAULT_PREFERENCES, SnapshotOrder, reconcileMarketRows, reconcileMarketOrder,
-    performance: { now: () => now },
     chartController: { ingestPrepared() {}, setPresentationActive() {}, getSnapshot: () => ({}), setUniverse: (...args: unknown[]) => { universeRequests.push(args) } },
     usePresentation: () => presentation,
     getPresentation: () => presentation,
@@ -105,10 +103,6 @@ function fixture(snapshotFailure = false) {
       return current.value
     },
     useCallback<T>(callback: T, dependencies: unknown[]) { return environment.useMemo(() => callback, dependencies) },
-    useSyncExternalStore(subscribe: (listener: () => void) => () => void, read: () => unknown) {
-      environment.useEffect(() => subscribe(() => { dirty = true }), [subscribe])
-      return read()
-    },
     useEffect(setup: () => void | (() => void), dependencies: unknown[]) {
       const current = slot()
       if (changed(current.dependencies, dependencies)) {
@@ -124,15 +118,6 @@ function fixture(snapshotFailure = false) {
     state, snapshotRequests, universeRequests,
     get view() { return rendered },
     get timers() { return timers },
-    get pendingTimers() { return pendingTimers.size },
-    advance(milliseconds: number) {
-      now += milliseconds
-      for (const [id, timer] of pendingTimers) if (timer.at <= now) { pendingTimers.delete(id); timer.callback() }
-    },
-    fireTimerEarly() {
-      const [id, timer] = pendingTimers.entries().next().value!
-      pendingTimers.delete(id); timer.callback()
-    },
     notify() { window.dispatchEvent(new Event('radar-market-changed')) },
     present(update: PresentationUpdate) { presentation = update; for (const listener of transitions) listener(update); dirty = true },
     async flush() {

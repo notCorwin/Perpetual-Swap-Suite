@@ -4,6 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
+import { installChartPriceReader } from '../helpers/chart-price-label.mjs'
 import { MarketStore } from '../../electron/services/market-store.js'
 import { MetadataStore, DEFAULT_PREFERENCES } from '../../electron/services/metadata-store.js'
 import { createNativeExchange } from '../helpers/native-exchange.mjs'
@@ -29,6 +30,7 @@ test('default multi-timeframe charts share native prices, isolate history and re
     const errors = []
     page.on('pageerror', error => errors.push(error.message))
     await page.waitForLoadState('domcontentloaded')
+    await installChartPriceReader(page)
     assert.deepEqual(await electron.evaluate(({ BrowserWindow }) => {
       const window = BrowserWindow.getAllWindows()[0]
       return { visible: window.isVisible(), focused: window.isFocused(), focusable: window.isFocusable() }
@@ -60,7 +62,7 @@ test('default multi-timeframe charts share native prices, isolate history and re
         const snapshot = chart.__chartSnapshot
         const label = chart.querySelector('[data-chart-price-label-value]')?.textContent ?? ''
         return snapshot?.instId === instId && snapshot.liveBar?.close === close && snapshot.priceObservedAt >= sentAt
-          && Number(label.split(/\s/)[0].replaceAll(',', '')) === close
+          && window.__chartPriceLabel(label) === close
       }), { instId, close, sentAt: event.sentAt }, { timeout: 15_000 })
     }
     console.log('multiframe: history released')
