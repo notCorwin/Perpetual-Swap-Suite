@@ -221,12 +221,16 @@ async function createWindow() {
     frame: false,
     ...(process.platform === 'darwin' ? { titleBarStyle: 'hidden', trafficLightPosition: windowToolbarLayout(1600, true).buttonsPosition } : {}),
     width: 1600, height: 1000, ...savedBounds, minWidth: 1200, minHeight: 640,
-    title: 'Perpetual Swap Suite', backgroundColor: '#101114', show: !testMode && !backgroundTests && !backgroundLaunch,
+    title: 'Perpetual Swap Suite', backgroundColor: '#101114', show: false,
     webPreferences: { ...testWindowOptions(backgroundTests).webPreferences,
       additionalArguments: [...(operationRecording ? ['--perpetual-swap-operation-recording'] : []),
         ...(!presentation.getState().active ? ['--perpetual-swap-presentation-idle'] : [])],
       preload: join(root, 'electron', 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true },
   })
+  if (!testMode && !backgroundTests && !backgroundLaunch) {
+    window.maximize()
+    window.show()
+  }
   if (backgroundLaunch) window.once('ready-to-show', () => { if (!window.isDestroyed()) window.showInactive() })
   subscribeWindowNotifications(window)
   if (process.platform === 'darwin') {
