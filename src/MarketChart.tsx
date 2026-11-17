@@ -23,7 +23,7 @@ import { formatPercent } from "@/market-percent"
 import { RADAR_TIMEFRAMES, timeframeLabel, timeframeMilliseconds, type RadarTimeframe } from '@/timeframe'
 
 import { chartController as defaultChartController, type ChartController } from '@/chart-controller'
-import { createChartPlotCache } from '@/chart-render'
+import { createChartIndicatorPresentation, createChartPlotCache } from '@/chart-render'
 import type { Bar, ChartSourceStatus, PreparedChartState, ReadyChartWindow } from '@/chart-data'
 import { measureOperation } from '../electron/services/operations.js'
 import { getPresentation, usePresentation, usePresentedStore, waitForPresentation } from '@/presentation-store'
@@ -336,9 +336,13 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     return chartController.open(instId, timeframe, target?.instId === instId && target.timeframe === timeframe ? target.end : null)
   }, [instId, timeframe, isActive, chartController])
   const surface = view.presented
+  // oxlint-disable-next-line react-hooks/exhaustive-deps -- Selection and controller changes own a new visual cache.
+  const indicatorPresentation = useMemo(() => createChartIndicatorPresentation(), [instId, timeframe, chartController])
+  const displayedIndicators = indicatorPresentation.project(surface)
+  useLayoutEffect(() => { indicatorPresentation.commit(surface) }, [indicatorPresentation, surface])
   const matchesSelection = surface?.instId === instId && surface.timeframe === timeframe
   const wheelSession = useMemo(() => ({ isActive, instId, timeframe }), [isActive, instId, timeframe])
-  const pending = view.pending || !matchesSelection
+  const pending = view.pending || !matchesSelection || displayedIndicators.stale
   const intervalMS = surface?.intervalMS ?? timeframeMilliseconds(timeframe)
   const displayedId = surface?.instId ?? instId
   const displayedFrame = surface?.timeframe ?? timeframe
@@ -355,7 +359,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
   const zoomRef = useRef(zoom)
   const viewport = useMemo(() => zoom ?? { spacing: CHART_DEFAULT_SPACING, offset: 0 }, [zoom])
   const overscan = chartOverscan(surface, chartController)
-  const preparedPlot = chartPlot(surface, plotSize, overscan, currentPriceTickSz, priceOnly, viewport)
+  const preparedPlot = chartPlot(displayedIndicators.window, plotSize, overscan, currentPriceTickSz, priceOnly, viewport)
   const bars = preparedPlot?.bars ?? surface?.bars ?? EMPTY_BARS
   const plotGeometry = preparedPlot?.geometry ?? null
   const visibleBars = plotGeometry?.windowBars ?? chartPitchSpan(plotSize.width, viewport.spacing)
@@ -662,7 +666,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
   if (surface && !error && priceState === 'loading') statusMessages.push('Loading price history…')
   if (priceState === 'error') statusMessages.push(sourceStatusText('Price history', priceState, surface?.priceStatus))
   if (priceState === 'unavailable') statusMessages.push('Price history is unavailable for this range')
-  if (surface?.indicatorState === 'loading') statusMessages.push('Calculating indicators…')
+  if (surface?.indicatorState === 'loading') statusMessages.push(displayedIndicators.stale ? 'Calculating indicators… Showing previous indicators.' : 'Calculating indicators…')
   if (surface?.indicatorState === 'error') statusMessages.push(sourceStatusText('Indicators', 'error', surface.indicatorStatus))
   if (surface?.indicatorState === 'unavailable') statusMessages.push(surface.indicatorStatus?.reason === 'insufficient-history' ? 'Insufficient history for some indicators' : 'Some indicators are undefined for this range')
   if (!priceOnly) for (const [label, state, status] of [['OI', oiState, surface?.oiStatus], ['Taker', takerState, surface?.takerStatus]] as const) {
@@ -704,7 +708,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
       <div data-chart-summary className="flex shrink-0 items-center border-b px-4">
         <h2 data-chart-title className="min-w-0 max-w-40 shrink-0 truncate" title={displayedId} aria-label={`${displayedId.replace(/-SWAP$/, '')} · ${timeframeLabel(displayedFrame)}`}>{priceOnly && matchesSelection ? timeframeLabel(displayedFrame) : `${displayedId.replace(/-SWAP$/, '')} · ${timeframeLabel(displayedFrame)}`}</h2>
         {priceOnly && !historical && <PriceStatus observedAt={surface?.priceObservedAt} realtime={surface?.realtimeState} active={isActive && windowVisible && presentation.active} />}
-        <div data-chart-status data-chart-indicator-state={surface?.indicatorState} data-chart-indicator-input={surface?.indicatorStatus?.inputVersion} role="status" aria-live="polite" aria-atomic="true" className="flex min-w-0 flex-1 items-center gap-2 text-xs text-muted-foreground">
+        <div data-chart-status data-chart-indicator-state={surface?.indicatorState} data-chart-indicator-stale={displayedIndicators.stale} data-chart-indicator-input={surface?.indicatorStatus?.inputVersion} role="status" aria-live="polite" aria-atomic="true" className="flex min-w-0 flex-1 items-center gap-2 text-xs text-muted-foreground">
           {statusLoading && <Spinner aria-hidden="true" role="presentation" />}
           <p className="min-w-0 truncate" title={statusSummary}>{statusMessages.map((message, index) => <span key={message}>{index > 0 && ' · '}<span>{message}</span></span>)}</p>
         </div>

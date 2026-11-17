@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { attachOperationSink } from '../electron/services/operations.js'
-import { createChartPlotCache } from './chart-render.ts'
+import { createChartIndicatorPresentation, createChartPlotCache } from './chart-render.ts'
 import type { ReadyChartWindow } from './chart-data.ts'
 
 const step = 900_000
@@ -13,6 +13,95 @@ const window = (instId = 'BTC-USDT-SWAP'): ReadyChartWindow => ({
     ema: 101, vwap: 101, bollUpper: 104, bollMiddle: 101, bollLower: 98, roc: 1, maroc: 1,
     rsi6: 50, rsi12: 50, rsi24: 50, atrPercent: 2, bbw: 6, oi: 10, buy: 7, sell: 3,
   })),
+})
+
+const loadingWindow = (frame: ReadyChartWindow): ReadyChartWindow => ({ ...frame, generation: frame.generation + 1, indicatorState: 'loading',
+  bars: frame.bars.map(bar => ({ ...bar, indicatorsObserved: false, ema: null, vwap: null, bollUpper: null, bollMiddle: null,
+    bollLower: null, roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null, atrPercent: null, bbw: null })),
+})
+
+const committedPresentation = () => {
+  const cache = createChartIndicatorPresentation()
+  return (window: ReadyChartWindow | null) => {
+    const result = cache.project(window)
+    cache.commit(window)
+    return result
+  }
+}
+
+test('uncommitted render projections cannot replace or invalidate the displayed indicator snapshot', () => {
+  const cache = createChartIndicatorPresentation(), frame = window()
+  cache.project(frame)
+  assert.equal(cache.project(loadingWindow(frame)).stale, false)
+  cache.commit(frame)
+  cache.project({ ...frame, bars: frame.bars.map(bar => ({ ...bar, vwap: 999 })) })
+  cache.project({ ...frame, indicatorState: 'error' })
+  cache.project(null)
+  const result = cache.project(loadingWindow(frame))
+  assert.equal(result.stale, true)
+  assert.equal(result.window!.bars[0].vwap, frame.bars[0].vwap)
+})
+
+test('indicator replay retains continuous curves while current prices, statistics and source flags update', () => {
+  const present = committedPresentation(), plots = createChartPlotCache(text => text.length * 6)
+  const frame = window(), size = { width: 960, height: 700 }
+  assert.equal(present(frame).window, frame)
+  const initial = plots(frame, size)!
+  const loading = { ...loadingWindow(frame), bars: loadingWindow(frame).bars.map(bar => ({ ...bar, close: 103, oi: 20 })) }
+  const retained = present(loading)
+  assert.equal(retained.stale, true)
+  assert.equal(retained.window!.indicatorState, 'loading')
+  assert.equal(retained.window!.generation, loading.generation)
+  assert.equal(retained.window!.bars[0].indicatorsObserved, false)
+  assert.equal(retained.window!.bars[0].close, 103)
+  assert.equal(retained.window!.bars[0].oi, 20)
+  assert.equal(loading.bars[0].vwap, null, 'Presentation must not mutate the invalidated source.')
+  const retainedPlot = plots(retained.window, size)!
+  assert.equal(retainedPlot.geometry.lines.vwap, initial.geometry.lines.vwap)
+  assert.equal(retainedPlot.geometry.lines.rsi6, initial.geometry.lines.rsi6)
+  assert.equal(present(loading), retained, 'Repeated renders reuse the same presentation projection.')
+  const partial = { ...loading, bars: loading.bars.map((bar, index) => index < 40 ? { ...bar, vwap: 105, indicatorsObserved: true } : bar) }
+  assert.deepEqual(present(partial).window!.bars.map(bar => bar.vwap), frame.bars.map(bar => bar.vwap), 'Chunked replay cannot repeatedly reshape the cached curves.')
+  const complete = { ...frame, generation: loading.generation, bars: frame.bars.map(bar => ({ ...bar, vwap: 105 })) }
+  assert.equal(present(complete).window, complete)
+  assert.equal(present(complete).stale, false)
+  const secondReplay = present(loadingWindow(complete))
+  assert.equal(secondReplay.stale, true)
+  assert.equal(secondReplay.window!.bars[0].vwap, 105, 'A second replay uses the latest complete snapshot.')
+  const unavailable = { ...loadingWindow(complete), indicatorState: 'unavailable' as const }
+  assert.equal(present(unavailable).window!.bars[0].vwap, null, 'Authoritative terminal nulls erase the previous curve.')
+})
+
+test('indicator snapshots expire on viewport changes, null, and every terminal result', () => {
+  const frame = window()
+  for (const changed of [
+    { ...loadingWindow(frame), instId: 'ETH-USDT-SWAP' },
+    { ...loadingWindow(frame), timeframe: '1H' as const },
+    { ...loadingWindow(frame), endHour: frame.endHour - step },
+    { ...loadingWindow(frame), windowBars: 192 },
+    { ...loadingWindow(frame), bars: frame.bars.slice(1) },
+    { ...loadingWindow(frame), bars: frame.bars.map(bar => ({ ...bar, hour: bar.hour + step })) },
+    null,
+    ...(['unavailable', 'error', 'partial', 'stale'] as const).map(indicatorState => ({ ...loadingWindow(frame), indicatorState })),
+  ]) {
+    const present = committedPresentation()
+    present(frame)
+    assert.equal(present(changed).stale, false)
+    assert.equal(present(changed).window, changed)
+    if (changed?.indicatorState !== 'unavailable') assert.equal(present(loadingWindow(frame)).stale, false)
+  }
+})
+
+test('forming prices update during replay and a new forming slot cannot inherit old indicators', () => {
+  const present = committedPresentation()
+  const frame = window(), live = { ...frame.bars.at(-1)!, confirmed: false, hour: 96 * step }
+  present({ ...frame, liveBar: live })
+  const loading = { ...loadingWindow(frame), liveBar: { ...live, close: 103, vwap: null, indicatorsObserved: false } }
+  const result = present(loading)
+  assert.equal(result.window!.liveBar!.close, 103)
+  assert.equal(result.window!.liveBar!.vwap, live.vwap)
+  const next = { ...loading, liveBar: { ...loading.liveBar, hour: 97 * step } }
+  assert.equal(present(next).window!.liveBar, next.liveBar)
 })
 
 test('selection reuses preconstructed live paths even beyond the geometry LRU capacity', () => {

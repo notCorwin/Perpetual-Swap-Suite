@@ -2,6 +2,41 @@ import type { ChartLayoutDensity } from './chart-layout.ts'
 import type { Bar, ReadyChartWindow } from './chart-data.ts'
 import { createChartGeometryCache, type ChartGeometryOverscan } from './chart-geometry.ts'
 
+const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw'] as const
+
+/** A loading-only visual snapshot. It never certifies or enters the source store. */
+export function createChartIndicatorPresentation() {
+  let snapshot: ReadyChartWindow | null = null
+  const projections = new WeakMap<ReadyChartWindow, { snapshot: ReadyChartWindow; window: ReadyChartWindow; stale: boolean }>()
+  const sameViewport = (window: ReadyChartWindow | null) => snapshot && window && snapshot.instId === window.instId && snapshot.timeframe === window.timeframe
+    && snapshot.intervalMS === window.intervalMS && snapshot.endHour === window.endHour && snapshot.windowBars === window.windowBars
+    && snapshot.bars.length === window.bars.length && snapshot.bars.every((bar, index) => bar.hour === window.bars[index].hour)
+  return {
+    commit(window: ReadyChartWindow | null) {
+      if (!sameViewport(window)) snapshot = null
+      if (!window || window.indicatorState !== 'loading') {
+        snapshot = window && (window.indicatorState === 'ready' || window.indicatorState === 'unavailable') ? window : null
+      }
+    },
+    project(window: ReadyChartWindow | null): { window: ReadyChartWindow | null; stale: boolean } {
+      if (!window || window.indicatorState !== 'loading' || !sameViewport(window)) return { window, stale: false }
+      const previous = snapshot!
+      const cached = projections.get(window)
+      if (cached?.snapshot === previous) return cached
+      const retain = <T extends Bar>(bar: T, prior: Bar): T => ({ ...bar,
+        ...Object.fromEntries(indicatorFields.map(field => [field, prior[field]])),
+      })
+      // Keep current OHLC, source flags, statistics and lifecycle metadata. Only
+      // the displayed curves retain their last committed shape until replay settles.
+      const liveBar = window.liveBar && previous.liveBar?.hour === window.liveBar.hour
+        ? retain(window.liveBar, previous.liveBar) : window.liveBar
+      const result = { snapshot: previous, window: { ...window, bars: window.bars.map((bar, index) => retain(bar, previous.bars[index])), liveBar }, stale: true }
+      projections.set(window, result)
+      return result
+    },
+  }
+}
+
 /** Selection and background rendering share the exact same immutable paths. */
 export function createChartPlotCache(measureText: (text: string) => number, layoutDensity?: ChartLayoutDensity) {
   const geometry = createChartGeometryCache(measureText)
