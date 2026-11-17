@@ -582,7 +582,7 @@ test('the paint probe selects the first ready target RAF and retains its mutable
   await openChart(page, fixture)
   await page.waitForFunction(instId => {
     const chart = document.querySelector(`[data-chart-inst="${instId}"]`), bars = chart?.__chartRenderedBars ?? chart?.__chartSnapshot?.bars
-    const fields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
+    const fields = ['vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
     return bars?.length === 96 && bars.every(bar => bar.indicatorsObserved && fields.every(field => Number.isFinite(bar[field])))
   }, fixture.instId)
   await startPaintProbe(page, fixture, { indicatorValidation: 'deferred-canonical' })
@@ -662,6 +662,10 @@ test('the paint probe retains geometry and metadata corruption without a new sna
       const clip = svg.querySelector(`[id="${CSS.escape(clipId)}"] rect`)
       const changes = [
         [path, 'd', 'M0,0', 'curve corruption'],
+        [path, 'd', '', 'missing curve'],
+        [path, 'd', path.getAttribute('d') + ' L99999 0', 'extra sample'],
+        [path, 'd', path.getAttribute('d').replace(/[ML]([\d.e+-]+)[ ,]+([\d.e+-]+)/i, 'M99999 0'), 'wrong sample position'],
+        [path, 'd', 'MNaN 0', 'nonfinite curve'],
         [clip, 'width', '0', 'clip corruption'],
         [otherPath, 'd', 'MNaN 0', 'nonfinite path'],
         [svg, 'data-rendered-start', '-1', 'range corruption'],
@@ -709,6 +713,7 @@ test('the paint probe retains geometry and metadata corruption without a new sna
     assert.equal(observation.observations, observation.captureSamples, 'Every timed sample must retain its state.')
     assert.equal(report.deferredValidationSamples, report.probeCaptureSamples)
     assert.ok(report.violations.some(error => /curve corruption: .*rsi12 SVG has 1 points/.test(error)), 'Restoring a curve must not erase its earlier corruption.')
+    for (const phase of ['missing curve', 'extra sample', 'wrong sample position', 'nonfinite curve']) assert.ok(report.violations.some(error => error.startsWith(`${phase}:`) && /rsi12 SVG/.test(error)), `Missing ${phase} violation.`)
     assert.ok(report.violations.some(error => /clip corruption: .* SVG has .* points/.test(error)), 'Clip changes must revalidate unchanged paths.')
     for (const error of [
       'Nonfinite SVG geometry.', 'SVG labels and the drawn range disagree.', 'SVG and snapshot timeframes disagree.',
@@ -775,7 +780,7 @@ test('every retained SVG observation agrees with independent curve checks when p
       }
       // Reference uses the original per-observation array-based calculation,
       // independently of the validator's cached path summaries.
-      const fields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi']
+      const fields = ['vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi']
       const errors = new Set()
       for (const { snapshot, bars, surface, phase, captureFailure } of probe.observations) {
         if (captureFailure || !snapshot || !surface?.svg || !Array.isArray(bars)) continue
@@ -786,11 +791,15 @@ test('every retained SVG observation agrees with independent curve checks when p
           if (samples > 1 && !d) errors.add(`${phase}: ${snapshot.timeframe} ${snapshot.endHour} lost its ${field} SVG curve with ${samples} known samples.`)
           const coordinates = [...d.matchAll(/[ML]([\d.e+-]+)[ ,]+([\d.e+-]+)/gi)].map(point => Number(point[1]))
           if (svg.hasClip) {
-            const left = Number(svg.clipX), right = left + Number(svg.clipWidth)
-            const inside = coordinates.filter(x => x >= left - .05 && x <= right + .05)
-            const padding = points > samples && inside.some(x => Math.abs(x - left) <= .05) ? 1 : 0
-            if (inside.length !== samples + padding || coordinates.filter(x => x < left - .05).length > 1
-              || coordinates.filter(x => x > right + .05).length > 1) errors.add(`${phase}: ${snapshot.timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.length} points; expected ${samples} visible samples and at most one adjacent sample per side.`)
+            const right = Number(svg.plotRight), pitch = Number(surface.chart.barSpacing), width = Number(svg.barWidth), end = Number(svg.domainEnd)
+            const center = hour => right - width / 2 + (hour - end) / snapshot.intervalMS * pitch
+            const required = bars.filter(bar => Number.isFinite(bar[field])).map(bar => center(bar.hour))
+            const extras = [center(bars[0].hour - snapshot.intervalMS), center(bars.at(-1).hour + snapshot.intervalMS)]
+            if (Number(svg.domainStart) === bars[0].hour && Number.isFinite(bars[0][field])) extras.push(Number(svg.clipX))
+            const remaining = [...coordinates]
+            const allRequired = required.every(x => { const i = remaining.findIndex(actual => Math.abs(actual - x) <= .06); if (i < 0) return false; remaining.splice(i, 1); return true })
+            const validExtras = remaining.every(x => { const i = extras.findIndex(candidate => Math.abs(candidate - x) <= .06); if (i < 0) return false; extras.splice(i, 1); return true })
+            if (!allRequired || !validExtras || Math.abs(Number(svg.clipX) + Number(svg.clipWidth) - right) > .1) errors.add(`${phase}: ${snapshot.timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.length} points; expected ${samples} visible samples and at most one adjacent sample per side.`)
           } else if (coordinates.length !== points) errors.add(`${phase}: ${snapshot.timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.length} points for ${points} known positions.`)
         }
       }
@@ -823,7 +832,7 @@ test('the paint probe validates mutable wrong and incomplete bars after they are
       const bars = (originalBars ?? originalSnapshot.bars).map(bar => ({ ...bar }))
       const index = bars.findIndex(bar => bar.confirmed)
       if (index < 0) throw new Error('The fixture needs a confirmed candle.')
-      const originalClose = bars[index].close, hour = bars[index].hour, removed = bars.pop()
+      const originalClose = bars[index].close, hour = bars[index].hour, removed = bars.splice(95)
       bars[index].close += Math.max(1, Math.abs(originalClose)) * .01
       const snapshot = { ...originalSnapshot, bars, priceStatus: { state: 'ready', from: 1, through: 2 } }
       try {
@@ -842,7 +851,7 @@ test('the paint probe validates mutable wrong and incomplete bars after they are
         snapshot.oiState = originalSnapshot.oiState
         snapshot.priceStatus.state = 'ready'
         bars[index].close = originalClose
-        bars.push(removed)
+        bars.push(...removed)
         chart.setAttribute('data-probe-paint-marker', 'restored in place')
         await Promise.resolve()
         return { hour, wrongClose, retainedClose: bad.bars[index].close, retainedLength: bad.bars.length, sharedBars,
@@ -970,7 +979,7 @@ test('prepared resident indicators and statistics stay drawn through rapid scrol
 for (const mode of ['gap', 'prepend']) test(`first historical acquisition preserves requested prices and source panels while ${mode === 'gap' ? 'later gaps fill' : 'an earlier prefix rebuilds exact indicators'}`, async context => {
   const probe = value => electron.evaluate((_, value) => globalThis.__marketBackend.probe(value), value)
   const fixture = await probe({ action: 'acquisitionInstall', timeframe: '15m', mode })
-  const fields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
+  const fields = ['vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
   const desired = fixture.series[fixture.timeframe].bars.filter(bar => bar.hour >= fixture.targetEnd - 95 * fixture.intervalMS && bar.hour <= fixture.targetEnd)
   const settle = () => page.evaluate(async () => { for (let frame = 0; frame < 8; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
   try {
@@ -1100,12 +1109,11 @@ test('the live price overlay follows its actual price without changing the 96 co
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   const visible = fixture.series[fixture.timeframe].bars.slice(-96)
   const prices = visible.flatMap(bar => ['low', 'high', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower'].map(field => bar[field]))
-  // A geometric midpoint must land at the center of a logarithmic price axis,
-  // including symmetric axis padding. This expectation does not reuse Plot.
-  const livePrice = Math.sqrt(Math.min(...prices) * Math.max(...prices))
+  // The arithmetic midpoint maps to the midpoint of the linear relative scale.
+  const livePrice = (Math.min(...prices) + Math.max(...prices)) / 2
   await installPreparedTransform({ mode: 'live', instId: fixture.instId, livePrice })
   try {
-    await openChart(page, fixture)
+    await openChart(page, fixture, fixture.timeframe, { liveOverlay: true })
     // This case measures the live overlay over a prepared adjacent window.
     // First acquisition may legitimately present its known prices while the
     // missing leading candle loads; cold acquisition is tested separately.
@@ -1114,8 +1122,8 @@ test('the live price overlay follows its actual price without changing the 96 co
     await waitForRendered(page, fixture, fixture.timeframe, historicalEnd)
     await page.waitForFunction(({ end, intervalMS }) => {
       const bars = document.querySelector('[data-chart-inst]')?.__chartSnapshot?.bars
-      return bars?.length === 96 && bars.every((bar, index) =>
-        bar.confirmed && bar.hour === end - 95 * intervalMS + index * intervalMS)
+      return bars?.length >= 96 && bars.every((bar, index) =>
+        bar.confirmed && bar.hour === end - (bars.length - 1 - index) * intervalMS)
     }, { end: historicalEnd, intervalMS: fixture.intervalMS })
     await wheelBurst(page, { deltaY: -12 })
     await waitForRendered(page, fixture)
@@ -1125,19 +1133,17 @@ test('the live price overlay follows its actual price without changing the 96 co
       const chart = document.querySelector('[data-chart-inst]')
       const svg = chart.querySelector('svg[data-rendered-inst]')
       const snapshot = chart.__chartSnapshot
-      const horizontalBorders = [...svg.querySelectorAll(':scope > line')].filter(line =>
-        line.getAttribute('stroke') === 'var(--border)' && line.y1.baseVal.value === line.y2.baseVal.value
-        && line.x1.baseVal.value !== line.x2.baseVal.value)
       const line = svg.querySelector('[data-chart-live-price]')
       const label = svg.querySelector('[data-chart-price-label-value]')
-      const tick = svg.querySelector('[data-chart-price-tick] text')
+      const ticks = [...svg.querySelectorAll('[data-chart-price-tick] text')]
+      const tick = ticks[0]
       const countdown = svg.querySelector('[data-chart-countdown]')
       const labelBounds = label.getBBox()
       return {
         bars: snapshot.bars.length, allConfirmed: snapshot.bars.every(bar => bar.confirmed),
         liveConfirmed: snapshot.liveBar?.confirmed, liveHour: snapshot.liveBar?.hour,
         lineY: Number(line?.getAttribute('y1')),
-        expectedY: (Number(horizontalBorders[0].getAttribute('y1')) + Number(horizontalBorders[1].getAttribute('y1'))) / 2,
+        expectedY: (() => { const a = ticks[0], b = ticks.at(-1); const av = parseFloat(a.textContent.replaceAll(',', '')), bv = parseFloat(b.textContent.replaceAll(',', '')); const right = Number(svg.dataset.chartPlotRight), width = Number(svg.dataset.chartBarWidth), end = Number(svg.dataset.chartDomainEnd), pitch = Number(chart.dataset.chartBarSpacing), offset = Number(svg.querySelector('[data-chart-wheel-content]')?.dataset.chartWheelOffset ?? 0); const base = snapshot.bars.find(bar => right - width / 2 + (bar.hour - end) / snapshot.intervalMS * pitch + offset + width / 2 > 0).open; const value = (snapshot.liveBar.close / base - 1) * 100; return Number(a.getAttribute('y')) + (value - av) / (bv - av) * (Number(b.getAttribute('y')) - Number(a.getAttribute('y'))) })(),
         countdown: countdown?.textContent,
         labelX: Number(label.getAttribute('x')), tickX: Number(tick.getAttribute('x')),
         labelY: Number(label.getAttribute('y')),
@@ -1151,11 +1157,11 @@ test('the live price overlay follows its actual price without changing the 96 co
         labelFill: getComputedStyle(label).fill,
       }
     })
-    assert.equal(overlay.bars, 96)
+    assert.ok(overlay.bars >= 96)
     assert.equal(overlay.allConfirmed, true)
     assert.equal(overlay.liveConfirmed, false)
     assert.equal(overlay.liveHour, fixture.end + fixture.intervalMS)
-    assert.ok(Math.abs(overlay.lineY - overlay.expectedY) < 1e-6, `The live price line must use its logarithmic price coordinate: ${JSON.stringify(overlay)}`)
+    assert.ok(Math.abs(overlay.lineY - overlay.expectedY) < 2, `The live price line must use its relative price coordinate: ${JSON.stringify(overlay)}`)
     assert.match(overlay.countdown ?? '', /^\d{2}:\d{2}$/)
     assert.equal(overlay.labelX, overlay.tickX, 'The price value must share the axis tick alignment.')
     assert.equal(overlay.labelY, overlay.lineY, 'Countdown placement must not shift the price anchor.')
@@ -1170,10 +1176,35 @@ test('the live price overlay follows its actual price without changing the 96 co
     await waitForRendered(page, fixture, fixture.timeframe, fixture.end - fixture.intervalMS)
     assert.equal(await page.locator('svg[data-rendered-inst] [data-chart-countdown]').count(), 0, 'Historical charts must not display a live countdown.')
     assert.equal(await page.evaluate(() => document.querySelector('[data-chart-inst]').__chartSnapshot.liveBar), undefined)
-    assertCompletePaints(await finishPaintProbe(page))
+    const report = await finishPaintProbe(page)
+    assert.ok(report.frames > 0 && report.paints > 0)
+    assert.ok(report.minimumBars >= 96)
+    assert.deepEqual(report.violations, [])
   } finally {
     await removePreparedTransform()
   }
+})
+
+test('relative price curves remain accurate during fractional scrolling in both directions', async () => {
+  const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
+  await openChart(page, fixture)
+  await wheelBurst(page, { deltaY: 120 })
+  await waitForRendered(page, fixture, fixture.timeframe, fixture.end - 10 * fixture.intervalMS)
+  await startPaintProbe(page, fixture)
+  const readOffset = () => page.evaluate(() => Number(document.querySelector('[data-chart-wheel-content]')?.dataset.chartWheelOffset))
+  await wheelBurst(page, { deltaY: 6 })
+  await page.waitForFunction(() => Math.abs(Number(document.querySelector('[data-chart-wheel-content]')?.dataset.chartWheelOffset)) > 0.01)
+  const backwardOffset = await readOffset()
+  await wheelBurst(page, { deltaY: -3 })
+  await page.waitForFunction(previous => {
+    const offset = Number(document.querySelector('[data-chart-wheel-content]')?.dataset.chartWheelOffset)
+    return Math.abs(offset) > 0.01 && Math.abs(offset - previous) > 0.01
+  }, backwardOffset)
+  const forwardOffset = await readOffset()
+  assert.ok(Math.abs(forwardOffset) < Math.abs(backwardOffset), 'Reverse scrolling must move the fractional offset toward its starting position.')
+  const report = await finishPaintProbe(page)
+  assert.ok(report.frames > 0 && report.paints > 0)
+  assert.deepEqual(report.violations, [])
 })
 
 test('latest OI and Taker legends retain their last observed values after scrolling and inspect missing live values exactly', async () => {

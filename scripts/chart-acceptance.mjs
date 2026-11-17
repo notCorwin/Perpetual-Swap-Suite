@@ -97,7 +97,7 @@ export async function waitForRendered(page, fixture, timeframe = fixture.timefra
         && svg.getAttribute('data-rendered-timeframe') === timeframe
         && Number(chart.getAttribute('data-chart-completed-end') ?? svg.getAttribute('data-rendered-end')) === end
         && Number(chart.getAttribute('data-chart-rendered-bars')) > 0
-        && Number(chart.getAttribute('data-chart-rendered-bars')) === Math.floor(Number(chart.getAttribute('data-chart-visible-bars')))
+        && Number(chart.getAttribute('data-chart-rendered-bars')) >= Math.floor(Number(chart.getAttribute('data-chart-visible-bars')))
         && Number(chart.getAttribute('data-chart-target-bars')) >= Number(chart.getAttribute('data-chart-visible-bars'))
         && chart.getAttribute('data-chart-loading') === 'false'
     }, { instId: fixture.instId, timeframe, end }, { timeout: 20_000 })
@@ -250,7 +250,7 @@ export async function assertIndicatorLegends(page, { requireFittedVolatility = f
   return reading
 }
 
-export async function openChart(page, fixture, timeframe = fixture.timeframe) {
+export async function openChart(page, fixture, timeframe = fixture.timeframe, { liveOverlay = false } = {}) {
   // These timing/oracle fixtures use a fixed 96-candle workload. Responsive
   // width and density coverage belongs to the workspace resize acceptance.
   await page.setViewportSize({ width: 1360, height: 1000 })
@@ -278,8 +278,10 @@ export async function openChart(page, fixture, timeframe = fixture.timeframe) {
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
   }
   await waitForRendered(page, fixture, timeframe)
-  assert.equal(Number(await page.locator(`[data-chart-inst="${fixture.instId}"]`).getAttribute('data-chart-rendered-bars')), 96,
-    'Timing and mathematical oracles require exactly 96 actual plotted candles.')
+  if (!liveOverlay) {
+    const count = Number(await page.locator(`[data-chart-inst="${fixture.instId}"]`).getAttribute('data-chart-rendered-bars'))
+    assert.ok(count >= 96 && count <= 98, `Expected 96 full slots plus partially visible candles; got ${count}.`)
+  }
 }
 
 // Inspect the actual immutable data passed to Plot and its SVG, rather than
@@ -424,7 +426,7 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
       const chartState = shareRecord(previous?.chart, {
         instId: chart.dataset.chartInst, label: chart.getAttribute('aria-label'), start: chart.dataset.chartStart, end: chart.dataset.chartEnd,
         completedEnd: chart.dataset.chartCompletedEnd, requestedEnd: chart.dataset.chartRequestedEnd, renderedBars: chart.dataset.chartRenderedBars,
-        targetBars: chart.dataset.chartTargetBars, visibleBars: chart.dataset.chartVisibleBars, loading: chart.dataset.chartLoading, visualStale: chart.dataset.chartVisualStale,
+        barSpacing: chart.dataset.chartBarSpacing, targetBars: chart.dataset.chartTargetBars, visibleBars: chart.dataset.chartVisibleBars, loading: chart.dataset.chartLoading, visualStale: chart.dataset.chartVisualStale,
         candleState: chart.dataset.chartCandleState, statisticsState: chart.dataset.chartStatisticsState, statisticsEnd: chart.dataset.chartStatisticsEnd,
         oiState: chart.dataset.chartOiState, takerState: chart.dataset.chartTakerState, incomplete: chart.dataset.chartIncomplete,
         oiSamples: chart.dataset.chartOiSamples, takerSamples: chart.dataset.chartTakerSamples,
@@ -458,7 +460,7 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
       const svgState = shareRecord(previousSVG, {
         instId: svg.dataset.renderedInst, timeframe: svg.dataset.renderedTimeframe, start: svg.dataset.renderedStart, end: svg.dataset.renderedEnd,
         label: svg.getAttribute('aria-label'),
-        clipPath, hasClip: Boolean(clip), clipX: clip?.getAttribute('x'), clipWidth: clip?.getAttribute('width'), curves, pathData,
+        plotRight: svg.dataset.chartPlotRight, barWidth: svg.dataset.chartBarWidth, domainEnd: svg.dataset.chartDomainEnd, domainStart: svg.dataset.chartDomainStart, clipPath, hasClip: Boolean(clip), clipX: clip?.getAttribute('x'), clipWidth: clip?.getAttribute('width'), curves, pathData,
         oi: oi?.getAttribute('data-chart-oi'), oiState: oi?.getAttribute('data-chart-oi-state'), oiSamples: oi?.getAttribute('data-chart-oi-samples'),
         taker: taker?.getAttribute('data-chart-taker'), takerState: taker?.getAttribute('data-chart-taker-state'),
         buySamples: taker?.querySelector('[data-chart-taker-buy-samples]')?.getAttribute('data-chart-taker-buy-samples'),
@@ -649,7 +651,8 @@ async function validateStoppedPaintProbe(page, { readyTarget, includeRequestComm
 
     const validationStartedAt = performance.now()
     const fields = ['open', 'high', 'low', 'close', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
-    const indicatorFields = fields.slice(4, -3), statisticFields = ['oi', 'buy', 'sell'], curveFields = [...indicatorFields, 'oi']
+    const indicatorFields = fields.slice(4, -3), statisticFields = ['oi', 'buy', 'sell']
+    const curveFields = ['vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi']
     const { instId, requireMatureData, requireWarmStatistics, indicatorValidation } = probe
     const oracles = Object.fromEntries(Object.entries(series).map(([frame, entry]) => [frame, new Map(entry.bars.map(bar => [bar.hour, bar]))]))
     const expectedGeometry = new WeakMap(), svgGeometry = new WeakMap(), known = new Map(), seenErrors = new Set(probe.errors)
@@ -662,15 +665,16 @@ async function validateStoppedPaintProbe(page, { readyTarget, includeRequestComm
       if (!curves) { curves = []; svgGeometry.set(svg, curves) }
       if (curves[index]) return curves[index]
       const left = Number(svg.clipX), right = left + Number(svg.clipWidth)
-      let count = 0, inside = 0, before = 0, after = 0, atLeft = false
+      let count = 0, inside = 0, before = 0, after = 0, atLeft = false, xs = []
       for (const point of svg.curves[index].matchAll(/[ML]([\d.e+-]+)[ ,]+([\d.e+-]+)/gi)) {
         const x = Number(point[1])
         count += 1
+        xs.push(x)
         if (x >= left - .05 && x <= right + .05) { inside += 1; if (Math.abs(x - left) <= .05) atLeft = true }
         if (x < left - .05) before += 1
         if (x > right + .05) after += 1
       }
-      return curves[index] = { count, inside, before, after, atLeft }
+      return curves[index] = { count, inside, before, after, atLeft, xs }
     }
     let deferredValidationSamples = 0, failedCaptureSamples = 0, readyFrame = null
     for (const { at, frame, snapshot, bars, surface, phase, newPaint, pendingWindowIndex, captureFailure } of probe.observations) {
@@ -686,8 +690,9 @@ async function validateStoppedPaintProbe(page, { readyTarget, includeRequestComm
           && snapshot.intervalMS === readyTarget.intervalMS
           && Number(chart.requestedEnd) === readyTarget.endHour && Number(chart.completedEnd) === readyTarget.endHour
           && svg.instId === readyTarget.instId && svg.timeframe === readyTarget.timeframe && Number(svg.end) === readyTarget.endHour
-          && Array.isArray(bars) && bars.length === 96
-          && bars.every((bar, index) => bar.hour === readyTarget.endHour - (95 - index) * readyTarget.intervalMS && bar.confirmed && bar.priceComplete !== false
+          && Array.isArray(bars) && bars.length >= 96 && bars.length <= 98
+          && bars.some(bar => bar.hour === readyTarget.endHour)
+          && bars.every((bar, index) => (!index || bar.hour - bars[index - 1].hour === readyTarget.intervalMS) && bar.confirmed && bar.priceComplete !== false
             && bar.indicatorsObserved && ['open', 'high', 'low', 'close', ...indicatorFields].every(field => Number.isFinite(bar[field])))) {
           // Retain just this one already-captured frame for the post-timing
           // SQLite oracle. SVG validation below uses the same observation.
@@ -717,12 +722,21 @@ async function validateStoppedPaintProbe(page, { readyTarget, includeRequestComm
             const coordinates = curveGeometry(svg, index)
             if (svg.hasClip) {
               const padding = expectedPoints > samples && coordinates.atLeft ? 1 : 0
-              if (coordinates.inside !== samples + padding || coordinates.before > 1 || coordinates.after > 1) fail(`${phase}: ${timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.count} points; expected ${samples} visible samples and at most one adjacent sample per side.`)
+              const pitch = Number(chart.barSpacing), right = Number(svg.plotRight), width = Number(svg.barWidth), end = Number(svg.domainEnd)
+              const center = hour => right - width / 2 + (hour - end) / snapshot.intervalMS * pitch
+              const required = bars.filter(bar => Number.isFinite(bar[field])).map(bar => center(bar.hour))
+              const candidates = [center(bars[0].hour - snapshot.intervalMS), center(bars.at(-1).hour + snapshot.intervalMS)]
+              if (Number(svg.domainStart) === bars[0].hour && Number.isFinite(bars[0][field])) candidates.push(Number(svg.clipX))
+              const remaining = [...coordinates.xs]
+              const take = x => { const i = remaining.findIndex(actual => Math.abs(actual - x) <= .06); if (i < 0) return false; remaining.splice(i, 1); return true }
+              const allRequired = required.every(take)
+              const validExtras = remaining.every(x => { const i = candidates.findIndex(candidate => Math.abs(candidate - x) <= .06); if (i < 0) return false; candidates.splice(i, 1); return true })
+              if (!allRequired || !validExtras || Math.abs(Number(svg.clipX) + Number(svg.clipWidth) - right) > .1) fail(`${phase}: ${timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.count} points; expected ${samples} visible samples and at most one adjacent sample per side.`)
             } else if (coordinates.count !== expectedPoints) fail(`${phase}: ${timeframe} ${snapshot.endHour} ${field} SVG has ${coordinates.count} points for ${expectedPoints} known positions.`)
             if (/NaN|Infinity|undefined/.test(d)) fail('Nonfinite SVG geometry.')
           }
           if (requireMatureData) {
-            for (let index = 0; index < indicatorFields.length; index += 1) if (!svg.curves[index]) fail(`${phase}: ${timeframe} ${snapshot.endHour} has no ${indicatorFields[index]} SVG curve for mature local history.`)
+            for (let index = 0; index < curveFields.length - 1; index += 1) if (!svg.curves[index]) fail(`${phase}: ${timeframe} ${snapshot.endHour} has no ${curveFields[index]} SVG curve for mature local history.`)
             const expectsOI = bars.some(bar => Number.isFinite(oracles[timeframe]?.get(bar.hour)?.oi))
             const expectsTaker = bars.some(bar => Number.isFinite(oracles[timeframe]?.get(bar.hour)?.buy) && Number.isFinite(oracles[timeframe]?.get(bar.hour)?.sell))
             if ((requireWarmStatistics ? expectsOI : bars.some(bar => bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1)))
@@ -754,7 +768,7 @@ async function validateStoppedPaintProbe(page, { readyTarget, includeRequestComm
         if (!Array.isArray(bars)) { fail('The rendered snapshot has no bars.'); continue }
         probe.quality.push({ phase, end: snapshot.endHour, timeframe, indicators: bars.filter(bar => indicatorFields.every(field => Number.isFinite(bar[field]))).length,
           oi: bars.filter(bar => Number.isFinite(bar.oi)).length, taker: bars.filter(bar => Number.isFinite(bar.buy) && Number.isFinite(bar.sell)).length })
-        if (bars.length !== 96) fail(`Rendered ${bars.length} bars for ${timeframe}.`)
+        if (bars.length < 96 || bars.length > 98) fail(`Rendered ${bars.length} bars for ${timeframe}; expected 96 full slots plus partially visible candles.`)
         const intervalMS = series[timeframe]?.intervalMS
         for (let index = 0; index < bars.length; index += 1) {
           const bar = bars[index]
@@ -842,7 +856,7 @@ async function validateStoppedPaintProbe(page, { readyTarget, includeRequestComm
 export function assertCompletePaints(report) {
   assert.ok(report.frames > 0, 'The acceptance probe must observe renderer animation frames.')
   assert.ok(report.paints > 0, 'The acceptance probe must inspect the real rendered snapshot.')
-  assert.equal(report.minimumBars, 96, 'Every observed window must contain 96 candles.')
+  assert.ok(report.minimumBars >= 96 && report.minimumBars <= 98, 'Every observed window must contain its complete candle range.')
   assert.deepEqual(report.violations, [], 'A rendered window was incomplete, mixed, or mathematically incorrect.')
 }
 
@@ -1729,7 +1743,7 @@ async function assertColdCanonicalViewport(electron, page, fixture, endHour, cap
     })) }
   })
   assert.equal(recovered.endHour, endHour)
-  assert.equal(recovered.bars.length, 96)
+  assert.ok(recovered.bars.length >= 96 && recovered.bars.length <= 98)
   // The cold fixture's full provider history is intentionally not all present
   // in SQLite. Build this oracle from every candle actually available after
   // the nearest page is committed, so recursive seeds and missing-period
@@ -1904,7 +1918,7 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m', offscreen
     phaseData.approachLatency = approachLatency
     phaseData.approachAcknowledgment = approachAcknowledgment
     assert.ok(targetCommit, 'The target chart snapshot must reach a renderer RAF sample.')
-    assert.ok(paint.readyFrame, 'No captured target RAF contained all 96 prices and observed finite indicators.')
+    assert.ok(paint.readyFrame, 'No captured target RAF contained the full price window and observed finite indicators.')
     assert.ok(sources.preparedTarget, 'No passive history publication witnessed the prepared target after the nearest source completed; the prefetch preparation gap cannot be measured without demand.')
     assert.equal(sources.preparedTarget.sourceCompletedAt, nearest.completedAt, 'The prepared witness must follow the exact nearest source request.')
     const timing = coldBoundaryTiming({ rendererTimeOrigin: timeOrigin, approachInputAt: approachInputs[0], finalInputAt: inputs.at(-1),

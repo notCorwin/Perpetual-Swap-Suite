@@ -153,7 +153,7 @@ test('current-price precision reserves label width and reuses unchanged chart in
   const live = { ...frame, liveBar: { ...frame.bars.at(-1)!, confirmed: false, hour: 96 * step } }
   const unpadded = cache(live, size)!
   const padded = cache(live, size, {}, '1e-20')!
-  const quote = '102.00000000000000000000 ↑'
+  const quote = 'Price 102.00000000000000000000 ↑'
   assert.ok(labels.includes(quote), 'The gutter must measure the same padded current price as the visible tag.')
   assert.ok(padded.geometry.gutter >= quote.length * 6 + 16)
   assert.ok(padded.geometry.gutter > unpadded.geometry.gutter)

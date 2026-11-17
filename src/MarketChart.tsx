@@ -12,7 +12,7 @@ import { chartAnalysis } from '@/analysis-service'
 import { analysisSessionKey, type AnalysisDirection } from '@/chart-analysis'
 import { captureStableChart, chartCaptureBounds } from '@/chart-capture'
 import { CHART_PANELS, chartContentClip, chartPanelClip, chartPriceLabelLayout, type ChartPanel as Panel } from "@/chart-layout"
-import { chartCompact as compact, chartPercent, type ChartGeometry } from "@/chart-geometry"
+import { chartCompact as compact, chartPercent, chartPricePresentation, type ChartGeometry } from "@/chart-geometry"
 import { formatCurrentPrice, formatHistoricalPrice, formatIndicatorPrice } from '@/price-format'
 import { chartRsiNavigationTarget, chartWheelIntent, chartZoomDemand, chartZoomSpacing, chartWheelContentOffset, chartPresentedWheelFraction, createChartWheelBatch, createChartWheelScheduler } from '@/chart-navigation'
 import { chartStatisticsSamples } from '@/chart-legend'
@@ -106,13 +106,13 @@ const chartOverscan = (surface: ReadyChartWindow | null, chartController: ChartC
   return { before, after }
 }
 
-const PlotPaths = memo(function PlotPaths({ bars, geometry, areaClipId, oiState, takerState }: { bars: readonly Bar[]; geometry: ChartGeometry; areaClipId: string; oiState: PreparedChartState; takerState: PreparedChartState }) {
+const PlotPaths = memo(function PlotPaths({ bars, geometry, areaClipId, oiState, takerState, priceVisible }: { priceVisible: boolean; bars: readonly Bar[]; geometry: ChartGeometry; areaClipId: string; oiState: PreparedChartState; takerState: PreparedChartState }) {
   const { upWicks, downWicks, upBodies, downBodies, buys, sells, lines, rsiMarkers, oiAxis, oiComplete, oiSamples, oiY, x, takerComplete, takerAvailable } = geometry
   const { panels } = geometry.layout
   const lineStroke = (key: keyof Bar, d: string, color: string, dash?: string) => <path data-chart-indicator={key} d={d} fill="none" stroke={color} strokeLinecap="round" strokeLinejoin="round" strokeDasharray={dash} />
   return measureOperation({ category: 'cpu', name: 'chart.svg.paths.construct', attributes: { candles: bars.length } }, () => <>
     {/* Expose contrasting segments within the same 1px stroke for the mandated light green. */}
-    <g clipPath={`url(#${areaClipId}-price)`}>
+    <g clipPath={`url(#${areaClipId}-price)`} visibility={priceVisible ? "visible" : "hidden"}>
     <path d={upWicks} fill="none" stroke="var(--foreground)" />
     <path d={upWicks} fill="none" stroke="var(--positive)" strokeDasharray="2 3" />
     <path d={downWicks} fill="none" stroke="var(--negative)" />
@@ -125,7 +125,7 @@ const PlotPaths = memo(function PlotPaths({ bars, geometry, areaClipId, oiState,
       <path data-chart-taker-sell-samples={geometry.sellSamples} d={sells} fill="var(--negative)" stroke="var(--foreground)" opacity="0.9" />
       <path d={sells} fill={`url(#${areaClipId}-sell-hatch)`} opacity="0.7" />
     </g>}
-    <g clipPath={`url(#${areaClipId}-price)`}>
+    <g clipPath={`url(#${areaClipId}-price)`} visibility={priceVisible ? "visible" : "hidden"}>
     {lineStroke("bollUpper", lines.bollUpper, "var(--chart-1)")}
     {lineStroke("bollMiddle", lines.bollMiddle, "var(--chart-1)")}
     {lineStroke("bollLower", lines.bollLower, "var(--chart-1)")}
@@ -157,6 +157,7 @@ const PlotPaths = memo(function PlotPaths({ bars, geometry, areaClipId, oiState,
 export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = false, inspected, inspectedBar, contentOffset = 0, oiState = 'ready', takerState = 'ready', oiStatus, takerStatus }: { bars: readonly Bar[]; geometry: ChartGeometry; liveBar: Bar; liveOverlay?: boolean; inspected: number | null; inspectedBar?: Bar; contentOffset?: number; oiState?: PreparedChartState; takerState?: PreparedChartState; oiStatus?: ChartSourceStatus; takerStatus?: ChartSourceStatus }) {
   const areaClipId = useId().replaceAll(":", "")
   return measureOperation({ category: 'cpu', name: 'chart.svg.construct', attributes: { candles: bars.length, inspected: inspected !== null } }, () => {
+  const presentation = chartPricePresentation(geometry, contentOffset)
   const n = bars.length
   const inspecting = inspected !== null || inspectedBar !== undefined
   const active = inspectedBar ?? bars[inspected ?? n - 1]
@@ -167,10 +168,10 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
   const { panels, columns, axisStarts, headerY, right } = geometry.layout
   const contentClip = chartContentClip(geometry.layout, height)
   const rocClip = chartPanelClip(geometry.layout, 'roc', geometry.barPitch)
-  const tag = { price: liveBar.close, rising: liveBar.close >= liveBar.open, inViewport: liveBar.hour <= endHour + (liveOverlay ? intervalMS : 0) }
-  const latestY = priceY(tag.price)
+  const tag = { price: liveBar.close, rising: liveBar.close >= liveBar.open, inViewport: presentation.base !== null && geometry.priceAxis.base !== null && Number.isFinite(liveBar.close) && liveBar.hour <= endHour + (liveOverlay ? intervalMS : 0) }
+  const latestY = tag.inViewport ? priceY(tag.price) : panels.price[0]
   const latestColor = tag.rising ? "var(--positive)" : "var(--negative)"
-  const latestPrice = `${formatCurrentPrice(tag.price, geometry.currentPriceTickSz)} ${tag.rising ? '↑' : '↓'}`
+  const latestPrice = `Price ${formatCurrentPrice(tag.price, geometry.currentPriceTickSz)} ${tag.rising ? '↑' : '↓'}`
   const priceLabel = chartPriceLabelLayout(latestY, panels.price, chartTokens.textSize, chartTokens.priceLabelPaddingY, liveOverlay)
   const tickHalfHeight = chartTokens.textSize / 2
   const inspectionX = x[0] + (active.hour - bars[0].hour) / intervalMS * geometry.barPitch
@@ -239,7 +240,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     </defs>
     <g clipPath={`url(#${areaClipId}-content)`}>
       <g transform={`translate(${contentOffset},0)`} data-chart-wheel-content data-chart-wheel-offset={contentOffset}>
-      <g clipPath={`url(#${areaClipId}-price)`}>{bollBands.map((d, index) => <path key={index} data-chart-boll-band d={d} fill="var(--chart-1)" fillOpacity="0.1" />)}</g>
+      <g clipPath={`url(#${areaClipId}-price)`} visibility={presentation.base !== null && presentation.geometryBase !== null ? "visible" : "hidden"}>{bollBands.map((d, index) => <path key={index} data-chart-boll-band d={d} fill="var(--chart-1)" fillOpacity="0.1" />)}</g>
       {!geometry.priceOnly && <g clipPath={`url(#${areaClipId}-roc)`}>{rocAreas.map((area, index) => <g key={index}>
         <path d={area} fill="var(--chart-roc-positive-area)" clipPath={`url(#${areaClipId}-positive)`} />
         <path d={area} fill="var(--chart-roc-negative-area)" clipPath={`url(#${areaClipId}-negative)`} />
@@ -253,10 +254,11 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
       <g transform={`translate(${contentOffset},0)`} data-chart-wheel-content data-chart-wheel-offset={contentOffset}>
     {bars.flatMap((bar, index) => (bar.hour - firstHour) % (12 * intervalMS) === 0 ? panelKeys.map(key => <line key={`${(bar.hour - firstHour) / intervalMS}-${key}`} x1={x[index]} x2={x[index]} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--border)" strokeOpacity="0.22" />) : [])}
     {timeLabels.map(({ bar, index }) => <text data-chart-time-label key={(bar.hour - firstHour) / intervalMS} x={x[index]} y={height - 4} textAnchor={index === 0 ? "start" : index === n - 1 ? "end" : "middle"} fill="var(--muted-foreground)">{hourLabel(bar.hour)}</text>)}
-    <PlotPaths bars={bars} geometry={geometry} areaClipId={areaClipId} oiState={oiState} takerState={takerState} />
+    <PlotPaths bars={bars} geometry={geometry} areaClipId={areaClipId} oiState={oiState} takerState={takerState} priceVisible={presentation.base !== null && presentation.geometryBase !== null} />
     {inspecting && panelKeys.map(key => <line key={key} x1={inspectionX} x2={inspectionX} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--foreground)" strokeDasharray="3 5" opacity="0.3" />)}
     <g clipPath={`url(#${areaClipId}-price)`}>
-    {([[highIndex, candleHigh, "high"], [lowIndex, candleLow, "low"]] as const).map(([index, value, kind]) => {
+    {presentation.base !== null && geometry.priceAxis.base !== null && ([[highIndex, candleHigh, "high"], [lowIndex, candleLow, "low"]] as const).map(([index, value, kind]) => {
+      if (!Number.isFinite(value)) return null
       const markerX = x[index], label = formatHistoricalPrice(value)
       const labelWidth = label.length * 6.5 + 8
       const start = index < n / 2 ? markerX + 10 : markerX - labelWidth - 10
@@ -285,7 +287,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     {oiAxis && panels.oi[1] - panels.oi[0] >= 35 && geometry.oiTicks.map(({ y, label }, index) => <g key={index} data-chart-oi-tick><line x1={columns.oi[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.25" />{lineLabel(axisStarts.oi, y, label)}</g>)}
     {panels.taker[1] - panels.taker[0] >= 35 && geometry.takerTicks.map(({ y, label }, index) => <g key={index} data-chart-taker-tick>{lineLabel(axisStarts.taker, y, label)}</g>)}
     {inspectedTime && <g data-chart-inspected-time><rect x={inspectedTimeX} y={height - 16} width={inspectedTimeWidth} height={15} rx={3} fill="var(--chart-annotation)" /><text x={inspectedTimeX + inspectedTimeWidth / 2} y={height - 4} textAnchor="middle" fill="var(--foreground)">{inspectedTime}</text></g>}
-    {geometry.priceTicks.map(({ y, label }, index) => <g key={index} data-chart-price-tick><line x1={columns.price[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.35" />{(!tag.inViewport || y + tickHalfHeight < priceLabel.top || y - tickHalfHeight > priceLabel.bottom) && lineLabel(axisStarts.price, y, label)}</g>)}
+    {presentation.ticks.map(({ y, label }, index) => <g key={index} data-chart-price-tick><line x1={columns.price[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.35" />{(!tag.inViewport || y + tickHalfHeight < priceLabel.top || y - tickHalfHeight > priceLabel.bottom) && <text x={axisStarts.price} y={y} dominantBaseline="middle" fill="var(--muted-foreground)" textLength={chartTextWidth(label) > gutter - 12 ? Math.max(1, gutter - 12) : undefined} lengthAdjust="spacingAndGlyphs">{label}</text>}</g>)}
     <line x1={right} x2={right} y1={panels.price[0]} y2={geometry.priceOnly ? panels.price[1] : panels.taker[1]} stroke="var(--border)" opacity="0.8" />
     {tag.inViewport && tag.rising && <line data-chart-live-price-outline x1={columns.price[0]} x2={right} y1={latestY} y2={latestY} stroke="var(--foreground)" />}
     {tag.inViewport && <line data-chart-live-price x1={columns.price[0]} x2={right} y1={latestY} y2={latestY} stroke={latestColor} strokeDasharray="4 5" />}
@@ -657,7 +659,8 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
   const oiState = surface?.oiState ?? 'ready'
   const takerState = surface?.takerState ?? 'ready'
   const atBoundary = view.historyExhausted && surface && view.oldestHour !== null && surface.endHour === Math.min(view.latestEnd ?? Infinity, view.oldestHour + ((surface.windowBars ?? 96) - 1) * intervalMS)
-  const priceScale = plotGeometry?.priceAxis.kind ?? 'logarithmic'
+  const pricePresentation = plotGeometry ? chartPricePresentation(plotGeometry, wheelContentOffset, false) : null
+  const priceScale = !pricePresentation || pricePresentation.base === null || pricePresentation.geometryBase === null ? 'unavailable' : 'relative'
   const priceState = surface?.priceState ?? 'loading'
   const statusMessages: string[] = []
   if (pending && !error) statusMessages.push(surface ? `Preparing ${instId.replace(/-SWAP$/, '')} ${timeframeLabel(timeframe)}${requestedEnd !== null ? ` · ${time(requestedEnd)}` : ''}…` : 'Loading local prices…')
@@ -720,7 +723,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
           return <div key={label} data-chart-ohlc={label.toLowerCase()} className="min-w-0"><span className="text-muted-foreground">{label} </span><span title={text}>{text}</span></div>
         })}
       </div>}
-        <span data-chart-price-scale={priceScale} className="ml-auto text-muted-foreground" title={priceScale === 'linear' ? 'Linear scale · BOLL includes zero or negative values' : 'Logarithmic price scale'}>{priceScale === 'linear' ? 'Linear' : 'Log'}</span>
+        <span data-chart-price-scale={priceScale} className="ml-auto text-muted-foreground" title={priceScale === 'unavailable' ? 'Price scale unavailable: first visible open must be positive' : 'Change from first visible open'}>{priceScale === 'unavailable' ? 'Unavailable' : 'Change %'}</span>
       </div>
       <div ref={plotRef} data-chart-plot tabIndex={-1} className="relative min-h-0 flex-1 overflow-hidden outline-none" onKeyDown={event => {
         if (event.key === 'Escape') { endInspection(); return }

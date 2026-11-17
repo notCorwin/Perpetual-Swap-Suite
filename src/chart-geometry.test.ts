@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { Bar } from './chart-data.ts'
-import { createChartGeometryCache } from './chart-geometry.ts'
+import { chartPricePresentation, createChartGeometryCache } from './chart-geometry.ts'
 import { chartPanelClip } from './chart-layout.ts'
 
 const intervalMS = 900_000
@@ -12,13 +12,13 @@ const rows = () => Object.freeze(Array.from({ length: 96 }, (_, index) => Object
 const viewport = { width: 960, height: 700, endHour: 95 * intervalMS, intervalMS }
 const close = (actual: number, expected: number) => assert.ok(Math.abs(actual - expected) < 1e-9, `${actual} != ${expected}`)
 
-test('shared viewport coordinates preserve time gaps and logarithmic price and zero-inclusive OI math', () => {
+test('shared viewport coordinates preserve time gaps and relative price and zero-inclusive OI math', () => {
   const bars = rows(), geometry = createChartGeometryCache(text => text.length * 6)(bars, viewport)
   const { priceAxis, oiAxis, layout } = geometry
-  assert.equal(priceAxis.kind, 'logarithmic')
+  assert.equal(priceAxis.kind, 'relative')
   assert.ok(oiAxis)
   for (const value of [98, 100, 102, 104]) {
-    const fraction = Math.log(value / priceAxis.min) / Math.log(priceAxis.max / priceAxis.min)
+    const fraction = ((value / 100 - 1) * 100 - priceAxis.min) / (priceAxis.max - priceAxis.min)
     close(geometry.priceY(value), layout.panels.price[1] - fraction * (layout.panels.price[1] - layout.panels.price[0]))
   }
   for (const value of [0, 1, 10, 950]) {
@@ -31,7 +31,7 @@ test('shared viewport coordinates preserve time gaps and logarithmic price and z
   close(geometry.rsiY(0), layout.panels.rsi[1])
   close(geometry.rsiY(100), layout.panels.rsi[0])
   close(geometry.takerY(7) - geometry.takerY(10), (layout.panels.taker[1] - layout.panels.taker[0]) * 3 / (geometry.takerAxis.max - geometry.takerAxis.min))
-  assert.ok(priceAxis.min < 98 && priceAxis.max > 104)
+  assert.ok(priceAxis.min <= -2 && priceAxis.max >= 4)
   assert.equal(geometry.buySamples, 96)
   assert.equal(geometry.sellSamples, 96)
 })
@@ -183,11 +183,11 @@ test('constant positive and zero volatility remain finite without artificial var
   }
 })
 
-test('Bollinger values crossing zero retain a linear domain and genuine warmup gaps', () => {
+test('Bollinger values crossing zero retain a relative domain and genuine warmup gaps', () => {
   const bars = rows().map((bar, index) => ({ ...bar, bollLower: index < 19 ? null : -2, ema: null }))
   const geometry = createChartGeometryCache(text => text.length * 6)(bars, viewport)
-  assert.equal(geometry.priceAxis.kind, 'linear')
-  assert.ok(geometry.priceAxis.min <= -2 && geometry.priceAxis.max >= 104)
+  assert.equal(geometry.priceAxis.kind, 'relative')
+  assert.ok(geometry.priceAxis.min <= -102 && geometry.priceAxis.max >= 4)
   close(geometry.priceY(0) - geometry.priceY(1), geometry.priceY(1) - geometry.priceY(2))
   assert.equal('ema' in geometry.lines, false)
   assert.equal((geometry.lines.bollLower.match(/[ML]/g) ?? []).length, 77)
@@ -208,7 +208,7 @@ test('immutable window revisits reuse geometry while corrections, resize, native
   const correction = get(corrected, viewport)
   assert.notEqual(correction, initial)
   assert.notEqual(correction.upWicks, initial.upWicks)
-  assert.ok(correction.priceAxis.max > 150)
+  assert.ok(correction.priceAxis.max >= 50)
 
   const resized = get(bars, { ...viewport, width: 1200, height: 900 })
   assert.notEqual(resized.x.at(-1), initial.x.at(-1))
@@ -218,7 +218,7 @@ test('immutable window revisits reuse geometry while corrections, resize, native
   const otherPeriod = get(bars, { ...viewport, intervalMS: intervalMS * 4 })
   assert.notEqual(otherPeriod.x[1] - otherPeriod.x[0], initial.x[1] - initial.x[0])
   const quote = get(bars, { ...viewport, liveClose: 1000 })
-  assert.ok(quote.priceAxis.max > 1000)
+  assert.ok(quote.priceAxis.max >= 900)
   assert.notEqual(quote.lines.vwap, initial.lines.vwap)
   assert.ok(quote.priceY(1000) >= quote.layout.panels.price[0])
 })
@@ -255,4 +255,75 @@ test('unplotted EMA values cannot widen the main price scale or generate a path'
     assert.equal('ema' in extremeEMA.lines, false)
     assert.ok(extremeEMA.lines.vwap && extremeEMA.lines.bollUpper && extremeEMA.lines.bollMiddle && extremeEMA.lines.bollLower)
   }
+})
+
+test('relative normalization uses a positive reference even with an invalid visible base', () => {
+  const bars = rows().map((bar, index) => ({ ...bar, open: 100 + index, high: 104 + index, low: 98 + index, close: 101 + index }))
+  const get = createChartGeometryCache(text => text.length * 6)
+  const options = { ...viewport, width: 400, barSpacing: 20 }
+  const a = get(bars, options)
+  assert.equal(a.priceAxis.base, a.bars[0].open)
+  const b = get(bars, { ...options, endHour: viewport.endHour - intervalMS * 2.5 })
+  assert.equal(b.priceAxis.base, b.bars[0].open)
+  assert.notEqual(a.priceAxis.base, b.priceAxis.base)
+  assert.equal(get(bars, options), a)
+  assert.ok(a.priceTicks.every(tick => /%$/.test(tick.label)))
+  const invalid = get([{ ...candle(0), open: 0 }], { ...viewport, endHour: 0 })
+  assert.ok(invalid.priceAxis.base! > 0)
+  assert.equal(chartPricePresentation(invalid, 0).base, null)
+  assert.deepEqual(chartPricePresentation(invalid, 0).ticks, [])
+})
+
+test('presentation follows fractional body visibility including overscan without rebuilding paths', () => {
+  const bars = rows().map((bar, index) => ({ ...bar, open: 100 + index, high: 104 + index, low: 98 + index, close: 101 + index }))
+  const geometry = createChartGeometryCache(text => text.length * 6)(bars, { ...viewport, width: 400, barSpacing: 20 })
+  const first = geometry.bars[0]
+  const boundary = -(geometry.x[0] + geometry.barWidth / 2)
+  const a = chartPricePresentation(geometry, boundary + 0.01)
+  const b = chartPricePresentation(geometry, boundary - 0.01)
+  assert.equal(a.base, first.open)
+  assert.equal(b.base, geometry.bars[1].open)
+  assert.equal(a.geometryBase, geometry.priceAxis.base)
+  const raw = geometry.priceAxis.base! * (1 + geometry.priceAxis.ticks[0] / 100)
+  assert.ok(Math.abs(parseFloat(b.ticks[0].label.replaceAll(',', '')) - (raw / b.base! - 1) * 100) <= 0.5 * 10 ** -geometry.priceAxis.decimals + 1e-8)
+  assert.deepEqual(chartPricePresentation(geometry, NaN).ticks, [])
+})
+
+test('rebased tick labels retain precision when the next visible base is much larger', () => {
+  const bars = rows().map((bar, index) => ({ ...bar, open: index > 0 ? 10000 : 100, high: index > 0 ? 10001 : 104, low: index > 0 ? 9999 : 98, close: index > 0 ? 10000 : 101 }))
+  const geometry = createChartGeometryCache(text => text.length * 6)(bars, { ...viewport, endHour: 14 * intervalMS, width: 400, barSpacing: 20 })
+  const offset = geometry.layout.left - (geometry.x[0] + geometry.barWidth / 2) - 0.01
+  const presentation = chartPricePresentation(geometry, offset)
+  assert.equal(presentation.base, 10000)
+  const values = presentation.ticks.map(tick => parseFloat(tick.label.replaceAll(',', '')))
+  assert.equal(new Set(values).size, values.length)
+})
+
+test('rebased labels preserve fractional offsets and cached paths across invalid bases', () => {
+  const bars = rows().map((bar, index) => ({ ...bar, open: index === 1 ? 0 : 100 + index, high: 110 + index, low: 90 + index, close: 101 + index }))
+  const get = createChartGeometryCache(text => text.length * 6)
+  const options = { ...viewport, endHour: 14 * intervalMS, width: 400, barSpacing: 20 }
+  const geometry = get(bars, options)
+  const offsetFor = (index: number) => geometry.layout.left - (geometry.x[index] + geometry.barWidth / 2) + 0.01
+  assert.ok(chartPricePresentation(geometry, offsetFor(0)).base! > 0)
+  assert.equal(chartPricePresentation(geometry, offsetFor(1)).base, null)
+  assert.ok(chartPricePresentation(geometry, offsetFor(2)).base! > 0)
+  assert.equal(get(bars, options), geometry)
+  assert.ok(geometry.upWicks + geometry.downWicks)
+  const mock = { ...geometry, priceAxis: { ...geometry.priceAxis, base: 100, step: 2.5, ticks: [-50, -47.5, -45] }, priceTicks: [{ y: 0, label: '' }, { y: 1, label: '' }, { y: 2, label: '' }] }
+  const rebased = chartPricePresentation(mock, offsetFor(0))
+  const expected = (52.5 / rebased.base! - 1) * 100
+  assert.ok(Math.abs(parseFloat(rebased.ticks[1].label.replaceAll(',', '')) - expected) <= 0.005001)
+})
+
+test('nonfinite OHLC never produces invalid cached price paths', () => {
+  const broken = rows().map((bar, index) => ({ ...bar, open: index === 0 ? 100 : NaN, high: NaN, low: NaN, close: NaN, vwap: null, bollUpper: null, bollMiddle: null, bollLower: null }))
+  const geometry = createChartGeometryCache(text => text.length * 6)(broken, viewport)
+  assert.equal(geometry.priceAxis.base, 100)
+  for (const path of [geometry.upWicks, geometry.downWicks, geometry.upBodies, geometry.downBodies, ...Object.values(geometry.lines), ...geometry.bollBands]) assert.doesNotMatch(path, /NaN|Infinity/)
+  assert.ok(geometry.priceTicks.every(tick => Number.isFinite(tick.y)))
+  const empty = broken.map(bar => ({ ...bar, open: NaN }))
+  const unavailable = createChartGeometryCache(text => text.length * 6)(empty, viewport)
+  assert.equal(unavailable.priceAxis.base, null)
+  assert.deepEqual(unavailable.priceTicks, [])
 })

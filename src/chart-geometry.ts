@@ -60,21 +60,22 @@ function chartAxes(bars: readonly Bar[], options: ChartGeometryOptions, measureT
   // once and shared by both the gutter measurement and the final plot.
   const { panels } = chartLayout(0, height, 64, options.priceOnly, options.layoutDensity)
   const priceLabels = axisLabelLimit(panels.price, 9)
-  const priceAxis = priceMin <= 0
-    ? { ...chartAxisForLabels(priceMin, priceMax, priceLabels), kind: 'linear' as const }
-    : { ...logarithmicChartAxis(priceMin, priceMax, priceLabels), kind: 'logarithmic' as const }
+  const base = bars.flatMap(bar => [bar.open, bar.high, bar.low, bar.close]).find(value => finite(value) && value > 0) ?? null
+  if (!Number.isFinite(priceMin) || !Number.isFinite(priceMax)) { priceMin = base ?? 0; priceMax = base ?? 1 }
+  const relative = (value: number) => (value / base! - 1) * 100
+  const priceAxis = { ...chartAxisForLabels(base === null ? -1 : relative(priceMin), base === null ? 1 : relative(priceMax), priceLabels), kind: 'relative' as const, base }
   const axisPrice = axisFormatter(priceAxis.decimals)
   const rocAxis = chartAxis(-(rocExtent || 1), rocExtent || 1, 8)
   const atrRange = paddedIndicatorRange(minATR, maxATR), bbwRange = paddedIndicatorRange(minBBW, maxBBW)
   const oiValues = oiSamples.map(sample => sample.value)
   const oiAxis = oiValues.length ? logarithmicChartAxis(Math.min(...oiValues), Math.max(...oiValues), axisLabelLimit(panels.oi, 7), true) : null
   const takerAxis = chartAxisForLabels(0, maxTaker, axisLabelLimit(panels.taker, 7))
-  const priceLabelsText = priceAxis.ticks.map(tick => axisPrice.format(tick))
+  const priceLabelsText = priceAxis.ticks.map(tick => `${tick > 0 ? '+' : ''}${axisPrice.format(tick)}%`)
   const oiLabelsText = oiAxis?.ticks.map(chartCompact) ?? [], takerLabelsText = takerAxis.ticks.map(chartCompact)
   const labels = [
     ...priceLabelsText,
     ...(!options.priceOnly ? [formatPercent(rocAxis.max, rocAxis.decimals), formatPercent(rocAxis.min, rocAxis.decimals), '100', '0', ...oiLabelsText, ...takerLabelsText] : []),
-    `${formatCurrentPrice(liveClose ?? bars.at(-1)!.close, options.currentPriceTickSz)} ↑`, '00:00',
+    `Price ${formatCurrentPrice(liveClose ?? bars.at(-1)!.close, options.currentPriceTickSz)} ↑`, '00:00',
   ]
   const gutter = Math.ceil(Math.max(...labels.map(measureText)) + 16)
   return { panels, priceAxis, priceLabelsText, rocAxis, atrRange, bbwRange, oiAxis, oiLabelsText, takerAxis, takerLabelsText, gutter, candleHigh, candleLow, highIndex, lowIndex, oiSamples }
@@ -85,7 +86,7 @@ function buildGeometry(sourceBars: readonly Bar[], options: ChartGeometryOptions
   const { width, height, endHour, intervalMS, liveClose, barSpacing } = options
   let bars = sourceBars
   let windowBars = options.windowBars ?? 96
-  let axes = axesFor(bars, options)
+  let axes = axesFor(bars, { ...options, liveClose: liveClose !== undefined && sourceBars.at(-1)!.hour <= endHour ? liveClose : bars.at(-1)!.close })
   let gutter = axes.gutter
   if (barSpacing !== undefined) {
     // Reserve the measured label gutter monotonically within this layout pass.
@@ -93,7 +94,7 @@ function buildGeometry(sourceBars: readonly Bar[], options: ChartGeometryOptions
     for (;;) {
       windowBars = chartPitchSpan(Math.max(0, width - 4 - gutter), barSpacing)
       const first = endHour - (windowBars - 1) * intervalMS
-      const inRange = sourceBars.filter(bar => bar.hour >= first - 0.001 && bar.hour <= endHour + 0.001)
+      const inRange = sourceBars.filter(bar => bar.hour > first - chartPitchBodyWidth(barSpacing) / barSpacing * intervalMS && bar.hour < endHour + chartPitchBodyWidth(barSpacing) / barSpacing * intervalMS)
       // A sub-candle-sized plot still uses only its nearest endpoint, never the
       // entire cache as an accidental vertical-axis fallback.
       const visible = inRange.length ? inRange : sourceBars.filter(bar => bar.hour <= endHour).slice(-1)
@@ -124,7 +125,8 @@ function buildGeometry(sourceBars: readonly Bar[], options: ChartGeometryOptions
     : right - barWidth / 2 + (hour - endHour) / intervalMS * barSpacing
   const x = bars.map(bar => hourX(bar.hour))
   const pathX = pathBars.map(bar => hourX(bar.hour))
-  const priceY = priceAxis.kind === 'linear' ? linearScale(priceAxis.min, priceAxis.max, panels.price) : logarithmicScale(priceAxis, panels.price)
+  const relativeY = linearScale(priceAxis.min, priceAxis.max, panels.price)
+  const priceY = (value: number) => priceAxis.base === null ? NaN : relativeY((value / priceAxis.base - 1) * 100)
   const rsiY = linearScale(0, 100, panels.rsi), rocY = linearScale(rocAxis.min, rocAxis.max, panels.roc)
   const visibleIndex = new Map(bars.map((bar, index) => [bar.hour, index]))
   const rsiCrossings = options.priceOnly ? [] : chartRsiCrossings(pathBars, intervalMS)
@@ -188,7 +190,7 @@ function buildGeometry(sourceBars: readonly Bar[], options: ChartGeometryOptions
     upper = []; lower = []
   }
   pathBars.forEach((bar, index) => {
-    if (!finite(bar.bollUpper) || !finite(bar.bollLower)) { finishBand(); return }
+    if (priceAxis.base === null || !finite(bar.bollUpper) || !finite(bar.bollLower)) { finishBand(); return }
     if (index > 0 && bar.hour - pathBars[index - 1].hour !== intervalMS) finishBand()
     const pointX = pathX[index].toFixed(1)
     if (index === 0 && firstAtLeft && bar.hour === firstHour) {
@@ -206,9 +208,13 @@ function buildGeometry(sourceBars: readonly Bar[], options: ChartGeometryOptions
   for (const [index, bar] of pathBars.entries()) {
     const rising = bar.close >= bar.open, center = pathX[index]
     const wicks = rising ? upWicks : downWicks, bodies = rising ? upBodies : downBodies
-    wicks.push(`M${center} ${priceY(bar.high)}V${priceY(bar.low)}`)
-    const top = priceY(Math.max(bar.open, bar.close))
-    bodies.push(rectangle(center - barWidth / 2, top, barWidth, Math.max(1.5, priceY(Math.min(bar.open, bar.close)) - top)))
+    if (priceAxis.base !== null) {
+      if (finite(bar.high) && finite(bar.low)) wicks.push(`M${center} ${priceY(bar.high)}V${priceY(bar.low)}`)
+      if (finite(bar.open) && finite(bar.close)) {
+        const top = priceY(Math.max(bar.open, bar.close))
+        bodies.push(rectangle(center - barWidth / 2, top, barWidth, Math.max(1.5, priceY(Math.min(bar.open, bar.close)) - top)))
+      }
+    }
     const buy = finite(bar.buy) ? bar.buy : 0, sell = finite(bar.sell) ? bar.sell : 0
     const buyY = takerY(buy), totalY = takerY(buy + sell)
     if (takerAvailable && buy > 0) buys.push(rectangle(center - barWidth / 2, buyY, barWidth, zeroY - buyY))
@@ -216,7 +222,7 @@ function buildGeometry(sourceBars: readonly Bar[], options: ChartGeometryOptions
   }
   return Object.freeze({
     ...options, windowBars, bars, before, after, layout, gutter, x, barPitch, barWidth, priceAxis, rocAxis, atrRange, bbwRange, oiAxis, takerAxis, priceY, rsiY, rocY, atrY, bbwY, oiY, takerY, rocZeroY, rsiMarkers,
-    priceTicks: priceAxis.ticks.map((value, index) => ({ y: priceY(value), label: priceLabelsText[index] })),
+    priceTicks: priceAxis.base === null ? [] : priceAxis.ticks.map((value, index) => ({ y: relativeY(value), label: priceLabelsText[index] })),
     oiTicks: oiAxis?.ticks.map((value, index) => ({ y: oiY(value), label: oiLabelsText[index] })) ?? [],
     takerTicks: takerAxis.ticks.map((value, index) => ({ y: takerY(value), label: takerLabelsText[index] })),
     firstHour, candleHigh, candleLow, highIndex, lowIndex, oiSamples, takerAvailable,
@@ -230,6 +236,28 @@ function buildGeometry(sourceBars: readonly Bar[], options: ChartGeometryOptions
 }
 
 export type ChartGeometry = ReturnType<typeof buildGeometry>
+
+/** Rebase labels without changing the cached raw-price geometry. */
+export function chartPricePresentation(geometry: ChartGeometry, contentOffset: number, includeTicks = true) {
+  const { left, right } = geometry.layout
+  const visible = (bar: Bar) => {
+    const center = geometry.x[0] + (bar.hour - geometry.bars[0].hour) / geometry.intervalMS * geometry.barPitch + contentOffset
+    return center + geometry.barWidth / 2 > left && center - geometry.barWidth / 2 < right
+  }
+  const first = (geometry.before && visible(geometry.before) ? geometry.before : undefined) ?? geometry.bars.find(visible) ?? (geometry.after && visible(geometry.after) ? geometry.after : undefined)
+  const base = first && finite(first.open) && first.open > 0 ? first.open : null
+  const geometryBase = geometry.priceAxis.base
+  const step = base !== null && geometryBase !== null ? geometry.priceAxis.step * geometryBase / base : 1
+  const decimals = Math.max(2, Math.min(20, -Math.floor(Math.log10(step)) + 1))
+  const formatter = axisFormatter(decimals)
+  const ticks = !includeTicks || base === null || geometryBase === null ? [] : geometry.priceAxis.ticks.map((value, index) => {
+    const raw = geometryBase * (1 + value / 100)
+    const change = (raw / base - 1) * 100
+    const rounded = Math.abs(change) < 0.5 * 10 ** -decimals ? 0 : change
+    return { y: geometry.priceTicks[index].y, label: `${rounded > 0 ? '+' : ''}${formatter.format(rounded)}%` }
+  })
+  return { base, geometryBase, ticks }
+}
 
 /** Weak ownership follows immutable chart windows. A separate LRU also caps
  * derived paths globally, including windows still resident in the source cache. */

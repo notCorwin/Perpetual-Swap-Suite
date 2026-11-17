@@ -1430,7 +1430,7 @@ test('ranking changes keep the chosen chart while long lists retain keyboard and
   await page.waitForFunction(() => document.querySelector('[data-total-market-count]')?.getAttribute('data-total-market-count') === '4')
 })
 
-test('constant Bollinger bands stay finite and negative lower bands explicitly switch to a linear price scale', async () => {
+test('constant Bollinger bands stay finite and negative lower bands retain the relative price scale', async () => {
   const publishMode = async mode => {
     await electron.evaluate((_electron, mode) => { const state = globalThis.__workspaceFixture; state.bollMode = mode; state.chartGeneration += 1 }, mode)
     await page.evaluate(async () => {
@@ -1442,10 +1442,10 @@ test('constant Bollinger bands stay finite and negative lower bands explicitly s
   try {
     await publishMode('constant')
     await page.waitForFunction(() => document.querySelector('[data-chart-inst]').__chartSnapshot?.bars.every(bar => bar.bollUpper === 100 && bar.bollLower === 100))
-    assert.equal(await page.locator('[data-chart-price-scale]').getAttribute('data-chart-price-scale'), 'logarithmic')
+    assert.equal(await page.locator('[data-chart-price-scale]').getAttribute('data-chart-price-scale'), 'relative')
     await publishMode('negative')
-    await page.locator('[data-chart-price-scale="linear"]').getByText('Linear', { exact: true }).waitFor()
-    assert.equal(await page.locator('[data-chart-price-scale="linear"]').getAttribute('title'), 'Linear scale · BOLL includes zero or negative values')
+    await page.locator('[data-chart-price-scale="relative"]').getByText('Change %', { exact: true }).waitFor()
+    assert.equal(await page.locator('[data-chart-price-scale="relative"]').getAttribute('title'), 'Change from first visible open')
     const paths = await page.locator('svg[data-rendered-inst] path[d]').evaluateAll(paths => paths.map(path => path.getAttribute('d')))
     assert.doesNotMatch(paths.join(' '), /NaN|Infinity|undefined/)
     assert.equal(await page.locator('svg[data-rendered-inst] [data-chart-indicator="bollLower"]').evaluate(path => path.getAttribute('d').length > 0), true)
