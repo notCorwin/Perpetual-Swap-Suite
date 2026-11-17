@@ -116,3 +116,37 @@ test('a forming price outside the zoom viewport cannot distort the visible price
   assert.ok(plot.geometry.priceAxis.max < 1000)
   assert.equal(plot.geometry.liveClose, 102)
 })
+
+test('fixed spacing survives resize and changing label gutters while axes use only visible prices', () => {
+  const cache = createChartPlotCache(text => text.length * 6), base = window()
+  const source = Array.from({ length: 1536 }, (_, index) => ({ ...base.bars[index % 96], hour: index * step,
+    ...(index < 100 ? { high: 1_000_000, close: 999_999 } : {}) }))
+  const frame = { ...base, bars: source, windowBars: 1536, endHour: 1535 * step }
+  for (const spacing of [4, 9.6, 25]) {
+    let previousCount = 0
+    for (const width of [840, 841, 1290, 2180, 3000]) {
+      const plot = cache(frame, { width, height: 700 }, {}, undefined, false, { spacing, offset: -0.25 })!
+      assert.equal(plot.geometry.barPitch, spacing)
+      assert.equal(plot.geometry.barWidth, spacing * 0.68)
+      assert.ok(Math.abs(plot.geometry.x[1] - plot.geometry.x[0] - spacing) < 1e-9)
+      assert.ok(plot.geometry.windowBars! > previousCount)
+      assert.equal(plot.geometry.endHour, 1534.75 * step)
+      assert.ok(plot.geometry.priceAxis.max < 1000, 'Hidden cache prices cannot affect vertical scaling.')
+      assert.equal(cache(frame, { width, height: 700 }, {}, undefined, false, { spacing, offset: -0.25 }), plot)
+      previousCount = plot.geometry.windowBars!
+    }
+  }
+})
+
+test('visible new highs can widen the price gutter without stretching candle spacing', () => {
+  const cache = createChartPlotCache(text => text.length * 6), base = window(), size = { width: 960, height: 700 }
+  const viewport = { spacing: 9.6, offset: 0 }
+  const normal = cache(base, size, {}, undefined, true, viewport)!
+  const changed = { ...base, bars: base.bars.map((bar, index) => index === base.bars.length - 1
+    ? { ...bar, high: 9_999_999, close: 9_999_999 } : bar) }
+  const expanded = cache(changed, size, {}, undefined, true, viewport)!
+  assert.notEqual(expanded.geometry.gutter, normal.geometry.gutter)
+  assert.equal(expanded.geometry.barPitch, normal.geometry.barPitch)
+  assert.equal(expanded.geometry.barWidth, normal.geometry.barWidth)
+  assert.ok(expanded.geometry.priceAxis.max >= 9_999_999)
+})

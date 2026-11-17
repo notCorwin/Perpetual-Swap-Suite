@@ -1,5 +1,5 @@
-export const CHART_MIN_ZOOM_BARS = 12
-export const CHART_MAX_ZOOM_BARS = 288
+import { CHART_MIN_SPACING, CHART_MAX_SPACING, chartPitchSpan } from './chart-layout.ts'
+import { CHART_MAX_WINDOW_BARS } from '../electron/chart-viewport.js'
 
 /** Chromium exposes a trackpad pinch as ctrl+wheel. Ordinary scrolling stays pan. */
 export function chartWheelIntent(event: { ctrlKey: boolean; deltaX: number; deltaY: number; deltaMode: number }) {
@@ -9,14 +9,15 @@ export function chartWheelIntent(event: { ctrlKey: boolean; deltaX: number; delt
     : { kind: 'pan' as const, pixels: (Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : -event.deltaY) * unit }
 }
 
-/** Continuous candle spacing; fetching remains in the existing coarse cache buckets. */
-export function chartZoomWindow(count: number, pixels: number, anchor: number) {
-  const next = Math.max(CHART_MIN_ZOOM_BARS, Math.min(CHART_MAX_ZOOM_BARS, count * Math.exp(Math.max(-20, Math.min(20, pixels * 0.01)))))
-  return { count: next, shift: (next - count) * (1 - Math.max(0, Math.min(1, anchor))) }
+/** Zoom changes pixels per candle; resizing never changes this selected spacing. */
+export function chartZoomSpacing(spacing: number, pixels: number, anchor: number, plotWidth: number) {
+  const next = Math.max(CHART_MIN_SPACING, Math.min(CHART_MAX_SPACING, spacing * Math.exp(Math.max(-20, Math.min(20, -pixels * 0.01)))))
+  const count = chartPitchSpan(plotWidth, next)
+  return { spacing: next, count, shift: (count - chartPitchSpan(plotWidth, spacing)) * (1 - Math.max(0, Math.min(1, anchor))) }
 }
 
 export function chartZoomDemand(count: number) {
-  return Math.max(96, Math.min(288, Math.ceil((count + 1) / 48) * 48))
+  return Math.max(96, Math.min(CHART_MAX_WINDOW_BARS, Math.ceil((count + 1) / 48) * 48))
 }
 
 export const CHART_WHEEL_PIXELS_PER_BAR = 12

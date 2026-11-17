@@ -1,3 +1,4 @@
+import { validChartWindowBars } from './chart-viewport.js'
 import { validatePreferenceFields } from './services/preferences.js'
 
 const TIMEFRAMES = ['5m', '15m', '1H']
@@ -72,7 +73,10 @@ function chart(value, path) {
   if (path === 'chartFocus.target' || path === 'chartHistory') fields.push('windowBars')
   record(value, path, fields, ['instId', 'timeframe'])
   const result = { instId: text(value.instId, `${path}.instId`, { maximum: 256 }), timeframe: choice(value.timeframe, `${path}.timeframe`, TIMEFRAMES) }
-  optional(result, value, 'windowBars', input => choice(input, `${path}.windowBars`, [96, 144, 192, 240, 288]))
+  optional(result, value, 'windowBars', input => {
+    if (!validChartWindowBars(input)) throw new DesktopRequestError(`${path}.windowBars`, 'must be a supported chart window size')
+    return input
+  })
   optional(result, value, 'historyBars', input => number(input, `${path}.historyBars`, 96, 4_096, true))
   optional(result, value, 'focusId', input => text(input, `${path}.focusId`, { maximum: 256 }))
   return optional(result, value, 'endHour', input => number(input, `${path}.endHour`, 0, Number.MAX_SAFE_INTEGER, true))

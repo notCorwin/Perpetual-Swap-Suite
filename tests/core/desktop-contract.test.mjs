@@ -195,7 +195,7 @@ test('validation errors never include rejected credential values', () => {
 })
 
 test('viewport size crosses the production parser only on focus targets and history reads', () => {
-  for (const windowBars of [96, 144, 192, 240, 288]) {
+  for (const windowBars of [96, 144, 192, 240, 288, 336, 1536]) {
     for (const request of [
       { chartFocus: { id: 'wide-focus', target: { instId, timeframe: '15m', windowBars } } },
       { chartHistory: { instId, timeframe: '15m', focusId: 'wide-focus', windowBars } },
@@ -203,7 +203,7 @@ test('viewport size crosses the production parser only on focus targets and hist
     reject({ chartLocal: { instId, timeframe: '15m', windowBars } })
     reject({ chartWindow: { instId, timeframe: '15m', windowBars } })
   }
-  for (const windowBars of [0, 95, 97, 143, 145, 289, 4_096, 144.5, NaN, Infinity, '192', null, true]) {
+  for (const windowBars of [0, 95, 97, 143, 145, 289, 1537, 1584, 4_096, 144.5, NaN, Infinity, '192', null, true]) {
     reject({ chartFocus: { id: 'wide-focus', target: { instId, timeframe: '15m', windowBars } } })
     reject({ chartHistory: { instId, timeframe: '15m', windowBars } })
   }

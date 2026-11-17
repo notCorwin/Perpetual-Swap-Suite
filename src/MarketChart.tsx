@@ -1,5 +1,5 @@
 import { DeferredPanel } from '@/DeferredPanel'
-import { chartViewportBars } from './chart-layout.ts'
+import { CHART_DEFAULT_SPACING, chartPitchSpan } from './chart-layout.ts'
 import { lazy, createContext, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { flushSync } from "react-dom"
 import { Camera } from "lucide-react"
@@ -14,7 +14,7 @@ import { captureStableChart, chartCaptureBounds } from '@/chart-capture'
 import { CHART_PANELS, chartContentClip, chartPanelClip, chartPriceLabelLayout, type ChartPanel as Panel } from "@/chart-layout"
 import { chartCompact as compact, chartPercent, type ChartGeometry } from "@/chart-geometry"
 import { formatCurrentPrice, formatHistoricalPrice, formatIndicatorPrice } from '@/price-format'
-import { chartRsiNavigationTarget, chartWheelIntent, chartZoomDemand, chartZoomWindow, chartWheelContentOffset, chartPresentedWheelFraction, createChartWheelBatch, createChartWheelScheduler } from '@/chart-navigation'
+import { chartRsiNavigationTarget, chartWheelIntent, chartZoomDemand, chartZoomSpacing, chartWheelContentOffset, chartPresentedWheelFraction, createChartWheelBatch, createChartWheelScheduler } from '@/chart-navigation'
 import { chartStatisticsSamples } from '@/chart-legend'
 import { RSI_FIELDS, type RsiField } from '@/rsi-crossings'
 import { cn } from "@/lib/utils"
@@ -312,7 +312,7 @@ const ChartSurface = memo(function ChartSurface({ instId, timeframe, hasComplete
       data-prepared-chart-ready={ready} data-prepared-indicator-state={indicatorState} data-prepared-oi-state={oiState} data-prepared-taker-state={takerState}
       data-rendered-inst={selected ? instId : undefined} data-rendered-timeframe={selected ? timeframe : undefined}
       data-rendered-start={bars[0]!.hour} data-rendered-end={bars.at(-1)!.hour}
-      data-chart-domain-start={geometry.firstHour} data-chart-domain-end={geometry.endHour} data-chart-plot-right={geometry.layout.right}
+      data-chart-bar-width={geometry.barWidth} data-chart-domain-start={geometry.firstHour} data-chart-domain-end={geometry.endHour} data-chart-plot-right={geometry.layout.right}
       viewBox={`0 0 ${size.width} ${size.height}`} aria-hidden={!selected}
       style={{ visibility: selected ? 'visible' : 'hidden' }}
       className={cn('absolute inset-0 h-full w-full font-mono text-[length:var(--chart-text-size)] select-none outline-none', !selected && 'pointer-events-none')}
@@ -351,16 +351,16 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
   const chartRef = useRef<HTMLElement>(null)
   const plotRef = useRef<HTMLDivElement>(null)
   const [plotSize, setPlotSize] = useState({ width: 0, height: 0 })
-  const viewportBars = chartViewportBars(plotSize.width)
-  const [zoom, setZoom] = useState<{ count: number; offset: number } | null>(null)
+  const [zoom, setZoom] = useState<{ spacing: number; offset: number } | null>(null)
   const zoomRef = useRef(zoom)
-  const viewport = useMemo(() => zoom ?? { count: viewportBars, offset: 0 }, [zoom, viewportBars])
-  const demandBars = chartZoomDemand(viewport.count)
-  useLayoutEffect(() => { if (isActive) chartController.setWindowBars(demandBars) }, [chartController, demandBars, isActive])
+  const viewport = useMemo(() => zoom ?? { spacing: CHART_DEFAULT_SPACING, offset: 0 }, [zoom])
   const overscan = chartOverscan(surface, chartController)
   const preparedPlot = chartPlot(surface, plotSize, overscan, currentPriceTickSz, priceOnly, viewport)
   const bars = preparedPlot?.bars ?? surface?.bars ?? EMPTY_BARS
   const plotGeometry = preparedPlot?.geometry ?? null
+  const visibleBars = plotGeometry?.windowBars ?? chartPitchSpan(plotSize.width, viewport.spacing)
+  const demandBars = chartZoomDemand(visibleBars)
+  useLayoutEffect(() => { if (isActive) chartController.setWindowBars(demandBars) }, [chartController, demandBars, isActive])
   const [inspection, setInspection] = useState<{ instId: string; timeframe: RadarTimeframe; hour: number } | null>(null)
   const inspectedIndex = inspection?.instId === surface?.instId && inspection?.timeframe === surface?.timeframe ? bars.findIndex(bar => bar.hour === inspection?.hour) : -1
   const inspected = inspectedIndex >= 0 ? inspectedIndex : null
@@ -519,10 +519,10 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     zoomPixels.current += pixels
     wheelScheduler.schedule(() => {
       if (!getPresentation().active) return
-      const previous = zoomRef.current ?? { count: viewportBars, offset: 0 }
-      const next = chartZoomWindow(previous.count, zoomPixels.current, anchor)
+      const previous = zoomRef.current ?? { spacing: CHART_DEFAULT_SPACING, offset: 0 }
+      const next = chartZoomSpacing(previous.spacing, zoomPixels.current, anchor, plotGeometry.layout.right - plotGeometry.layout.left)
       zoomPixels.current = 0
-      if (next.count === previous.count) return
+      if (next.spacing === previous.spacing) return
       const offset = previous.offset + next.shift
       // Keep a fractional endpoint while using the existing integer cache cursor.
       const current = chartController.getSnapshot()
@@ -538,7 +538,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
         const actualSteps = sourceEnd !== undefined && sourceEnd !== null && targetEnd !== null && targetEnd !== undefined ? (targetEnd - sourceEnd) / intervalMS : 0
         const newLive = target?.end === null && latestHasLive ? 1 : 0
         const remaining = offset - actualSteps - (newLive - oldLive)
-        const nextZoom = { count: next.count, offset: Math.min(0, remaining) }
+        const nextZoom = { spacing: next.spacing, offset: Math.min(0, remaining) }
         zoomRef.current = nextZoom
         setZoom(nextZoom)
         endInspection()
@@ -700,7 +700,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}</div>}
     {capture.error && <p role="alert" className="shrink-0 border-b px-5 py-2 text-destructive">{capture.error}</p>}
     <div className="flex min-h-0 flex-1">
-    <section ref={chartRef} data-chart-inst={displayedId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={surface?.windowBars ?? 96} data-chart-visible-bars={viewport.count} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={priceState} data-chart-statistics-state={surface?.oiState === 'error' || surface?.takerState === 'error' ? 'error' : surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={priceState !== 'ready' || surface?.indicatorState !== 'ready' || oiState !== 'ready' || takerState !== 'ready' ? 'true' : 'false'} data-chart-loading={pending ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
+    <section ref={chartRef} data-chart-inst={displayedId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={surface?.windowBars ?? 96} data-chart-visible-bars={visibleBars} data-chart-bar-spacing={viewport.spacing} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={priceState} data-chart-statistics-state={surface?.oiState === 'error' || surface?.takerState === 'error' ? 'error' : surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={priceState !== 'ready' || surface?.indicatorState !== 'ready' || oiState !== 'ready' || takerState !== 'ready' ? 'true' : 'false'} data-chart-loading={pending ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
       <div data-chart-summary className="flex shrink-0 items-center border-b px-4">
         <h2 data-chart-title className="min-w-0 max-w-40 shrink-0 truncate" title={displayedId} aria-label={`${displayedId.replace(/-SWAP$/, '')} · ${timeframeLabel(displayedFrame)}`}>{priceOnly && matchesSelection ? timeframeLabel(displayedFrame) : `${displayedId.replace(/-SWAP$/, '')} · ${timeframeLabel(displayedFrame)}`}</h2>
         {priceOnly && !historical && <PriceStatus observedAt={surface?.priceObservedAt} realtime={surface?.realtimeState} active={isActive && windowVisible && presentation.active} />}

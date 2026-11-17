@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { advanceChartWheel, chartWheelIntent, chartZoomDemand, chartZoomWindow, chartRsiNavigationTarget, chartWheelContentOffset, chartPresentedWheelFraction, createChartWheelBatch, createChartWheelScheduler } from './chart-navigation.ts'
+import { advanceChartWheel, chartWheelIntent, chartZoomDemand, chartZoomSpacing, chartRsiNavigationTarget, chartWheelContentOffset, chartPresentedWheelFraction, createChartWheelBatch, createChartWheelScheduler } from './chart-navigation.ts'
 
 function wheelSchedulerHarness() {
   const microtasks: Array<() => void> = []
@@ -181,27 +181,14 @@ test('trackpad pinch owns ctrl-wheel while ordinary two-finger input retains his
   assert.deepEqual(chartWheelIntent({ ctrlKey: false, deltaX: 0, deltaY: 3, deltaMode: 1 }), { kind: 'pan', pixels: -48 })
 })
 
-test('continuous zoom preserves the pointer time and clamps at finite candle limits', () => {
-  for (const anchor of [0, 0.25, 0.5, 1]) {
-    const before = 144, end = 1000
-    const next = chartZoomWindow(before, -12, anchor)
-    assert.ok(next.count < before)
-    assert.ok(Math.abs((end - (before - 1) * (1 - anchor)) - (end + next.shift - (next.count - 1) * (1 - anchor))) < 1e-9)
-    const reverse = chartZoomWindow(next.count, 12, anchor)
-    assert.ok(Math.abs(reverse.count - before) < 1e-9)
-    assert.ok(Math.abs(reverse.shift + next.shift) < 1e-9)
-  }
-  assert.equal(chartZoomWindow(96, -10000, 0.5).count, 12)
-  assert.equal(chartZoomWindow(96, 10000, 0.5).count, 288)
-  assert.equal(chartZoomWindow(12, -2, 0.5).shift, 0)
-})
-
 test('zoom reuses coarse history demand between bucket boundaries', () => {
   assert.equal(chartZoomDemand(12), 96)
   assert.equal(chartZoomDemand(94.8), 96)
   assert.equal(chartZoomDemand(96), 144)
   assert.equal(chartZoomDemand(139.2), 144)
-  assert.equal(chartZoomDemand(288), 288)
+  assert.equal(chartZoomDemand(288), 336)
+  assert.equal(chartZoomDemand(1500), 1536)
+  assert.equal(chartZoomDemand(2000), 1536)
 })
 
 
@@ -216,4 +203,21 @@ test('pending history holds the retained frame at its known edge and catches up 
   assert.equal(chartPresentedWheelFraction(-0.1, end - interval, end - interval, interval), -0.1)
   assert.equal(chartPresentedWheelFraction(0.25, end + 4 * interval, end, interval), 1)
   assert.equal(chartPresentedWheelFraction(0.25, null, end, interval), 0)
+})
+
+test('pinch selects a bounded pixel spacing rather than a window-specific candle count', () => {
+  const zoom = chartZoomSpacing(9.6, -20, 0.4, 1200)
+  assert.ok(zoom.spacing > 9.6)
+  assert.ok(zoom.count < 126)
+  assert.equal(chartZoomSpacing(4, 10000, 0.5, 2400).spacing, 4)
+  assert.equal(chartZoomSpacing(100, -10000, 0.5, 2400).spacing, 100)
+})
+
+test('spacing zoom preserves the pointer time over its actual drawable plot', () => {
+  for (const anchor of [0, 0.25, 0.5, 1]) {
+    const before = 1200 / 9.6 + 0.32, end = 1000
+    const next = chartZoomSpacing(9.6, -12, anchor, 1200)
+    assert.ok(Math.abs((end - (before - 1) * (1 - anchor)) - (end + next.shift - (next.count - 1) * (1 - anchor))) < 1e-9)
+    assert.equal(chartZoomSpacing(100, -2, anchor, 1200).shift, 0)
+  }
 })

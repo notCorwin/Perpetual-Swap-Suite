@@ -1,5 +1,5 @@
 import { chartAxis, chartAxisForLabels, logarithmicChartAxis, logarithmicScale } from './chart-axis.ts'
-import { chartCandleWidth, chartHourX, chartLayout, type ChartLayoutDensity } from './chart-layout.ts'
+import { chartCandleWidth, chartHourX, chartLayout, chartPitchBodyWidth, chartPitchSpan, type ChartLayoutDensity } from './chart-layout.ts'
 import type { Bar } from './chart-data.ts'
 import { finitePercentage, formatPercent } from './market-percent.ts'
 import { measureOperation } from '../electron/services/operations.js'
@@ -25,7 +25,7 @@ const axisFormatter = (decimals: number) => {
 }
 
 type Range = readonly [number, number]
-export type ChartGeometryOptions = Readonly<{ width: number; height: number; endHour: number; intervalMS: number; liveClose?: number; currentPriceTickSz?: string | null; priceOnly?: boolean; windowBars?: number; layoutDensity?: ChartLayoutDensity }>
+export type ChartGeometryOptions = Readonly<{ width: number; height: number; endHour: number; intervalMS: number; liveClose?: number; currentPriceTickSz?: string | null; priceOnly?: boolean; windowBars?: number; layoutDensity?: ChartLayoutDensity; barSpacing?: number }>
 export type ChartGeometryOverscan = Readonly<{ before?: Bar; after?: Bar }>
 const linearScale = (min: number, max: number, panel: Range) => {
   const span = max - min || 1, height = panel[1] - panel[0]
@@ -37,16 +37,8 @@ const paddedIndicatorRange = (min: number, max: number) => {
   return { min: Math.max(0, min - padding), max: max + padding }
 }
 
-/** One immutable viewport owns its axes, coordinates and paths. */
-function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, measureText: (text: string) => number, overscan: ChartGeometryOverscan = {}) {
-  const { width, height, endHour, intervalMS, liveClose } = options
-  const windowBars = options.windowBars ?? 96
-  const firstHour = endHour - (windowBars - 1) * intervalMS, firstAtLeft = bars[0].hour === firstHour
-  const pathBars = [
-    ...(overscan.before?.hour === bars[0].hour - intervalMS ? [overscan.before] : []),
-    ...bars,
-    ...(overscan.after?.hour === bars.at(-1)!.hour + intervalMS ? [overscan.after] : []),
-  ]
+function chartAxes(bars: readonly Bar[], options: ChartGeometryOptions, measureText: (text: string) => number) {
+  const { height, liveClose } = options
   let priceMin = Infinity, priceMax = -Infinity, rocExtent = 0, minATR = Infinity, maxATR = 0, minBBW = Infinity, maxBBW = 0, maxTaker = 1
   let candleHigh = -Infinity, candleLow = Infinity, highIndex = 0, lowIndex = 0
   const oiSamples: { index: number; value: number }[] = []
@@ -85,11 +77,53 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
     `${formatCurrentPrice(liveClose ?? bars.at(-1)!.close, options.currentPriceTickSz)} ↑`, '00:00',
   ]
   const gutter = Math.ceil(Math.max(...labels.map(measureText)) + 16)
+  return { panels, priceAxis, priceLabelsText, rocAxis, atrRange, bbwRange, oiAxis, oiLabelsText, takerAxis, takerLabelsText, gutter, candleHigh, candleLow, highIndex, lowIndex, oiSamples }
+}
+
+/** One immutable viewport owns its axes, coordinates and paths. */
+function buildGeometry(sourceBars: readonly Bar[], options: ChartGeometryOptions, overscan: ChartGeometryOverscan, axesFor: (bars: readonly Bar[], options: ChartGeometryOptions) => ReturnType<typeof chartAxes>) {
+  const { width, height, endHour, intervalMS, liveClose, barSpacing } = options
+  let bars = sourceBars
+  let windowBars = options.windowBars ?? 96
+  let axes = axesFor(bars, options)
+  let gutter = axes.gutter
+  if (barSpacing !== undefined) {
+    // Reserve the measured label gutter monotonically within this layout pass.
+    // Only axes are recalculated if an edge candle leaves; paths are built once.
+    for (;;) {
+      windowBars = chartPitchSpan(Math.max(0, width - 4 - gutter), barSpacing)
+      const first = endHour - (windowBars - 1) * intervalMS
+      const inRange = sourceBars.filter(bar => bar.hour >= first - 0.001 && bar.hour <= endHour + 0.001)
+      // A sub-candle-sized plot still uses only its nearest endpoint, never the
+      // entire cache as an accidental vertical-axis fallback.
+      const visible = inRange.length ? inRange : sourceBars.filter(bar => bar.hour <= endHour).slice(-1)
+      if (!visible.length) { bars = sourceBars.slice(0, 1); axes = axesFor(bars, { ...options, liveClose: undefined }); break }
+      const same = visible.length === bars.length && visible[0] === bars[0] && visible.at(-1) === bars.at(-1)
+      if (same) break
+      bars = visible
+      const visibleLive = liveClose !== undefined && sourceBars.at(-1)!.hour <= endHour ? liveClose : bars.at(-1)!.close
+      axes = axesFor(bars, { ...options, liveClose: visibleLive })
+      const nextGutter = Math.max(gutter, axes.gutter)
+      if (nextGutter === gutter) break
+      gutter = nextGutter
+    }
+  }
+  const { panels, priceAxis, priceLabelsText, rocAxis, atrRange, bbwRange, oiAxis, oiLabelsText, takerAxis, takerLabelsText, candleHigh, candleLow, highIndex, lowIndex, oiSamples } = axes
+  const firstHour = endHour - (windowBars - 1) * intervalMS, firstAtLeft = bars[0].hour === firstHour
+  const before = sourceBars.find(bar => bar.hour === bars[0].hour - intervalMS) ?? overscan.before
+  const after = sourceBars.find(bar => bar.hour === bars.at(-1)!.hour + intervalMS) ?? overscan.after
+  const pathBars = [
+    ...(before?.hour === bars[0].hour - intervalMS ? [before] : []),
+    ...bars,
+    ...(after?.hour === bars.at(-1)!.hour + intervalMS ? [after] : []),
+  ]
   const layout = chartLayout(width, height, gutter, options.priceOnly, options.layoutDensity), { left, right } = layout
-  const x = bars.map(bar => chartHourX(bar.hour, endHour, left, right, intervalMS, windowBars))
-  const barWidth = chartCandleWidth(right - left, windowBars)
-  const barPitch = (right - left - barWidth) / (windowBars - 1)
-  const pathX = pathBars.map(bar => chartHourX(bar.hour, endHour, left, right, intervalMS, windowBars))
+  const barWidth = barSpacing === undefined ? chartCandleWidth(right - left, windowBars) : chartPitchBodyWidth(barSpacing)
+  const barPitch = barSpacing ?? (right - left - barWidth) / (windowBars - 1)
+  const hourX = (hour: number) => barSpacing === undefined ? chartHourX(hour, endHour, left, right, intervalMS, windowBars)
+    : right - barWidth / 2 + (hour - endHour) / intervalMS * barSpacing
+  const x = bars.map(bar => hourX(bar.hour))
+  const pathX = pathBars.map(bar => hourX(bar.hour))
   const priceY = priceAxis.kind === 'linear' ? linearScale(priceAxis.min, priceAxis.max, panels.price) : logarithmicScale(priceAxis, panels.price)
   const rsiY = linearScale(0, 100, panels.rsi), rocY = linearScale(rocAxis.min, rocAxis.max, panels.roc)
   const visibleIndex = new Map(bars.map((bar, index) => [bar.hour, index]))
@@ -181,7 +215,7 @@ function buildGeometry(bars: readonly Bar[], options: ChartGeometryOptions, meas
     if (takerAvailable && sell > 0) sells.push(rectangle(center - barWidth / 2, totalY, barWidth, buyY - totalY))
   }
   return Object.freeze({
-    ...options, layout, gutter, x, barPitch, priceAxis, rocAxis, atrRange, bbwRange, oiAxis, takerAxis, priceY, rsiY, rocY, atrY, bbwY, oiY, takerY, rocZeroY, rsiMarkers,
+    ...options, windowBars, bars, before, after, layout, gutter, x, barPitch, barWidth, priceAxis, rocAxis, atrRange, bbwRange, oiAxis, takerAxis, priceY, rsiY, rocY, atrY, bbwY, oiY, takerY, rocZeroY, rsiMarkers,
     priceTicks: priceAxis.ticks.map((value, index) => ({ y: priceY(value), label: priceLabelsText[index] })),
     oiTicks: oiAxis?.ticks.map((value, index) => ({ y: oiY(value), label: oiLabelsText[index] })) ?? [],
     takerTicks: takerAxis.ticks.map((value, index) => ({ y: takerY(value), label: takerLabelsText[index] })),
@@ -200,6 +234,19 @@ export type ChartGeometry = ReturnType<typeof buildGeometry>
 /** Weak ownership follows immutable chart windows. A separate LRU also caps
  * derived paths globally, including windows still resident in the source cache. */
 export function createChartGeometryCache(measureText: (text: string) => number) {
+  type AxesVariant = { options: ChartGeometryOptions; axes: ReturnType<typeof chartAxes> }
+  const axisCache = new WeakMap<readonly Bar[], AxesVariant[]>()
+  const axesFor = (bars: readonly Bar[], options: ChartGeometryOptions) => {
+    const variants = axisCache.get(bars) ?? []
+    const cached = variants.find(({ options: prior }) => prior.height === options.height && prior.liveClose === options.liveClose
+      && prior.priceOnly === options.priceOnly && prior.currentPriceTickSz === options.currentPriceTickSz && prior.layoutDensity === options.layoutDensity)
+    if (cached) return cached.axes
+    const axes = chartAxes(bars, options, measureText)
+    variants.push({ options, axes })
+    if (variants.length > 2) variants.shift()
+    axisCache.set(bars, variants)
+    return axes
+  }
   type Variant = { value: ChartGeometry; before?: Bar; after?: Bar }
   const cache = new WeakMap<readonly Bar[], Variant[]>()
   const resident = new Map<ChartGeometry, Variant[]>()
@@ -208,7 +255,7 @@ export function createChartGeometryCache(measureText: (text: string) => number) 
     const liveClose = finite(options.liveClose) ? options.liveClose : undefined
     const index = variants.findIndex(({ value, before, after }) => value.width === options.width && value.height === options.height
       && value.endHour === options.endHour && value.intervalMS === options.intervalMS && value.liveClose === liveClose
-      && value.layoutDensity === options.layoutDensity && (value.windowBars ?? 96) === (options.windowBars ?? 96) && value.currentPriceTickSz === options.currentPriceTickSz && value.priceOnly === options.priceOnly
+      && value.barSpacing === options.barSpacing && value.layoutDensity === options.layoutDensity && (options.barSpacing !== undefined || (value.windowBars ?? 96) === (options.windowBars ?? 96)) && value.currentPriceTickSz === options.currentPriceTickSz && value.priceOnly === options.priceOnly
       && before === overscan.before && after === overscan.after)
     if (index >= 0) {
       const [variant] = variants.splice(index, 1)
@@ -219,7 +266,7 @@ export function createChartGeometryCache(measureText: (text: string) => number) 
     }
     const value = measureOperation({ category: 'cpu', name: 'chart.geometry', attributes: {
       candles: bars.length + Number(Boolean(overscan.before)) + Number(Boolean(overscan.after)), width: options.width, height: options.height, intervalMS: options.intervalMS,
-    } }, () => buildGeometry(bars, { ...options, liveClose }, measureText, overscan))
+    } }, () => buildGeometry(bars, { ...options, liveClose }, overscan, axesFor))
     const variant = { value, before: overscan.before, after: overscan.after }
     variants.push(variant)
     if (variants.length > 4) resident.delete(variants.shift()!.value)

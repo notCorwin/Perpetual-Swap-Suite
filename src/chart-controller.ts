@@ -1,3 +1,4 @@
+import { CHART_MAX_WINDOW_BARS } from '../electron/chart-viewport.js'
 import { PreparedChartStore } from './chart-series-store.ts'
 import { completeChartPriceRange } from './chart-data.ts'
 import type { ChartSourceStatus, PreparedChartNotification, PreparedChartResponse, ReadyChartWindow } from './chart-data.ts'
@@ -179,7 +180,7 @@ export class ChartController {
   }
 
   setWindowBars(count: number) {
-    const next = Math.max(96, Math.min(288, Math.round(count / 48) * 48))
+    const next = Math.max(96, Math.min(CHART_MAX_WINDOW_BARS, Math.round(count / 48) * 48))
     if (next === this.windowBars) return
     this.windowBars = next
     const target = this.view.requested

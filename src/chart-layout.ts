@@ -1,6 +1,11 @@
-// Wider default candles; resize in coarse steps while data demand stays independent.
-export function chartViewportBars(plotWidth: number) {
-  return Math.min(192, 64 + Math.max(0, Math.floor((plotWidth - 720) / 240)) * 32)
+export const CHART_DEFAULT_SPACING = 9.6
+export const CHART_MIN_SPACING = 4
+export const CHART_MAX_SPACING = 100
+export const chartPitchBodyWidth = (spacing: number) => spacing * 0.68
+
+/** Continuous display span inside the actual plot, independent of data buckets. */
+export function chartPitchSpan(plotWidth: number, spacing = CHART_DEFAULT_SPACING) {
+  return Math.max(1, 1 + (Math.max(0, plotWidth) - chartPitchBodyWidth(spacing)) / spacing)
 }
 
 export const CHART_PANELS = ["price", "roc", "rsi", "atr", "oi", "taker"] as const

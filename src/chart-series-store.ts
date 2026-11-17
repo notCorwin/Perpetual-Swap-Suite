@@ -1,10 +1,10 @@
+import { validChartWindowBars } from '../electron/chart-viewport.js'
 import { hookOperationMethods, measureOperation } from '../electron/services/operations.js'
 import { completeChartPriceRange } from './chart-data.ts'
 import type { Bar, ChartSourceStatus, PreparedChartBar, PreparedChartLiveUpdate, PreparedChartMeta, PreparedChartResponse, PreparedChartState, ReadyChartWindow } from './chart-data.ts'
 import { RADAR_TIMEFRAMES, timeframeMilliseconds, type RadarTimeframe } from './timeframe.ts'
 
 const WINDOW_BARS = 96
-const MAX_WINDOW_BARS = 288
 const indicatorFields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw'] as const
 const barFields = ['hour', 'open', 'high', 'low', 'close', 'confirmed', 'priceComplete', 'statisticsSources', 'statisticsObserved', 'oiObserved', 'takerObserved', 'indicatorsObserved', ...indicatorFields, 'oi', 'buy', 'sell', 'oiUnavailableReason', 'takerUnavailableReason'] as const
 const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value)
@@ -100,11 +100,11 @@ function sourceMeta(previous: PreparedChartMeta | undefined, response: PreparedC
 }
 
 /** Status residency follows possible resident viewports, rather than an LRU count. */
-function retainedSourceMeta(meta: PreparedChartMeta, hours: readonly number[], liveEnd?: number): PreparedChartMeta {
+function retainedSourceMeta(meta: PreparedChartMeta, hours: readonly number[], liveEnd?: number, windowBars = 288): PreparedChartMeta {
   if (!meta.sourceStatuses?.length) return meta
   const ranges: Array<{ from: number; through: number }> = []
   for (const hour of [...hours, ...(liveEnd === undefined ? [] : [liveEnd])].sort((left, right) => left - right)) {
-    const from = hour - (MAX_WINDOW_BARS - 1) * meta.intervalMS, previous = ranges.at(-1)
+    const from = hour - (windowBars - 1) * meta.intervalMS, previous = ranges.at(-1)
     if (previous && from <= previous.through + meta.intervalMS) previous.through = hour
     else ranges.push({ from, through: hour })
   }
@@ -241,7 +241,7 @@ function liveWindow(meta: PreparedChartMeta, liveBar: Bar | undefined, previous:
 export class PreparedChartStore {
   private readonly viewportBars = new Map<string, number>()
   setWindowBars(instId: string, timeframe: RadarTimeframe, count: number) {
-    if (!Number.isInteger(count) || count < WINDOW_BARS || count > MAX_WINDOW_BARS || (count - WINDOW_BARS) % 48) throw new RangeError('Invalid chart viewport size.')
+    if (!validChartWindowBars(count)) throw new RangeError('Invalid chart viewport size.')
     const key = keyFor(instId, timeframe)
     if ((this.viewportBars.get(key) ?? WINDOW_BARS) === count) return
     this.viewportBars.set(key, count)
@@ -294,7 +294,7 @@ export class PreparedChartStore {
   private setLatestFrame(key: string, value: { meta: PreparedChartMeta; window: ReadyChartWindow } | null) {
     const previous = this.latestFrames.get(key)
     if (value && (previous?.window.bars !== value.window.bars || previous.window.endHour !== value.window.endHour || previous.meta.sourceStatuses !== value.meta.sourceStatuses)) {
-      value = { ...value, meta: retainedSourceMeta(value.meta, value.window.bars.map(bar => bar.hour), value.window.liveBar ? value.window.endHour : undefined) }
+      value = { ...value, meta: retainedSourceMeta(value.meta, value.window.bars.map(bar => bar.hour), value.window.liveBar ? value.window.endHour : undefined, Math.max(288, this.count(key))) }
     }
     if (previous?.window.bars !== value?.window.bars) {
       this.latestBytes += (value ? this.sizeOfBars(value.window.bars) : 0) - (previous ? this.sizeOfBars(previous.window.bars) : 0)
@@ -603,7 +603,7 @@ export class PreparedChartStore {
         current.boundaries = null
         changed = true
       }
-      current.meta = retainedSourceMeta(current.meta, current.hours.filter(hour => current.bars.get(hour)?.generation === generation), current.liveBar ? current.meta.latestEnd ?? undefined : undefined)
+      current.meta = retainedSourceMeta(current.meta, current.hours.filter(hour => current.bars.get(hour)?.generation === generation), current.liveBar ? current.meta.latestEnd ?? undefined : undefined, Math.max(288, this.count(key)))
       if (this.universe.has(key)) {
         const previous = this.latestFrame(key)
         // A historical batch can carry a new indicator generation and a fully

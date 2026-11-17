@@ -264,9 +264,22 @@ export async function openChart(page, fixture, timeframe = fixture.timeframe) {
   await page.locator(`[aria-label="View ${fixture.instId} chart"]`).click({ timeout: 15_000 })
   await page.locator(`[data-chart-inst="${fixture.instId}"]`).waitFor({ state: 'visible' })
   await assertWorkspaceLayout(page)
+  // Calibrate the viewport from actual drawable width, excluding its measured
+  // axis gutter. Keep exactly 96 plotted candles, without changing production
+  // spacing or relying on a particular sidebar/font width.
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const state = await page.locator(`[data-chart-inst="${fixture.instId}"]`).evaluate(chart => ({
+      span: Number(chart.dataset.chartVisibleBars), spacing: Number(chart.dataset.chartBarSpacing),
+      scale: Number(document.querySelector('[data-layout="market-workspace"]').dataset.uiScale),
+    }))
+    if (Math.floor(state.span) === 96) break
+    const viewport = page.viewportSize()
+    await page.setViewportSize({ ...viewport, width: Math.round(viewport.width + (96.5 - state.span) * state.spacing * state.scale) })
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+  }
   await waitForRendered(page, fixture, timeframe)
-  assert.equal(await page.locator(`[data-chart-inst="${fixture.instId}"]`).getAttribute('data-chart-visible-bars'), '96',
-    'Timing and mathematical oracles require exactly 96 visible candles.')
+  assert.equal(Number(await page.locator(`[data-chart-inst="${fixture.instId}"]`).getAttribute('data-chart-rendered-bars')), 96,
+    'Timing and mathematical oracles require exactly 96 actual plotted candles.')
 }
 
 // Inspect the actual immutable data passed to Plot and its SVG, rather than
@@ -681,7 +694,7 @@ async function validateStoppedPaintProbe(page, { readyTarget, includeRequestComm
           readyFrame = { at, frame: true, snapshot: { ...snapshot, bars: undefined }, bars }
         }
         if (Array.isArray(bars)) {
-          if (Number(chart.renderedBars) !== bars.length || Number(chart.visibleBars) !== 96 || Number(chart.targetBars) < 96) fail('Chart candle-count metadata disagrees with the actual snapshot.')
+          if (Number(chart.renderedBars) !== bars.length || Math.floor(Number(chart.visibleBars)) !== 96 || Number(chart.targetBars) < 96) fail('Chart candle-count metadata disagrees with the actual snapshot.')
           if (Number(svg.start) !== bars[0]?.hour || Number(svg.end) !== bars.at(-1)?.hour) fail('SVG labels and the drawn range disagree.')
           if (Number(chart.start) !== bars[0]?.hour || Number(chart.end) !== bars.at(-1)?.hour) fail('Header and actual plot refer to different ranges.')
           if (Number(chart.completedEnd) !== snapshot.endHour || Number(chart.statisticsEnd) !== snapshot.endHour) fail('Chart completed-range metadata disagrees with the snapshot.')

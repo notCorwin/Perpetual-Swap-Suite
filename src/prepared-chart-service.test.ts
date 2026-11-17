@@ -3832,3 +3832,25 @@ test('wide latest windows retain their older edge across confirmed updates and r
     assert.equal(incomplete.priceStatus.from, appended.timestamp - 287 * interval)
   } finally { await pipeline.dispose() }
 })
+
+test('maximum selected viewport has bounded complete history reserves through repeated navigation', { timeout: 15000 }, async () => {
+  const { pipeline, store } = fixture(source(5000))
+  try {
+    const target = end() - 1200 * interval
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: target, windowBars: 1536 }, 'maximum-history')
+    await pipeline.focus.task
+    await finishSeed(pipeline)
+    const frame = await pipeline.localHistory(instId, '15m', target, { focusId: 'maximum-history', windowBars: 1536 })
+    const selected = frame.bars.filter((bar: any) => bar.hour <= target && bar.hour >= target - 1535 * interval)
+    assert.equal(selected.length, 1536)
+    assert.equal(frame.priceState, 'ready')
+    assert.equal(frame.priceStatus.from, target - 1535 * interval)
+    const queries = store.queries.length
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: target + interval, windowBars: 1536 }, 'maximum-next')
+    await pipeline.focus.task
+    assert.ok(store.queries.length - queries <= 2, 'Resident runway must avoid repeated unfulfillable reserve reads.')
+    assert.equal(pipeline.visibleBars('OTHER:15m'), 96)
+    assert.equal(pipeline.historyReadBars('OTHER:15m'), 1536, 'Unselected series keep the original source budget.')
+    assert.throws(() => pipeline.setFocus({ instId, timeframe: '15m', windowBars: 1584 }), /Invalid chart window/)
+  } finally { await pipeline.dispose() }
+})

@@ -1431,3 +1431,14 @@ test('compact frames from a new generation cannot certify retained wide candles 
   assert.equal(frame.priceState, 'partial')
   assert.equal(frame.bars[0].hour, 96 * hour)
 })
+
+test('maximum source buckets preserve every canonical candle and explicit missing-price status', () => {
+  const store = new PreparedChartStore()
+  store.ingest(response(bars(0, 1800)))
+  store.setWindowBars(instId, '1H', 1536)
+  const wide = store.window(instId, '1H', 1700 * hour)!
+  assert.equal(wide.bars.length, 1536)
+  assert.equal(wide.bars[0].hour, 165 * hour)
+  assert.equal(wide.priceState, 'ready')
+  assert.throws(() => store.setWindowBars(instId, '1H', 1584), /Invalid chart viewport/)
+})

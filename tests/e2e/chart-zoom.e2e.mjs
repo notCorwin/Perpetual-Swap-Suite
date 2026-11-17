@@ -23,9 +23,9 @@ test('trackpad pinch zooms the cached chart around the pointer and keeps wheel h
       visible: Number(chart.dataset.chartVisibleBars), prepared: Number(chart.dataset.chartTargetBars),
       rendered: Number(chart.dataset.chartRenderedBars),
     }))
-    assert.ok(initial.visible >= 64 && initial.visible <= 192, 'Default candles use a readable density.')
+    assert.ok(initial.visible >= 50 && initial.visible <= 250, 'Default candles use a readable density.')
     assert.ok(initial.visible < initial.prepared, 'Display density is independent from coarse history demand.')
-    assert.equal(initial.rendered, initial.visible, 'The default viewport projects the recent candles without gaps.')
+    assert.equal(initial.rendered, Math.floor(initial.visible), 'The default viewport projects the recent candles without gaps.')
     const input = async (deltaY, ctrlKey = true, deltaX = 0) => page.locator('[data-chart-plot]').evaluate((plot, options) => {
       const rect = plot.getBoundingClientRect()
       const event = new WheelEvent('wheel', { ...options, bubbles: true, cancelable: true, clientX: rect.left + rect.width * 0.4 })
@@ -38,9 +38,25 @@ test('trackpad pinch zooms the cached chart around the pointer and keeps wheel h
       const width = svg.viewBox.baseVal.width
       const anchor = rect.width * 0.4 * width / rect.width / Number(svg.dataset.chartPlotRight)
       const start = Number(svg.dataset.chartDomainStart), end = Number(svg.dataset.chartDomainEnd)
-      return { count: Number(chart.dataset.chartVisibleBars), end: Number(chart.dataset.chartCompletedEnd), domainEnd: end,
+      return { spacing: Number(chart.dataset.chartBarSpacing), body: Number(svg.dataset.chartBarWidth), count: Number(chart.dataset.chartVisibleBars), end: Number(chart.dataset.chartCompletedEnd), domainEnd: end,
         timeAtPointer: start + (end - start) * anchor }
     })
+    const resize = async width => {
+      await page.setViewportSize({ width, height: 1000 })
+      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+      await page.waitForFunction(() => document.querySelector('[data-chart-inst]')?.dataset.chartLoading === 'false')
+      return state()
+    }
+    const narrow = await resize(1200)
+    const wide = await resize(1600)
+    assert.equal(wide.spacing, narrow.spacing)
+    assert.equal(wide.body, narrow.body)
+    assert.equal(wide.domainEnd, narrow.domainEnd)
+    assert.ok(wide.count > narrow.count, 'Widening reveals history rather than stretching candles.')
+    const wider = await resize(1601)
+    assert.equal(wider.spacing, wide.spacing)
+    assert.equal(wider.body, wide.body)
+    assert.ok(wider.count > wide.count && wider.count - wide.count < 1, 'Single-pixel resize has no density bucket jump.')
     // Start away from the live boundary, where both zoom directions have room.
     await input(720, false)
     await page.waitForFunction(() => document.querySelector('[data-chart-inst]')?.dataset.chartLoading === 'false')
@@ -50,11 +66,16 @@ test('trackpad pinch zooms the cached chart around the pointer and keeps wheel h
     const zoomed = await state()
     assert.ok(zoomed.count < before.count)
     assert.ok(Math.abs(zoomed.timeAtPointer - before.timeAtPointer) < 900_000, `Pointer anchor: ${JSON.stringify({ before, zoomed })}`)
+    const zoomResize = await resize(1800)
+    assert.equal(zoomResize.spacing, zoomed.spacing, 'Resize preserves the selected pinch spacing.')
+    assert.equal(zoomResize.body, zoomed.body)
+    assert.equal(zoomResize.domainEnd, zoomed.domainEnd, 'Resize preserves a historical fractional endpoint.')
+    await resize(1601)
     assert.equal(await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.getZoomFactor()), 1)
     await input(24, false, 48)
     await page.waitForFunction(end => Number(document.querySelector('[data-chart-inst]').dataset.chartCompletedEnd) > end, zoomed.end)
     const panned = await state()
-    assert.equal(panned.count, zoomed.count, 'Two-finger scrolling preserves zoom.')
+    assert.equal(panned.spacing, zoomed.spacing, 'Two-finger scrolling preserves zoom.')
     // Pinching leaves a fractional endpoint; reaching latest must release it.
     await input(-100_000, false)
     await page.waitForFunction(() => {
@@ -63,11 +84,11 @@ test('trackpad pinch zooms the cached chart around the pointer and keeps wheel h
       return Number(chart.querySelector('svg[data-rendered-inst]')?.dataset.chartDomainEnd) === latest
         && Number(chart.dataset.chartEnd) === latest
     })
-    assert.equal((await state()).count, zoomed.count, 'Returning to latest preserves candle spacing.')
+    assert.equal((await state()).spacing, zoomed.spacing, 'Returning to latest preserves candle spacing.')
     await input(-1, false)
     await input(1, false)
     await page.waitForFunction(() => Number(document.querySelector('[data-chart-wheel-content]').dataset.chartWheelOffset) > 0)
-    assert.equal((await state()).count, zoomed.count, 'Reversing from the latest edge responds immediately without changing zoom.')
+    assert.equal((await state()).spacing, zoomed.spacing, 'Reversing from the latest edge responds immediately without changing zoom.')
     await input(10)
     await page.waitForFunction(count => Number(document.querySelector('[data-chart-visible-bars]').dataset.chartVisibleBars) > count, zoomed.count)
     assert.ok((await state()).count > zoomed.count)
@@ -79,18 +100,24 @@ test('trackpad pinch zooms the cached chart around the pointer and keeps wheel h
         deltaY: -1, ctrlKey: true, clientX: rect.left + rect.width * 0.4, bubbles: true, cancelable: true,
       }))
     })
-    await page.waitForFunction(count => Math.abs(Number(document.querySelector('[data-chart-visible-bars]').dataset.chartVisibleBars) - count) < 1e-8, burstBefore.count * Math.exp(-0.32))
+    await page.waitForFunction(spacing => Math.abs(Number(document.querySelector('[data-chart-bar-spacing]').dataset.chartBarSpacing) - spacing) < 1e-8, burstBefore.spacing * Math.exp(0.32))
     await input(-10000)
-    await page.waitForFunction(() => Number(document.querySelector('[data-chart-visible-bars]').dataset.chartVisibleBars) === 12)
+    await page.waitForFunction(() => Number(document.querySelector('[data-chart-bar-spacing]').dataset.chartBarSpacing) === 100)
     const minimum = await state()
     await input(-10000)
     assert.equal((await state()).domainEnd, minimum.domainEnd, 'Saturating zoom cannot accumulate hidden navigation.')
     await input(1)
-    await page.waitForFunction(() => Number(document.querySelector('[data-chart-visible-bars]').dataset.chartVisibleBars) > 12)
+    await page.waitForFunction(() => Number(document.querySelector('[data-chart-bar-spacing]').dataset.chartBarSpacing) < 100)
     await input(10000)
-    await page.waitForFunction(() => Number(document.querySelector('[data-chart-visible-bars]').dataset.chartVisibleBars) === 288)
+    await page.waitForFunction(() => Number(document.querySelector('[data-chart-bar-spacing]').dataset.chartBarSpacing) === 4)
+    const maximum = await state()
+    const ultraWide = await resize(2400)
+    assert.equal(ultraWide.spacing, maximum.spacing)
+    assert.equal(ultraWide.body, maximum.body)
+    assert.ok(ultraWide.count > 288, 'A widened zoomed-out chart can use more than the former cache maximum.')
+    assert.equal(ultraWide.domainEnd, maximum.domainEnd)
     await input(-1)
-    await page.waitForFunction(() => Number(document.querySelector('[data-chart-visible-bars]').dataset.chartVisibleBars) < 288)
+    await page.waitForFunction(() => Number(document.querySelector('[data-chart-bar-spacing]').dataset.chartBarSpacing) > 4)
 
     // Queue a trailing gesture then switch the series before its frame flushes.
     await page.locator('[data-chart-plot]').evaluate(plot => {
@@ -115,7 +142,7 @@ test('trackpad pinch zooms the cached chart around the pointer and keeps wheel h
       rendered: chart.__chartRenderedBars.length, visible: Number(chart.dataset.chartVisibleBars),
       prepared: Number(chart.dataset.chartTargetBars), cached: chart.__chartSnapshot.bars.length,
     }))
-    assert.equal(oracle.visible, 96, 'Fixed timing/oracle fixtures explicitly select a 96-candle display.')
+    assert.equal(Math.floor(oracle.visible), 96, 'Fixed timing/oracle fixtures explicitly select a 96-candle display.')
     assert.equal(oracle.rendered, 96, 'The oracle uses the actual projected candle input.')
     assert.ok(oracle.prepared > oracle.visible && oracle.cached >= oracle.visible, 'The prepared cache may retain additional candles.')
     assert.deepEqual(errors, [])

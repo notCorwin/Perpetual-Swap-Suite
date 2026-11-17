@@ -97,13 +97,13 @@ test('default multi-timeframe charts share native prices, isolate history and re
     assert.equal(fractional.reversed, 0, 'Reversing the gesture returns to the original position.')
     // A zoomed historical viewport must return to the forming candle and
     // resume native WebSocket updates without retaining its fractional offset.
-    const zoomCount = await page.locator('[data-chart-plot]').nth(1).evaluate(async plot => {
+    const zoomSpacing = await page.locator('[data-chart-plot]').nth(1).evaluate(async plot => {
       const rect = plot.getBoundingClientRect()
       plot.dispatchEvent(new WheelEvent('wheel', { ctrlKey: true, deltaY: -19, clientX: rect.left + rect.width * .4, bubbles: true, cancelable: true }))
       await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
-      const count = Number(plot.closest('[data-chart-inst]').dataset.chartVisibleBars)
+      const spacing = Number(plot.closest('[data-chart-inst]').dataset.chartBarSpacing)
       plot.dispatchEvent(new WheelEvent('wheel', { deltaX: 100_000, bubbles: true, cancelable: true }))
-      return count
+      return spacing
     })
     await page.waitForFunction(() => {
       const chart = document.querySelectorAll('[data-chart-inst]')[1], snapshot = chart?.__chartSnapshot
@@ -111,7 +111,7 @@ test('default multi-timeframe charts share native prices, isolate history and re
         && Number(chart.querySelector('svg[data-rendered-inst]').dataset.chartDomainEnd) === snapshot.liveBar.hour
     })
     await live(btc, 141.25, 35)
-    assert.equal(await page.locator('[data-chart-inst]').nth(1).getAttribute('data-chart-visible-bars'), String(zoomCount))
+    assert.equal(await page.locator('[data-chart-inst]').nth(1).getAttribute('data-chart-bar-spacing'), String(zoomSpacing))
     await page.evaluate(() => { location.hash = '#/settings/workspace' })
     await page.getByRole('link', { name: 'Back to markets' }).click()
     await page.waitForFunction(() => document.querySelectorAll('[data-multi-timeframe-charts] svg[data-rendered-inst]').length === 3)

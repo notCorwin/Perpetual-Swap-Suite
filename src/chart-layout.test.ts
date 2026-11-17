@@ -96,10 +96,12 @@ test("a countdown including its padding remains visible at an exact fit", () => 
   })
 })
 
-test('default candle density stays legible while expanding for desktop widths', async () => {
-  const { chartViewportBars } = await import('./chart-layout.ts')
-  assert.equal(chartViewportBars(840), 64) // 1200px window, 360px sidebar.
-  assert.equal(chartViewportBars(1090), 96) // 1510px window, 420px sidebar.
-  assert.equal(chartViewportBars(1290), 128) // Actual 1710px logical display.
-  assert.equal(chartViewportBars(2180), 192)
+test('continuous spans retain exact candle pitch and body width across every resize pixel', async () => {
+  const { chartPitchSpan, chartPitchBodyWidth } = await import('./chart-layout.ts')
+  for (const spacing of [4, 9.6, 25]) for (const width of [840, 841, 1090, 1290, 2180, 6000]) {
+    const span = chartPitchSpan(width, spacing)
+    assert.ok(Math.abs((width - chartPitchBodyWidth(spacing)) / (span - 1) - spacing) < 1e-9)
+  }
+  assert.ok(chartPitchSpan(1290 - 64) > 120 && chartPitchSpan(1290 - 64) < 130)
+  assert.ok(chartPitchSpan(2180, 4) > 288, 'Wide windows must preserve the selected spacing past the old source limit.')
 })
