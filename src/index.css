@@ -4,6 +4,22 @@
 @source "../node_modules/streamdown/dist/*.js";
 @source "../node_modules/@streamdown/code/dist/*.js";
 
+@font-face {
+  font-family: "DM Mono";
+  src: url("./../public/fonts/dm-mono-latin-400-normal.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "DM Mono";
+  src: url("./../public/fonts/dm-mono-latin-500-normal.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+}
+
 @theme inline {
   --text-xs: var(--ui-font-meta);
   --text-xs--line-height: var(--ui-line-meta);
@@ -13,7 +29,7 @@
   --text-base--line-height: var(--ui-line-height);
   --text-lg: var(--ui-font-heading);
   --text-lg--line-height: var(--ui-line-height);
-  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  --font-mono: "DM Mono", ui-monospace, monospace;
   --font-sans: var(--font-mono);
   --font-heading: var(--font-sans);
   --color-positive: var(--positive);
