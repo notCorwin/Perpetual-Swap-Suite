@@ -478,6 +478,7 @@ test('the existing chart toolbar provides window dragging while its controls rem
   await page.getByRole('status').filter({ hasText: 'Chart copied to clipboard' }).waitFor()
   const settingsLink = sidebar.getByRole('link', { name: 'Settings', exact: true })
   assert.equal(await settingsLink.evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'no-drag')
+  const settingsLinkBounds = await settingsLink.boundingBox()
   await settingsLink.click()
   const settings = settingsPage()
   await settings.waitFor({ state: 'visible' })
@@ -486,7 +487,9 @@ test('the existing chart toolbar provides window dragging while its controls rem
     const heading = await settings.getByRole('heading', { name: 'Settings', exact: true }).boundingBox()
     assert.ok(heading.x >= 72, 'Settings must reserve native traffic light space as well.')
   }
-  assert.equal(await settings.getByRole('link', { name: 'Back to markets', exact: true }).evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'no-drag')
+  const returnLink = settings.getByRole('link', { name: 'Back to markets', exact: true })
+  assert.equal(await returnLink.evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'no-drag')
+  assert.deepEqual(await returnLink.boundingBox(), settingsLinkBounds, 'Return must occupy the same position and hit area as the Settings launcher.')
   await backToMarkets()
 })
 
