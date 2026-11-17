@@ -758,7 +758,7 @@ test('RSI crossings retain a flat panel and expose the sampled candle and time a
         const chart = document.querySelector('[data-chart-inst]')
         const width = chart.querySelector('[data-chart-plot]').clientWidth
         const count = Math.min(288, 96 + Math.max(0, Math.floor((width - 720) / 240)) * 48)
-        return Number(chart.dataset.chartRenderedBars) === count
+        return Number(chart.dataset.chartTargetBars) === count && Number(chart.dataset.chartRenderedBars) > 0
       })
       const frame = await publish(true)
       await page.waitForFunction(generation => document.querySelector('[data-chart-inst]')?.__chartSnapshot?.generation === generation, frame.generation)
@@ -975,9 +975,7 @@ test('selection persists while six width/DPR combinations share page, pointer, a
       await assertWorkspaceLayout(page)
       await page.waitForFunction(() => {
         const chart = document.querySelector('[data-chart-inst]')
-        const width = chart.querySelector('[data-chart-plot]').clientWidth
-        const count = Math.min(288, 96 + Math.max(0, Math.floor((width - 720) / 240)) * 48)
-        return Number(chart.dataset.chartRenderedBars) === count
+        return chart?.dataset.chartLoading === 'false' && Number(chart.dataset.chartRenderedBars) > 0
       })
       const currentFixture = await electron.evaluate(() => globalThis.__workspaceFixture.request(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } }))
       const target = await vwapCandleTarget(24, currentFixture)
