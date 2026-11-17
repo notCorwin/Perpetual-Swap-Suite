@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { ArrowLeft, ChevronRight, Database, Settings2, SlidersHorizontal, Sparkles } from 'lucide-react'
+import { ChevronRight, Database, Settings2, SlidersHorizontal, Sparkles } from 'lucide-react'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Field, FieldContent, FieldDescription, FieldError, FieldGroup, FieldLabel, FieldLegend, FieldSet } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
@@ -250,7 +250,7 @@ export function WorkspaceSettings({ section, preferences, loaded, loadError, onS
     <header data-window-toolbar data-window-drag-region className="flex border-b">
       <div data-native-window-controls-row className="flex h-full w-[var(--market-list-width)] shrink-0 items-center gap-3 border-r px-4">
         <h1 className="min-w-0 flex-1 truncate text-sm font-medium">Settings</h1>
-        <a href="#/" aria-label="Back to markets" title="Back to markets" className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}><ArrowLeft aria-hidden="true" /></a>
+        <a href="#/" aria-label="Settings" title="Settings" className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}><Settings2 aria-hidden="true" /></a>
       </div>
     </header>
     <div className="flex min-h-0 flex-1">
@@ -283,7 +283,7 @@ export function WorkspaceSettings({ section, preferences, loaded, loadError, onS
               <div hidden={section !== 'liquidity'} className="flex flex-col gap-8">
         <FieldSet disabled={preferenceDisabled} aria-labelledby="settings-section-title">
           <FieldGroup>
-            {LIQUIDITY_FIELDS.map(field => <FieldGroup key={field.key} className="gap-3">
+            {LIQUIDITY_FIELDS.map(field => <FieldGroup key={field.key} data-settings-liquidity-field className="gap-3">
               <Field orientation="horizontal" data-invalid={Boolean(errors[field.key])} data-disabled={preferenceDisabled} className="justify-between gap-6">
                 <FieldContent className="self-center">
                   <FieldLabel id={`condition-label-${field.key}`} htmlFor={`condition-${field.key}`}>{field.label}</FieldLabel>
@@ -300,7 +300,7 @@ export function WorkspaceSettings({ section, preferences, loaded, loadError, onS
                 </InputGroup>
                 <Switch id={`condition-${field.key}`} aria-labelledby={`condition-label-${field.key}`} className="self-center" checked={draft.liquidity[field.key].enabled} onCheckedChange={enabled => setDraft(current => ({ ...current, liquidity: { ...current.liquidity, [field.key]: { ...current.liquidity[field.key], enabled } } }))} />
               </Field>
-              {field.key === 'slippage' && <FieldGroup className="pr-14">{numericField('slippageNotional', 'Slippage trade size (USDT)')}</FieldGroup>}
+              {field.key === 'slippage' && <FieldGroup>{numericField('slippageNotional', 'Slippage trade size (USDT)')}</FieldGroup>}
             </FieldGroup>)}
           </FieldGroup>
         </FieldSet>

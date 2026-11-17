@@ -222,7 +222,7 @@ try {
         await settings.getByRole('link', { name: 'Market data', exact: true }).click()
         await screenshot(`settings-${theme}-bottom`, width, 1000, dpr)
         report.measurements.push({ theme, surface: 'settings-bottom', ...await measure() })
-        await settings.getByRole('link', { name: 'Back to markets', exact: true }).click()
+        await settings.getByRole('link', { name: 'Settings', exact: true }).click()
         await settings.waitFor({ state: 'hidden' })
       }
     }

@@ -113,7 +113,7 @@ test('default multi-timeframe charts share native prices, isolate history and re
     await live(btc, 141.25, 35)
     assert.equal(await page.locator('[data-chart-inst]').nth(1).getAttribute('data-chart-bar-spacing'), String(zoomSpacing))
     await page.evaluate(() => { location.hash = '#/settings/workspace' })
-    await page.getByRole('link', { name: 'Back to markets' }).click()
+    await page.getByRole('main', { name: 'Settings', exact: true }).getByRole('link', { name: 'Settings', exact: true }).click()
     await page.waitForFunction(() => document.querySelectorAll('[data-multi-timeframe-charts] svg[data-rendered-inst]').length === 3)
     await page.locator('[data-chart-plot]').first().evaluate(plot => plot.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true })))
     await page.waitForFunction(() => [...document.querySelectorAll('[data-chart-inst]')].every(chart => chart.__chartSnapshot?.instId === 'ETH-USDT-SWAP'))

@@ -276,7 +276,7 @@ const openSettings = async (category = 'Workspace') => {
   return settings
 }
 const backToMarkets = async () => {
-  await settingsPage().getByRole('link', { name: 'Back to markets', exact: true }).click()
+  await settingsPage().getByRole('link', { name: 'Settings', exact: true }).click()
   await settingsPage().waitFor({ state: 'hidden' })
   await page.getByRole('textbox', { name: 'Search contracts' }).waitFor({ state: 'visible' })
 }
@@ -487,9 +487,9 @@ test('the existing chart toolbar provides window dragging while its controls rem
     const heading = await settings.getByRole('heading', { name: 'Settings', exact: true }).boundingBox()
     assert.ok(heading.x >= 72, 'Settings must reserve native traffic light space as well.')
   }
-  const returnLink = settings.getByRole('link', { name: 'Back to markets', exact: true })
+  const returnLink = settings.getByRole('link', { name: 'Settings', exact: true })
   assert.equal(await returnLink.evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'no-drag')
-  assert.deepEqual(await returnLink.boundingBox(), settingsLinkBounds, 'Return must occupy the same position and hit area as the Settings launcher.')
+  assert.deepEqual(await returnLink.boundingBox(), settingsLinkBounds, 'The Settings toggle must keep the same position and hit area when returning to markets.')
   await backToMarkets()
 })
 
@@ -1063,7 +1063,7 @@ test('settings is a separate grouped page with keyboard navigation and a retaine
   await settings.getByRole('heading', { name: 'Workspace', level: 2, exact: true }).waitFor()
   await page.keyboard.press('Escape')
   assert.equal(await settings.isVisible(), true, 'Escape must not dismiss an independent page.')
-  await settings.getByRole('link', { name: 'Back to markets', exact: true }).focus()
+  await settings.getByRole('link', { name: 'Settings', exact: true }).focus()
   await page.keyboard.press('Enter')
   await settings.waitFor({ state: 'hidden' })
   assert.equal(await page.getByRole('textbox', { name: 'Search contracts' }).inputValue(), 'ALPHA')
@@ -1152,7 +1152,7 @@ test('leaving settings confirms before discarding an unsaved preference draft', 
   const ranking = settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' })
   await ranking.fill('60')
   const rejectedDialog = page.waitForEvent('dialog')
-  const rejectedNavigation = settings.getByRole('link', { name: 'Back to markets', exact: true }).click()
+  const rejectedNavigation = settings.getByRole('link', { name: 'Settings', exact: true }).click()
   const rejected = await rejectedDialog
   assert.equal(rejected.type(), 'confirm')
   await rejected.dismiss()
@@ -1160,7 +1160,7 @@ test('leaving settings confirms before discarding an unsaved preference draft', 
   assert.equal(await settings.isVisible(), true)
   assert.equal(await ranking.inputValue(), '60')
   const acceptedDialog = page.waitForEvent('dialog')
-  const acceptedNavigation = settings.getByRole('link', { name: 'Back to markets', exact: true }).click()
+  const acceptedNavigation = settings.getByRole('link', { name: 'Settings', exact: true }).click()
   const accepted = await acceptedDialog
   assert.equal(accepted.type(), 'confirm')
   await accepted.accept()
@@ -1192,7 +1192,7 @@ test('AI configuration is inline and retains its draft and loaded settings acros
   assert.equal(await key.inputValue(), 'renderer-fixture-key')
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.analysisSettings?.action === 'read').length), before + 1)
   const confirmDialog = page.waitForEvent('dialog')
-  const attemptedLeave = settings.getByRole('link', { name: 'Back to markets', exact: true }).click()
+  const attemptedLeave = settings.getByRole('link', { name: 'Settings', exact: true }).click()
   const confirm = await confirmDialog
   await confirm.dismiss()
   await attemptedLeave
