@@ -1,4 +1,4 @@
-export const CHART_DEFAULT_SPACING = 9.6
+export const CHART_DEFAULT_SPACING = 19.2
 export const CHART_MIN_SPACING = 4
 export const CHART_MAX_SPACING = 100
 export const chartPitchBodyWidth = (spacing: number) => spacing * 0.68

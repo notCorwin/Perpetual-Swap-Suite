@@ -102,6 +102,6 @@ test('continuous spans retain exact candle pitch and body width across every res
     const span = chartPitchSpan(width, spacing)
     assert.ok(Math.abs((width - chartPitchBodyWidth(spacing)) / (span - 1) - spacing) < 1e-9)
   }
-  assert.ok(chartPitchSpan(1290 - 64) > 120 && chartPitchSpan(1290 - 64) < 130)
+  assert.ok(chartPitchSpan(1290 - 64) > 60 && chartPitchSpan(1290 - 64) < 65)
   assert.ok(chartPitchSpan(2180, 4) > 288, 'Wide windows must preserve the selected spacing past the old source limit.')
 })
