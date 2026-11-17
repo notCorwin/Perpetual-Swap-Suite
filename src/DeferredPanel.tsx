@@ -9,10 +9,10 @@ export class DeferredPanel extends Component<Props, { failed: boolean }> {
   static getDerivedStateFromError() { return { failed: true } }
   render() {
     const { name, onClose, children, className } = this.props
-    const pending = <section className={className} aria-label={name}>
-      <p role={this.state.failed ? 'alert' : 'status'} className="mb-3 text-muted-foreground">{this.state.failed ? `${name} could not load. Restart the app to try again.` : `Loading ${name.toLowerCase()}…`}</p>
+    const pending = <section className={className} aria-label={name}><div className="flex flex-col items-start gap-3">
+      <p role={this.state.failed ? 'alert' : 'status'} className="text-muted-foreground">{this.state.failed ? `${name} could not load. Restart the app to try again.` : `Loading ${name.toLowerCase()}…`}</p>
       <Button variant="outline" size="sm" onClick={onClose}>Close {name.toLowerCase()}</Button>
-    </section>
+      </div></section>
     return this.state.failed ? pending : <Suspense fallback={pending}>{children}</Suspense>
   }
 }

@@ -44,6 +44,16 @@ export function inspectSurfaceContract(source: string, file: string, css: string
     const attribute = (name: string) => attributes.find(item => isNode(item.name) && item.name.name === name)
     const classes = strings(attribute('className')?.value).flatMap(value => value.split(/\s+/))
     for (const value of classes) {
+      const spacing = value.match(/(?:^|:)(-?)(m[xysetblr]?|p[xysetblr]?|gap(?:-[xy])?|space-[xy])-(.+?)(?:!)?$/)
+      if (spacing) {
+        const [, negative, kind, amount] = spacing
+        const isMargin = kind.startsWith('m')
+        const token = amount.match(/^(?:\[var\(--(space-[\w-]+)\)\]|\(--(space-[\w-]+)\))$/)
+        const scale = /^(?:0|[1-9]\d*)(?:\.5)?$/.test(amount)
+        const dynamicScale = amount === '[--spacing(var(--gap))]'
+        if (kind.startsWith('space-') || isMargin && !['0', 'auto'].includes(amount)) report(node, 'Layout containers must own spacing with gap or padding; margin is reserved for zero resets and auto alignment.')
+        else if (negative || !(scale || dynamicScale || token && tokens.has(token[1] ?? token[2]) || isMargin && amount === 'auto')) report(node, 'Spacing must use the shared scale or a declared space token.')
+      }
       if (/(?:^|:)backdrop-(?!none(?:$|!))/.test(value)) report(node, 'Use the default opaque component surfaces; backdrop filters are retired.')
       const background = value.match(/(?:^|:)bg-(\[[^\]]+\]|[^:!]+)/)?.[1]
       if (background && !background.startsWith('clip-') && !['transparent', 'none', 'inherit', 'current'].includes(background)) {
@@ -61,6 +71,12 @@ export function inspectSurfaceContract(source: string, file: string, css: string
     walk(attribute('style')?.value, property => {
       if (property.type !== 'ObjectProperty' || !isNode(property.key)) return
       const key = String(property.key.name ?? property.key.value)
+      if (/^(?:margin|padding|gap|rowGap|columnGap)/.test(key)) {
+        const values = strings(property.value)
+        const zero = isNode(property.value) && property.value.type === 'NumericLiteral' && property.value.value === 0
+        const allowed = values.length > 0 && values.every(value => value === '0' || key.startsWith('margin') && value === 'auto' || !key.startsWith('margin') && tokens.has(value.match(/^var\(--(space-[\w-]+)\)$/)?.[1] ?? ''))
+        if (!zero && !allowed) report(property, 'Inline spacing must use a declared space token; containers own gaps and padding.')
+      }
       if (['background', 'backgroundColor', 'backdropFilter', 'WebkitBackdropFilter', 'boxShadow', 'color', 'borderColor'].includes(key)) {
         const values = strings(property.value)
         if (!values.length || values.some(value => !['transparent', 'none', 'inherit', 'currentColor'].includes(value) && !tokens.has(value.match(/^var\(--([\w-]+)\)$/)?.[1] ?? ''))) report(node, 'Inline colors must reference a declared design token.')

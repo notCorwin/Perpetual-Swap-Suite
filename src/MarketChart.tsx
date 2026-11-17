@@ -1,3 +1,4 @@
+import { readDesignLengths } from '@/design-lengths'
 import { DeferredPanel } from '@/DeferredPanel'
 import { CHART_DEFAULT_SPACING, chartPitchSpan } from './chart-layout.ts'
 import { lazy, createContext, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react"
@@ -44,14 +45,26 @@ const chartTimeFormatter = new Intl.DateTimeFormat("en-US", { month: "short", da
 const time = (hour: number) => chartTimeFormatter.format(hour)
 const hourLabel = time
 const chartStyle = getComputedStyle(document.documentElement)
-const chartTokenNumber = (token: string, fallback: number) => {
-  const value = Number.parseFloat(chartStyle.getPropertyValue(token))
-  return Number.isFinite(value) ? value : fallback
-}
+// Tokens are fixed for the page lifetime; geometry and rendered annotations share these resolved pixels.
+const chartLengths = readDesignLengths({
+  '--chart-text-size': 10, '--chart-legend-gap': 16, '--space-4': 12,
+  '--space-annotation-small': 8, '--space-annotation-xs': 4,
+  '--space-annotation-symbol': 18, '--space-annotation-label': 26, '--space-annotation-value': 10,
+  '--chart-price-label-padding-y': 3, '--chart-top-inset': 2,
+  '--chart-panel-header-height': 18, '--chart-row-gap': 2,
+  '--chart-bottom-axis-height': 16, '--chart-panel-header-baseline': 11,
+})
+const chartTokenNumber = (token: keyof typeof chartLengths) => chartLengths[token]
 const chartTokens = {
-  textSize: chartTokenNumber('--chart-text-size', 11),
-  legendGap: chartTokenNumber('--chart-legend-gap', 16),
-  priceLabelPaddingY: chartTokenNumber('--chart-price-label-padding-y', 3),
+  textSize: chartTokenNumber('--chart-text-size'),
+  legendGap: chartTokenNumber('--chart-legend-gap'),
+  annotationPadding: chartTokenNumber('--space-4'),
+  annotationSmall: chartTokenNumber('--space-annotation-small'),
+  annotationXs: chartTokenNumber('--space-annotation-xs'),
+  legendSymbol: chartTokenNumber('--space-annotation-symbol'),
+  legendLabel: chartTokenNumber('--space-annotation-label'),
+  legendValue: chartTokenNumber('--space-annotation-value'),
+  priceLabelPaddingY: chartTokenNumber('--chart-price-label-padding-y'),
 } as const
 const legendContext = document.createElement("canvas").getContext("2d")
 const chartTextWidths = new Map<string, number>()
@@ -88,11 +101,11 @@ const sourceStatusText = (label: string, state: PreparedChartState, status?: Cha
   return ''
 }
 const chartPlot = createChartPlotCache(legendWidth, {
-  top: chartTokenNumber('--chart-top-inset', 2),
-  headerHeight: chartTokenNumber('--chart-panel-header-height', 18),
-  rowGap: chartTokenNumber('--chart-row-gap', 2),
-  bottomAxis: chartTokenNumber('--chart-bottom-axis-height', 16),
-  headerBaseline: chartTokenNumber('--chart-panel-header-baseline', 11),
+  top: chartTokenNumber('--chart-top-inset'),
+  headerHeight: chartTokenNumber('--chart-panel-header-height'),
+  rowGap: chartTokenNumber('--chart-row-gap'),
+  bottomAxis: chartTokenNumber('--chart-bottom-axis-height'),
+  headerBaseline: chartTokenNumber('--chart-panel-header-baseline'),
 })
 const chartOverscan = (surface: ReadyChartWindow | null, chartController: ChartController): { before?: Bar; after?: Bar } => {
   if (!surface?.bars.length) return {}
@@ -176,7 +189,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
   const tickHalfHeight = chartTokens.textSize / 2
   const inspectionX = x[0] + (active.hour - bars[0].hour) / intervalMS * geometry.barPitch
   const inspectedTime = inspecting ? time(active.hour) : null
-  const inspectedTimeWidth = inspectedTime ? chartTextWidth(inspectedTime) + 12 : 0
+  const inspectedTimeWidth = inspectedTime ? chartTextWidth(inspectedTime) + chartTokens.annotationPadding : 0
   const inspectedTimeX = !inspecting ? 0 : Math.max(columns.rsi[0], Math.min(right - inspectedTimeWidth, inspectionX + contentOffset - inspectedTimeWidth / 2))
   const rsiValue = (field: RsiField) => {
     const marker = !inspecting ? undefined : rsiMarkers.find(marker => marker.hour === active.hour && marker.field === field)
@@ -193,7 +206,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     const start = columns[key][0] + gap / 2
     const contexts = items.map(([, , , , sourceHour]) => sourceHour !== undefined && sourceHour !== active.hour ? ` · as of ${time(sourceHour)}` : '')
     const showValues = !geometry.priceOnly || inspecting
-    const widths = items.map(([label, value], index) => 26 + legendWidth(label) + (showValues ? 10 + legendWidth(value) + legendWidth(contexts[index]) : 0))
+    const widths = items.map(([label, value], index) => chartTokens.legendLabel + legendWidth(label) + (showValues ? chartTokens.legendValue + legendWidth(value) + legendWidth(contexts[index]) : 0))
     const available = right - start
     const required = widths.reduce((sum, itemWidth) => sum + itemWidth, 0) + gap * (items.length - 1)
     const shrink = Math.min(1, available / required)
@@ -207,11 +220,11 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
         const labelColor = key === "rsi" ? "var(--muted-foreground)" : key === "taker" ? index === 0 ? "var(--chart-positive-label)" : "var(--chart-negative-label)" : color
         return <g key={label} transform={`translate(${itemStart},0)`} data-chart-legend-source-hour={sourceHour}>
         <title>{label} {geometry.priceOnly && key === 'price' ? label === 'VWAP(14)' ? formatIndicatorPrice(active.vwap) : `U ${formatIndicatorPrice(active.bollUpper)} · M ${formatIndicatorPrice(active.bollMiddle)} · L ${formatIndicatorPrice(active.bollLower)}` : value}{contexts[index]}</title>
-        {key === "taker" && !dash && <line data-chart-legend-outline={label} x1="0" x2="18" stroke="var(--foreground)" />}
-        <line data-chart-legend={label} x1="0" x2="18" stroke={color} strokeDasharray={key === "taker" && !dash ? "2 3" : dash} />
-        <text x="26" dominantBaseline="middle" fill={geometry.priceOnly && !inspecting ? "var(--muted-foreground)" : labelColor}>{label}</text>
-        {showValues && <text data-chart-legend-value x={26 + legendWidth(label) + 10} dominantBaseline="middle" fill="var(--foreground)">{value}</text>}
-        {showValues && contexts[index] && <text data-chart-legend-source-context x={26 + legendWidth(label) + 10 + legendWidth(value)} dominantBaseline="middle" fill="var(--muted-foreground)">{contexts[index]}</text>}
+        {key === "taker" && !dash && <line data-chart-legend-outline={label} x1="0" x2={chartTokens.legendSymbol} stroke="var(--foreground)" />}
+        <line data-chart-legend={label} x1="0" x2={chartTokens.legendSymbol} stroke={color} strokeDasharray={key === "taker" && !dash ? "2 3" : dash} />
+        <text x={chartTokens.legendLabel} dominantBaseline="middle" fill={geometry.priceOnly && !inspecting ? "var(--muted-foreground)" : labelColor}>{label}</text>
+        {showValues && <text data-chart-legend-value x={chartTokens.legendLabel + legendWidth(label) + chartTokens.legendValue} dominantBaseline="middle" fill="var(--foreground)">{value}</text>}
+        {showValues && contexts[index] && <text data-chart-legend-source-context x={chartTokens.legendLabel + legendWidth(label) + chartTokens.legendValue + legendWidth(value)} dominantBaseline="middle" fill="var(--muted-foreground)">{contexts[index]}</text>}
         </g>
       })}
       </g>
@@ -224,7 +237,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     const width = chartTextWidth(hourLabel(bar.hour))
     const start = x[index] + contentOffset - (index === 0 ? 0 : index === n - 1 ? width : width / 2)
     const end = start + width
-    if (end + 8 > nextTimeLabelStart || inspectedTime && !(end < inspectedTimeX - 4 || start > inspectedTimeX + inspectedTimeWidth + 4)) return false
+    if (end + chartTokens.annotationSmall > nextTimeLabelStart || inspectedTime && !(end < inspectedTimeX - chartTokens.annotationXs || start > inspectedTimeX + inspectedTimeWidth + chartTokens.annotationXs)) return false
     nextTimeLabelStart = start
     return true
   }).reverse()
@@ -287,7 +300,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     {oiAxis && panels.oi[1] - panels.oi[0] >= 35 && geometry.oiTicks.map(({ y, label }, index) => <g key={index} data-chart-oi-tick><line x1={columns.oi[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.25" />{lineLabel(axisStarts.oi, y, label)}</g>)}
     {panels.taker[1] - panels.taker[0] >= 35 && geometry.takerTicks.map(({ y, label }, index) => <g key={index} data-chart-taker-tick>{lineLabel(axisStarts.taker, y, label)}</g>)}
     {inspectedTime && <g data-chart-inspected-time><rect x={inspectedTimeX} y={height - 16} width={inspectedTimeWidth} height={15} rx={3} fill="var(--chart-annotation)" /><text x={inspectedTimeX + inspectedTimeWidth / 2} y={height - 4} textAnchor="middle" fill="var(--foreground)">{inspectedTime}</text></g>}
-    {presentation.ticks.map(({ y, label }, index) => <g key={index} data-chart-price-tick><line x1={columns.price[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.35" />{(!tag.inViewport || y + tickHalfHeight < priceLabel.top || y - tickHalfHeight > priceLabel.bottom) && <text x={axisStarts.price} y={y} dominantBaseline="middle" fill="var(--muted-foreground)" textLength={chartTextWidth(label) > gutter - 12 ? Math.max(1, gutter - 12) : undefined} lengthAdjust="spacingAndGlyphs">{label}</text>}</g>)}
+    {presentation.ticks.map(({ y, label }, index) => <g key={index} data-chart-price-tick><line x1={columns.price[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.35" />{(!tag.inViewport || y + tickHalfHeight < priceLabel.top || y - tickHalfHeight > priceLabel.bottom) && <text x={axisStarts.price} y={y} dominantBaseline="middle" fill="var(--muted-foreground)" textLength={chartTextWidth(label) > gutter - chartTokens.annotationPadding ? Math.max(1, gutter - chartTokens.annotationPadding) : undefined} lengthAdjust="spacingAndGlyphs">{label}</text>}</g>)}
     <line x1={right} x2={right} y1={panels.price[0]} y2={geometry.priceOnly ? panels.price[1] : panels.taker[1]} stroke="var(--border)" opacity="0.8" />
     {tag.inViewport && tag.rising && <line data-chart-live-price-outline x1={columns.price[0]} x2={right} y1={latestY} y2={latestY} stroke="var(--foreground)" />}
     {tag.inViewport && <line data-chart-live-price x1={columns.price[0]} x2={right} y1={latestY} y2={latestY} stroke={latestColor} strokeDasharray="4 5" />}
@@ -691,7 +704,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
       {(historical || displayedFrame !== timeframe) && <Badge variant="secondary">{timeframeLabel(displayedFrame)}{historical ? ' history' : ' chart'}</Badge>}
       {!historical && <PriceStatus observedAt={surface?.priceObservedAt} realtime={surface?.realtimeState} active={isActive && windowVisible && presentation.active} />}
     </header>}
-    <dialog ref={controlsHelp} aria-labelledby="chart-controls-title" className="m-auto w-[min(28rem,calc(100%-2rem))] rounded-lg border bg-popover p-6 text-popover-foreground backdrop:bg-background/80">
+    <dialog ref={controlsHelp} aria-labelledby="chart-controls-title" className="m-auto w-[min(28rem,calc(100%-var(--space-8)))] rounded-lg border bg-popover p-6 text-popover-foreground backdrop:bg-background/80">
       <div className="flex flex-col gap-4">
         <h2 id="chart-controls-title" className="text-base font-medium">Chart controls</h2>
         <ul className="flex list-disc flex-col gap-2 pl-4 text-sm">

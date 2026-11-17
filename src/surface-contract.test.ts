@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { checkSurfaceFiles, inspectSurfaceContract } from '../scripts/check-surfaces.ts'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
-const tokens = `:root { --background: white; --card: white; --input: gray; --foreground: black; --border: gray; --primary: blue; --secondary: gray; }
+const tokens = `:root { --space-2: 6px; --background: white; --card: white; --input: gray; --foreground: black; --border: gray; --primary: blue; --secondary: gray; }
 @theme inline { --color-background: var(--background); --color-card: var(--card); --color-input: var(--input); --color-foreground: var(--foreground); --color-border: var(--border); --color-primary: var(--primary); }`
 const check = (source: string) => inspectSurfaceContract(source, 'src/components/ui/example.tsx', tokens)
 
@@ -36,4 +36,19 @@ test('Radix and glass effects cannot recreate an alternative component system', 
   assert.match(check('<div className="bg-card backdrop-blur-md" />').join('\n'), /backdrop filters/)
   assert.match(check('<div style={{ backdropFilter: "var(--card)" }} />').join('\n'), /Backdrop filters/)
   assert.deepEqual(check('import { Button } from "@base-ui/react/button"; const x = <Button className="bg-primary" />'), [])
+})
+
+
+test('spacing uses shared steps and belongs to layout containers', () => {
+  assert.deepEqual(check('<div className="flex gap-3 px-4 mx-auto" />'), [])
+  assert.deepEqual(check('<div className="gap-[var(--space-2)]" style={{ padding: "var(--space-2)", margin: 0 }} />'), [])
+  for (const source of [
+    '<div className="gap-[13px]" />',
+    '<div className="gap-[var(--space-missing)]" />',
+    '<div className="mt-2" />',
+    '<div className="hover:-ml-1" />',
+    '<div className="flex space-y-2" />',
+    '<div style={{ gap: 13 }} />',
+    'const styles = cva("flex", { variants: { size: { default: "gap-[13px]" } } }); const x = <div className={styles()} />',
+  ]) assert.match(check(source).join('\n'), /spacing|Spacing/)
 })
