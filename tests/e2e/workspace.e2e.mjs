@@ -278,7 +278,7 @@ const openSettings = async (category = 'Workspace') => {
 const backToMarkets = async () => {
   await settingsPage().getByRole('link', { name: 'Settings', exact: true }).click()
   await settingsPage().waitFor({ state: 'hidden' })
-  await page.getByRole('textbox', { name: 'Search contracts' }).waitFor({ state: 'visible' })
+  await page.locator('[data-market-status-row]').waitFor({ state: 'visible' })
 }
 const vwapCandleTarget = async (slot, fixture) => {
   const target = await page.locator('svg[data-rendered-inst]').evaluate((svg, { slot, intervalMS }) => {
@@ -353,15 +353,9 @@ test('market arrow shortcuts survive contract clicks, toolbar focus and repeated
     'DOM focus regressions must be exercised without acquiring macOS window focus.')
 })
 
-test('clicking the chart releases search focus while editing and settings keep their arrow keys', async () => {
-  const search = page.getByRole('textbox', { name: 'Search contracts' })
+test('chart and settings retain their keyboard behavior', async () => {
   try {
     await page.getByRole('row', { name: 'View BETA-USDT-SWAP chart', exact: true }).click()
-    await search.fill('BETA')
-    await page.keyboard.press('ArrowLeft')
-    assert.equal(await search.evaluate(input => input.selectionStart), 3)
-    assert.equal(await selected().getAttribute('aria-label'), 'View BETA-USDT-SWAP chart')
-    await search.fill('')
     await page.locator('svg[data-rendered-inst]').click({ position: { x: 50, y: 50 } })
     assert.equal(await page.locator('[data-chart-plot]').evaluate(plot => document.activeElement === plot), true,
       'A chart click must explicitly transfer DOM focus after preventing pointer defaults for inspection.')
@@ -387,7 +381,6 @@ test('clicking the chart releases search focus while editing and settings keep t
       if (await discard.isEnabled()) await discard.click()
       await backToMarkets()
     }
-    await search.fill('')
     await page.getByRole('row', { name: 'View BETA-USDT-SWAP chart', exact: true }).click()
   }
 })
@@ -971,7 +964,7 @@ test('a delayed chart capture cannot copy pixels after the selected timeframe ch
   }
 })
 
-test('search preserves selection while six width/DPR combinations share page, pointer, and capture coordinates', async () => {
+test('selection persists while six width/DPR combinations share page, pointer, and capture coordinates', async () => {
   const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }))
   const client = await page.context().newCDPSession(page)
   const fixture = await electron.evaluate(({ ipcMain }) => globalThis.__workspaceFixture.request(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } }))
@@ -1016,17 +1009,12 @@ test('search preserves selection while six width/DPR combinations share page, po
       if (process.env.PERPETUAL_SWAP_UI_SCREENSHOTS) await page.screenshot({ path: join(process.env.PERPETUAL_SWAP_UI_SCREENSHOTS, `settings-${width}-dpr${deviceScaleFactor}.png`) })
       await backToMarkets()
     }
-    await page.getByRole('textbox', { name: 'Search contracts' }).fill('ALPHA')
-    assert.equal(await page.locator('[data-market-index]').count(), 1)
     assert.equal(await page.locator('[data-chart-inst]').getAttribute('data-chart-inst'), 'BETA-USDT-SWAP')
-    await page.getByRole('textbox', { name: 'Search contracts' }).fill('NO MATCH')
-    assert.equal(await page.locator('[data-market-index]').count(), 0)
-    assert.equal(await page.locator('[data-chart-inst]').getAttribute('data-chart-inst'), 'BETA-USDT-SWAP')
+    assert.equal(await page.getByRole('textbox', { name: 'Search contracts' }).count(), 0)
   } finally {
     await page.mouse.up()
     await page.keyboard.press('Escape')
     if (await settingsPage().isVisible()) await backToMarkets()
-    await page.getByRole('textbox', { name: 'Search contracts' }).fill('')
     await client.send('Emulation.clearDeviceMetricsOverride')
     await client.detach()
     await page.setViewportSize({ width: viewport.width + 1, height: viewport.height })
@@ -1036,7 +1024,6 @@ test('search preserves selection while six width/DPR combinations share page, po
 })
 
 test('settings is a separate grouped page with keyboard navigation and a retained market workspace', async () => {
-  await page.getByRole('textbox', { name: 'Search contracts' }).fill('ALPHA')
   const before = {
     contract: await page.locator('[data-chart-inst]').getAttribute('data-chart-inst'),
     timeframe: await page.locator('[aria-label="Chart timeframe"] button[aria-pressed="true"]').textContent(),
@@ -1046,7 +1033,7 @@ test('settings is a separate grouped page with keyboard navigation and a retaine
   const settings = settingsPage()
   await settings.getByRole('heading', { name: 'Settings', level: 1, exact: true }).waitFor()
   assert.equal(await page.getByRole('dialog', { name: 'Settings', exact: true }).count(), 0)
-  assert.equal(await page.getByRole('textbox', { name: 'Search contracts' }).isVisible(), false)
+  assert.equal(await page.locator('[data-market-list]').isVisible(), false)
   const categories = settings.getByRole('navigation', { name: 'Settings categories' })
   assert.deepEqual(await categories.getByRole('link').allTextContents(), ['Workspace', 'Liquidity filters', 'Market data', 'AI analysis'])
   assert.equal(await categories.getByRole('link', { name: 'Workspace', exact: true }).getAttribute('aria-current'), 'page')
@@ -1066,10 +1053,8 @@ test('settings is a separate grouped page with keyboard navigation and a retaine
   await settings.getByRole('link', { name: 'Settings', exact: true }).focus()
   await page.keyboard.press('Enter')
   await settings.waitFor({ state: 'hidden' })
-  assert.equal(await page.getByRole('textbox', { name: 'Search contracts' }).inputValue(), 'ALPHA')
   assert.equal(await page.locator('[data-chart-inst]').getAttribute('data-chart-inst'), before.contract)
   assert.equal(await page.locator('[aria-label="Chart timeframe"] button[aria-pressed="true"]').textContent(), before.timeframe)
-  await page.getByRole('textbox', { name: 'Search contracts' }).fill('')
 })
 
 test('preference drafts survive category changes and validation returns to the first invalid group', async () => {
@@ -1393,7 +1378,7 @@ test('new download pushes win over held replies and completion distinguishes una
   }
 })
 
-test('ranking changes keep the chosen chart while long lists retain keyboard and search access', async () => {
+test('ranking changes keep the chosen chart while long lists retain keyboard access', async () => {
   await electron.evaluate(() => {
     const state = globalThis.__workspaceFixture
     state.rows = state.rows.map(row => row.instId === 'ZETA-USDT-SWAP' ? { ...row, rankingChange: 4 } : row)
@@ -1423,11 +1408,7 @@ test('ranking changes keep the chosen chart while long lists retain keyboard and
   await page.waitForFunction(() => document.activeElement?.getAttribute('aria-label') === 'View ZETA-USDT-SWAP chart')
   await page.keyboard.press('End')
   await page.waitForFunction(() => document.activeElement?.getAttribute('aria-label') === 'View NULL-USDT-SWAP chart')
-  await page.getByRole('textbox', { name: 'Search contracts' }).fill('BETA')
-  await page.locator('[data-market-index="0"][aria-label="View BETA-USDT-SWAP chart"]').waitFor({ state: 'visible' })
-  assert.equal(await page.locator('[data-market-index]').count(), 1, 'Filtering a scrolled virtual list must reveal its surviving row.')
   assert.equal(await page.locator('[data-chart-inst]').getAttribute('data-chart-inst'), 'BETA-USDT-SWAP')
-  await page.getByRole('textbox', { name: 'Search contracts' }).fill('')
   await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.rows = state.initialRows; state.revision += 1; state.notify() })
   await page.waitForFunction(() => document.querySelector('[aria-label="View ZETA-USDT-SWAP chart"] td:last-child')?.textContent.includes('+3.00%'))
   await page.waitForFunction(() => document.querySelector('[data-total-market-count]')?.getAttribute('data-total-market-count') === '4')

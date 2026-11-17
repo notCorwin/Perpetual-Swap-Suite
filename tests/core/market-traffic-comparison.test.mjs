@@ -85,10 +85,10 @@ function report({ baseline = false, foreground = false, multiplier = 1, seed = 1
   const appBuild = { provenance: 'working-tree checkout', revision, dirty: false }
   const interactionDurations = samplesWithPercentile(foreground ? 21 : 3, 33.4, interactionP95MS,
     foreground ? Math.max(42, interactionP95MS) : interactionP95MS)
-  const searchSamples = interactionDurations.map((durationMS, index) => {
+  const selectionSamples = interactionDurations.map((durationMS, index) => {
     const startedMS = index * 345
     return { startedMS, completedMS: startedMS + durationMS, durationMS,
-      expectedResultCount: 1, actualResultCount: 1, correct: true }
+      expected: "row", actual: "row", correct: true }
   })
   const frameSamples = samplesWithPercentile(400, 16.7, frameGapP95MS, Math.max(25, frameGapP95MS))
   return {
@@ -106,7 +106,7 @@ function report({ baseline = false, foreground = false, multiplier = 1, seed = 1
       sampleStartedAt, expectOptimized: !baseline, requiredChannels, replay: replayInputDigest(receiptEvidence.fixtureEvents),
       qualification: { total: 10, completed: 10, pending: 0, verified: 2, failed: 8, unknown: 0 },
       ...(foreground ? { readinessPhase: 'all-passing-15m-frames-ready-before-steady-state-sample',
-        searchScenario: { version: 'distributed-input-v1', eventCount: 21, windowMS: 7_000, lastInputAtMS: 6_900 },
+        selectionScenario: { version: 'distributed-selection-v1', eventCount: 21, windowMS: 7_000, lastInputAtMS: 6_900 },
         readiness: { timeframe: '15m', expectedFrames: 2, readyFrames: 2, elapsedMS: 100,
           measurement: 'Bounded chart startup readiness warmup; elapsedMS is excluded from steady-state performance results.' } } : {}) },
     traffic: { durationSeconds: 7, websocketPayloadBytes, httpResponsePayloadBytes: 0, totalPayloadBytes: websocketPayloadBytes,
@@ -115,9 +115,9 @@ function report({ baseline = false, foreground = false, multiplier = 1, seed = 1
       configuredDemand: { candidateIDs, eligibleIDs: passingIDs, focusedInstrumentID: passingIDs[0], booksEnabled: true } },
     renderer: { frameCount: 400, rafOpportunityGapMS: { sampleCount: 400, p50: 16.7, p95: frameGapP95MS,
       max: Math.max(25, frameGapP95MS), samples: frameSamples },
-      searchInputToSecondRAFMS: { sampleCount: searchSamples.length, p50: 33.4, p95: interactionP95MS,
+      selectionToSecondRAFMS: { sampleCount: selectionSamples.length, p50: 33.4, p95: interactionP95MS,
         p95Interpretation: 'Empirical nearest-rank summary; descriptive at this sample count, not a tail guarantee.',
-        max: Math.max(...interactionDurations), samples: searchSamples },
+        max: Math.max(...interactionDurations), samples: selectionSamples },
       measurement: 'Renderer RAF callback opportunity gaps. These timings do not measure SVG commit or native compositor paint; input timing ends at the second RAF.' },
     correctness: { finalRealtimeState: 'live', connectedWebSocketClients: 3,
       allCandidatesHaveContinuousTickerOpenInterestAnd5mReceipts: true, passingIDs,
@@ -162,7 +162,7 @@ test('paired comparison requires distinct clean app revisions', () => {
 test('renderer timing summaries are recomputed from finite raw samples', () => {
   const before = report({ baseline: true, foreground: true, multiplier: 3 })
   const staleP95 = report({ foreground: true, multiplier: 2 })
-  staleP95.renderer.searchInputToSecondRAFMS.p95 += 1
+  staleP95.renderer.selectionToSecondRAFMS.p95 += 1
   assert.throws(() => compareMarketTrafficReports(before, staleP95), /input-to-second-RAF p95 does not match its raw samples/)
 
   const nullP95 = report({ foreground: true, multiplier: 2 })
@@ -170,7 +170,7 @@ test('renderer timing summaries are recomputed from finite raw samples', () => {
   assert.throws(() => compareMarketTrafficReports(before, nullP95), /RAF opportunity gap p95 must be a finite measurement/)
 
   const invalidSample = report({ foreground: true, multiplier: 2 })
-  invalidSample.renderer.searchInputToSecondRAFMS.samples[0].durationMS = Number.NaN
+  invalidSample.renderer.selectionToSecondRAFMS.samples[0].durationMS = Number.NaN
   assert.throws(() => compareMarketTrafficReports(before, invalidSample), /has an invalid or missing duration/)
 })
 
@@ -202,10 +202,10 @@ test('market traffic comparison rejects pending, disconnected, empty and non-opt
   assert.throws(() => compareMarketTrafficReports(before, remotePeriods), /candle15m acknowledgements/)
 })
 
-test('optimized foreground reports retain the absolute 50ms RAF and search budgets', () => {
+test('optimized foreground reports retain the absolute 50ms RAF and selection budgets', () => {
   const before = report({ baseline: true, foreground: true, multiplier: 3, interactionP95MS: 49 })
-  const tooSlowSearch = report({ foreground: true, multiplier: 2, interactionP95MS: 50.1 })
-  assert.throws(() => compareMarketTrafficReports(before, tooSlowSearch), /input-to-second-RAF p95 exceeded 50ms/)
+  const tooSlowSelection = report({ foreground: true, multiplier: 2, interactionP95MS: 50.1 })
+  assert.throws(() => compareMarketTrafficReports(before, tooSlowSelection), /input-to-second-RAF p95 exceeded 50ms/)
   const tooSlowRAF = report({ foreground: true, multiplier: 2, frameGapP95MS: 50.1 })
   assert.throws(() => compareMarketTrafficReports(before, tooSlowRAF), /RAF opportunity gap p95 exceeded 50ms/)
 })
@@ -233,26 +233,26 @@ test('foreground comparison rejects presentation, readiness, runtime and paired 
   assert.throws(() => compareMarketTrafficReports(before, regressed), /inputToSecondRAFP95MS/)
 })
 
-test('foreground search measurements require complete, distributed, correct result samples', () => {
+test('foreground selection measurements require complete, distributed, correct result samples', () => {
   const before = report({ baseline: true, foreground: true, multiplier: 3 })
   const after = report({ foreground: true, multiplier: 2 })
   const incomplete = structuredClone(after)
-  incomplete.renderer.searchInputToSecondRAFMS.sampleCount = 7
-  incomplete.renderer.searchInputToSecondRAFMS.samples.length = 7
-  incomplete.renderer.searchInputToSecondRAFMS.p50 = 33.4
-  incomplete.renderer.searchInputToSecondRAFMS.p95 = 33.4
-  incomplete.renderer.searchInputToSecondRAFMS.max = 33.4
-  assert.throws(() => compareMarketTrafficReports(before, incomplete), /every declared search event/)
+  incomplete.renderer.selectionToSecondRAFMS.sampleCount = 7
+  incomplete.renderer.selectionToSecondRAFMS.samples.length = 7
+  incomplete.renderer.selectionToSecondRAFMS.p50 = 33.4
+  incomplete.renderer.selectionToSecondRAFMS.p95 = 33.4
+  incomplete.renderer.selectionToSecondRAFMS.max = 33.4
+  assert.throws(() => compareMarketTrafficReports(before, incomplete), /every declared selection event/)
   const burst = structuredClone(after)
-  burst.renderer.searchInputToSecondRAFMS.samples.forEach((sample, index) => {
+  burst.renderer.selectionToSecondRAFMS.samples.forEach((sample, index) => {
     sample.startedMS = index * 30
     sample.completedMS = sample.startedMS + sample.durationMS
   })
   assert.throws(() => compareMarketTrafficReports(before, burst), /initial burst/)
   const wrongResults = structuredClone(after)
-  wrongResults.renderer.searchInputToSecondRAFMS.samples[3].correct = false
-  wrongResults.renderer.searchInputToSecondRAFMS.samples[3].actualResultCount = 2
-  assert.throws(() => compareMarketTrafficReports(before, wrongResults), /filtered results/)
+  wrongResults.renderer.selectionToSecondRAFMS.samples[3].correct = false
+  wrongResults.renderer.selectionToSecondRAFMS.samples[3].actual = "wrong"
+  assert.throws(() => compareMarketTrafficReports(before, wrongResults), /selected row/)
 })
 
 test('comparison rejects legacy reports without matched actual input evidence', () => {

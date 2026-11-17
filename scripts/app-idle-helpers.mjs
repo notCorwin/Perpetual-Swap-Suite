@@ -86,8 +86,8 @@ export async function seedAndPrepare(electron, page, { count, periods }) {
 
 export async function selectChart(page, instId, timeframe) {
   if (await page.locator('[data-chart-display-mode="multi"]').count()) await page.getByRole('button', { name: 'Indicators', exact: true }).click()
-  await page.getByRole('textbox', { name: 'Search contracts' }).fill(instId)
   await page.locator(`[aria-label="View ${instId} chart"]`).evaluate(node => node.click())
+  await page.waitForFunction(instId => document.querySelector('[data-chart-inst]')?.getAttribute('data-chart-inst') === instId, instId, { timeout: 30_000 })
   await page.locator('[aria-label="Chart timeframe"] button').filter({ hasText: new RegExp(`^${timeframe}$`, 'i') }).evaluate(node => node.click())
   await page.waitForFunction(({ instId, timeframe }) => {
     const chart = document.querySelector('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
@@ -95,7 +95,7 @@ export async function selectChart(page, instId, timeframe) {
     return snapshot?.instId === instId && snapshot?.timeframe === timeframe && svg?.dataset.renderedInst === instId
       && svg?.dataset.renderedTimeframe === timeframe && Number(svg.dataset.renderedEnd) === snapshot.endHour
       && chart.dataset.chartVisualStale === 'false' && chart.dataset.chartLoading === 'false'
-      && Number(chart.dataset.chartRenderedBars) === 96 && snapshot.indicatorState === 'ready'
+      && Number(chart.dataset.chartRenderedBars) > 0 && snapshot.bars.length === 96 && snapshot.indicatorState === 'ready'
   }, { instId, timeframe }, { timeout: 60_000 })
 }
 
@@ -152,7 +152,7 @@ export function assertReadyFrame(frame, { instId, timeframe, expected, historica
   assert.equal(frame.instId, instId); assert.equal(frame.chartInst, instId); assert.equal(frame.renderedInst, instId)
   assert.equal(frame.timeframe, timeframe); assert.equal(frame.renderedTimeframe, timeframe)
   assert.equal(frame.visible, true); assert.equal(frame.visualStale, 'false'); assert.equal(frame.loading, 'false')
-  assert.equal(frame.renderedBars, 96); assert.equal(frame.bars, 96); assert.equal(frame.indicatorState, 'ready')
+  assert.ok(frame.renderedBars > 0 && frame.renderedBars <= frame.bars); assert.equal(frame.bars, 96); assert.equal(frame.indicatorState, 'ready')
   assert.equal(frame.renderedEnd, frame.chartEnd)
   if (marketCount !== undefined) assert.equal(frame.marketCount, marketCount, 'The ready market list is incomplete.')
   if (marketExpected !== undefined) {

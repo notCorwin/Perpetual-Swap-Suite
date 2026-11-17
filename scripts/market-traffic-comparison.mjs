@@ -136,38 +136,38 @@ export function validateMarketTrafficReport(report, label, { baseline = false } 
   assert.ok(report.renderer?.frameCount >= report.fixture.durationSeconds * 15, `${label} has insufficient renderer frame samples.`)
   assert.equal(report.renderer?.rafOpportunityGapMS?.sampleCount, report.renderer?.frameCount, `${label} RAF opportunity sample count is inconsistent.`)
   assert.equal(report.renderer?.rafOpportunityGapMS?.samples?.length, report.renderer?.rafOpportunityGapMS?.sampleCount, `${label} RAF opportunity timestamps are incomplete.`)
-  assert.ok(report.renderer?.searchInputToSecondRAFMS?.sampleCount >= report.fixture.passingCount, `${label} has insufficient renderer interaction samples.`)
-  assert.equal(report.renderer?.searchInputToSecondRAFMS?.samples?.length, report.renderer?.searchInputToSecondRAFMS?.sampleCount, `${label} input-to-RAF samples are incomplete.`)
+  assert.ok(report.renderer?.selectionToSecondRAFMS?.sampleCount >= report.fixture.passingCount, `${label} has insufficient renderer interaction samples.`)
+  assert.equal(report.renderer?.selectionToSecondRAFMS?.samples?.length, report.renderer?.selectionToSecondRAFMS?.sampleCount, `${label} input-to-RAF samples are incomplete.`)
   assertSummaryMatchesSamples(report.renderer.rafOpportunityGapMS,
     report.renderer.rafOpportunityGapMS.samples, `${label} RAF opportunity gap`)
-  const interactionSamples = report.renderer.searchInputToSecondRAFMS.samples
+  const interactionSamples = report.renderer.selectionToSecondRAFMS.samples
   const interactionDurations = interactionSamples.map((sample, index) => {
-    assert.ok(Number.isFinite(sample?.startedMS) && sample.startedMS >= 0, `${label} search sample ${index} has an invalid start time.`)
+    assert.ok(Number.isFinite(sample?.startedMS) && sample.startedMS >= 0, `${label} selection sample ${index} has an invalid start time.`)
     assert.ok(Number.isFinite(sample?.completedMS) && Number.isFinite(sample?.durationMS) && sample.durationMS >= 0,
-      `${label} search sample ${index} has an invalid or missing duration.`)
+      `${label} selection sample ${index} has an invalid or missing duration.`)
     assert.ok(Math.abs(sample.completedMS - sample.startedMS - sample.durationMS) <= summaryTolerance,
-      `${label} search sample ${index} duration does not match its raw timestamps.`)
+      `${label} selection sample ${index} duration does not match its raw timestamps.`)
     return sample.durationMS
   })
-  assertSummaryMatchesSamples(report.renderer.searchInputToSecondRAFMS, interactionDurations,
+  assertSummaryMatchesSamples(report.renderer.selectionToSecondRAFMS, interactionDurations,
     `${label} input-to-second-RAF`)
   for (const [name, value] of Object.entries({ rafOpportunityGapP95: report.renderer.rafOpportunityGapMS?.p95,
     rafOpportunityGapMax: report.renderer.rafOpportunityGapMS?.max,
-    inputToSecondRAFP95: report.renderer.searchInputToSecondRAFMS?.p95,
-    inputToSecondRAFMax: report.renderer.searchInputToSecondRAFMS?.max })) {
+    inputToSecondRAFP95: report.renderer.selectionToSecondRAFMS?.p95,
+    inputToSecondRAFMax: report.renderer.selectionToSecondRAFMS?.max })) {
     assert.ok(Number.isFinite(value) && value >= 0, `${label} has no valid ${name} measurement.`)
   }
   assert.match(report.renderer?.measurement ?? '', /RAF callback opportunity gaps/,
     `${label} must label renderer timing as RAF opportunity measurements.`)
   assert.match(report.renderer.measurement, /do not measure SVG commit or native compositor paint/,
     `${label} must state that renderer timing is not SVG commit or native paint.`)
-  assert.match(report.renderer.searchInputToSecondRAFMS.p95Interpretation ?? '', /descriptive at this sample count/,
-    `${label} must identify the small-sample empirical search p95 as descriptive.`)
+  assert.match(report.renderer.selectionToSecondRAFMS.p95Interpretation ?? '', /descriptive at this sample count/,
+    `${label} must identify the small-sample empirical selection p95 as descriptive.`)
   if (report.fixture.expectOptimized) {
     assert.ok(report.renderer.rafOpportunityGapMS.p95 <= 50, `${label} optimized renderer RAF opportunity gap p95 exceeded 50ms.`)
-    assert.ok(report.renderer.searchInputToSecondRAFMS.p95 <= 50, `${label} optimized input-to-second-RAF p95 exceeded 50ms.`)
+    assert.ok(report.renderer.selectionToSecondRAFMS.p95 <= 50, `${label} optimized input-to-second-RAF p95 exceeded 50ms.`)
     assert.ok(report.renderer.rafOpportunityGapMS.max < 100, `${label} optimized renderer had a RAF stall of at least 100ms.`)
-    assert.ok(report.renderer.searchInputToSecondRAFMS.max < 100, `${label} optimized renderer had a search stall of at least 100ms.`)
+    assert.ok(report.renderer.selectionToSecondRAFMS.max < 100, `${label} optimized renderer had a selection stall of at least 100ms.`)
   }
   if (baseline) {
     assert.ok(report.app?.build?.revision, `${label} baseline app identity is missing.`)
@@ -181,16 +181,16 @@ export function validateMarketTrafficReport(report, label, { baseline = false } 
     }
   }
   if (foreground) {
-    assert.equal(report.fixture?.searchScenario?.version, 'distributed-input-v1', `${label} must use distributed search sampling.`)
-    const schedule = report.fixture.searchScenario, interactions = report.renderer.searchInputToSecondRAFMS
+    assert.equal(report.fixture?.selectionScenario?.version, 'distributed-selection-v1', `${label} must use distributed selection sampling.`)
+    const schedule = report.fixture.selectionScenario, interactions = report.renderer.selectionToSecondRAFMS
     assert.ok(schedule.eventCount >= 21 && schedule.windowMS === report.fixture.durationSeconds * 1_000
-      && schedule.lastInputAtMS === schedule.windowMS - 100, `${label} has an invalid fixed search schedule.`)
-    assert.equal(interactions.sampleCount, schedule.eventCount, `${label} did not complete every declared search event.`)
-    assert.equal(interactions.samples?.length, schedule.eventCount, `${label} lacks per-input search evidence.`)
-    assert.ok(interactions.samples.every(sample => sample.correct && sample.actualResultCount === sample.expectedResultCount),
-      `${label} did not verify the filtered results for every timed search.`)
+      && schedule.lastInputAtMS === schedule.windowMS - 100, `${label} has an invalid fixed selection schedule.`)
+    assert.equal(interactions.sampleCount, schedule.eventCount, `${label} did not complete every declared selection event.`)
+    assert.equal(interactions.samples?.length, schedule.eventCount, `${label} lacks per-input selection evidence.`)
+    assert.ok(interactions.samples.every(sample => sample.correct && sample.actual === sample.expected),
+      `${label} did not verify the selected row for every timed selection.`)
     assert.ok(interactions.samples.at(-1).startedMS - interactions.samples[0].startedMS >= schedule.windowMS * .8,
-      `${label} search inputs must span the steady-state sample, rather than an initial burst.`)
+      `${label} selection inputs must span the steady-state sample, rather than an initial burst.`)
     assert.equal(report.fixture?.readinessPhase, 'all-passing-15m-frames-ready-before-steady-state-sample',
       `${label} must sample only after the selected chart readiness barrier.`)
     assert.equal(report.fixture?.readiness?.timeframe, '15m', `${label} must use the same selected 15m readiness phase.`)
@@ -226,7 +226,7 @@ export function compareMarketTrafficReports(before, after) {
   assert.equal(after.fixture.replay.normalizedInputHash, before.fixture.replay.normalizedInputHash, 'Replay semantic input hashes must match for comparison.')
   assert.equal(after.runtime.electronVersion, before.runtime.electronVersion, 'Before/after must use the same Electron version.')
   if (foreground) {
-    assert.deepEqual(after.fixture.searchScenario, before.fixture.searchScenario, 'Before/after must use the same search schedule.')
+    assert.deepEqual(after.fixture.selectionScenario, before.fixture.selectionScenario, 'Before/after must use the same selection schedule.')
     assert.equal(after.runtime.executable, before.runtime.executable, 'Before/after must use the same actual Electron executable.')
     assert.equal(after.fixture.readinessPhase, before.fixture.readinessPhase, 'Before/after must cross the same chart readiness phase before sampling.')
     for (const key of ['timeframe', 'expectedFrames', 'readyFrames']) assert.equal(after.fixture.readiness[key], before.fixture.readiness[key],
@@ -272,13 +272,13 @@ export function compareMarketTrafficReports(before, after) {
   }))
   const responsiveness = {
     rafOpportunityGapP95MS: closeToNoRegression(before.renderer.rafOpportunityGapMS.p95, after.renderer.rafOpportunityGapMS.p95, 2, .15),
-    inputToSecondRAFP95MS: closeToNoRegression(before.renderer.searchInputToSecondRAFMS.p95, after.renderer.searchInputToSecondRAFMS.p95, 3, .2),
+    inputToSecondRAFP95MS: closeToNoRegression(before.renderer.selectionToSecondRAFMS.p95, after.renderer.selectionToSecondRAFMS.p95, 3, .2),
   }
   for (const [name, result] of Object.entries(responsiveness)) assert.equal(result.passed, true,
     `Renderer responsiveness regressed beyond the bounded noise allowance for ${name}: ${JSON.stringify(result)}`)
   if (!foreground) {
     assert.ok(after.renderer.rafOpportunityGapMS.p95 <= 50, 'After RAF opportunity gap p95 exceeded the 50ms responsiveness budget.')
-    assert.ok(after.renderer.searchInputToSecondRAFMS.p95 <= 75, 'After input-to-second-RAF p95 exceeded the 75ms hidden renderer budget.')
+    assert.ok(after.renderer.selectionToSecondRAFMS.p95 <= 75, 'After input-to-second-RAF p95 exceeded the 75ms hidden renderer budget.')
   }
   assert.ok(afterRate < beforeRate,
     `Optimized total payload rate must decrease: before=${beforeRate.toFixed(2)} B/s, after=${afterRate.toFixed(2)} B/s.`)

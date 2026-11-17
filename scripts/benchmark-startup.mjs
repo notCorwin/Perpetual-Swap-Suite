@@ -53,14 +53,10 @@ try {
       const page = await electron.firstWindow()
       const errors = []
       page.on('pageerror', error => errors.push(error.message))
-      await page.waitForFunction(() => Boolean(document.querySelector('[data-market-list] input[aria-label="Search contracts"]') && document.querySelector('[data-chart-panel]') && document.querySelector('a[aria-label="Settings"]')), undefined, { timeout: 10_000 })
+      await page.waitForFunction(() => Boolean(document.querySelector('[data-market-status-row]') && document.querySelector('[data-chart-panel]') && document.querySelector('a[aria-label="Settings"]')), undefined, { timeout: 10_000 })
       await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
       const firstScreenMS = performance.now() - started
-      const search = page.getByRole('textbox', { name: 'Search contracts' })
-      await search.fill('startup-probe')
-      await page.waitForFunction(() => document.querySelector('[data-market-status-row]')?.textContent?.includes(' / '))
       const readyMS = performance.now() - started
-      await search.fill('')
       let cachedChartMS
       if (fixture) {
         await page.waitForFunction(instId => {
@@ -85,7 +81,7 @@ try {
   }
 } finally { if (cachedProfile) await rm(cachedProfile, { recursive: true, force: true }) }
 const median = field => [...samples].sort((a, b) => a[field] - b[field])[1][field]
-const report = { app, revision, observedAt: new Date().toISOString(), mode: `guarded offscreen packaged replica; fresh processes; ${fixture ? 'persisted, unexpired market observations and SQLite candles, seed process excluded' : 'empty profiles'}; OS filesystem cache uncontrolled; recording disabled; readiness includes a verified React search interaction; no AI requests`,
+const report = { app, revision, observedAt: new Date().toISOString(), mode: `guarded offscreen packaged replica; fresh processes; ${fixture ? 'persisted, unexpired market observations and SQLite candles, seed process excluded' : 'empty profiles'}; OS filesystem cache uncontrolled; recording disabled; readiness includes the market status, chart, and settings controls; no AI requests`,
   targetMS: maximum, meetsTarget: maximum === undefined ? undefined : samples.every(sample => sample.readyMS <= maximum && (!fixture || sample.cachedChartMS <= maximum)),
   medianReadyMS: median('readyMS'), maxReadyMS: Math.max(...samples.map(sample => sample.readyMS)), medianCachedChartMS: fixture ? median('cachedChartMS') : undefined, medianWorkingSetMB: median('workingSetMB'), samples }
 if (values.report) await writeFile(values.report, `${JSON.stringify(report, null, 2)}\n`)

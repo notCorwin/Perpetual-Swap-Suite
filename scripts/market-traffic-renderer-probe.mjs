@@ -1,5 +1,5 @@
 // Self-contained so Playwright can install the same probe in the renderer world.
-export function installMarketTrafficRendererProbe({ requireForeground, passingIDs }, host = globalThis) {
+export function installMarketTrafficRendererProbe({ requireForeground,  }, host = globalThis) {
   const { performance, document, window, PerformanceObserver } = host
   const state = { gaps: [], frames: [], interactions: [], interactionSamples: [], lastFrame: null,
     startedAt: performance.now(), active: true,
@@ -28,16 +28,15 @@ export function installMarketTrafficRendererProbe({ requireForeground, passingID
     scheduleFrame(frame)
   }
   const input = event => {
-    if (event.target?.getAttribute?.('aria-label') !== 'Search contracts') return
+    const row = event.target?.closest?.('[data-market-index]')
+    if (!row) return
     checkPresentation()
-    const started = performance.now(), term = event.target.value
+    const started = performance.now(), expected = row.getAttribute('aria-label')
     scheduleFrame(() => scheduleFrame(() => {
       const completed = performance.now(), durationMS = completed - started
-      const expectedResultCount = passingIDs.filter(id => id.toLowerCase().includes(term.trim().toLowerCase())).length
-      const actualResultCount = Number(document.querySelector('[data-market-count]')?.getAttribute('data-market-count'))
+      const actual = document.querySelector('[data-market-index][aria-selected="true"]')?.getAttribute('aria-label')
       state.interactions.push(durationMS)
-      state.interactionSamples.push({ term, startedMS: started - state.startedAt, completedMS: completed - state.startedAt, durationMS,
-        expectedResultCount, actualResultCount, correct: actualResultCount === expectedResultCount })
+      state.interactionSamples.push({ expected, actual, startedMS: started - state.startedAt, completedMS: completed - state.startedAt, durationMS, correct: actual === expected })
     }))
   }
   const timingFields = (entry, names) => Object.fromEntries(names.filter(name => Number.isFinite(entry[name]))
@@ -82,7 +81,7 @@ export function installMarketTrafficRendererProbe({ requireForeground, passingID
       longAnimationFrames,
       rafOpportunityGapMS: { sampleCount: state.gaps.length, p50: percentile(state.gaps, .5), p95: percentile(state.gaps, .95),
         max: Math.max(0, ...state.gaps), samples: state.gaps },
-      searchInputToSecondRAFMS: { sampleCount: state.interactions.length, p50: percentile(state.interactions, .5),
+      selectionToSecondRAFMS: { sampleCount: state.interactions.length, p50: percentile(state.interactions, .5),
         p95: percentile(state.interactions, .95), p95Interpretation: 'Empirical nearest-rank summary; descriptive at this sample count, not a tail guarantee.',
         max: Math.max(0, ...state.interactions), samples: state.interactionSamples } }
     observer?.disconnect()
@@ -90,13 +89,13 @@ export function installMarketTrafficRendererProbe({ requireForeground, passingID
     pendingFrames.clear()
     document.removeEventListener('visibilitychange', checkPresentation)
     window.removeEventListener('blur', checkPresentation)
-    document.removeEventListener('input', input, true)
+    document.removeEventListener('click', input, true)
     return captured
   }
   host.__marketTrafficResponsiveness = state
   document.addEventListener('visibilitychange', checkPresentation)
   window.addEventListener('blur', checkPresentation)
-  document.addEventListener('input', input, true)
+  document.addEventListener('click', input, true)
   checkPresentation()
   scheduleFrame(frame)
 }

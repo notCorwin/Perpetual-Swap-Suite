@@ -442,7 +442,7 @@ test('ATR% and BBW share the panel between RSI and OI with independent fitted sc
   }
 })
 
-test('the 1600 design workspace keeps both panels and chart selection when search hides the selected row', async () => {
+test('the 1600 design workspace keeps both panels and chart selection', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   await openChart(page, fixture)
   const originalViewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }))
@@ -452,15 +452,11 @@ test('the 1600 design workspace keeps both panels and chart selection when searc
       await page.waitForFunction(width => Math.abs(Number(document.querySelector('[data-layout="market-workspace"]')?.dataset.uiScale) - width / 1_600) < 1e-5, width)
       await assertWorkspaceLayout(page)
     }
-    await page.getByRole('textbox', { name: 'Search contracts' }).fill('NO-MATCHING-CONTRACT')
-    assert.equal(await page.locator('[data-market-list] [aria-label^="View "]').count(), 0)
-    assert.equal(await page.locator('svg[data-rendered-inst]').getAttribute('data-rendered-inst'), fixture.instId, 'Search must preserve the selected chart even if the contract is hidden.')
+    assert.equal(await page.getByRole('textbox', { name: 'Search contracts' }).count(), 0)
     await assertWorkspaceLayout(page)
-    await page.getByRole('textbox', { name: 'Search contracts' }).fill('')
     await page.locator(`[aria-label="View ${fixture.instId} chart"]`).waitFor({ state: 'visible' })
     assert.equal(await page.locator(`[aria-label="View ${fixture.instId} chart"]`).getAttribute('aria-selected'), 'true')
   } finally {
-    await page.getByRole('textbox', { name: 'Search contracts' }).fill('')
     if (originalViewport) await page.setViewportSize(originalViewport)
   }
 })

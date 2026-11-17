@@ -222,12 +222,16 @@ try {
   const choose = async (instId, phase) => {
     const expected = sequence ? 100 + Number(instId.slice(5, 8)) * 3 + 10 + fixture.periods * .01 + sequence * .001 : null
     report.pendingSelection = { instId, phase, expected }
-    const selectedBeforeSearch = await page.evaluate(() => document.querySelector('[data-chart-inst]')?.__chartSnapshot?.instId ?? null)
-    await page.getByRole('textbox', { name: 'Search contracts' }).fill(instId)
     const selectedBeforeClick = await page.evaluate(() => document.querySelector('[data-chart-inst]')?.__chartSnapshot?.instId ?? null)
-    assert.equal(selectedBeforeClick, selectedBeforeSearch, 'Filtering contracts must preserve chart selection until a row is selected.')
-    // The search filters the list; the row click selects the chart. Capture
-    // that semantic input in its renderer task, excluding driver round trips.
+    const row = page.locator(`[aria-label="View ${instId} chart"]`)
+    const scroller = page.locator('[data-market-scroll]')
+    await scroller.evaluate(node => { node.scrollTop = 0 })
+    for (let attempt = 0; attempt < 100 && !await row.count(); attempt++) {
+      await scroller.evaluate(node => { node.scrollTop += node.clientHeight / 2 })
+      await page.waitForTimeout(30)
+    }
+    await row.waitFor({ state: 'attached' })
+    // Capture the row selection in the renderer task.
     const inputAt = await page.locator(`[aria-label="View ${instId} chart"]`).evaluate(node => {
       const at = performance.timeOrigin + performance.now()
       node.click()
@@ -237,7 +241,7 @@ try {
     report.viewIntents.push({ at: inputAt, instId, timeframe: '15m', liveEndHour: currentEnd })
     await page.waitForFunction(({ instId, inputAt, expected }) => window.__resourcePaint.records.some(record => window.__resourcePaint.isFrame(record) && record.instId === instId && record.timeframe === '15m' && record.nextFrameAt >= inputAt && record.bars === 96 && record.indicatorState === 'ready' && (expected === null || record.frame.livePrice >= expected)), { instId, inputAt, expected }, { timeout: 20_000 })
     const value = await page.evaluate(({ instId, inputAt, expected }) => window.__resourcePaint.records.find(record => window.__resourcePaint.isFrame(record) && record.instId === instId && record.timeframe === '15m' && record.nextFrameAt >= inputAt && record.bars === 96 && record.indicatorState === 'ready' && (expected === null || record.frame.livePrice >= expected)), { instId, inputAt, expected })
-    report.switches.push({ phase, instId, inputMode: 'row click after search filtering', selectedBeforeClick, rowClickToFrameMS: value.nextFrameAt - inputAt, bars: value.bars, indicatorState: value.indicatorState, expected, actualPrice: value.livePrice })
+    report.switches.push({ phase, instId, inputMode: 'row click', selectedBeforeClick, rowClickToFrameMS: value.nextFrameAt - inputAt, bars: value.bars, indicatorState: value.indicatorState, expected, actualPrice: value.livePrice })
     delete report.pendingSelection
   }
   await choose(fixture.instIds[1], 'first selection after renderer frame delivery')
@@ -344,7 +348,7 @@ try {
   if (page) {
     try { report.failureRenderer = await page.evaluate(() => {
       const chart = document.querySelector('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
-      return { search: document.querySelector('[aria-label="Search contracts"]')?.value,
+      return {
         selectedRow: document.querySelector('[data-market-index][aria-selected="true"]')?.getAttribute('aria-label'),
         chart: chart ? Object.fromEntries([...chart.attributes].filter(value => value.name.startsWith('data-chart')).map(value => [value.name, value.value])) : null,
         snapshot: snapshot ? { instId: snapshot.instId, timeframe: snapshot.timeframe, endHour: snapshot.endHour, generation: snapshot.generation, revision: snapshot.revision, bars: snapshot.bars.length, liveBar: snapshot.liveBar } : null,

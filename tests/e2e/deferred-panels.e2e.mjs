@@ -11,7 +11,7 @@ for (const panel of ['settings', 'analysis']) test(`a missing ${panel} chunk lea
   try {
     electron = await _electron.launch({ args: ['.', '--disable-gpu'], env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_USER_DATA: userData } })
     const page = await electron.firstWindow()
-    await page.getByRole('textbox', { name: 'Search contracts' }).waitFor()
+    await page.locator('[data-market-status-row]').waitFor()
     await electron.evaluate(({ BrowserWindow }, chunk) => {
       BrowserWindow.getAllWindows()[0].webContents.session.webRequest.onBeforeRequest((details, callback) => callback({ cancel: details.url.includes(chunk) }))
     }, panel === 'settings' ? '/WorkspaceSettings-' : '/ChartAnalysisPanel-')
@@ -26,8 +26,7 @@ for (const panel of ['settings', 'analysis']) test(`a missing ${panel} chunk lea
     assert.match(await region.textContent(), /could not load.*Restart the app/)
     await region.getByRole('button', { name: panel === 'settings' ? 'Close settings' : 'Close chart analysis', exact: true }).click()
     await region.waitFor({ state: 'detached' })
-    await page.getByRole('textbox', { name: 'Search contracts' }).fill('still-responsive')
-    await page.waitForFunction(() => document.querySelector('[data-market-status-row]')?.textContent?.includes(' / '))
+    await page.locator('[data-market-status-row]').waitFor()
     assert.equal(await page.locator('[data-chart-panel]').count(), 1)
   } finally {
     try { await electron?.close() } finally { await rm(userData, { recursive: true, force: true }) }

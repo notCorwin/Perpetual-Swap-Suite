@@ -27,20 +27,15 @@ test('simulated app idle retains historical UI and background work, then resumes
         && Number(svg?.dataset.renderedEnd) === snapshot.endHour && chart.dataset.chartLoading === 'false'
         && chart.dataset.chartVisualStale === 'false' && snapshot.indicatorState === 'ready'
     }, { instId, timeframe, latestEnd }, { timeout: 30_000 })
-    const textbox = page.getByRole('textbox', { name: 'Search contracts' })
-    await textbox.fill('SCALE001')
-    await textbox.evaluate(input => input.setSelectionRange(2, 6))
     await page.waitForFunction(async () => (await window.radarDesktop.request({ preferences: { action: 'read' } })).chartTimeframe === '1H', null, { timeout: 10_000 })
     const preferencesBefore = await page.evaluate(() => window.radarDesktop.request({ preferences: { action: 'read' } }))
     const before = await page.evaluate(() => {
-      const input = document.querySelector('[aria-label="Search contracts"]'), chart = document.querySelector('[data-chart-inst]')
+      const chart = document.querySelector('[data-chart-inst]')
       const snapshot = chart.__chartSnapshot, svg = chart.querySelector('svg[data-rendered-inst]')
-      return { value: input.value, start: input.selectionStart, end: input.selectionEnd, focused: document.activeElement === input,
-        selected: snapshot.instId, timeframe: snapshot.timeframe, endHour: snapshot.endHour, bars: snapshot.bars,
+      return { selected: snapshot.instId, timeframe: snapshot.timeframe, endHour: snapshot.endHour, bars: snapshot.bars,
         svg: svg.outerHTML, cacheStart: chart.dataset.chartCacheStart }
     })
     assert.equal(before.selected, instId); assert.equal(before.timeframe, timeframe); assert.ok(before.endHour < latestEnd)
-    assert.equal(before.focused, true)
     const preparedBefore = await probe(electron, { action: 'preparedDiagnostics' })
     const key = `${instId}:${timeframe}`
     const cachedBefore = preparedBefore.series.find(series => series.key === key)
@@ -79,12 +74,11 @@ test('simulated app idle retains historical UI and background work, then resumes
     const counts = await page.evaluate(() => window.__idleFunctionalCounts.stop())
     assert.deepEqual(counts, { chartMutations: 0, listMutations: 0, notifications: 0 }, 'The idle renderer must keep its last presentation without continuing market notification delivery or DOM updates.')
     const idleView = await page.evaluate(() => {
-      const input = document.querySelector('[aria-label="Search contracts"]'), chart = document.querySelector('[data-chart-inst]'), snapshot = chart.__chartSnapshot
-      return { value: input.value, start: input.selectionStart, end: input.selectionEnd, focused: document.activeElement === input,
-        selected: snapshot.instId, timeframe: snapshot.timeframe, endHour: snapshot.endHour, bars: snapshot.bars,
+      const chart = document.querySelector('[data-chart-inst]'), snapshot = chart.__chartSnapshot
+      return { selected: snapshot.instId, timeframe: snapshot.timeframe, endHour: snapshot.endHour, bars: snapshot.bars,
         svg: chart.querySelector('svg[data-rendered-inst]').outerHTML, cacheStart: chart.dataset.chartCacheStart }
     })
-    assert.deepEqual(idleView, before, 'The last DOM, input selection, selected contract, historical viewport and displayed bars must remain intact during idle.')
+    assert.deepEqual(idleView, before, 'The last DOM, selected contract, historical viewport and displayed bars must remain intact during idle.')
     const backgroundAfter = await probe(electron, { action: 'backgroundStatus' })
     assert.ok(backgroundAfter.archiveRows >= background.writtenRecords)
     if (background.writtenRecords < 12_240) assert.ok(backgroundAfter.archiveRows > background.writtenRecords, 'Archive work must continue while presentation is idle.')
@@ -110,13 +104,11 @@ test('simulated app idle retains historical UI and background work, then resumes
     const historicalReady = await awaitReady(page, finalUpdate)
     assertReadyFrame(historicalReady, { instId, timeframe, historicalEnd: before.endHour })
     const after = await page.evaluate(() => {
-      const input = document.querySelector('[aria-label="Search contracts"]'), chart = document.querySelector('[data-chart-inst]'), snapshot = chart.__chartSnapshot
-      return { value: input.value, start: input.selectionStart, end: input.selectionEnd, focused: document.activeElement === input,
-        selected: snapshot.instId, timeframe: snapshot.timeframe, endHour: snapshot.endHour, bars: snapshot.bars,
+      const chart = document.querySelector('[data-chart-inst]'), snapshot = chart.__chartSnapshot
+      return { selected: snapshot.instId, timeframe: snapshot.timeframe, endHour: snapshot.endHour, bars: snapshot.bars,
         svg: chart.querySelector('svg[data-rendered-inst]').outerHTML, cacheStart: chart.dataset.chartCacheStart }
     })
-    assert.deepEqual(after, { value: before.value, start: before.start, end: before.end, focused: before.focused,
-      selected: before.selected, timeframe: before.timeframe, endHour: before.endHour, bars: before.bars, svg: before.svg, cacheStart: before.cacheStart })
+    assert.deepEqual(after, { selected: before.selected, timeframe: before.timeframe, endHour: before.endHour, bars: before.bars, svg: before.svg, cacheStart: before.cacheStart })
     const preferencesAfter = await page.evaluate(() => window.radarDesktop.request({ preferences: { action: 'read' } }))
     assert.deepEqual(preferencesAfter, preferencesBefore, 'Persisted preferences must survive the app presentation lifecycle.')
     const cachedAfter = (await probe(electron, { action: 'preparedDiagnostics' })).series.find(series => series.key === key)

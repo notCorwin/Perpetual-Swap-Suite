@@ -1,8 +1,7 @@
-import { lazy, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { lazy, memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { DeferredPanel } from '@/DeferredPanel'
 import { Settings2 } from 'lucide-react'
 import { buttonVariants } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
 import { MarketChart } from '@/MarketChart'
@@ -67,7 +66,6 @@ function App() {
   const [candidateIds, setCandidateIds] = useState<string[]>([])
   const [turnoverOrder, setTurnoverOrder] = useState<string[]>([])
   const [selected, setSelected] = useState<string | null>(null)
-  const [query, setQuery] = useState('')
   const [ready, setReady] = useState(false)
   const [catalog, setCatalog] = useState<Pick<MarketSnapshot, 'loading' | 'catalogSource' | 'catalogProgress'>>({ loading: true, catalogSource: 'none' })
   const [status, setStatus] = useState('Connecting')
@@ -175,8 +173,8 @@ function App() {
     }
   }, [preferencesLoaded, applyMarket])
 
-  const visible = useMemo(() => rows.filter(row => row.instId.toLowerCase().includes(query.trim().toLowerCase())), [rows, query])
-  const visibleIds = useMemo(() => candidateIds.filter(id => id.toLowerCase().includes(query.trim().toLowerCase())), [candidateIds, query])
+  const visible = rows
+  const visibleIds = candidateIds
   const verifying = Boolean(catalog.loading) && qualificationPending(catalog.catalogProgress) || (!ready && !error)
   const awaitingObservations = Boolean(catalog.loading && catalog.catalogProgress && catalog.catalogProgress.completed === catalog.catalogProgress.total && catalog.catalogProgress.pending > 0)
   const verificationUnavailable = !verifying && (Boolean(error) || catalog.catalogSource === 'none' || (catalog.catalogProgress?.unknown ?? 0) > 0)
@@ -184,7 +182,6 @@ function App() {
   const emptyDescription = verifying
     ? awaitingObservations ? 'Waiting for fresh observations. Market data collection continues in the background.' : catalog.catalogProgress?.total ? `Checking enabled conditions: ${catalog.catalogProgress.completed} / ${catalog.catalogProgress.total} contracts completed.` : 'The data service is preparing and verifying the market list.'
     : verificationUnavailable ? 'Market data could not verify the enabled conditions. Waiting for updated observations from the data service.' : 'Adjust the enabled liquidity conditions in Settings.'
-  const noSearchMatch = Boolean(query.trim()) && rows.length > 0
   // A qualification change must not discard the user's chart or history cursor.
   const selectedRow = rows.find(row => row.instId === selected)
   const retainedChart = Boolean(selected && !selectedRow)
@@ -257,9 +254,8 @@ function App() {
     <aside data-market-list className="flex h-full w-[var(--market-list-width)] shrink-0 flex-col border-r" aria-label="Contract list">
       <header className="flex flex-col">
         <div data-sidebar-toolbar data-window-toolbar data-window-drag-region data-native-window-controls-row className="flex items-center gap-3 border-b px-4"><h1 className="min-w-0 flex-1 truncate text-sm font-medium">Perpetual Swap Suite</h1><a ref={settingsLauncher} href={settingsHref('workspace')} aria-label="Settings" title="Settings" className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}><Settings2 aria-hidden="true" /></a></div>
-        <div className="flex flex-col gap-2 border-b p-4">
-        <Input aria-label="Search contracts" placeholder="Search contracts…" spellCheck={false} autoCorrect="off" autoCapitalize="off" autoComplete="off" value={query} onChange={event => setQuery(event.target.value)} />
-        <div data-market-status-row data-has-markets={visible.length > 0} className="flex min-h-5 min-w-0 items-start justify-between gap-3 text-xs leading-5 text-muted-foreground"><span className="shrink-0">{query.trim() ? `${visible.length} / ${rows.length}` : rows.length} contracts</span><span data-market-status role={marketProblem ? 'alert' : marketStatus ? 'status' : undefined} className={cn('min-w-0 break-words text-left', visible.length > 0 && 'line-clamp-2', (marketProblem || connectionFailure) && 'text-destructive')} title={marketStatusDetail || undefined} aria-label={marketStatusDetail || undefined}>{marketStatus || (updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString('en-US')}` : 'Waiting for market data')}</span></div>
+        <div className="flex flex-col border-b p-4">
+        <div data-market-status-row data-has-markets={visible.length > 0} className="flex min-h-5 min-w-0 items-start justify-between gap-3 text-xs leading-5 text-muted-foreground"><span className="shrink-0">{rows.length} contracts</span><span data-market-status role={marketProblem ? 'alert' : marketStatus ? 'status' : undefined} className={cn('min-w-0 break-words text-left', visible.length > 0 && 'line-clamp-2', (marketProblem || connectionFailure) && 'text-destructive')} title={marketStatusDetail || undefined} aria-label={marketStatusDetail || undefined}>{marketStatus || (updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString('en-US')}` : 'Waiting for market data')}</span></div>
         </div>
       </header>
       <section data-market-scroll className="min-h-0 flex-1 overflow-y-auto [&>[data-slot=table-container]]:overflow-visible" aria-label="Perpetual swap markets">
@@ -267,7 +263,7 @@ function App() {
           <colgroup><col className="w-[35%]" /><col className="w-[33%]" /><col className="w-[32%]" /></colgroup>
           <TableHeader className="sticky top-0 bg-background [&_th]:text-xs [&_th]:text-muted-foreground"><TableRow className="hover:bg-transparent"><TableHead>Contract</TableHead><TableHead className="text-right">Price</TableHead><TableHead className="text-right" aria-sort="other" aria-label={`${preferences.rankingLookback}m change By magnitude`} title="Sorted by absolute signed relative change from completed candles, largest first"><span>{preferences.rankingLookback}m change</span></TableHead></TableRow></TableHeader>
           {visible.length ? <MarketRowsViewport ids={visibleIds}>{index => <MarketRowView row={visible[index]} index={index} selected={visible[index].instId === selectedID} lookback={preferences.rankingLookback} onSelect={setSelected} />}</MarketRowsViewport> : <TableBody><TableRow><TableCell colSpan={3}>
-            <Empty><EmptyHeader><EmptyTitle>{noSearchMatch ? 'No matching contracts' : emptyTitle}</EmptyTitle><EmptyDescription>{noSearchMatch ? 'Try another contract name.' : emptyDescription}</EmptyDescription></EmptyHeader></Empty>
+            <Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{emptyDescription}</EmptyDescription></EmptyHeader></Empty>
           </TableCell></TableRow></TableBody>}
         </Table>
       </section>

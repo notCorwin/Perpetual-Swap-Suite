@@ -57,13 +57,13 @@ const baselineReportPath = values['baseline-report'] ? resolve(values['baseline-
 if (values.diagnostic && baselineReportPath) throw new Error('Diagnostic profiling cannot be compared with an acceptance baseline.')
 if (values.resources && (values.diagnostic || foreground || !values['wait-ready'])) throw new Error('--resources requires --wait-ready and a hidden, non-diagnostic run.')
 const waitReady = foreground || values['wait-ready'] === true
-const searchEventCount = (passingCount + 1) * (foreground ? Math.ceil(21 / (passingCount + 1)) : 1)
-const searchScenario = foreground ? { version: 'distributed-input-v1', eventCount: searchEventCount,
+const selectionEventCount = (passingCount + 1) * (foreground ? Math.ceil(21 / (passingCount + 1)) : 1)
+const selectionScenario = foreground ? { version: 'distributed-selection-v1', eventCount: selectionEventCount,
   windowMS: durationSeconds * 1_000, lastInputAtMS: durationSeconds * 1_000 - 100 } : null
 const benchmarkMode = foreground
   ? 'foreground-electron-loopback-market-traffic-and-renderer-responsiveness'
   : 'hidden-electron-loopback-market-traffic-and-renderer-responsiveness'
-const searchMeasurement = `${foreground ? 'Native foreground' : 'Hidden offscreen'} renderer RAF callback opportunity gaps and input-to-second-RAF scheduling latency. These timings do not measure SVG commit or native compositor paint; filtered result counts are sampled after the second RAF.`
+const selectionMeasurement = `${foreground ? 'Native foreground' : 'Hidden offscreen'} renderer RAF callback opportunity gaps and input-to-second-RAF scheduling latency. These timings do not measure SVG commit or native compositor paint; selected rows are sampled after the second RAF.`
 if (candidateCount < 3 || candidateCount > 100) throw new Error('--candidate-count must be between 3 and 100.')
 if (durationSeconds < 5 || durationSeconds > (fixedRounds && !foreground ? 60 : 10)) throw new Error(`--duration-seconds must be between 5 and ${fixedRounds && !foreground ? 60 : 10}.`)
 if (cadenceMS < 100 || cadenceMS > 2_000) throw new Error('--cadence-ms must be between 100 and 2000.')
@@ -288,7 +288,7 @@ try {
   const runtime = await runtimeMetadata(electron)
   presentationEvidence = presentation
   runtimeEvidence = runtime
-  await page.waitForSelector('input[aria-label="Search contracts"]', { timeout: 30_000 })
+  await page.waitForSelector('[data-market-count]', { timeout: 30_000 })
 
   let snapshot
   const qualificationDeadline = Date.now() + 120_000
@@ -382,13 +382,13 @@ try {
   const sampleWindow = await fixture.beginSample(fixedRounds ? { rounds: roundCount } : undefined)
   const sampleStartedAt = sampleWindow.startedAt
   await page.evaluate(installMarketTrafficRendererProbe, { requireForeground: foreground, passingIDs: [...qualifyingIDs] })
-  const search = page.locator('input[aria-label="Search contracts"]')
-  const searches = fixture.instIds.slice(0, passingCount).map(instId => instId.slice(0, 4))
   const interactionTask = (async () => {
-    const terms = [...searches, ''], startedAt = performance.now()
-    for (let index = 0; index < searchEventCount; index++) {
-      if (foreground) await sleep(Math.max(0, startedAt + index * searchScenario.lastInputAtMS / (searchEventCount - 1) - performance.now()))
-      await search.fill(terms[index % terms.length])
+    const startedAt = performance.now()
+    for (let index = 0; index < selectionEventCount; index++) {
+      if (foreground) await sleep(Math.max(0, startedAt + index * selectionScenario.lastInputAtMS / (selectionEventCount - 1) - performance.now()))
+      const rows = page.locator('[data-market-index]')
+      const count = await rows.count()
+      await rows.nth(index % Math.min(count, passingCount)).click()
       if (!foreground) await sleep(30)
     }
   })()
@@ -409,7 +409,7 @@ try {
     fixture: { asOf: fixture.asOf, candidateCount, passingCount, spreadFailureCount, oiFailureCount: fixture.oiFailureCount, seed: fixture.seed,
       candidateIDs: fixture.instIds,
       dataFingerprint: `market-traffic-v3-app-receipts-${candidateCount}-${passingCount}-${spreadFailureCount}-seed-${fixture.seed}`,
-      cadenceMS, durationSeconds, sampleStartedAt, expectOptimized, readiness, searchScenario,
+      cadenceMS, durationSeconds, sampleStartedAt, expectOptimized, readiness, selectionScenario,
       ...(fixedRounds ? { replay: { version: 'fixed-rounds-v1', expectedRounds: roundCount, actualRounds: traffic.rounds.length,
         timeSemantics: 'Live wall-clock timestamps; values use fixed round offsets. Runs crossing a 5-minute candle boundary are rejected; timestamps are not byte-identical.',
         fixtureSourceHash: createHash('sha256').update(await readFile(join(root, 'tests/helpers/market-traffic-exchange.mjs'))).digest('hex'),
@@ -426,7 +426,7 @@ try {
   let rendererCaptureError
   const renderer = await page.evaluate(() => globalThis.__marketTrafficResponsiveness.stop())
     .catch(error => { rendererCaptureError = error; return null })
-  failureMeasurements.renderer = renderer ? { ...renderer, measurement: searchMeasurement } : null
+  failureMeasurements.renderer = renderer ? { ...renderer, measurement: selectionMeasurement } : null
   if (rendererCaptureError) failureMeasurements.rendererCaptureError = rendererCaptureError.message
   const mainProcess = await electron.evaluate(() => globalThis.__mainLoopWitness.stop())
   mainLoopStarted = false
@@ -479,12 +479,12 @@ try {
     'Candidate output must remain correct throughout the sample.')
   assert.equal(outputMatchesLatest, true, 'Rendered passing tickers must match the latest fixture values.')
   assert.ok(renderer.frameCount >= durationSeconds * 15, 'Renderer RAF sampling is incomplete; reject disconnected/no-op runs.')
-  assert.ok(renderer.searchInputToSecondRAFMS.sampleCount >= passingCount, 'Renderer did not process all search interactions.')
-  assert.equal(renderer.searchInputToSecondRAFMS.sampleCount, searchEventCount, 'Renderer must complete the entire declared search schedule.')
-  if (foreground) assert.ok(renderer.searchInputToSecondRAFMS.samples.every(sample => sample.correct), 'Every timed input must render the expected filtered contract count.')
+  assert.ok(renderer.selectionToSecondRAFMS.sampleCount >= passingCount, 'Renderer did not process all selection interactions.')
+  assert.equal(renderer.selectionToSecondRAFMS.sampleCount, selectionEventCount, 'Renderer must complete the entire declared selection schedule.')
+  if (foreground) assert.ok(renderer.selectionToSecondRAFMS.samples.every(sample => sample.correct), 'Every timed input must render the expected selected contract.')
   if (expectOptimized) {
     assert.ok(renderer.rafOpportunityGapMS.p95 <= 50, `Optimized renderer RAF opportunity gap p95 exceeded 50ms: ${renderer.rafOpportunityGapMS.p95}`)
-    assert.ok(renderer.searchInputToSecondRAFMS.p95 <= 50, `Optimized input-to-second-RAF p95 exceeded 50ms: ${renderer.searchInputToSecondRAFMS.p95}`)
+    assert.ok(renderer.selectionToSecondRAFMS.p95 <= 50, `Optimized input-to-second-RAF p95 exceeded 50ms: ${renderer.selectionToSecondRAFMS.p95}`)
   }
   assert.deepEqual(fixture.errors, [], 'The fixture observed a production protocol or endpoint error during measurement.')
   const unsolicitedHTTP = fixture.requests.filter(request => !request.respondedAt || request.responsePayloadBytes <= 0)
@@ -531,7 +531,7 @@ try {
       qualification: { total: finalSnapshot.catalogProgress.total, completed: finalSnapshot.catalogProgress.completed,
         pending: finalSnapshot.catalogProgress.pending, verified: finalSnapshot.catalogProgress.verified,
         failed: finalSnapshot.catalogProgress.failed, unknown: finalSnapshot.catalogProgress.unknown },
-      requiredChannels, cadenceMS, durationSeconds, sampleStartedAt, expectOptimized, readiness, searchScenario,
+      requiredChannels, cadenceMS, durationSeconds, sampleStartedAt, expectOptimized, readiness, selectionScenario,
       ...(fixedRounds ? { replay: failureMeasurements.fixture.replay } : {}),
       readinessPhase: readiness ? 'all-passing-15m-frames-ready-before-steady-state-sample' : null },
     traffic: { durationSeconds: traffic.durationSeconds,
@@ -544,7 +544,7 @@ try {
       configuredDemand: appReceipts.marketDemand,
       fixtureRequests: fixture.requests.length,
       fixtureRequestDetails: fixtureRequestEvidence(fixture.requests) },
-    renderer: { ...renderer, measurement: searchMeasurement },
+    renderer: { ...renderer, measurement: selectionMeasurement },
     ...(resources ? { resources } : {}),
     mainProcess,
     correctness: { finalRealtimeState: finalSnapshot.realtimeState, connectedWebSocketClients: fixture.readyState.clients,

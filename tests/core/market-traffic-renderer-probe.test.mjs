@@ -3,7 +3,7 @@ import test from 'node:test'
 import { installMarketTrafficRendererProbe } from '../../scripts/market-traffic-renderer-probe.mjs'
 
 function browser({ observeLongFrames = true } = {}) {
-  let now = 10, nextFrame = 1, resultCount = 1
+  let now = 10, nextFrame = 1, selected = null
   const frames = new Map(), listeners = new Map(), windowListeners = new Map(), observers = []
   const events = store => ({
     addEventListener: (name, callback) => { store.set(name, callback) },
@@ -20,7 +20,7 @@ function browser({ observeLongFrames = true } = {}) {
   const host = {
     performance: { timeOrigin: 1793140680000, now: () => now },
     document: { ...events(listeners), visibilityState: 'visible', hasFocus: () => true,
-      querySelector: () => ({ getAttribute: () => String(resultCount) }) },
+      querySelector: () => selected ? ({ getAttribute: () => selected }) : null },
     window: events(windowListeners), PerformanceObserver: Observer,
     requestAnimationFrame: callback => { const id = nextFrame++; frames.set(id, callback); return id },
     cancelAnimationFrame: id => { frames.delete(id) },
@@ -34,9 +34,9 @@ function browser({ observeLongFrames = true } = {}) {
       frames.clear()
       for (const callback of callbacks) callback(timestampMS)
     },
-    input(term, count = 1) {
-      resultCount = count
-      listeners.get('input')({ target: { getAttribute: () => 'Search contracts', value: term } })
+    input(term) {
+      selected = term
+      listeners.get('click')({ target: { closest: () => ({ getAttribute: () => term }) } })
     },
   }
 }
@@ -62,8 +62,8 @@ test('formal renderer evidence preserves RAF timestamps separately from callback
   assert.deepEqual(report.rafOpportunityGapMS.samples, [16, 128])
   assert.equal(report.rafOpportunityGapMS.max, 128)
   assert.equal(report.frameCount, 2)
-  assert.deepEqual(report.searchInputToSecondRAFMS.samples, [{ term: 'T000', startedMS: 10, completedMS: 165,
-    durationMS: 155, expectedResultCount: 1, actualResultCount: 1, correct: true }])
+  assert.deepEqual(report.selectionToSecondRAFMS.samples, [{ expected: 'T000', actual: 'T000', startedMS: 10, completedMS: 165,
+    durationMS: 155, correct: true }])
   assert.equal(report.presentation.totalViolations, 0)
 })
 
@@ -95,7 +95,7 @@ test('stop drains queued LoAF timings, bounds them to the measured interval, and
   assert.equal(fixture.frames.size, 0)
   assert.equal(fixture.listeners.size, 0)
   assert.equal(fixture.windowListeners.size, 0)
-  assert.equal(report.searchInputToSecondRAFMS.sampleCount, 0)
+  assert.equal(report.selectionToSecondRAFMS.sampleCount, 0)
   fixture.frame(220, 220)
   assert.equal(report.rafTimeline.samples.length, 1)
   assert.equal(fixture.host.__marketTrafficResponsiveness.stop(), report)
@@ -106,12 +106,12 @@ test('unsupported LoAF observation does not change RAF or input acceptance evide
   const fixture = browser({ observeLongFrames: false })
   installMarketTrafficRendererProbe({ requireForeground: false, passingIDs: ['T000-USDT-SWAP'] }, fixture.host)
   fixture.setNow(11)
-  fixture.input('', 1)
+  fixture.input('T000')
   fixture.frame(16, 17)
   fixture.frame(32, 33)
   const report = fixture.host.__marketTrafficResponsiveness.stop()
   assert.deepEqual(report.longAnimationFrames, { supported: false, samples: [] })
-  assert.equal(report.searchInputToSecondRAFMS.sampleCount, 1)
-  assert.equal(report.searchInputToSecondRAFMS.samples[0].correct, true)
+  assert.equal(report.selectionToSecondRAFMS.sampleCount, 1)
+  assert.equal(report.selectionToSecondRAFMS.samples[0].correct, true)
   assert.equal(report.rafOpportunityGapMS.max, 16)
 })
