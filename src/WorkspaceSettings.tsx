@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { ChevronRight, Database, Settings2, SlidersHorizontal, Sparkles } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Database, Settings2, SlidersHorizontal, Sparkles } from 'lucide-react'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Field, FieldContent, FieldDescription, FieldError, FieldGroup, FieldLabel, FieldLegend, FieldSet } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
@@ -248,9 +248,8 @@ export function WorkspaceSettings({ section, preferences, loaded, loadError, onS
   const currentSection = SETTINGS_SECTIONS.find(value => value.id === section)!
   return <main aria-label="Settings" data-layout="settings-workspace" className="flex h-full min-w-0 flex-1 flex-col bg-background">
     <header data-window-toolbar data-window-drag-region className="flex border-b">
-      <div data-native-window-controls-row className="flex h-full w-[var(--market-list-width)] shrink-0 items-center gap-3 border-r px-4">
-        <h1 className="min-w-0 flex-1 truncate text-sm font-medium">Settings</h1>
-        <a href="#/" aria-label="Settings" title="Settings" className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}><Settings2 aria-hidden="true" /></a>
+      <div data-native-window-controls-row className="flex h-full w-64 shrink-0 items-center border-r px-4">
+        <h1><a href="#/" className={buttonVariants({ variant: 'ghost' })}><ChevronLeft aria-hidden="true" data-icon="inline-start" />Settings</a></h1>
       </div>
     </header>
     <div className="flex min-h-0 flex-1">

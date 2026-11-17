@@ -471,7 +471,6 @@ test('the existing chart toolbar provides window dragging while its controls rem
   await page.getByRole('status').filter({ hasText: 'Chart copied to clipboard' }).waitFor()
   const settingsLink = sidebar.getByRole('link', { name: 'Settings', exact: true })
   assert.equal(await settingsLink.evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'no-drag')
-  const settingsLinkBounds = await settingsLink.boundingBox()
   await settingsLink.click()
   const settings = settingsPage()
   await settings.waitFor({ state: 'visible' })
@@ -482,7 +481,26 @@ test('the existing chart toolbar provides window dragging while its controls rem
   }
   const returnLink = settings.getByRole('link', { name: 'Settings', exact: true })
   assert.equal(await returnLink.evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'no-drag')
-  assert.deepEqual(await returnLink.boundingBox(), settingsLinkBounds, 'The Settings toggle must keep the same position and hit area when returning to markets.')
+  assert.equal(await settings.locator('header a').count(), 1, 'The clickable title must be the only header navigation control.')
+  assert.equal(await settings.getByRole('heading', { name: 'Settings', level: 1, exact: true }).getByRole('link', { name: 'Settings', exact: true }).textContent(), 'Settings', 'The visible Settings title must itself return to markets.')
+  const viewport = page.viewportSize()
+  try {
+    for (const width of [1_200, 1_600, 2_000]) {
+      await page.setViewportSize({ width, height: 1_000 })
+      await page.waitForFunction(width => document.querySelector('[data-layout="market-workspace"]').getBoundingClientRect().width === width, width)
+      const geometry = await settings.evaluate(element => {
+        const headerColumn = element.querySelector('header > div')
+        const categories = element.querySelector('nav')
+        const title = element.querySelector('h1 a')
+        const top = headerColumn.getBoundingClientRect(), side = categories.getBoundingClientRect()
+        return { headerRight: top.right, sidebarRight: side.right, headerWidth: top.width, sidebarWidth: side.width,
+          titleLeft: title.getBoundingClientRect().left, contentLeft: top.left + parseFloat(getComputedStyle(headerColumn).paddingLeft) }
+      })
+      assert.equal(geometry.headerRight, geometry.sidebarRight, 'Settings header and categories dividers must align at every window width.')
+      assert.equal(geometry.headerWidth, geometry.sidebarWidth)
+      assert.equal(geometry.titleLeft, geometry.contentLeft, 'The back title must align left after the native window controls inset.')
+    }
+  } finally { if (viewport) await page.setViewportSize(viewport) }
   await backToMarkets()
 })
 
