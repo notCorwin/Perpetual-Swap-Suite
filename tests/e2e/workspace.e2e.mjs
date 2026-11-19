@@ -1465,14 +1465,21 @@ test('market status changes do not move the contract list', async () => {
     state.notify()
   }, values)
   const positions = async () => page.locator('[data-market-list]').evaluate(list => {
+    const toolbar = list.querySelector('[data-sidebar-toolbar]').getBoundingClientRect()
+    const scroll = list.querySelector('[data-market-scroll]').getBoundingClientRect()
     const header = list.querySelector('thead').getBoundingClientRect()
     const row = list.querySelector('[data-market-index]').getBoundingClientRect()
-    return { header: header.top, row: row.top }
+    const footer = list.querySelector('[data-market-status-row]').getBoundingClientRect()
+    return { toolbarBottom: toolbar.bottom, header: header.top, row: row.top,
+      scrollBottom: scroll.bottom, footerTop: footer.top, footerBottom: footer.bottom, listBottom: list.getBoundingClientRect().bottom }
   })
   try {
     await publish({ rows: await electron.evaluate(() => globalThis.__workspaceFixture.initialRows), loading: false, error: '', realtimeState: 'live', catalogSource: 'live', catalogProgress: undefined })
     await page.waitForFunction(() => document.querySelector('[data-market-status]')?.textContent.startsWith('Updated '))
     const baseline = await positions()
+    assert.ok(Math.abs(baseline.header - baseline.toolbarBottom) < 1, 'The table starts directly below the toolbar.')
+    assert.equal(baseline.footerTop, baseline.scrollBottom, 'The status footer follows the scrolling list.')
+    assert.equal(baseline.footerBottom, baseline.listBottom, 'The status footer stays at the bottom of the sidebar.')
     for (const [index, pending] of [1, 4, 0, 3, 0].entries()) {
       const updatedAt = 1_800_000_000_000 + (index + 1) * 60_000
       await publish({ updatedAt, loading: pending > 0, catalogProgress: { total: 4, completed: 4, verified: 4, failed: 0, unknown: 0, pending } })
@@ -1519,14 +1526,14 @@ test('long market errors remain fully visible when the list is empty', async () 
       await page.setViewportSize({ width, height: 1000 })
       const bounds = await status.evaluate(element => {
         const rect = element.getBoundingClientRect(), parent = element.parentElement.getBoundingClientRect()
-        const table = document.querySelector('[data-market-list] thead').getBoundingClientRect()
+        const table = document.querySelector('[data-market-scroll]').getBoundingClientRect()
         return { width: element.clientWidth, scrollWidth: element.scrollWidth, height: element.clientHeight,
           scrollHeight: element.scrollHeight, lineHeight: parseFloat(getComputedStyle(element).lineHeight),
-          top: rect.top, bottom: rect.bottom, parentBottom: parent.bottom, tableTop: table.top }
+          top: rect.top, bottom: rect.bottom, parentBottom: parent.bottom, tableBottom: table.bottom }
       })
       assert.ok(bounds.height > bounds.lineHeight, `The long error must wrap at width ${width}.`)
       assert.ok(bounds.scrollWidth <= bounds.width && bounds.scrollHeight <= bounds.height, `The error must not be clipped: ${JSON.stringify(bounds)}`)
-      assert.ok(bounds.bottom <= bounds.parentBottom && bounds.bottom < bounds.tableTop, `The error must remain above the table: ${JSON.stringify(bounds)}`)
+      assert.ok(bounds.top >= bounds.tableBottom && bounds.bottom <= bounds.parentBottom, `The error must fit in the footer: ${JSON.stringify(bounds)}`)
       if (process.env.PERPETUAL_SWAP_UI_SCREENSHOTS) await page.locator('[data-market-list]').screenshot({ path: join(process.env.PERPETUAL_SWAP_UI_SCREENSHOTS, `market-error-${width}.png`) })
     }
   } finally {
@@ -1946,7 +1953,7 @@ test('compact workspaces preserve complete market prices and keep overflowing ch
   }
 })
 
-test('compact density reserves at least eighty percent of each stacked chart for price geometry', async () => {
+test('compact density reserves at least eighty-five percent of each stacked chart for price geometry', async () => {
   const previousSize = page.viewportSize(), folder = process.env.PERPETUAL_SWAP_DENSITY_SCREENSHOTS
   const baseline = process.env.PERPETUAL_SWAP_DENSITY_STAGE === 'before'
   try {
@@ -1966,18 +1973,32 @@ test('compact density reserves at least eighty percent of each stacked chart for
         charts: [...document.querySelectorAll('[data-chart-workspace]')].map(chart => {
           const svg = chart.querySelector('svg[data-rendered-inst]'), clip = svg.querySelector('clipPath[id$="-price"] rect')
           const height = chart.getBoundingClientRect().height
-          const priceHeight = Number(clip.getAttribute('height')) * svg.getBoundingClientRect().height / svg.viewBox.baseVal.height
-          return { height, priceHeight, ratio: priceHeight / height, bars: Number(chart.querySelector('[data-chart-inst]').dataset.chartRenderedBars), fontSize: getComputedStyle(svg).fontSize }
+          const svgBounds = svg.getBoundingClientRect()
+          const priceHeight = Number(clip.getAttribute('height')) * svgBounds.height / svg.viewBox.baseVal.height
+          const ticks = [...svg.querySelectorAll('[data-chart-price-tick] > text')]
+          const clippedTicks = ticks.map(tick => {
+            const bounds = tick.getBoundingClientRect()
+            return { text: tick.textContent, overflow: {
+              top: Math.max(0, svgBounds.top - bounds.top), bottom: Math.max(0, bounds.bottom - svgBounds.bottom),
+              left: Math.max(0, svgBounds.left - bounds.left), right: Math.max(0, bounds.right - svgBounds.right),
+            } }
+          }).filter(tick => Object.values(tick.overflow).some(pixels => pixels > 0.5))
+          return { height, priceHeight, ratio: priceHeight / height, bars: Number(chart.querySelector('[data-chart-inst]').dataset.chartRenderedBars),
+            fontSize: getComputedStyle(svg).fontSize, ticks: ticks.length, clippedTicks }
         }) }))
       readings.push(reading)
       if (!baseline) {
         assert.ok(reading.sidebar <= 320)
         assert.ok(reading.rowHeight >= 28 && reading.rowHeight <= 30)
         assert.equal(reading.fontSize, '11px')
-        assert.ok(reading.charts.every(chart => chart.ratio >= .80), JSON.stringify(reading))
+        assert.ok(reading.charts.every(chart => chart.ratio >= .85), JSON.stringify(reading))
+        assert.ok(reading.charts.every(chart => chart.ticks > 0 && chart.clippedTicks.length === 0), JSON.stringify(reading))
       }
       if (!baseline) {
         assert.equal(await page.locator('[data-shared-chart-title]').count(), 1)
+        assert.deepEqual(await page.locator('[data-chart-legend]').evaluateAll(swatches => swatches.map(swatch => swatch.dataset.chartLegend)), ['VWAP(14)', 'BOLL(20,2)'])
+        assert.equal(await page.locator('[data-chart-price-scale="relative"]').count(), 1)
+        assert.equal(await page.locator('[data-chart-panel-header]').count(), 0)
         const chart = page.locator('[data-chart-workspace]').first()
         assert.deepEqual(await page.locator('[data-chart-title]').allTextContents(), ['BETA-USDT', '1h', '15m', '5m'])
         assert.equal(await chart.locator('[data-chart-inspection-readout]').isVisible(), false)
@@ -1992,6 +2013,7 @@ test('compact density reserves at least eighty percent of each stacked chart for
         await page.mouse.move(plot.x + plot.width / 2, plot.y + plot.height / 2)
         await page.mouse.down()
         await chart.locator('[data-chart-inspection-readout]').waitFor({ state: 'visible' })
+        assert.deepEqual(await chart.locator('[data-chart-plot]').boundingBox(), plot)
         assert.equal(await chart.locator('[data-chart-legend-value]').count(), 2)
         const expected = await chart.locator('[data-chart-inst]').evaluate(element => {
           const hour = Number(element.querySelector('[data-chart-inspected-hour]').dataset.chartInspectedHour)
@@ -1999,7 +2021,7 @@ test('compact density reserves at least eighty percent of each stacked chart for
           return { close: bar.close, vwap: new Intl.NumberFormat('en-US', { maximumSignificantDigits: 6 }).format(bar.vwap) }
         })
         assert.equal(Number(await chart.locator('[data-chart-ohlc="close"] span[title]').textContent()), expected.close)
-        assert.equal(await chart.locator('[data-chart-legend="VWAP(14)"]').locator('..').locator('[data-chart-legend-value]').textContent(), expected.vwap)
+        assert.equal(await chart.locator('[data-chart-inspection-indicator="VWAP(14)"] [data-chart-legend-value]').textContent(), expected.vwap)
         await page.mouse.up()
         await chart.locator('[data-chart-inspection-readout]').waitFor({ state: 'hidden' })
       }

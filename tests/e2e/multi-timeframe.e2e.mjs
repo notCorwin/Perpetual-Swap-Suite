@@ -46,7 +46,9 @@ test('default multi-timeframe charts share native prices, isolate history and re
           && chart.querySelector('svg[data-rendered-inst]')?.getAttribute('data-rendered-inst') === instId)
       }, instId, { timeout: 30_000 })
       assert.deepEqual(await page.locator('svg[data-rendered-inst]').evaluateAll(svgs => svgs.map(svg => svg.dataset.renderedTimeframe)), frames)
-      assert.equal(await page.locator('[data-chart-panel-header]:not([data-chart-panel-header="price"])').count(), 0)
+      assert.equal(await page.locator('[data-chart-panel-header]').count(), 0)
+      assert.deepEqual(await page.locator('[data-shared-chart-legend] [data-chart-legend]').evaluateAll(swatches => swatches.map(swatch => swatch.dataset.chartLegend)), ['VWAP(14)', 'BOLL(20,2)'])
+      assert.equal(await page.locator('[data-chart-price-scale="relative"]').count(), 1)
       assert.equal(await page.locator('[data-chart-indicator="rsi6"]').count(), 0)
       assert.equal(await page.locator('[data-chart-indicator="ema"], [data-chart-legend="EMA(200)"]').count(), 0)
       for (const field of ['vwap', 'bollUpper', 'bollMiddle', 'bollLower']) assert.equal(await page.locator(`[data-chart-indicator="${field}"]`).count(), 3)
@@ -55,20 +57,35 @@ test('default multi-timeframe charts share native prices, isolate history and re
       assert.ok(positions[0].top < positions[1].top && positions[1].top < positions[2].top)
     }
     const live = async (instId, close, volume) => {
-      await exchange.waitForSubscription(instId, 'candle5m')
+      await Promise.all(['candle5m', 'tickers'].map(channel => exchange.waitForSubscription(instId, channel)))
       exchange.sendTicker(instId, close)
       const event = exchange.sendCandle(instId, '5m', { close, volume })
-      await page.waitForFunction(({ instId, close, sentAt }) => [...document.querySelectorAll('[data-chart-inst]')].every(chart => {
-        const snapshot = chart.__chartSnapshot
-        const label = chart.querySelector('[data-chart-price-label-value]')?.textContent ?? ''
-        return snapshot?.instId === instId && snapshot.liveBar?.close === close && snapshot.priceObservedAt >= sentAt
-          && window.__chartPriceLabel(label) === close
-      }), { instId, close, sentAt: event.sentAt }, { timeout: 15_000 })
+      await page.waitForFunction(({ instId, close, sentAt }) => {
+        const quote = document.querySelector('[data-shared-chart-price]')?.textContent
+        const charts = [...document.querySelectorAll('[data-chart-inst]')]
+        return Number(quote?.replaceAll(',', '')) === close && charts.length === 3 && charts.every(chart => {
+          const snapshot = chart.__chartSnapshot
+          const svg = chart.querySelector('svg[data-rendered-inst]')
+          const firstOpen = snapshot?.bars.find(bar => bar.hour === Number(svg?.dataset.renderedStart))?.open
+          const label = svg?.querySelector('[data-chart-price-label-value]')?.textContent ?? ''
+          const percent = /^([+-]?[\d,]+(?:\.\d+)?)% [↑↓]$/.exec(label)?.[1]
+          return snapshot?.instId === instId && snapshot.liveBar?.close === close && snapshot.priceObservedAt >= sentAt
+            && percent !== undefined && Math.abs(Number(percent.replaceAll(',', '')) - (close / firstOpen - 1) * 100) < 0.005001
+            && svg.querySelector('[data-chart-countdown]')
+        })
+      }, { instId, close, sentAt: event.sentAt }, { timeout: 15_000 })
     }
     console.log('multiframe: history released')
     await ready(btc)
     console.log('multiframe: three ready')
     await live(btc, 139.25, 20)
+    exchange.sendTicker(btc, 138.75)
+    await page.waitForFunction(() => {
+      const charts = [...document.querySelectorAll('[data-chart-inst]')]
+      return Number(document.querySelector('[data-shared-chart-price]')?.textContent) === 138.75 && charts.length === 3
+        && charts.every(chart => window.__chartPriceLabel(chart.querySelector('[data-chart-price-label-value]')?.textContent) === 139.25
+          && chart.querySelector('[data-chart-countdown]'))
+    })
     await live(btc, 140.5, 30)
     // Each chart owns its own cursor; scrolling 15m must leave the other two live.
     const before = await page.locator('[data-chart-inst]').evaluateAll(charts => charts.map(chart => chart.__chartSnapshot.endHour))
@@ -77,7 +94,13 @@ test('default multi-timeframe charts share native prices, isolate history and re
       const charts = [...document.querySelectorAll('[data-chart-inst]')]
       return charts[1].__chartSnapshot.endHour < before[1] && charts[0].__chartSnapshot.endHour === before[0] && charts[2].__chartSnapshot.endHour === before[2]
     }, before)
-    await page.waitForFunction(() => document.querySelectorAll('[data-chart-inst]')[1]?.dataset.chartLoading === 'false')
+    await page.waitForFunction(() => {
+      const chart = document.querySelectorAll('[data-chart-inst]')[1], svg = chart.querySelector('svg[data-rendered-inst]')
+      const last = chart.__chartSnapshot?.bars.find(bar => bar.hour === Number(svg?.dataset.renderedEnd))
+      const label = svg?.querySelector('[data-chart-price-label-value]')?.textContent
+      return chart.dataset.chartLoading === 'false' && last?.confirmed && window.__chartPriceLabel(label) === last.close
+        && !svg.querySelector('[data-chart-countdown]')
+    })
     await page.waitForTimeout(1000)
     // A partial wheel gesture moves existing paths; the path nodes and their
     // market-data geometry remain untouched until the viewport changes.

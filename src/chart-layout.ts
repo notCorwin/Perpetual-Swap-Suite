@@ -52,22 +52,24 @@ export function chartPanelClip(layout: ReturnType<typeof chartLayout>, panel: Ch
   }
 }
 
-export type ChartLayoutDensity = { top: number; headerHeight: number; rowGap: number; bottomAxis: number; headerBaseline: number }
-const compactChartDensity: ChartLayoutDensity = { top: 2, headerHeight: 18, rowGap: 2, bottomAxis: 16, headerBaseline: 11 }
+export type ChartLayoutDensity = { top: number; priceOnlyTop: number; headerHeight: number; rowGap: number; bottomAxis: number; headerBaseline: number }
+const compactChartDensity: ChartLayoutDensity = { top: 2, priceOnlyTop: 9, headerHeight: 18, rowGap: 2, bottomAxis: 16, headerBaseline: 11 }
 
 export function chartLayout(width: number, height: number, labelGutter = 64, priceOnly = false, density: ChartLayoutDensity = compactChartDensity) {
   const rightMargin = 4
-  const { top, headerHeight, rowGap, bottomAxis, headerBaseline } = density
+  const { headerHeight, rowGap, bottomAxis, headerBaseline } = density
+  const top = priceOnly ? density.priceOnlyTop : density.top
   const right = width - rightMargin - labelGutter, column: Range = [0, right]
   const order: readonly ChartPanel[] = priceOnly ? ['price'] : CHART_PANELS
-  const availableHeight = Math.max(1, height - top - bottomAxis - headerHeight * order.length - rowGap * (order.length - 1))
+  const panelHeaderHeight = priceOnly ? 0 : headerHeight
+  const availableHeight = Math.max(1, height - top - bottomAxis - panelHeaderHeight * order.length - rowGap * (order.length - 1))
   const weights: Record<ChartPanel, number> = { price: 0.4, roc: 0.12, rsi: 0.12, atr: 0.12, oi: 0.12, taker: 0.12 }
   const panels = {} as Record<ChartPanel, Range>
   const headerY = {} as Record<ChartPanel, number>
   let cursor = top
   for (const key of order) {
-    headerY[key] = cursor + headerBaseline
-    cursor += headerHeight
+    headerY[key] = cursor + (priceOnly ? 0 : headerBaseline)
+    cursor += panelHeaderHeight
     panels[key] = [cursor, cursor + availableHeight * (priceOnly ? 1 : weights[key])]
     cursor = panels[key][1] + rowGap
   }

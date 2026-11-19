@@ -250,13 +250,18 @@ export function chartPricePresentation(geometry: ChartGeometry, contentOffset: n
   const step = base !== null && geometryBase !== null ? geometry.priceAxis.step * geometryBase / base : 1
   const decimals = Math.max(2, Math.min(20, -Math.floor(Math.log10(step)) + 1))
   const formatter = axisFormatter(decimals)
+  const formatChange = (raw: number) => {
+    if (base === null) return null
+    const change = (raw / base - 1) * 100
+    if (!finite(change)) return null
+    const rounded = Math.abs(change) < 0.5 * 10 ** -decimals ? 0 : change
+    return `${rounded > 0 ? '+' : ''}${formatter.format(rounded)}%`
+  }
   const ticks = !includeTicks || base === null || geometryBase === null ? [] : geometry.priceAxis.ticks.map((value, index) => {
     const raw = geometryBase * (1 + value / 100)
-    const change = (raw / base - 1) * 100
-    const rounded = Math.abs(change) < 0.5 * 10 ** -decimals ? 0 : change
-    return { y: geometry.priceTicks[index].y, label: `${rounded > 0 ? '+' : ''}${formatter.format(rounded)}%` }
+    return { y: geometry.priceTicks[index].y, label: formatChange(raw) ?? '—' }
   })
-  return { base, geometryBase, ticks }
+  return { base, geometryBase, ticks, formatChange }
 }
 
 /** Weak ownership follows immutable chart windows. A separate LRU also caps

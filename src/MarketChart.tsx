@@ -50,7 +50,7 @@ const chartLengths = readDesignLengths({
   '--chart-text-size': 10, '--chart-legend-gap': 16, '--space-4': 12,
   '--space-annotation-small': 8, '--space-annotation-xs': 4,
   '--space-annotation-symbol': 18, '--space-annotation-label': 26, '--space-annotation-value': 10,
-  '--chart-price-label-padding-y': 3, '--chart-top-inset': 2,
+  '--chart-price-label-padding-y': 3, '--chart-top-inset': 2, '--chart-price-top-inset': 9,
   '--chart-panel-header-height': 18, '--chart-row-gap': 2,
   '--chart-bottom-axis-height': 16, '--chart-panel-header-baseline': 11,
 })
@@ -66,6 +66,23 @@ const chartTokens = {
   legendValue: chartTokenNumber('--space-annotation-value'),
   priceLabelPaddingY: chartTokenNumber('--chart-price-label-padding-y'),
 } as const
+const vwapOverlay = { label: 'VWAP(14)', color: 'var(--chart-2)', dash: '2 3',
+  value: (bar: Bar, compact?: boolean) => formatIndicatorPrice(bar.vwap, compact) }
+const bollOverlay = { label: 'BOLL(20,2)', color: 'var(--chart-1)', dash: undefined,
+  value: (bar: Bar, compact?: boolean) => `U ${formatIndicatorPrice(bar.bollUpper, compact)}\u00a0·\u00a0M ${formatIndicatorPrice(bar.bollMiddle, compact)}\u00a0·\u00a0L ${formatIndicatorPrice(bar.bollLower, compact)}` }
+const priceOverlays = [vwapOverlay, bollOverlay]
+
+export function MultiChartLegend() {
+  return <div data-shared-chart-legend role="group" aria-label="Price overlays" className="flex items-center gap-4 whitespace-nowrap text-xs text-muted-foreground">
+    {priceOverlays.map(({ label, color, dash }) => <span key={label} className="inline-flex items-center gap-2">
+      <svg aria-hidden="true" width={chartTokens.legendSymbol} height="1" strokeWidth="var(--chart-line-width)">
+        <line data-chart-legend={label} y1=".5" y2=".5" x2={chartTokens.legendSymbol} stroke={color} strokeDasharray={dash} />
+      </svg>
+      {label}
+    </span>)}
+  </div>
+}
+
 const legendContext = document.createElement("canvas").getContext("2d")
 const chartTextWidths = new Map<string, number>()
 const chartTextWidth = (text: string, fontSize: number = chartTokens.textSize) => {
@@ -102,6 +119,7 @@ const sourceStatusText = (label: string, state: PreparedChartState, status?: Cha
 }
 const chartPlot = createChartPlotCache(legendWidth, {
   top: chartTokenNumber('--chart-top-inset'),
+  priceOnlyTop: chartTokenNumber('--chart-price-top-inset'),
   headerHeight: chartTokenNumber('--chart-panel-header-height'),
   rowGap: chartTokenNumber('--chart-row-gap'),
   bottomAxis: chartTokenNumber('--chart-bottom-axis-height'),
@@ -139,10 +157,10 @@ const PlotPaths = memo(function PlotPaths({ bars, geometry, areaClipId, oiState,
       <path d={sells} fill={`url(#${areaClipId}-sell-hatch)`} opacity="0.7" />
     </g>}
     <g clipPath={`url(#${areaClipId}-price)`} visibility={priceVisible ? "visible" : "hidden"}>
-    {lineStroke("bollUpper", lines.bollUpper, "var(--chart-1)")}
-    {lineStroke("bollMiddle", lines.bollMiddle, "var(--chart-1)")}
-    {lineStroke("bollLower", lines.bollLower, "var(--chart-1)")}
-    {lineStroke("vwap", lines.vwap, "var(--chart-2)", "2 3")}
+    {lineStroke('bollUpper', lines.bollUpper, bollOverlay.color)}
+    {lineStroke('bollMiddle', lines.bollMiddle, bollOverlay.color)}
+    {lineStroke('bollLower', lines.bollLower, bollOverlay.color)}
+    {lineStroke('vwap', lines.vwap, vwapOverlay.color, vwapOverlay.dash)}
     </g>
     {!geometry.priceOnly && <g clipPath={`url(#${areaClipId}-rsi)`}>
     {lineStroke("rsi6", lines.rsi6, "var(--chart-1)")}
@@ -167,14 +185,14 @@ const PlotPaths = memo(function PlotPaths({ bars, geometry, areaClipId, oiState,
   </>)
 })
 
-export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = false, inspected, inspectedBar, contentOffset = 0, oiState = 'ready', takerState = 'ready', oiStatus, takerStatus }: { bars: readonly Bar[]; geometry: ChartGeometry; liveBar: Bar; liveOverlay?: boolean; inspected: number | null; inspectedBar?: Bar; contentOffset?: number; oiState?: PreparedChartState; takerState?: PreparedChartState; oiStatus?: ChartSourceStatus; takerStatus?: ChartSourceStatus }) {
+export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = false, usesSharedPrice = false, inspected, inspectedBar, contentOffset = 0, oiState = 'ready', takerState = 'ready', oiStatus, takerStatus }: { bars: readonly Bar[]; geometry: ChartGeometry; liveBar: Bar; liveOverlay?: boolean; usesSharedPrice?: boolean; inspected: number | null; inspectedBar?: Bar; contentOffset?: number; oiState?: PreparedChartState; takerState?: PreparedChartState; oiStatus?: ChartSourceStatus; takerStatus?: ChartSourceStatus }) {
   const areaClipId = useId().replaceAll(":", "")
   return measureOperation({ category: 'cpu', name: 'chart.svg.construct', attributes: { candles: bars.length, inspected: inspected !== null } }, () => {
   const presentation = chartPricePresentation(geometry, contentOffset)
   const n = bars.length
   const inspecting = inspected !== null || inspectedBar !== undefined
   const active = inspectedBar ?? bars[inspected ?? n - 1]
-  const statistics = inspectedBar ? chartStatisticsSamples([inspectedBar], 0) : chartStatisticsSamples(bars, inspected)
+  const statistics = geometry.priceOnly ? null : inspectedBar ? chartStatisticsSamples([inspectedBar], 0) : chartStatisticsSamples(bars, inspected)
   const { height, endHour, intervalMS, gutter, x, firstHour, candleHigh, candleLow, highIndex, lowIndex,
     rocAxis, oiAxis,
     priceY, rsiY, rocZeroY, rocAreas, bollBands, rsiMarkers } = geometry
@@ -184,7 +202,8 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
   const tag = { price: liveBar.close, rising: liveBar.close >= liveBar.open, inViewport: presentation.base !== null && geometry.priceAxis.base !== null && Number.isFinite(liveBar.close) && liveBar.hour <= endHour + (liveOverlay ? intervalMS : 0) }
   const latestY = tag.inViewport ? priceY(tag.price) : panels.price[0]
   const latestColor = tag.rising ? "var(--positive)" : "var(--negative)"
-  const latestPrice = `Price ${formatCurrentPrice(tag.price, geometry.currentPriceTickSz)} ${tag.rising ? '↑' : '↓'}`
+  const change = usesSharedPrice ? presentation.formatChange(tag.price) : null
+  const latestPrice = `${change ?? `Price ${formatCurrentPrice(tag.price, geometry.currentPriceTickSz)}`} ${tag.rising ? '↑' : '↓'}`
   const priceLabel = chartPriceLabelLayout(latestY, panels.price, chartTokens.textSize, chartTokens.priceLabelPaddingY, liveOverlay)
   const tickHalfHeight = chartTokens.textSize / 2
   const inspectionX = x[0] + (active.hour - bars[0].hour) / intervalMS * geometry.barPitch
@@ -201,12 +220,10 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
   const grid = panelKeys.flatMap(key => panels[key].map((y, index) =>
     <line key={`${key}-${index}`} x1={columns[key][0]} x2={columns[key][1]} y1={y} y2={y} stroke="var(--border)" opacity={index ? 0.32 : 0.55} />))
   const legend = (key: Panel, items: [string, string, string, string?, number?][]) => {
-    if (geometry.priceOnly && key !== 'price') return null
     const gap = chartTokens.legendGap
     const start = columns[key][0] + gap / 2
     const contexts = items.map(([, , , , sourceHour]) => sourceHour !== undefined && sourceHour !== active.hour ? ` · as of ${time(sourceHour)}` : '')
-    const showValues = !geometry.priceOnly || inspecting
-    const widths = items.map(([label, value], index) => chartTokens.legendLabel + legendWidth(label) + (showValues ? chartTokens.legendValue + legendWidth(value) + legendWidth(contexts[index]) : 0))
+    const widths = items.map(([label, value], index) => chartTokens.legendLabel + legendWidth(label) + chartTokens.legendValue + legendWidth(value) + legendWidth(contexts[index]))
     const available = right - start
     const required = widths.reduce((sum, itemWidth) => sum + itemWidth, 0) + gap * (items.length - 1)
     const shrink = Math.min(1, available / required)
@@ -219,12 +236,12 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
         cursor += widths[index] + gap
         const labelColor = key === "rsi" ? "var(--muted-foreground)" : key === "taker" ? index === 0 ? "var(--chart-positive-label)" : "var(--chart-negative-label)" : color
         return <g key={label} transform={`translate(${itemStart},0)`} data-chart-legend-source-hour={sourceHour}>
-        <title>{label} {geometry.priceOnly && key === 'price' ? label === 'VWAP(14)' ? formatIndicatorPrice(active.vwap) : `U ${formatIndicatorPrice(active.bollUpper)} · M ${formatIndicatorPrice(active.bollMiddle)} · L ${formatIndicatorPrice(active.bollLower)}` : value}{contexts[index]}</title>
+        <title>{label} {value}{contexts[index]}</title>
         {key === "taker" && !dash && <line data-chart-legend-outline={label} x1="0" x2={chartTokens.legendSymbol} stroke="var(--foreground)" />}
         <line data-chart-legend={label} x1="0" x2={chartTokens.legendSymbol} stroke={color} strokeDasharray={key === "taker" && !dash ? "2 3" : dash} />
-        <text x={chartTokens.legendLabel} dominantBaseline="middle" fill={geometry.priceOnly && !inspecting ? "var(--muted-foreground)" : labelColor}>{label}</text>
-        {showValues && <text data-chart-legend-value x={chartTokens.legendLabel + legendWidth(label) + chartTokens.legendValue} dominantBaseline="middle" fill="var(--foreground)">{value}</text>}
-        {showValues && contexts[index] && <text data-chart-legend-source-context x={chartTokens.legendLabel + legendWidth(label) + chartTokens.legendValue + legendWidth(value)} dominantBaseline="middle" fill="var(--muted-foreground)">{contexts[index]}</text>}
+        <text x={chartTokens.legendLabel} dominantBaseline="middle" fill={labelColor}>{label}</text>
+        <text data-chart-legend-value x={chartTokens.legendLabel + legendWidth(label) + chartTokens.legendValue} dominantBaseline="middle" fill="var(--foreground)">{value}</text>
+        {contexts[index] && <text data-chart-legend-source-context x={chartTokens.legendLabel + legendWidth(label) + chartTokens.legendValue + legendWidth(value)} dominantBaseline="middle" fill="var(--muted-foreground)">{contexts[index]}</text>}
         </g>
       })}
       </g>
@@ -284,16 +301,19 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
       </g>
     </g>
     {tag.inViewport && <g data-chart-price-label>
+      {change !== null && <title>{`Change from first visible open ${change} · Forming candle ${tag.rising ? 'at or above' : 'below'} its open`}</title>}
       <rect data-chart-price-label-background x={right} y={priceLabel.top} width={gutter} height={priceLabel.bottom - priceLabel.top} fill="var(--chart-annotation)" />
-      <text data-chart-price-label-value x={axisStarts.price} y={latestY} dominantBaseline="middle" fill="var(--foreground)">{latestPrice}</text>
+      <text data-chart-price-label-value x={axisStarts.price} y={latestY} dominantBaseline="middle" fill="var(--foreground)" textLength={change !== null && chartTextWidth(latestPrice) > gutter - chartTokens.annotationPadding ? Math.max(1, gutter - chartTokens.annotationPadding) : undefined} lengthAdjust={change !== null ? 'spacingAndGlyphs' : undefined}>{latestPrice}</text>
       {priceLabel.countdownY !== null && <PriceCountdown hour={liveBar.hour} intervalMS={intervalMS} x={axisStarts.price} y={priceLabel.countdownY} />}
     </g>}
-    {legend("price", [["VWAP(14)", formatIndicatorPrice(active.vwap, geometry.priceOnly), "var(--chart-2)", "2 3"], ["BOLL(20,2)", `U ${formatIndicatorPrice(active.bollUpper, geometry.priceOnly)}\u00a0·\u00a0M ${formatIndicatorPrice(active.bollMiddle, geometry.priceOnly)}\u00a0·\u00a0L ${formatIndicatorPrice(active.bollLower, geometry.priceOnly)}`, "var(--chart-1)"]])}
+    {statistics && <>
+    {legend("price", priceOverlays.map(({ label, value, color, dash }) => [label, value(active), color, dash]))}
     {legend("roc", [["ROC(9)", formatPercent(active.roc), "var(--chart-1)"], ["MAROC(9)", formatPercent(active.maroc), "var(--chart-2)", "7 4"]])}
     {legend("rsi", [["RSI(6)", rsiValue('rsi6'), "var(--chart-1)"], ["RSI(12)", rsiValue('rsi12'), "var(--chart-2)", "7 4"], ["RSI(24)", rsiValue('rsi24'), "var(--chart-3)", "3 4"]])}
     {legend("atr", [["ATR%(14)", chartPercent(active.atrPercent), "var(--chart-3)"], ["BBW(20,2)", chartPercent(active.bbw), "var(--chart-1)", "7 4"]])}
     {legend("oi", [["OI (Contracts)", statistics.oi ? compact(statistics.oi.oi) : oiState === "loading" ? "Loading…" : oiState === "error" ? "Failed" : "Unavailable", "var(--chart-2)", undefined, statistics.oi?.hour]])}
     {legend("taker", [["↑ Taker Buy (Contracts)", statistics.taker ? compact(statistics.taker.buy) : takerState === "loading" ? "Loading…" : takerState === "error" ? "Failed" : "Unavailable", "var(--positive)", undefined, statistics.taker?.hour], ["↓ Taker Sell (Contracts)", statistics.taker ? compact(statistics.taker.sell) : takerState === "loading" ? "Loading…" : takerState === "error" ? "Failed" : "Unavailable", "var(--negative)", "2 3", statistics.taker?.hour]])}
+    </>}
     {!geometry.priceOnly && [30, 70].map(level => <g key={level} data-chart-rsi-tick={level}>{lineLabel(axisStarts.rsi, rsiY(level), String(level), 'var(--foreground)')}</g>)}
     {panels.rsi[1] - panels.rsi[0] >= chartTokens.textSize * 6 && <>{lineLabel(axisStarts.rsi, rsiY(100), '100')}{lineLabel(axisStarts.rsi, rsiY(50), '50')}{lineLabel(axisStarts.rsi, rsiY(0), '0')}</>}
     {panels.roc[1] - panels.roc[0] >= 35 && <>{lineLabel(axisStarts.roc, panels.roc[0], formatPercent(rocAxis.max, rocAxis.decimals))}{lineLabel(axisStarts.roc, panels.roc[1], formatPercent(rocAxis.min, rocAxis.decimals))}</>}
@@ -311,10 +331,10 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
 type PlotSize = { width: number; height: number }
 
 const ChartSurface = memo(function ChartSurface({ instId, timeframe, hasCompletedBars, priceState, indicatorState, oiState, takerState, oiStatus, takerStatus,
-  liveBar, plot, size, selected, visible, inspected, inspectedBar, wheelFraction, readoutId }: {
+  liveBar, usesSharedPrice, plot, size, selected, visible, inspected, inspectedBar, wheelFraction, readoutId }: {
   instId: string; timeframe: RadarTimeframe; hasCompletedBars: boolean; priceState?: PreparedChartState; indicatorState: PreparedChartState
   oiState: PreparedChartState; takerState: PreparedChartState; oiStatus?: ChartSourceStatus; takerStatus?: ChartSourceStatus
-  liveBar?: Bar; plot: NonNullable<ReturnType<typeof chartPlot>>; size: PlotSize; selected: boolean; visible: boolean; inspected: number | null
+  liveBar?: Bar; usesSharedPrice: boolean; plot: NonNullable<ReturnType<typeof chartPlot>>; size: PlotSize; selected: boolean; visible: boolean; inspected: number | null
   inspectedBar?: Bar; wheelFraction: number; readoutId: string
 }) {
   const ready = Boolean(hasCompletedBars && (priceState === 'ready' || priceState === 'stale')
@@ -333,13 +353,13 @@ const ChartSurface = memo(function ChartSurface({ instId, timeframe, hasComplete
       className={cn('absolute inset-0 h-full w-full font-mono text-[length:var(--chart-text-size)] select-none outline-none', !selected && 'pointer-events-none')}
       role="img" tabIndex={selected ? 0 : -1} aria-describedby={readoutId}
       aria-label={`${instId} ${bars.length}-candle ${timeframeLabel(timeframe)} chart. Hold the primary mouse button to inspect a candle, drag to inspect others, and release to return to the window end.${geometry.priceOnly ? '' : ' Hover RSI crossing triangles to inspect their candle and time. Alt+Left and Alt+Right inspect RSI crossings;'} Escape clears inspection. Scroll to review history. Pinch the trackpad to zoom around the pointer. Arrow keys navigate markets.`}>
-      <Plot bars={bars} geometry={geometry} liveBar={liveBar ?? bars.at(-1)!} liveOverlay={!!liveBar} contentOffset={contentOffset}
+      <Plot bars={bars} geometry={geometry} liveBar={liveBar ?? bars.at(-1)!} liveOverlay={!!liveBar} usesSharedPrice={usesSharedPrice} contentOffset={contentOffset}
         inspected={selected ? inspected : null} inspectedBar={selected ? inspectedBar : undefined} oiState={oiState} takerState={takerState} oiStatus={oiStatus} takerStatus={takerStatus} />
     </svg>
   </PlotVisible>
 })
 
-export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, turnoverOrder, onSelect, controller: chartController = defaultChartController, priceOnly = false, navigation = true }: { controller?: ChartController; priceOnly?: boolean; navigation?: boolean; instId: string; tickSz?: string | null; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; candidateIds?: string[]; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
+export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, turnoverOrder, onSelect, controller: chartController = defaultChartController, priceOnly = false, sharedPrice, navigation = true }: { controller?: ChartController; priceOnly?: boolean; sharedPrice?: number; navigation?: boolean; instId: string; tickSz?: string | null; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; candidateIds?: string[]; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
   const presentation = usePresentation()
   const readoutId = useId()
   const windowVisible = usePresentedStore(subscribeVisibility, documentVisible)
@@ -669,6 +689,8 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     }, direction)
   }
   const active = inspectedBar ?? bars[inspected ?? bars.length - 1]
+  const liveBar = surface?.liveBar && plotGeometry && surface.liveBar.hour <= plotGeometry.endHour ? surface.liveBar : undefined
+  const usesSharedPrice = priceOnly && matchesSelection && !historical && liveBar != null && !liveBar.confirmed && liveBar.close === sharedPrice
   const oiState = surface?.oiState ?? 'ready'
   const takerState = surface?.takerState ?? 'ready'
   const atBoundary = view.historyExhausted && surface && view.oldestHour !== null && surface.endHour === Math.min(view.latestEnd ?? Infinity, view.oldestHour + ((surface.windowBars ?? 96) - 1) * intervalMS)
@@ -735,8 +757,11 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
           const text = label === 'Close' && active === surface?.liveBar ? formatCurrentPrice(value, currentPriceTickSz) : formatHistoricalPrice(value)
           return <div key={label} data-chart-ohlc={label.toLowerCase()} className="min-w-0"><span className="text-muted-foreground">{label} </span><span title={text}>{text}</span></div>
         })}
+        {priceOnly && inspectedBar && priceOverlays.map(({ label, value }) => <div key={label} data-chart-inspection-indicator={label}>
+          <span className="text-muted-foreground">{label} </span><span data-chart-legend-value title={value(inspectedBar)}>{value(inspectedBar, true)}</span>
+        </div>)}
       </div>}
-        <span data-chart-price-scale={priceScale} className="ml-auto text-muted-foreground" title={priceScale === 'unavailable' ? 'Price scale unavailable: first visible open must be positive' : 'Change from first visible open'}>{priceScale === 'unavailable' ? 'Unavailable' : 'Change %'}</span>
+        {(!priceOnly || priceScale === 'unavailable') && <span data-chart-price-scale={priceScale} className="ml-auto text-muted-foreground" title={priceScale === 'unavailable' ? 'Price scale unavailable: first visible open must be positive' : 'Change from first visible open'}>{priceScale === 'unavailable' ? 'Unavailable' : 'Change %'}</span>}
       </div>
       <div ref={plotRef} data-chart-plot tabIndex={-1} className="relative min-h-0 flex-1 overflow-hidden outline-none" onKeyDown={event => {
         if (event.key === 'Escape') { endInspection(); return }
@@ -773,7 +798,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
       }}>
         {surface && preparedPlot && <ChartSurface instId={surface.instId} timeframe={surface.timeframe} hasCompletedBars={surface.bars.length > 0}
           priceState={surface.priceState} indicatorState={surface.indicatorState} oiState={surface.oiState} takerState={surface.takerState}
-          oiStatus={surface.oiStatus} takerStatus={surface.takerStatus} liveBar={surface.liveBar && surface.liveBar.hour <= preparedPlot.geometry.endHour ? surface.liveBar : undefined} plot={preparedPlot} size={plotSize}
+          oiStatus={surface.oiStatus} takerStatus={surface.takerStatus} liveBar={liveBar} usesSharedPrice={usesSharedPrice} plot={preparedPlot} size={plotSize}
           selected={matchesSelection} visible={matchesSelection && isActive && windowVisible && presentation.active} inspected={inspected} inspectedBar={inspectedBar} wheelFraction={activeWheelFraction} readoutId={readoutId} />}
       </div>
       {captureStatus === 'flashing' && <div aria-hidden="true" className="pointer-events-none absolute inset-0 z-10 bg-[var(--chart-capture-flash)] motion-safe:animate-[chart-capture-flash_550ms_ease-out_both] motion-reduce:hidden" />}

@@ -189,10 +189,11 @@ export async function smokeElectron({ app, revision, report: reportPath, operati
         && chart.__chartSnapshot.timeframe === ['1H', '15m', '5m'][index]
         && chart.querySelector('svg[data-rendered-inst]'))
     }, fixture.instId, { timeout: 20_000 })
-    assert.equal(await page.locator('[data-chart-panel-header]:not([data-chart-panel-header="price"])').count(), 0)
+    assert.equal(await page.locator('[data-chart-panel-header]').count(), 0)
+    assert.deepEqual(await page.locator('[data-shared-chart-legend] [data-chart-legend]').evaluateAll(swatches => swatches.map(swatch => swatch.dataset.chartLegend)), ['VWAP(14)', 'BOLL(20,2)'])
     assert.equal(await page.locator('[data-chart-indicator="ema"], [data-chart-legend="EMA(200)"]').count(), 0)
     for (const field of ['vwap', 'bollUpper', 'bollMiddle', 'bollLower']) assert.equal(await page.locator(`[data-chart-indicator="${field}"]`).count(), 3)
-    report.checks.push('default 1h / 15min / 5min price-only SVGs with BOLL/VWAP overlays and no EMA')
+    report.checks.push('default 1h / 15min / 5min price-only SVGs with shared BOLL/VWAP legend')
     await openChart(page, fixture)
     const prepared = await request({ chartHistory: { instId: fixture.instId, timeframe: fixture.timeframe, endHour: fixture.end } })
     assert.ok(prepared.bars.length >= 96, 'The packaged worker must prepare a complete chart.')
