@@ -53,7 +53,7 @@ export function chartPanelClip(layout: ReturnType<typeof chartLayout>, panel: Ch
 }
 
 export type ChartLayoutDensity = { top: number; priceOnlyTop: number; headerHeight: number; rowGap: number; bottomAxis: number; headerBaseline: number }
-const compactChartDensity: ChartLayoutDensity = { top: 2, priceOnlyTop: 9, headerHeight: 18, rowGap: 2, bottomAxis: 16, headerBaseline: 11 }
+const compactChartDensity: ChartLayoutDensity = { top: 2, priceOnlyTop: 0, headerHeight: 18, rowGap: 2, bottomAxis: 16, headerBaseline: 11 }
 
 export function chartLayout(width: number, height: number, labelGutter = 64, priceOnly = false, density: ChartLayoutDensity = compactChartDensity) {
   const rightMargin = 4

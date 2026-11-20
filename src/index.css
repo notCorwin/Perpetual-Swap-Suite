@@ -109,7 +109,7 @@
   --chart-panel-header-height: 18px;
   --chart-panel-header-baseline: 11px;
   --chart-top-inset: var(--space-micro);
-  --chart-price-top-inset: calc(var(--chart-text-size) / 2 + var(--space-annotation-xs));
+  --chart-price-top-inset: 0px;
   --chart-row-gap: var(--space-micro);
   --chart-bottom-axis-height: 16px;
   color-scheme: light;

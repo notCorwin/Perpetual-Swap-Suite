@@ -50,7 +50,7 @@ const chartLengths = readDesignLengths({
   '--chart-text-size': 10, '--chart-legend-gap': 16, '--space-4': 12,
   '--space-annotation-small': 8, '--space-annotation-xs': 4,
   '--space-annotation-symbol': 18, '--space-annotation-label': 26, '--space-annotation-value': 10,
-  '--chart-price-label-padding-y': 3, '--chart-top-inset': 2, '--chart-price-top-inset': 9,
+  '--chart-price-label-padding-y': 3, '--chart-top-inset': 2, '--chart-price-top-inset': 0,
   '--chart-panel-header-height': 18, '--chart-row-gap': 2,
   '--chart-bottom-axis-height': 16, '--chart-panel-header-baseline': 11,
 })
@@ -193,7 +193,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
   const inspecting = inspected !== null || inspectedBar !== undefined
   const active = inspectedBar ?? bars[inspected ?? n - 1]
   const statistics = geometry.priceOnly ? null : inspectedBar ? chartStatisticsSamples([inspectedBar], 0) : chartStatisticsSamples(bars, inspected)
-  const { height, endHour, intervalMS, gutter, x, firstHour, candleHigh, candleLow, highIndex, lowIndex,
+  const { width, height, endHour, intervalMS, gutter, x, firstHour, candleHigh, candleLow, highIndex, lowIndex,
     rocAxis, oiAxis,
     priceY, rsiY, rocZeroY, rocAreas, bollBands, rsiMarkers } = geometry
   const { panels, columns, axisStarts, headerY, right } = geometry.layout
@@ -216,8 +216,10 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
   const lineLabel = (x: number, y: number, label: string, color = "var(--muted-foreground)") =>
     <text x={x} y={y} dominantBaseline="middle" fill={color}>{label}</text>
   const panelKeys: readonly Panel[] = geometry.priceOnly ? ['price'] : CHART_PANELS
-  const grid = panelKeys.flatMap(key => panels[key].map((y, index) =>
-    <line key={`${key}-${index}`} x1={columns[key][0]} x2={columns[key][1]} y1={y} y2={y} stroke="var(--border)" opacity={index ? 0.32 : 0.55} />))
+  // The panel and time-axis dividers span the whole viewport. Drawing both
+  // edges of each plot would frame the data separately from its axes.
+  const dividers = panelKeys.map(key => <line key={key} data-chart-panel-divider={key}
+    x1={0} x2={width} y1={panels[key][1]} y2={panels[key][1]} stroke="var(--border)" opacity="0.55" />)
   const legend = (key: Panel, items: [string, string, string, string?, number?][]) => {
     const gap = chartTokens.legendGap
     const start = columns[key][0] + gap / 2
@@ -265,6 +267,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
       <clipPath id={`${areaClipId}-positive`}><rect x={rocClip.x} y={panels.roc[0]} width={rocClip.width} height={rocZeroY - panels.roc[0]} /></clipPath>
       <clipPath id={`${areaClipId}-negative`}><rect x={rocClip.x} y={rocZeroY} width={rocClip.width} height={panels.roc[1] - rocZeroY} /></clipPath>
       <clipPath id={`${areaClipId}-content`}><rect {...contentClip} /></clipPath>
+      <clipPath id={`${areaClipId}-time-axis`}><rect x={0} y={panels[panelKeys.at(-1)!][1]} width={width} height={height - panels[panelKeys.at(-1)!][1]} /></clipPath>
       {panelKeys.map(key => <clipPath key={key} id={`${areaClipId}-${key}`}><rect {...chartPanelClip(geometry.layout, key, geometry.barPitch)} /></clipPath>)}
     </defs>
     <g clipPath={`url(#${areaClipId}-content)`}>
@@ -277,12 +280,11 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
       </g>
     </g>
     {!geometry.priceOnly && [30, 50, 70].map(level => <line key={level} data-chart-rsi-threshold={level} x1={columns.rsi[0]} x2={columns.rsi[1]} y1={rsiY(level)} y2={rsiY(level)} stroke={level === 50 ? 'var(--chart-midpoint)' : 'var(--chart-threshold)'} />)}
-    {grid}
+    {dividers}
     {rocZeroY > panels.roc[0] && rocZeroY < panels.roc[1] && <line x1={columns.roc[0]} x2={columns.roc[1]} y1={rocZeroY} y2={rocZeroY} stroke="var(--muted-foreground)" strokeOpacity="0.5" />}
     <g clipPath={`url(#${areaClipId}-content)`}>
       <g transform={`translate(${contentOffset},0)`} data-chart-wheel-content data-chart-wheel-offset={contentOffset}>
     {bars.flatMap((bar, index) => (bar.hour - firstHour) % (12 * intervalMS) === 0 ? panelKeys.map(key => <line key={`${(bar.hour - firstHour) / intervalMS}-${key}`} x1={x[index]} x2={x[index]} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--border)" strokeOpacity="0.22" />) : [])}
-    {timeLabels.map(({ bar, index }) => <text data-chart-time-label key={(bar.hour - firstHour) / intervalMS} x={x[index]} y={height - 4} textAnchor={index === 0 ? "start" : index === n - 1 ? "end" : "middle"} fill="var(--muted-foreground)">{hourLabel(bar.hour)}</text>)}
     <PlotPaths bars={bars} geometry={geometry} areaClipId={areaClipId} oiState={oiState} takerState={takerState} priceVisible={presentation.base !== null && presentation.geometryBase !== null} />
     {inspecting && panelKeys.map(key => <line key={key} x1={inspectionX} x2={inspectionX} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--foreground)" strokeDasharray="3 5" opacity="0.3" />)}
     <g clipPath={`url(#${areaClipId}-price)`}>
@@ -297,6 +299,11 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
       </g>
     })}
     </g>
+      </g>
+    </g>
+    <g clipPath={`url(#${areaClipId}-time-axis)`}>
+      <g transform={`translate(${contentOffset},0)`}>
+        {timeLabels.map(({ bar, index }) => <text data-chart-time-label key={(bar.hour - firstHour) / intervalMS} x={x[index]} y={height - 4} textAnchor={index === 0 ? "start" : index === n - 1 ? "end" : "middle"} fill="var(--muted-foreground)">{hourLabel(bar.hour)}</text>)}
       </g>
     </g>
     {tag.inViewport && <g data-chart-price-label>

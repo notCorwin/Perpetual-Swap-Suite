@@ -21,6 +21,14 @@ test("stacked chart layout stays aligned and bounded", () => {
   }
 })
 
+test("price-only plot meets the top of the viewport while reserving its axes", () => {
+  const layout = chartLayout(960, 700, 64, true)
+  assert.equal(layout.panels.price[0], 0)
+  assert.equal(layout.panels.price[1], 684)
+  assert.ok(layout.right < 960)
+  assert.ok(layout.axisStarts.price > layout.right)
+})
+
 test("chart hours retain their position when candles are missing", () => {
   const hour = 3_600_000
   const first = chartHourX(0, 95 * hour, 0, 960)
