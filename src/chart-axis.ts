@@ -28,6 +28,19 @@ export function chartAxisForLabels(min: number, max: number, maxLabels: number) 
   return makeChartAxis(min, max, limit - 1, limit)
 }
 
+// Choose a stable candle interval with room for a full label at the current zoom.
+export function chartTimeTickStep(barPitch: number, labelWidth: number, gap: number) {
+  const minimum = Math.max(1, Math.ceil((labelWidth + gap) / Math.max(barPitch, 0.001)))
+  return [1, 2, 3, 4, 6, 12, 24].find(step => step >= minimum) ?? Math.ceil(minimum / 24) * 24
+}
+
+export function isChartTimeTick(time: number, intervalMS: number, step: number, offsetMinutes = new Date(time).getTimezoneOffset()) {
+  // Align to local clock boundaries where possible, while retaining actual
+  // candle boundaries for zones whose offsets are not a whole candle.
+  const localOffsetBars = Math.round(-offsetMinutes * 60_000 / intervalMS)
+  return (Math.round(time / intervalMS) + localOffsetBars) % step === 0
+}
+
 export type LogChartAxis = { min: number; max: number; ticks: number[]; decimals: number; zeroInclusive: boolean }
 
 const logCoordinate = (value: number, zeroInclusive: boolean) => zeroInclusive ? Math.log1p(value) / Math.LN10 : Math.log10(value)

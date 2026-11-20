@@ -1,6 +1,23 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { chartAxis, chartAxisForLabels, logarithmicChartAxis, logarithmicScale } from "./chart-axis.ts"
+import { chartAxis, chartAxisForLabels, chartTimeTickStep, isChartTimeTick, logarithmicChartAxis, logarithmicScale } from "./chart-axis.ts"
+
+test('time ticks track pixel spacing and stay aligned to actual candle times', () => {
+  assert.equal(chartTimeTickStep(20, 90, 8), 6)
+  assert.equal(chartTimeTickStep(5, 90, 8), 24)
+  assert.equal(chartTimeTickStep(100, 90, 8), 1)
+  for (const interval of [300_000, 900_000, 3_600_000]) {
+    const bars = Array.from({ length: 80 }, (_, i) => Date.UTC(2026, 10, 20) + i * interval)
+    const ticks = bars.filter(time => isChartTimeTick(time, interval, 6, -480))
+    assert.ok(ticks.length >= 12)
+    assert.ok(ticks.every((time, index) => index === 0 || time - ticks[index - 1] === 6 * interval))
+    // A fractional viewport offset cannot change which timestamps are ticks.
+    assert.deepEqual(bars.slice(1).filter(time => isChartTimeTick(time, interval, 6, -480)), ticks.filter(time => time !== bars[0]))
+  }
+  // Local midnight and subsequent six-hour ticks in UTC+8.
+  assert.equal(isChartTimeTick(Date.UTC(2026, 10, 19, 16), 3_600_000, 6, -480), true)
+  assert.equal(isChartTimeTick(Date.UTC(2026, 10, 19, 17), 3_600_000, 6, -480), false)
+})
 
 test("axes fit the plotted range and keep labels sparse", () => {
   const price = chartAxis(90, 94.34, 8)

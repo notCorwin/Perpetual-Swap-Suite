@@ -1,6 +1,7 @@
 import { readDesignLengths } from '@/design-lengths'
 import { DeferredPanel } from '@/DeferredPanel'
 import { CHART_DEFAULT_SPACING, chartPitchSpan } from './chart-layout.ts'
+import { chartTimeTickStep, isChartTimeTick } from './chart-axis.ts'
 import { lazy, createContext, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { flushSync } from "react-dom"
 import { Camera } from "lucide-react"
@@ -248,10 +249,13 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
       </g>
     </g>
   }
+  const timeTickStep = chartTimeTickStep(geometry.barPitch, chartTextWidth(hourLabel(bars[n - 1].hour)), chartTokens.annotationSmall)
+  const timeTicks = bars.map((bar, index) => ({ bar, index })).filter(({ bar }) => isChartTimeTick(bar.hour, intervalMS, timeTickStep))
   // Reserve the newest label first; older ticks are only useful when their
   // measured text fits without colliding with the next retained label.
   let nextTimeLabelStart = Infinity
-  const timeLabels = bars.map((bar, index) => ({ bar, index })).filter(({ bar, index }) => index === n - 1 || (bar.hour - firstHour) % (24 * intervalMS) === 0).reverse().filter(({ bar, index }) => {
+  const timeCandidates = timeTicks.at(-1)?.index === n - 1 ? [...timeTicks] : [...timeTicks, { bar: bars[n - 1], index: n - 1 }]
+  const timeLabels = timeCandidates.reverse().filter(({ bar, index }) => {
     const width = chartTextWidth(hourLabel(bar.hour))
     const start = x[index] + contentOffset - (index === 0 ? 0 : index === n - 1 ? width : width / 2)
     const end = start + width
@@ -284,7 +288,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     {rocZeroY > panels.roc[0] && rocZeroY < panels.roc[1] && <line x1={columns.roc[0]} x2={columns.roc[1]} y1={rocZeroY} y2={rocZeroY} stroke="var(--muted-foreground)" strokeOpacity="0.5" />}
     <g clipPath={`url(#${areaClipId}-content)`}>
       <g transform={`translate(${contentOffset},0)`} data-chart-wheel-content data-chart-wheel-offset={contentOffset}>
-    {bars.flatMap((bar, index) => (bar.hour - firstHour) % (12 * intervalMS) === 0 ? panelKeys.map(key => <line key={`${(bar.hour - firstHour) / intervalMS}-${key}`} x1={x[index]} x2={x[index]} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--border)" strokeOpacity="0.22" />) : [])}
+    {timeTicks.flatMap(({ bar, index }) => panelKeys.map(key => <line key={`${bar.hour}-${key}`} x1={x[index]} x2={x[index]} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--border)" strokeOpacity="0.22" />))}
     <PlotPaths bars={bars} geometry={geometry} areaClipId={areaClipId} oiState={oiState} takerState={takerState} priceVisible={presentation.base !== null && presentation.geometryBase !== null} />
     {inspecting && panelKeys.map(key => <line key={key} x1={inspectionX} x2={inspectionX} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--foreground)" strokeDasharray="3 5" opacity="0.3" />)}
     <g clipPath={`url(#${areaClipId}-price)`}>
