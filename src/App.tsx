@@ -4,7 +4,7 @@ import { Settings2 } from 'lucide-react'
 import { buttonVariants } from '@/components/ui/button'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
-import { MarketChart, MultiChartLegend } from '@/MarketChart'
+import { ChartTimeSyncProvider, MarketChart, MultiChartLegend } from '@/MarketChart'
 import { MarketRowsViewport } from '@/MarketRowsViewport'
 import { WorkspaceViewport } from '@/WorkspaceViewport'
 import { settingsHref, useSettingsSection, type SettingsNavigationState } from '@/settings-navigation'
@@ -286,9 +286,9 @@ function App() {
             <span data-chart-price-scale="relative" title="Change from first visible open">Change %</span>
           </div>}
         </header>
-        {multiChart ? <div className="grid min-h-0 flex-1 grid-rows-3 divide-y" data-multi-timeframe-charts>
+        {multiChart ? <ChartTimeSyncProvider key={selectedID}><div className="grid min-h-0 flex-1 grid-rows-3 divide-y" data-multi-timeframe-charts>
           {(['1H', '15m', '5m'] as const).map((frame, index) => <MarketChart key={frame} controller={multiChartControllers[frame]} priceOnly navigation={index === 0} active={settingsSection === null} instId={selectedID} tickSz={selectedRow?.tickSz} timeframe={frame} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} />)}
-        </div> : <MarketChart active={settingsSection === null} instId={selectedID} tickSz={selectedRow?.tickSz} timeframe={timeframe} candidateIds={candidateIds} onTimeframeChange={changeTimeframe} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} />}
+        </div></ChartTimeSyncProvider> : <MarketChart active={settingsSection === null} instId={selectedID} tickSz={selectedRow?.tickSz} timeframe={timeframe} candidateIds={candidateIds} onTimeframeChange={changeTimeframe} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} />}
       </div> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}
     </section>
     </div>

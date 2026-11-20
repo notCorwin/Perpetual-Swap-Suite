@@ -10,7 +10,7 @@ import { createNativeExchange } from '../helpers/native-exchange.mjs'
 
 const frames = ['1H', '15m', '5m'], btc = 'BTC-USDT-SWAP', eth = 'ETH-USDT-SWAP'
 
-test('default multi-timeframe charts share native prices, isolate history and retain selectable indicators', { timeout: 120_000 }, async () => {
+test('default multi-timeframe charts synchronize time navigation and retain selectable indicators', { timeout: 120_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'perp-multiframe-'))
   const exchange = await createNativeExchange()
   let electron
@@ -71,7 +71,16 @@ test('default multi-timeframe charts share native prices, isolate history and re
             && percent !== undefined && Math.abs(Number(percent.replaceAll(',', '')) - (close / referenceOpen - 1) * 100) < 0.005001
             && svg.querySelector('[data-chart-countdown]')
         })
-      }, { instId, close, sentAt: event.sentAt }, { timeout: 15_000 })
+      }, { instId, close, sentAt: event.sentAt }, { timeout: 15_000 }).catch(async error => {
+        console.error('multiframe live diagnostics:', await page.locator('[data-chart-inst]').evaluateAll(charts => charts.map(chart => ({
+          timeStart: chart.dataset.chartTimeStart, timeEnd: chart.dataset.chartTimeEnd,
+          loading: chart.dataset.chartLoading, liveBar: chart.__chartSnapshot?.liveBar,
+          label: chart.querySelector('[data-chart-price-label-value]')?.textContent,
+          countdown: Boolean(chart.querySelector('[data-chart-countdown]')),
+          observedAt: chart.__chartSnapshot?.priceObservedAt,
+        }))))
+        throw error
+      })
     }
     console.log('multiframe: history released')
     await ready(btc)
@@ -90,59 +99,41 @@ test('default multi-timeframe charts share native prices, isolate history and re
         })
     })
     await live(btc, 140.5, 30)
-    // Each chart owns its own cursor; scrolling 15m must leave the other two live.
-    const before = await page.locator('[data-chart-inst]').evaluateAll(charts => charts.map(chart => chart.__chartSnapshot.endHour))
+    // Read the actual time at each plot edge, not candle indexes: each
+    // timeframe uses a different number of candles for the same duration.
+    const timeRanges = () => page.locator('[data-chart-inst]').evaluateAll(charts => charts.map(chart => ({
+      start: Number(chart.dataset.chartTimeStart), end: Number(chart.dataset.chartTimeEnd),
+    })))
+    const waitForAlignedRanges = async (previous, mode) => {
+      await page.waitForFunction(({ previous, mode }) => {
+        const charts = [...document.querySelectorAll('[data-chart-inst]')]
+        if (charts.length !== 3) return false
+        const ranges = charts.map(chart => ({ start: Number(chart.dataset.chartTimeStart), end: Number(chart.dataset.chartTimeEnd) }))
+        if (!ranges.every(range => Number.isFinite(range.start) && Number.isFinite(range.end) && range.end > range.start)) return false
+        // Each renderer can update in a separate frame. One second is well
+        // below a candle in any displayed timeframe and accommodates the live clock.
+        if (ranges.some(range => Math.abs(range.start - ranges[0].start) > 1000 || Math.abs(range.end - ranges[0].end) > 1000)) return false
+        if (!previous) return true
+        return mode === 'pan' ? ranges.every((range, index) => range.end < previous[index].end - 1000)
+          : ranges.every((range, index) => range.end - range.start < (previous[index].end - previous[index].start) * 0.95)
+      }, { previous, mode }, { timeout: 30_000 })
+      return timeRanges()
+    }
+    const initial = await waitForAlignedRanges(null, null)
     await page.locator('[data-chart-plot]').nth(1).evaluate(plot => plot.dispatchEvent(new WheelEvent('wheel', { deltaY: 240, bubbles: true, cancelable: true })))
-    await page.waitForFunction(before => {
-      const charts = [...document.querySelectorAll('[data-chart-inst]')]
-      return charts[1].__chartSnapshot.endHour < before[1] && charts[0].__chartSnapshot.endHour === before[0] && charts[2].__chartSnapshot.endHour === before[2]
-    }, before)
-    await page.waitForFunction(() => {
-      const chart = document.querySelectorAll('[data-chart-inst]')[1], svg = chart.querySelector('svg[data-rendered-inst]')
-      const last = chart.__chartSnapshot?.bars.find(bar => bar.hour === Number(svg?.dataset.renderedEnd))
-      const label = svg?.querySelector('[data-chart-price-label-value]')?.textContent
-      const referenceOpen = last?.open
-      const percent = /^([+-]?[\d,]+(?:\.\d+)?)% [↑↓]$/.exec(label ?? '')?.[1]
-      return chart.dataset.chartLoading === 'false' && last?.confirmed && percent !== undefined
-        && Math.abs(Number(percent.replaceAll(',', '')) - (last.close / referenceOpen - 1) * 100) < 0.005001
-        && !svg.querySelector('[data-chart-countdown]')
-    })
-    await page.waitForTimeout(1000)
-    // A partial wheel gesture moves existing paths; the path nodes and their
-    // market-data geometry remain untouched until the viewport changes.
-    const fractional = await page.locator('[data-chart-plot]').nth(1).evaluate(async plot => {
-      const path = plot.querySelector('[data-chart-indicator="vwap"]')
-      const content = path.closest('[data-chart-wheel-content]')
-      const svg = path.closest('svg'), before = { d: path.getAttribute('d'), end: svg.dataset.renderedEnd }
-      const frame = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
-      plot.dispatchEvent(new WheelEvent('wheel', { deltaY: 3, bubbles: true, cancelable: true }))
-      await frame()
-      const moved = Number(content.dataset.chartWheelOffset)
-      const same = path === plot.querySelector('[data-chart-indicator="vwap"]') && before.d === path.getAttribute('d') && before.end === svg.dataset.renderedEnd
-      plot.dispatchEvent(new WheelEvent('wheel', { deltaY: -3, bubbles: true, cancelable: true }))
-      await frame()
-      return { moved, same, reversed: Number(content.dataset.chartWheelOffset), before, after: { d: path.getAttribute('d'), end: svg.dataset.renderedEnd }, sameNode: path === plot.querySelector('[data-chart-indicator="vwap"]') }
-    })
-    assert.ok(fractional.same, `Partial scrolling must retain the existing SVG path and geometry: ${JSON.stringify(fractional)}`)
-    assert.notEqual(fractional.moved, 0, 'A cached adjacent candle permits immediate partial movement.')
-    assert.equal(fractional.reversed, 0, 'Reversing the gesture returns to the original position.')
-    // A zoomed historical viewport must return to the forming candle and
-    // resume native WebSocket updates without retaining its fractional offset.
-    const zoomSpacing = await page.locator('[data-chart-plot]').nth(1).evaluate(async plot => {
+    const panned = await waitForAlignedRanges(initial, 'pan')
+    // Zoom a different chart and check all three absolute ranges, including
+    // their left edges and durations, instead of their bar-spacing values.
+    await page.locator('[data-chart-plot]').nth(2).evaluate(plot => {
       const rect = plot.getBoundingClientRect()
       plot.dispatchEvent(new WheelEvent('wheel', { ctrlKey: true, deltaY: -19, clientX: rect.left + rect.width * .4, bubbles: true, cancelable: true }))
-      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
-      const spacing = Number(plot.closest('[data-chart-inst]').dataset.chartBarSpacing)
-      plot.dispatchEvent(new WheelEvent('wheel', { deltaX: 100_000, bubbles: true, cancelable: true }))
-      return spacing
     })
-    await page.waitForFunction(() => {
-      const chart = document.querySelectorAll('[data-chart-inst]')[1], snapshot = chart?.__chartSnapshot
-      return snapshot?.liveBar && Number(chart.dataset.chartEnd) === snapshot.liveBar.hour
-        && Number(chart.querySelector('svg[data-rendered-inst]').dataset.chartDomainEnd) === snapshot.liveBar.hour
-    })
+    const zoomed = await waitForAlignedRanges(panned, 'zoom')
+    assert.ok(zoomed.every(range => range.end - range.start < panned[0].end - panned[0].start))
+    // Return to the latest time and verify all three resume native updates.
+    await page.locator('[data-chart-plot]').first().evaluate(plot => plot.dispatchEvent(new WheelEvent('wheel', { deltaX: 100_000, bubbles: true, cancelable: true })))
+    await waitForAlignedRanges(null, null)
     await live(btc, 141.25, 35)
-    assert.equal(await page.locator('[data-chart-inst]').nth(1).getAttribute('data-chart-bar-spacing'), String(zoomSpacing))
     await page.evaluate(() => { location.hash = '#/settings/workspace' })
     await page.getByRole('main', { name: 'Settings', exact: true }).getByRole('link', { name: 'Settings', exact: true }).click()
     await page.waitForFunction(() => document.querySelectorAll('[data-multi-timeframe-charts] svg[data-rendered-inst]').length === 3)

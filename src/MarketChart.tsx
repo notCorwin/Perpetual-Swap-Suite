@@ -16,7 +16,7 @@ import { captureStableChart, chartCaptureBounds } from '@/chart-capture'
 import { CHART_PANELS, chartContentClip, chartPanelClip, chartPriceLabelLayout, type ChartPanel as Panel } from "@/chart-layout"
 import { chartCompact as compact, chartPercent, chartPricePresentation, type ChartGeometry } from "@/chart-geometry"
 import { formatCurrentPrice, formatHistoricalPrice, formatIndicatorPrice } from '@/price-format'
-import { chartRsiNavigationTarget, chartWheelIntent, chartZoomDemand, chartZoomSpacing, chartWheelContentOffset, chartPresentedWheelFraction, createChartWheelBatch, createChartWheelScheduler } from '@/chart-navigation'
+import { CHART_WHEEL_PIXELS_PER_BAR, chartRsiNavigationTarget, chartWheelIntent, chartZoomDemand, chartZoomSpacing, chartWheelContentOffset, chartPresentedWheelFraction, createChartWheelBatch, createChartWheelScheduler } from '@/chart-navigation'
 import { chartStatisticsSamples } from '@/chart-legend'
 import { RSI_FIELDS, type RsiField } from '@/rsi-crossings'
 import { cn } from "@/lib/utils"
@@ -30,6 +30,13 @@ import type { Bar, ChartSourceStatus, PreparedChartState, ReadyChartWindow } fro
 import { measureOperation } from '../electron/services/operations.js'
 import { getPresentation, usePresentation, usePresentedStore, waitForPresentation } from '@/presentation-store'
 import { isPriceFresh, watchPriceFreshness, watchPriceCountdown } from '@/price-clock'
+import { sharedChartEnd, sharedChartGesture, sharedChartViewport, type SharedChartTime } from '@/chart-time-sync'
+
+const ChartTimeSync = createContext<{ value: SharedChartTime | null; setValue: React.Dispatch<React.SetStateAction<SharedChartTime | null>> } | null>(null)
+export function ChartTimeSyncProvider({ children }: { children: React.ReactNode }) {
+  const [value, setValue] = useState<SharedChartTime | null>(null)
+  return <ChartTimeSync.Provider value={{ value, setValue }}>{children}</ChartTimeSync.Provider>
+}
 
 const presentationActive = () => getPresentation().active
 const EMPTY_BARS: readonly Bar[] = []
@@ -366,6 +373,7 @@ const ChartSurface = memo(function ChartSurface({ instId, timeframe, hasComplete
 })
 
 export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, turnoverOrder, onSelect, controller: chartController = defaultChartController, priceOnly = false, navigation = true }: { controller?: ChartController; priceOnly?: boolean; navigation?: boolean; instId: string; tickSz?: string | null; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; candidateIds?: string[]; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
+  const sync = useContext(ChartTimeSync)
   const presentation = usePresentation()
   const readoutId = useId()
   const windowVisible = usePresentedStore(subscribeVisibility, documentVisible)
@@ -398,14 +406,60 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
   const [plotSize, setPlotSize] = useState({ width: 0, height: 0 })
   const [zoom, setZoom] = useState<{ spacing: number; offset: number } | null>(null)
   const zoomRef = useRef(zoom)
-  const viewport = useMemo(() => zoom ?? { spacing: CHART_DEFAULT_SPACING, offset: 0 }, [zoom])
+  const lastSourceBar = surface?.liveBar?.hour ?? surface?.bars.at(-1)?.hour
+  const sharedEnd = sync?.value ? sharedChartEnd(sync.value, Date.now()) : null
+  const syncWidth = Math.max(1, plotSize.width - 100)
+  const viewport = useMemo(() => sync?.value && sharedEnd !== null && lastSourceBar !== undefined
+    ? { ...sharedChartViewport(sharedEnd, sync.value.span, syncWidth, intervalMS, lastSourceBar), fixedGutter: 96 }
+    : zoom ?? { spacing: CHART_DEFAULT_SPACING, offset: 0 }, [sync?.value, sharedEnd, lastSourceBar, syncWidth, intervalMS, zoom])
   const overscan = chartOverscan(surface, chartController)
   const preparedPlot = chartPlot(displayedIndicators.window, plotSize, overscan, currentPriceTickSz, priceOnly, viewport)
   const bars = preparedPlot?.bars ?? surface?.bars ?? EMPTY_BARS
   const plotGeometry = preparedPlot?.geometry ?? null
   const visibleBars = plotGeometry?.windowBars ?? chartPitchSpan(plotSize.width, viewport.spacing)
-  const demandBars = chartZoomDemand(visibleBars)
+  const demandBars = chartZoomDemand(sync?.value ? sync.value.span / intervalMS + 4 : visibleBars)
   useLayoutEffect(() => { if (isActive) chartController.setWindowBars(demandBars) }, [chartController, demandBars, isActive])
+  useLayoutEffect(() => {
+    if (!sync || sync.value || timeframe !== '1H' || !surface || !matchesSelection || !plotGeometry) return
+    const now = Date.now()
+    const last = surface.liveBar?.hour ?? surface.bars.at(-1)?.hour
+    if (last === undefined) return
+    const live = Boolean(surface.liveBar)
+    // A completed frame may be presented before the forming candle arrives.
+    // Do not navigate that fresh frame into history while waiting for its live update.
+    const nearNow = now >= last && now - last <= 2 * intervalMS
+    const end = live ? Math.max(last, Math.min(surface.priceObservedAt ?? now, last + intervalMS))
+      : nearNow ? now : plotGeometry.endHour + intervalMS * 0.34
+    const span = Math.min((1536 - 96) * 300_000, (plotGeometry.layout.right - plotGeometry.layout.left) / plotGeometry.barPitch * intervalMS)
+    sync.setValue(current => current ?? { end, span, follow: true, liveEnd: end, observedAt: now, advancing: false, oldest: 0 })
+  }, [sync, timeframe, surface, matchesSelection, plotGeometry, intervalMS])
+  useLayoutEffect(() => {
+    if (!sync?.value || timeframe !== '1H' || !matchesSelection || !surface?.liveBar || !surface.priceObservedAt) return
+    const last = surface.liveBar.hour
+    const observed = Math.max(last, Math.min(surface.priceObservedAt, last + intervalMS))
+    sync.setValue(current => !current || observed <= current.liveEnd ? current : {
+      ...current, end: current.follow ? observed : current.end, liveEnd: observed, observedAt: surface.priceObservedAt!, advancing: false,
+    })
+  }, [sync, timeframe, matchesSelection, surface, intervalMS])
+  useLayoutEffect(() => {
+    if (!sync?.value || !view.historyExhausted || view.oldestHour === null) return
+    const oldest = view.oldestHour
+    sync.setValue(current => !current || oldest <= current.oldest ? current : {
+      ...current, oldest, end: Math.max(oldest, current.end),
+    })
+  }, [sync, view.historyExhausted, view.oldestHour])
+  useLayoutEffect(() => {
+    if (!sync?.value || sharedEnd === null || !isActive) return
+    const current = chartController.getSnapshot()
+    if (!current.requested || current.latestEnd === null) return
+    // Following uses each native latest cursor even if the first cached frame
+    // predates the next live update. Otherwise initialization can accidentally
+    // turn a stale startup frame into a permanent historical request.
+    const target = sync.value.follow ? current.latestEnd : Math.min(current.latestEnd, Math.floor(sharedEnd / intervalMS) * intervalMS)
+    const currentEnd = current.requested.end ?? current.latestEnd
+    const steps = Math.round((target - currentEnd) / intervalMS)
+    if (steps) chartController.scroll(steps)
+  }, [chartController, sync?.value, sharedEnd, intervalMS, isActive, view.latestEnd, view.requested])
   const [inspection, setInspection] = useState<{ instId: string; timeframe: RadarTimeframe; hour: number } | null>(null)
   const inspectedIndex = inspection?.instId === surface?.instId && inspection?.timeframe === surface?.timeframe ? bars.findIndex(bar => bar.hour === inspection?.hour) : -1
   const inspected = inspectedIndex >= 0 ? inspectedIndex : null
@@ -560,6 +614,18 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     if (!rect?.width) return
     const x = (clientX - rect.left) * plotSize.width / rect.width
     const anchor = (x - plotGeometry.layout.left) / (plotGeometry.layout.right - plotGeometry.layout.left)
+    if (sync?.value) {
+      startGesture('zoom')
+      zoomPixels.current += pixels
+      wheelScheduler.schedule(() => {
+        const amount = zoomPixels.current
+        zoomPixels.current = 0
+        if (!getPresentation().active) return
+        sync.setValue(current => current ? sharedChartGesture(current, 'zoom', amount, plotGeometry.layout.right - plotGeometry.layout.left, anchor, Date.now()) : current)
+        endInspection()
+      })
+      return
+    }
     startGesture('zoom')
     zoomPixels.current += pixels
     wheelScheduler.schedule(() => {
@@ -592,6 +658,18 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
   }
   const queueWheel = (pixels: number) => {
     if (!isActive || !getPresentation().active || !surface || !matchesSelection || !Number.isFinite(pixels) || pixels === 0) return
+    if (sync?.value && plotGeometry) {
+      startGesture('pan')
+      wheelBatch.current.add(pixels)
+      wheelScheduler.schedule(() => {
+        const progress = wheelBatch.current.consume(0)
+        const amount = progress.steps * CHART_WHEEL_PIXELS_PER_BAR + progress.remainderPixels
+        if (!getPresentation().active) return
+        sync.setValue(current => current ? sharedChartGesture(current, 'pan', amount, plotGeometry.layout.right - plotGeometry.layout.left, 0.5, Date.now()) : current)
+        endInspection()
+      })
+      return
+    }
     startGesture('pan')
     const owner = { session: wheelSession, instId: surface.instId, timeframe: surface.timeframe, generation: surface.generation }
     const currentOwner = wheelOwnerRef.current
@@ -695,7 +773,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     }, direction)
   }
   const active = inspectedBar ?? bars[inspected ?? bars.length - 1]
-  const liveBar = surface?.liveBar && plotGeometry && surface.liveBar.hour <= plotGeometry.endHour ? surface.liveBar : undefined
+  const liveBar = surface?.liveBar && plotGeometry && surface.liveBar.hour <= plotGeometry.endHour + intervalMS * 0.34 ? surface.liveBar : undefined
   const oiState = surface?.oiState ?? 'ready'
   const takerState = surface?.takerState ?? 'ready'
   const atBoundary = view.historyExhausted && surface && view.oldestHour !== null && surface.endHour === Math.min(view.latestEnd ?? Infinity, view.oldestHour + ((surface.windowBars ?? 96) - 1) * intervalMS)
@@ -747,7 +825,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}</div>}
     {capture.error && <p role="alert" className="shrink-0 border-b px-5 py-2 text-destructive">{capture.error}</p>}
     <div className="flex min-h-0 flex-1">
-    <section ref={chartRef} data-chart-inst={displayedId} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={surface?.windowBars ?? 96} data-chart-visible-bars={visibleBars} data-chart-bar-spacing={viewport.spacing} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={priceState} data-chart-statistics-state={surface?.oiState === 'error' || surface?.takerState === 'error' ? 'error' : surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={priceState !== 'ready' || surface?.indicatorState !== 'ready' || oiState !== 'ready' || takerState !== 'ready' ? 'true' : 'false'} data-chart-loading={pending ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
+    <section ref={chartRef} data-chart-inst={displayedId} data-chart-time-end={plotGeometry ? plotGeometry.endHour + intervalMS * 0.34 - wheelContentOffset / plotGeometry.barPitch * intervalMS : undefined} data-chart-time-start={plotGeometry ? plotGeometry.endHour + intervalMS * 0.34 - (plotGeometry.layout.right - plotGeometry.layout.left + wheelContentOffset) / plotGeometry.barPitch * intervalMS : undefined} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={surface?.windowBars ?? 96} data-chart-visible-bars={visibleBars} data-chart-bar-spacing={viewport.spacing} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={priceState} data-chart-statistics-state={surface?.oiState === 'error' || surface?.takerState === 'error' ? 'error' : surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={priceState !== 'ready' || surface?.indicatorState !== 'ready' || oiState !== 'ready' || takerState !== 'ready' ? 'true' : 'false'} data-chart-loading={pending ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
       <div data-chart-summary className="flex shrink-0 items-center border-b px-4">
         <h2 data-chart-title className="min-w-0 max-w-40 shrink-0 truncate" title={displayedId} aria-label={`${displayedId.replace(/-SWAP$/, '')} · ${timeframeLabel(displayedFrame)}`}>{priceOnly && matchesSelection ? timeframeLabel(displayedFrame) : `${displayedId.replace(/-SWAP$/, '')} · ${timeframeLabel(displayedFrame)}`}</h2>
         {priceOnly && !historical && <PriceStatus observedAt={surface?.priceObservedAt} realtime={surface?.realtimeState} active={isActive && windowVisible && presentation.active} />}

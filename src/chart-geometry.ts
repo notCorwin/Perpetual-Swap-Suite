@@ -24,7 +24,7 @@ const axisFormatter = (decimals: number) => {
 }
 
 type Range = readonly [number, number]
-export type ChartGeometryOptions = Readonly<{ width: number; height: number; endHour: number; intervalMS: number; liveClose?: number; currentPriceTickSz?: string | null; priceOnly?: boolean; windowBars?: number; layoutDensity?: ChartLayoutDensity; barSpacing?: number }>
+export type ChartGeometryOptions = Readonly<{ width: number; height: number; endHour: number; intervalMS: number; liveClose?: number; currentPriceTickSz?: string | null; priceOnly?: boolean; windowBars?: number; layoutDensity?: ChartLayoutDensity; barSpacing?: number; fixedGutter?: number }>
 export type ChartGeometryOverscan = Readonly<{ before?: Bar; after?: Bar }>
 const linearScale = (min: number, max: number, panel: Range) => {
   const span = max - min || 1, height = panel[1] - panel[0]
@@ -90,7 +90,7 @@ function buildGeometry(sourceBars: readonly Bar[], options: ChartGeometryOptions
   let bars = sourceBars
   let windowBars = options.windowBars ?? 96
   let axes = axesFor(bars, { ...options, liveClose: liveClose !== undefined && sourceBars.at(-1)!.hour <= endHour ? liveClose : bars.at(-1)!.close })
-  let gutter = axes.gutter
+  let gutter = options.fixedGutter ?? axes.gutter
   if (barSpacing !== undefined) {
     // Reserve the measured label gutter monotonically within this layout pass.
     // Only axes are recalculated if an edge candle leaves; paths are built once.
@@ -107,7 +107,7 @@ function buildGeometry(sourceBars: readonly Bar[], options: ChartGeometryOptions
       bars = visible
       const visibleLive = liveClose !== undefined && sourceBars.at(-1)!.hour <= endHour ? liveClose : bars.at(-1)!.close
       axes = axesFor(bars, { ...options, liveClose: visibleLive })
-      const nextGutter = Math.max(gutter, axes.gutter)
+      const nextGutter = options.fixedGutter ?? Math.max(gutter, axes.gutter)
       if (nextGutter === gutter) break
       gutter = nextGutter
     }
@@ -291,7 +291,7 @@ export function createChartGeometryCache(measureText: (text: string) => number) 
     const liveClose = finite(options.liveClose) ? options.liveClose : undefined
     const index = variants.findIndex(({ value, before, after }) => value.width === options.width && value.height === options.height
       && value.endHour === options.endHour && value.intervalMS === options.intervalMS && value.liveClose === liveClose
-      && value.barSpacing === options.barSpacing && value.layoutDensity === options.layoutDensity && (options.barSpacing !== undefined || (value.windowBars ?? 96) === (options.windowBars ?? 96)) && value.currentPriceTickSz === options.currentPriceTickSz && value.priceOnly === options.priceOnly
+      && value.barSpacing === options.barSpacing && value.fixedGutter === options.fixedGutter && value.layoutDensity === options.layoutDensity && (options.barSpacing !== undefined || (value.windowBars ?? 96) === (options.windowBars ?? 96)) && value.currentPriceTickSz === options.currentPriceTickSz && value.priceOnly === options.priceOnly
       && before === overscan.before && after === overscan.after)
     if (index >= 0) {
       const [variant] = variants.splice(index, 1)
