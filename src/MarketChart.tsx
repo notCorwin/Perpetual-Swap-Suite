@@ -196,7 +196,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
   const statistics = geometry.priceOnly ? null : inspectedBar ? chartStatisticsSamples([inspectedBar], 0) : chartStatisticsSamples(bars, inspected)
   const { width, height, endHour, intervalMS, gutter, x, candleHigh, candleLow, highIndex, lowIndex,
     rocAxis, oiAxis,
-    priceY, rsiY, rocZeroY, rocAreas, bollBands, rsiMarkers } = geometry
+    priceY, rsiY, rocY, rocZeroY, rocAreas, bollBands, rsiMarkers } = geometry
   const { panels, columns, axisStarts, headerY, right } = geometry.layout
   const contentClip = chartContentClip(geometry.layout, height)
   const rocClip = chartPanelClip(geometry.layout, 'roc', geometry.barPitch)
@@ -322,7 +322,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     </>}
     {!geometry.priceOnly && [30, 70].map(level => <g key={level} data-chart-rsi-tick={level}>{lineLabel(axisStarts.rsi, rsiY(level), String(level), 'var(--foreground)')}</g>)}
     {panels.rsi[1] - panels.rsi[0] >= chartTokens.textSize * 6 && <>{lineLabel(axisStarts.rsi, rsiY(100), '100')}{lineLabel(axisStarts.rsi, rsiY(50), '50')}{lineLabel(axisStarts.rsi, rsiY(0), '0')}</>}
-    {panels.roc[1] - panels.roc[0] >= 35 && <>{lineLabel(axisStarts.roc, panels.roc[0], formatPercent(rocAxis.max, rocAxis.decimals))}{lineLabel(axisStarts.roc, panels.roc[1], formatPercent(rocAxis.min, rocAxis.decimals))}</>}
+    {panels.roc[1] - panels.roc[0] >= 35 && rocAxis.ticks.map(tick => <g key={tick} data-chart-roc-tick>{lineLabel(axisStarts.roc, rocY(tick), formatPercent(tick, rocAxis.decimals))}</g>)}
     {oiAxis && panels.oi[1] - panels.oi[0] >= 35 && geometry.oiTicks.map(({ y, label }, index) => <g key={index} data-chart-oi-tick><line x1={columns.oi[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.25" />{lineLabel(axisStarts.oi, y, label)}</g>)}
     {panels.taker[1] - panels.taker[0] >= 35 && geometry.takerTicks.map(({ y, label }, index) => <g key={index} data-chart-taker-tick>{lineLabel(axisStarts.taker, y, label)}</g>)}
     {inspectedTime && <g data-chart-inspected-time><rect x={inspectedTimeX} y={height - 16} width={inspectedTimeWidth} height={15} rx={3} fill="var(--chart-annotation)" /><text x={inspectedTimeX + inspectedTimeWidth / 2} y={height - 4} textAnchor="middle" fill="var(--foreground)">{inspectedTime}</text></g>}

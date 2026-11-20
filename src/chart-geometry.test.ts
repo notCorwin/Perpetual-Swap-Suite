@@ -36,6 +36,17 @@ test('shared viewport coordinates preserve time gaps and relative price and zero
   assert.equal(geometry.sellSamples, 96)
 })
 
+test('visible data determines padded linear viewports independently from their ticks', () => {
+  const geometry = createChartGeometryCache(text => text.length * 6)(rows(), viewport)
+  close(geometry.priceAxis.min, -2.3)
+  close(geometry.priceAxis.max, 4.3)
+  close(geometry.takerAxis.min, 0)
+  close(geometry.takerAxis.max, 10.5)
+  close(geometry.rocAxis.max, 92 * 1.05)
+  assert.ok(geometry.priceAxis.ticks.every(tick => tick >= geometry.priceAxis.min && tick <= geometry.priceAxis.max))
+  assert.ok(geometry.rocAxis.ticks.every(tick => tick >= geometry.rocAxis.min && tick <= geometry.rocAxis.max))
+})
+
 test('RSI markers use the sampled candle coordinates and combine thresholds crossed in one jump', () => {
   const bars = rows().map((bar, index) => ({ ...bar, rsi6: index === 0 ? 20 : 80 }))
   const get = createChartGeometryCache(text => text.length * 6)

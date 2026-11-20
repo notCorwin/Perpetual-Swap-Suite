@@ -1,4 +1,4 @@
-import { chartAxis, chartAxisForLabels, logarithmicChartAxis, logarithmicScale } from './chart-axis.ts'
+import { chartAxisForLabels, logarithmicChartAxis, logarithmicScale } from './chart-axis.ts'
 import { chartCandleWidth, chartHourX, chartLayout, chartPitchBodyWidth, chartPitchSpan, type ChartLayoutDensity } from './chart-layout.ts'
 import type { Bar } from './chart-data.ts'
 import { finitePercentage, formatCandleChange, formatPercent } from './market-percent.ts'
@@ -62,18 +62,22 @@ function chartAxes(bars: readonly Bar[], options: ChartGeometryOptions, measureT
   const base = bars.flatMap(bar => [bar.open, bar.high, bar.low, bar.close]).find(value => finite(value) && value > 0) ?? null
   if (!Number.isFinite(priceMin) || !Number.isFinite(priceMax)) { priceMin = base ?? 0; priceMax = base ?? 1 }
   const relative = (value: number) => (value / base! - 1) * 100
-  const priceAxis = { ...chartAxisForLabels(base === null ? -1 : relative(priceMin), base === null ? 1 : relative(priceMax), priceLabels), kind: 'relative' as const, base }
+  const priceLow = base === null ? -1 : relative(priceMin), priceHigh = base === null ? 1 : relative(priceMax)
+  // Reserve breathing room based on the visible data, not on a rounded tick.
+  const pricePadding = (priceHigh - priceLow || Math.max(Math.abs(priceHigh) * 0.01, 0.01)) * 0.05
+  const priceAxis = { ...chartAxisForLabels(priceLow - pricePadding, priceHigh + pricePadding, priceLabels), kind: 'relative' as const, base }
   const axisPrice = axisFormatter(priceAxis.decimals)
-  const rocAxis = chartAxis(-(rocExtent || 1), rocExtent || 1, 8)
+  const rocRange = (rocExtent || 1) * 1.05
+  const rocAxis = chartAxisForLabels(-rocRange, rocRange, axisLabelLimit(panels.roc, 7))
   const atrRange = paddedIndicatorRange(minATR, maxATR), bbwRange = paddedIndicatorRange(minBBW, maxBBW)
   const oiValues = oiSamples.map(sample => sample.value)
   const oiAxis = oiValues.length ? logarithmicChartAxis(Math.min(...oiValues), Math.max(...oiValues), axisLabelLimit(panels.oi, 7), true) : null
-  const takerAxis = chartAxisForLabels(0, maxTaker, axisLabelLimit(panels.taker, 7))
+  const takerAxis = chartAxisForLabels(0, maxTaker * 1.05, axisLabelLimit(panels.taker, 7))
   const priceLabelsText = priceAxis.ticks.map(tick => `${tick > 0 ? '+' : ''}${axisPrice.format(tick)}%`)
   const oiLabelsText = oiAxis?.ticks.map(chartCompact) ?? [], takerLabelsText = takerAxis.ticks.map(chartCompact)
   const labels = [
     ...priceLabelsText,
-    ...(!options.priceOnly ? [formatPercent(rocAxis.max, rocAxis.decimals), formatPercent(rocAxis.min, rocAxis.decimals), '100', '0', ...oiLabelsText, ...takerLabelsText] : []),
+    ...(!options.priceOnly ? [...rocAxis.ticks.map(tick => formatPercent(tick, rocAxis.decimals)), '100', '0', ...oiLabelsText, ...takerLabelsText] : []),
     formatCandleChange(bars.at(-1)!.open, liveClose ?? bars.at(-1)!.close), '00:00',
   ]
   const gutter = Math.ceil(Math.max(...labels.map(measureText)) + 16)
