@@ -64,11 +64,11 @@ test('default multi-timeframe charts share native prices, isolate history and re
         return Number(quote?.replaceAll(',', '')) === close && charts.length === 3 && charts.every(chart => {
           const snapshot = chart.__chartSnapshot
           const svg = chart.querySelector('svg[data-rendered-inst]')
-          const firstOpen = snapshot?.bars.find(bar => bar.hour === Number(svg?.dataset.renderedStart))?.open
+          const referenceOpen = snapshot?.liveBar?.open
           const label = svg?.querySelector('[data-chart-price-label-value]')?.textContent ?? ''
           const percent = /^([+-]?[\d,]+(?:\.\d+)?)% [↑↓]$/.exec(label)?.[1]
           return snapshot?.instId === instId && snapshot.liveBar?.close === close && snapshot.priceObservedAt >= sentAt
-            && percent !== undefined && Math.abs(Number(percent.replaceAll(',', '')) - (close / firstOpen - 1) * 100) < 0.005001
+            && percent !== undefined && Math.abs(Number(percent.replaceAll(',', '')) - (close / referenceOpen - 1) * 100) < 0.005001
             && svg.querySelector('[data-chart-countdown]')
         })
       }, { instId, close, sentAt: event.sentAt }, { timeout: 15_000 })
@@ -83,9 +83,9 @@ test('default multi-timeframe charts share native prices, isolate history and re
       return Number(document.querySelector('[data-shared-chart-price]')?.textContent) === 138.75 && charts.length === 3
         && charts.every(chart => {
           const svg = chart.querySelector('svg[data-rendered-inst]'), snapshot = chart.__chartSnapshot
-          const firstOpen = snapshot?.bars.find(bar => bar.hour === Number(svg?.dataset.renderedStart))?.open
+          const referenceOpen = snapshot?.liveBar?.open
           const percent = /^([+-]?[\d,]+(?:\.\d+)?)% [↑↓]$/.exec(svg?.querySelector('[data-chart-price-label-value]')?.textContent ?? '')?.[1]
-          return percent !== undefined && Math.abs(Number(percent.replaceAll(',', '')) - (139.25 / firstOpen - 1) * 100) < 0.005001
+          return percent !== undefined && Math.abs(Number(percent.replaceAll(',', '')) - (139.25 / referenceOpen - 1) * 100) < 0.005001
             && chart.querySelector('[data-chart-countdown]')
         })
     })
@@ -101,10 +101,10 @@ test('default multi-timeframe charts share native prices, isolate history and re
       const chart = document.querySelectorAll('[data-chart-inst]')[1], svg = chart.querySelector('svg[data-rendered-inst]')
       const last = chart.__chartSnapshot?.bars.find(bar => bar.hour === Number(svg?.dataset.renderedEnd))
       const label = svg?.querySelector('[data-chart-price-label-value]')?.textContent
-      const firstOpen = chart.__chartSnapshot?.bars.find(bar => bar.hour === Number(svg?.dataset.renderedStart))?.open
+      const referenceOpen = last?.open
       const percent = /^([+-]?[\d,]+(?:\.\d+)?)% [↑↓]$/.exec(label ?? '')?.[1]
       return chart.dataset.chartLoading === 'false' && last?.confirmed && percent !== undefined
-        && Math.abs(Number(percent.replaceAll(',', '')) - (last.close / firstOpen - 1) * 100) < 0.005001
+        && Math.abs(Number(percent.replaceAll(',', '')) - (last.close / referenceOpen - 1) * 100) < 0.005001
         && !svg.querySelector('[data-chart-countdown]')
     })
     await page.waitForTimeout(1000)

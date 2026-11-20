@@ -32,7 +32,7 @@ export async function runNativeMarketAcceptance({ directory, launch, close = ele
       svgInstId: svg?.getAttribute('data-rendered-inst'), svgTimeframe: svg?.getAttribute('data-rendered-timeframe'),
       svgEnd: Number(svg?.getAttribute('data-rendered-end')), label, labelPrice: window.__chartPriceLabel(label),
       snapshot: snapshot ? { instId: snapshot.instId, timeframe: snapshot.timeframe, endHour: snapshot.endHour,
-        liveHour: snapshot.liveBar?.hour, livePrice: snapshot.liveBar?.close, confirmed: snapshot.liveBar?.confirmed,
+        liveHour: snapshot.liveBar?.hour, livePrice: snapshot.liveBar?.close, liveOpen: snapshot.liveBar?.open, confirmed: snapshot.liveBar?.confirmed,
         priceObservedAt: snapshot.priceObservedAt, realtimeState: snapshot.realtimeState, generation: snapshot.generation,
         completed: snapshot.bars.length } : null,
       status: [...(workspace?.querySelectorAll('[role="status"]') ?? [])].map(value => value.textContent?.trim()),
@@ -49,7 +49,8 @@ export async function runNativeMarketAcceptance({ directory, launch, close = ele
         const svg = chart?.querySelector('svg[data-rendered-inst]')
         const price = window.__chartPriceLabel(svg?.querySelector('[data-chart-price-label-value]')?.textContent)
         return snapshot?.instId === expected.instId && snapshot.timeframe === expected.timeframe
-          && snapshot.liveBar?.hour === expected.hour && snapshot.liveBar.close === expected.close && price === expected.close
+          && snapshot.liveBar?.hour === expected.hour && snapshot.liveBar.close === expected.close
+          && price !== null && Math.abs(price - (snapshot.liveBar.close / snapshot.liveBar.open - 1) * 100) < 0.005001
           && svg?.getAttribute('data-rendered-inst') === expected.instId && svg.getAttribute('data-rendered-timeframe') === expected.timeframe
           && Number(svg.getAttribute('data-rendered-end')) === expected.hour
           && snapshot.priceObservedAt >= expected.sentAt && snapshot.realtimeState === 'live'
@@ -156,7 +157,7 @@ export async function runNativeMarketAcceptance({ directory, launch, close = ele
       for (let index = 0; index < 10; index++) {
         const current = await readPrice()
         assert.equal(current.snapshot.livePrice, 135.75, `A delayed history repair rewound the visible native price: ${JSON.stringify(current)}`)
-        assert.equal(current.labelPrice, 135.75)
+        assert.ok(Number.isFinite(current.labelPrice) && Math.abs(current.labelPrice - (current.snapshot.livePrice / current.snapshot.liveOpen - 1) * 100) < 0.005001)
         assert.equal(current.snapshot.liveHour, heldPrice.snapshot.liveHour)
         assert.ok(current.snapshot.priceObservedAt >= heldPrice.snapshot.priceObservedAt)
         await new Promise(resolve => setTimeout(resolve, 50))
@@ -191,7 +192,8 @@ export async function runNativeMarketAcceptance({ directory, launch, close = ele
           && [...workspace.querySelectorAll('[role="status"]')].some(value => value.textContent?.trim() === 'Cached price')
       }, null, { timeout: 2_000 })
       const disconnectedPrice = await readPrice()
-      assert.equal(disconnectedPrice.labelPrice, 136.25, 'Disconnecting must preserve the actual last price while revoking its live status.')
+      assert.equal(disconnectedPrice.snapshot.livePrice, 136.25, 'Disconnecting must preserve the actual last price while revoking its live status.')
+      assert.ok(Number.isFinite(disconnectedPrice.labelPrice) && Math.abs(disconnectedPrice.labelPrice - (disconnectedPrice.snapshot.livePrice / disconnectedPrice.snapshot.liveOpen - 1) * 100) < 0.005001)
       await exchange.waitForBusinessReconnect()
       assert.deepEqual(exchange.businessSubscriptions(), [], 'The reconnect ACK hold must keep canonical 5m ownership pending.')
       exchange.resumeBusinessAcknowledgments()

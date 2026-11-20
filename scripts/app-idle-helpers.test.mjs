@@ -8,11 +8,12 @@ const quote = expectedClose(fixture, fixture.instIds[1], '1H', 7)
 const frame = { instId: fixture.instIds[1], chartInst: fixture.instIds[1], renderedInst: fixture.instIds[1],
   timeframe: '1H', renderedTimeframe: '1H', visible: true, visualStale: 'false', loading: 'false',
   renderedBars: 96, bars: 96, indicatorState: 'ready', renderedEnd: 20, chartEnd: 20, endHour: 20,
-  liveBar: { hour: 20, close: quote }, priceLabel: String(quote) }
+  liveBar: { hour: 20, open: quote / 1.01, close: quote }, priceLabel: '+1.00% ↑' }
 
 test('a ready event must contain the correct SVG identity and actual latest price', () => {
   assertReadyFrame(frame, { instId: frame.instId, timeframe: '1H', expected: quote })
-  assertReadyFrame({ ...frame, priceLabel: `${quote} ↑` }, { instId: frame.instId, timeframe: '1H', expected: quote })
+  assert.throws(() => assertReadyFrame({ ...frame, priceLabel: `${quote} ↑` }, { instId: frame.instId, timeframe: '1H', expected: quote }))
+  assert.throws(() => assertReadyFrame({ ...frame, liveBar: { ...frame.liveBar, open: 0 } }, { instId: frame.instId, timeframe: '1H', expected: quote }))
   assert.throws(() => assertReadyFrame({ ...frame, liveBar: { ...frame.liveBar, close: quote - .001 } }, { instId: frame.instId, timeframe: '1H', expected: quote }))
   assert.throws(() => assertReadyFrame({ ...frame, priceLabel: String(quote - .001) }, { instId: frame.instId, timeframe: '1H', expected: quote }))
   assert.throws(() => assertReadyFrame({ ...frame, renderedInst: fixture.instIds[0] }, { instId: frame.instId, timeframe: '1H', expected: quote }))

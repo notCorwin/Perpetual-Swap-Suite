@@ -1,10 +1,9 @@
 import { chartAxis, chartAxisForLabels, logarithmicChartAxis, logarithmicScale } from './chart-axis.ts'
 import { chartCandleWidth, chartHourX, chartLayout, chartPitchBodyWidth, chartPitchSpan, type ChartLayoutDensity } from './chart-layout.ts'
 import type { Bar } from './chart-data.ts'
-import { finitePercentage, formatPercent } from './market-percent.ts'
+import { finitePercentage, formatCandleChange, formatPercent } from './market-percent.ts'
 import { measureOperation } from '../electron/services/operations.js'
 import { chartRsiCrossings } from './rsi-crossings.ts'
-import { formatCurrentPrice } from './price-format.ts'
 
 const compactFormatter = new Intl.NumberFormat('en-US', { maximumSignificantDigits: 5, notation: 'compact' })
 const axisFormatters = new Map<number, Intl.NumberFormat>()
@@ -75,7 +74,7 @@ function chartAxes(bars: readonly Bar[], options: ChartGeometryOptions, measureT
   const labels = [
     ...priceLabelsText,
     ...(!options.priceOnly ? [formatPercent(rocAxis.max, rocAxis.decimals), formatPercent(rocAxis.min, rocAxis.decimals), '100', '0', ...oiLabelsText, ...takerLabelsText] : []),
-    `Price ${formatCurrentPrice(liveClose ?? bars.at(-1)!.close, options.currentPriceTickSz)} ↑`, '00:00',
+    formatCandleChange(bars.at(-1)!.open, liveClose ?? bars.at(-1)!.close), '00:00',
   ]
   const gutter = Math.ceil(Math.max(...labels.map(measureText)) + 16)
   return { panels, priceAxis, priceLabelsText, rocAxis, atrRange, bbwRange, oiAxis, oiLabelsText, takerAxis, takerLabelsText, gutter, candleHigh, candleLow, highIndex, lowIndex, oiSamples }

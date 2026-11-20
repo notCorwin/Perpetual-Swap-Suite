@@ -96,7 +96,7 @@ export function installResourcePaintProbe(fixture) {
       loading: chart?.dataset.chartLoading ?? null, endHour: snapshot?.endHour ?? null,
       renderedInst: svg?.dataset.renderedInst ?? null, renderedTimeframe: svg?.dataset.renderedTimeframe ?? null,
       renderedEnd, visible: Boolean(svg?.isConnected && svg.getAttribute('aria-hidden') !== 'true' && svg.style.visibility !== 'hidden'),
-      liveHour, livePrice: snapshot?.liveBar?.close ?? null, priceObservedAt: snapshot?.priceObservedAt ?? null,
+      liveHour, liveOpen: snapshot?.liveBar?.open ?? null, livePrice: snapshot?.liveBar?.close ?? null, priceObservedAt: snapshot?.priceObservedAt ?? null,
       sequence, expectedLivePrice: liveVisible ? baseline + fixture.periods * .01 + sequence * .001 : null,
       label: svg?.querySelector('[data-chart-price-label-value]')?.textContent ?? '',
       bars: snapshot?.bars?.length ?? 0, renderedBars: number(chart?.dataset.chartRenderedBars), indicatorState: snapshot?.indicatorState ?? null,
@@ -223,7 +223,11 @@ export function installResourcePaintProbe(fixture) {
         }
         if (snapshot.liveBar && frame.renderedEnd === snapshot.liveBar.hour) {
           near(snapshot.liveBar.close, frame.expectedLivePrice, `${kind === 'raf' ? 'RAF' : 'Visible'} synthetic quote`)
-          near(Number(frame.label.split(/\s/)[0].replaceAll(',', '')), snapshot.liveBar.close, `${kind === 'raf' ? 'RAF' : 'Visible'} SVG live-price label`)
+          const { open, close } = snapshot.liveBar
+          const change = Number.isFinite(open) && open !== 0 && Number.isFinite(close) ? (close - open) / Math.abs(open) * 100 : null
+          const rounded = change !== null && Math.abs(change) < .005 ? 0 : change
+          const expectedLabel = rounded === null || !Number.isFinite(rounded) ? '—' : `${rounded > 0 ? '+' : ''}${rounded.toFixed(2)}% ${close >= open ? '↑' : '↓'}`
+          if (frame.label !== expectedLabel) violate(`${kind === 'raf' ? 'RAF' : 'Visible'} SVG live-price label: ${frame.label} != ${expectedLabel}`)
         }
       } catch (error) { violate(`Deferred resource validation failed: ${String(error?.message ?? error)}`) }
     }
@@ -284,14 +288,16 @@ function verifiedFrame(record) {
 function verifiedLiveFrame(record, ticksBySequence) {
   if (!verifiedFrame(record)) return false
   const frame = record.frame, source = ticksBySequence.get(record.sequence)
-  const labelPrice = Number(frame.label.split(/\s/)[0].replaceAll(',', ''))
+  const change = Number.isFinite(frame.liveOpen) && frame.liveOpen !== 0 ? (frame.livePrice - frame.liveOpen) / Math.abs(frame.liveOpen) * 100 : null
+  const rounded = change !== null && Math.abs(change) < .005 ? 0 : change
+  const expectedLabel = rounded === null || !Number.isFinite(rounded) ? '—' : `${rounded > 0 ? '+' : ''}${rounded.toFixed(2)}% ${frame.livePrice >= frame.liveOpen ? '↑' : '↓'}`
   return Boolean(source && Number.isSafeInteger(record.sequence) && record.sequence > 0
     && frame.sequence === record.sequence && Number.isFinite(record.livePrice) && frame.livePrice === record.livePrice
     && Number.isFinite(frame.expectedLivePrice)
     && Math.abs(frame.livePrice - frame.expectedLivePrice) <= Math.max(1, Math.abs(frame.expectedLivePrice)) * 1e-10
     && record.priceObservedAt === source.receivedAt && frame.priceObservedAt === source.receivedAt
     && Number.isFinite(frame.liveHour) && frame.liveHour === frame.renderedEnd
-    && Number.isFinite(labelPrice) && Math.abs(labelPrice - frame.livePrice) <= Math.max(1, Math.abs(frame.livePrice)) * 1e-10
+    && Number.isFinite(frame.liveOpen) && frame.liveOpen !== 0 && frame.label === expectedLabel
     && record.committedAt + crossProcessOriginToleranceMS >= source.receivedAt
     && record.nextFrameAt + crossProcessOriginToleranceMS >= source.receivedAt)
 }

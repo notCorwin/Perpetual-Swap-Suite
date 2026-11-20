@@ -237,7 +237,7 @@ test('qualified rows stay stable while one SVG surface handles canonical frames,
         resolve({ price, currentInst: snapshot?.instId, livePrice: snapshot?.liveBar?.close, labelPrice,
           currentAtNextFrame: snapshot?.instId === instId && snapshot.liveBar?.close === price
           && snapshot.bars.length === 96 && snapshot.bars.every(bar => bar.confirmed)
-          && svg === window.__sharedSurface && Math.abs(labelPrice - price) < 1e-5 })
+          && svg === window.__sharedSurface && labelPrice === 0 })
       }))
     }, { instId: liveTarget, frame: liveFrame }) }
     finally { await electron.evaluate(() => globalThis.__prerenderGate.release()) }

@@ -111,7 +111,7 @@ export async function installReadyRecorder(page) {
       const row = snapshot?.instId ? document.querySelector(`[aria-label="View ${snapshot.instId} chart"]`) : null
       records.push({ epoch: event.detail?.epoch, at: Date.now(), marker: document.documentElement.dataset.presentationEpoch,
         instId: snapshot?.instId, timeframe: snapshot?.timeframe, endHour: snapshot?.endHour,
-        liveBar: snapshot?.liveBar ? { hour: snapshot.liveBar.hour, close: snapshot.liveBar.close } : null,
+        liveBar: snapshot?.liveBar ? { hour: snapshot.liveBar.hour, open: snapshot.liveBar.open, close: snapshot.liveBar.close } : null,
         bars: snapshot?.bars?.length, indicatorState: snapshot?.indicatorState,
         chartInst: chart?.dataset.chartInst, chartEnd: Number(chart?.dataset.chartEnd),
         visualStale: chart?.dataset.chartVisualStale, loading: chart?.dataset.chartLoading,
@@ -166,8 +166,12 @@ export function assertReadyFrame(frame, { instId, timeframe, expected, historica
     assert.ok(frame.liveBar && Number.isFinite(frame.liveBar.close), 'A live ready frame must contain the latest quote.')
     assert.equal(frame.renderedEnd, frame.liveBar.hour)
     assert.ok(Math.abs(frame.liveBar.close - expected) < 1e-8, `Expected live close ${expected}, got ${frame.liveBar.close}.`)
-    const label = Number(frame.priceLabel?.replaceAll(',', '').match(/[-+]?(?:\d*\.)?\d+(?:e[-+]?\d+)?/i)?.[0])
-    assert.ok(Number.isFinite(label) && Math.abs(label - expected) < 1e-8, `SVG price ${frame.priceLabel} does not match ${expected}.`)
+    const { open, close } = frame.liveBar
+    assert.ok(Number.isFinite(open) && open !== 0, 'A live ready frame must contain a valid open price.')
+    const change = (close - open) / Math.abs(open) * 100
+    const rounded = Math.abs(change) < .005 ? 0 : change
+    const label = `${rounded > 0 ? '+' : ''}${rounded.toFixed(2)}% ${close >= open ? '↑' : '↓'}`
+    assert.equal(frame.priceLabel, label, 'SVG candle change does not match the live candle.')
   }
 }
 

@@ -20,7 +20,7 @@ import { chartStatisticsSamples } from '@/chart-legend'
 import { RSI_FIELDS, type RsiField } from '@/rsi-crossings'
 import { cn } from "@/lib/utils"
 import { chartNavigationTarget } from "@/market-sort"
-import { formatPercent } from "@/market-percent"
+import { formatCandleChange, formatPercent } from "@/market-percent"
 import { RADAR_TIMEFRAMES, timeframeLabel, timeframeMilliseconds, type RadarTimeframe } from '@/timeframe'
 
 import { chartController as defaultChartController, type ChartController } from '@/chart-controller'
@@ -202,8 +202,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
   const tag = { price: liveBar.close, rising: liveBar.close >= liveBar.open, inViewport: presentation.base !== null && geometry.priceAxis.base !== null && Number.isFinite(liveBar.close) && liveBar.hour <= endHour + (liveOverlay ? intervalMS : 0) }
   const latestY = tag.inViewport ? priceY(tag.price) : panels.price[0]
   const latestColor = tag.rising ? "var(--positive)" : "var(--negative)"
-  const change = geometry.priceOnly ? presentation.formatChange(tag.price) : null
-  const latestPrice = `${geometry.priceOnly ? change ?? '—' : `Price ${formatCurrentPrice(tag.price, geometry.currentPriceTickSz)}`} ${tag.rising ? '↑' : '↓'}`
+  const latestPrice = formatCandleChange(liveBar.open, tag.price)
   const priceLabel = chartPriceLabelLayout(latestY, panels.price, chartTokens.textSize, chartTokens.priceLabelPaddingY, liveOverlay)
   const tickHalfHeight = chartTokens.textSize / 2
   const inspectionX = x[0] + (active.hour - bars[0].hour) / intervalMS * geometry.barPitch
@@ -301,9 +300,9 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
       </g>
     </g>
     {tag.inViewport && <g data-chart-price-label>
-      {change !== null && <title>{`Change from first visible open ${change} · ${liveOverlay ? 'Forming candle' : 'Candle'} ${tag.rising ? 'at or above' : 'below'} its open`}</title>}
+      <title>{`Change from candle open ${latestPrice} · ${liveOverlay ? 'Forming candle' : 'Candle'}`}</title>
       <rect data-chart-price-label-background x={right} y={priceLabel.top} width={gutter} height={priceLabel.bottom - priceLabel.top} fill="var(--chart-annotation)" />
-      <text data-chart-price-label-value x={axisStarts.price} y={latestY} dominantBaseline="middle" fill="var(--foreground)" textLength={change !== null && chartTextWidth(latestPrice) > gutter - chartTokens.annotationPadding ? Math.max(1, gutter - chartTokens.annotationPadding) : undefined} lengthAdjust={change !== null ? 'spacingAndGlyphs' : undefined}>{latestPrice}</text>
+      <text data-chart-price-label-value x={axisStarts.price} y={latestY} dominantBaseline="middle" fill="var(--foreground)" textLength={chartTextWidth(latestPrice) > gutter - chartTokens.annotationPadding ? Math.max(1, gutter - chartTokens.annotationPadding) : undefined} lengthAdjust="spacingAndGlyphs">{latestPrice}</text>
       {priceLabel.countdownY !== null && <PriceCountdown hour={liveBar.hour} intervalMS={intervalMS} x={axisStarts.price} y={priceLabel.countdownY} />}
     </g>}
     {statistics && <>

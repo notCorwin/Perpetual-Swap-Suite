@@ -9,10 +9,10 @@ const load = (count = 3) => ({ state: 'complete', emitted: count, completed: cou
 const commit = (sequence, delay = 20, options = {}) => {
   const { instId = 'BTC', timeframe = '5m', committedAt = sequence * 100 + 10, nextFrameAt = sequence * 100 + delay,
     receivedAt = sequence * 100 + 2, endHour = 1000 } = options
-  const livePrice = 100 + sequence / 1000, label = `${livePrice} ↑`, liveHour = 1100
+  const livePrice = 100 + sequence / 1000, label = '0.00% ↑', liveHour = 1100
   return { kind: 'commit', sequence, instId, timeframe, endHour, livePrice, priceObservedAt: receivedAt, committedAt, nextFrameAt, label, bars: 96,
     frame: { sameSnapshot: true, visible: true, instId, chartInst: instId, renderedInst: instId, timeframe, renderedTimeframe: timeframe,
-      endHour, chartEnd: liveHour, renderedEnd: liveHour, requestedEnd: endHour, visualStale: 'false', liveHour, livePrice,
+      endHour, chartEnd: liveHour, renderedEnd: liveHour, requestedEnd: endHour, visualStale: 'false', liveHour, liveOpen: 100, livePrice,
       priceObservedAt: receivedAt, sequence, label, expectedLivePrice: livePrice, bars: 96, renderedBars: 96 } }
 }
 const historyFrame = (nextFrameAt, { instId = 'BTC', timeframe = '5m', endHour = 900 } = {}) => ({
@@ -30,7 +30,7 @@ function resourceProbeFixture(context, { indicators = false, frozen = false, cpu
   context.mock.method(performance, 'now', () => now)
   const names = ['window', 'document', 'MutationObserver', 'requestAnimationFrame', 'cancelAnimationFrame']
   const original = new Map(names.map(name => [name, Object.getOwnPropertyDescriptor(globalThis, name)]))
-  const callbacks = [], cancelled = [], label = { textContent: '113.204 ↑' }
+  const callbacks = [], cancelled = [], label = { textContent: '+0.18% ↑' }
   const svg = { dataset: { renderedInst: 'SCALE000-USDT-SWAP', renderedTimeframe: '15m', renderedEnd: '1000' },
     style: { visibility: 'visible' }, isConnected: true, getAttribute: () => 'false', querySelector: () => label }
   const candles = Array.from({ length: 320 }, (_, index) => {
@@ -38,7 +38,7 @@ function resourceProbeFixture(context, { indicators = false, frozen = false, cpu
     return { timestamp: -31_000 + index * 100, open: close - .02, high: close + .06, low: close - .05, close, baseVolume: 100 + index % 7 }
   })
   const bars = buildIndicatorSeries(candles, 100).bars.slice(-96).map(value => ({ ...value, indicatorsObserved: indicators }))
-  const snapshot = { instId: 'SCALE000-USDT-SWAP', timeframe: '15m', endHour: 900, bars, liveBar: { hour: 1000, close: 113.204 },
+  const snapshot = { instId: 'SCALE000-USDT-SWAP', timeframe: '15m', endHour: 900, bars, liveBar: { hour: 1000, open: 113, close: 113.204 },
     priceObservedAt: 402, indicatorState: 'ready', oiState: 'loading', takerState: 'loading' }
   if (frozen) { bars.forEach(Object.freeze); Object.freeze(bars); Object.freeze(snapshot.liveBar); Object.freeze(snapshot) }
   const chart = { __chartSnapshot: snapshot, dataset: { chartInst: snapshot.instId, chartEnd: '1000', chartRequestedEnd: '900',
@@ -78,7 +78,7 @@ test('renderer probe reads the displayed SVG and snapshot again at RAF, includin
   assert.equal(record.frame.requestedEnd, 800)
   assert.equal(record.frame.renderedEnd, 1000)
   assert.equal(record.frame.sequence, 4)
-  assert.equal(record.frame.label, '113.204 ↑')
+  assert.equal(record.frame.label, '+0.18% ↑')
   assert.equal(paint.isFrame(record), true)
   assert.deepEqual(paint.violations, [])
   const input = { instId: snapshot.instId, timeframe: snapshot.timeframe, sequence: 4, afterAt: performance.timeOrigin + 1011 }
@@ -93,7 +93,7 @@ test('renderer probe reads the displayed SVG and snapshot again at RAF, includin
   assert.equal(unchanged.committedAt, record.committedAt)
   assert.equal(paint.isFrame(unchanged), true)
   assert.equal(paint.readyForLatest(input), true)
-  chart.__chartSnapshot = { ...snapshot, liveBar: { hour: 1000, close: 113.203 } }
+  chart.__chartSnapshot = { ...snapshot, liveBar: { hour: 1000, open: 113, close: 113.203 } }
   assert.equal(paint.readyForLatest(input), false, 'A stale current snapshot cannot reuse an earlier good frame.')
   chart.__chartSnapshot = snapshot
   chart.dataset.chartRenderedBars = '95'
@@ -102,22 +102,22 @@ test('renderer probe reads the displayed SVG and snapshot again at RAF, includin
 
   paint.recheck()
   const wrongLabel = paint.records.at(-1)
-  label.textContent = '113.203 ↑'
+  label.textContent = '+0.19% ↑'
   callbacks.at(-1)(25)
   assert.equal(paint.isFrame(wrongLabel), false)
   assert.deepEqual(paint.violations, [], 'Numerical validation must not run inside the timed RAF.')
-  label.textContent = '113.204 ↑'
+  label.textContent = '+0.18% ↑'
 
   paint.recheck()
   const replaced = paint.records.at(-1)
-  chart.__chartSnapshot = { ...snapshot, liveBar: { hour: 1000, close: 113.205 } }
-  label.textContent = '113.205 ↑'
+  chart.__chartSnapshot = { ...snapshot, liveBar: { hour: 1000, open: 113, close: 113.205 } }
+  label.textContent = '+0.18% ↑'
   callbacks.at(-1)(30)
   assert.equal(replaced.frame.sequence, 5)
   assert.equal(replaced.frame.sameSnapshot, false)
   assert.equal(paint.isFrame(replaced), false)
-  chart.__chartSnapshot = { ...snapshot, liveBar: { hour: 1000, close: 113.2044 } }
-  label.textContent = '113.2044 ↑'
+  chart.__chartSnapshot = { ...snapshot, liveBar: { hour: 1000, open: 113, close: 113.2044 } }
+  label.textContent = '+0.18% ↑'
   mutation()
   const offGrid = paint.records.at(-1)
   callbacks.at(-1)(35)
@@ -243,10 +243,10 @@ test('deferred resource validation retains mutable corruption and wrong RAF labe
   mutation()
   const record = paint.records[0]
   bars[0].ema = ema
-  label.textContent = '113.203 ↑'
+  label.textContent = '+0.19% ↑'
   at(1010); callbacks[1](10)
   assert.equal(record.frame.sameSnapshot, false, 'Mutating the same source object cannot reuse a retained earlier frame.')
-  label.textContent = '113.204 ↑'
+  label.textContent = '+0.18% ↑'
   const result = paint.finish()
   assert.equal(result.complete, false)
   assert.ok(result.violations.some(value => /224\/ema/.test(value)), 'Repairing the source must not rewrite the captured corruption.')
@@ -258,9 +258,9 @@ test('deferred resource validation retains mutable corruption and wrong RAF labe
 test('continuous resource RAF capture retains repaired DOM-only corruption with an unchanged snapshot', context => {
   const { paint, mutation, callbacks, label, svg, at } = resourceProbeFixture(context, { frozen: true })
   mutation(); at(1010); callbacks[1](10)
-  label.textContent = '113.203 ↑'
+  label.textContent = '+0.19% ↑'
   at(1015); callbacks[0](15)
-  label.textContent = '113.204 ↑'
+  label.textContent = '+0.18% ↑'
   svg.dataset.renderedInst = 'SCALE999-USDT-SWAP'
   at(1020); callbacks[2](20)
   svg.dataset.renderedInst = 'SCALE000-USDT-SWAP'
@@ -543,6 +543,8 @@ test('unverified old records and stale, wrong-series, or wrong-label RAF evidenc
     { ...correct, bars: 95 }, { ...correct, frame: { ...correct.frame, bars: 95 } },
     { ...correct, frame: { ...correct.frame, renderedBars: 95 } },
     { ...correct, frame: { ...correct.frame, expectedLivePrice: undefined } },
+    { ...correct, frame: { ...correct.frame, liveOpen: 0 } },
+    { ...correct, label: '+1.00% ↑', frame: { ...correct.frame, label: '+1.00% ↑' } },
     { ...correct, livePrice: correct.livePrice + .0004, label: `${correct.livePrice + .0004} ↑`,
       frame: { ...correct.frame, livePrice: correct.livePrice + .0004, label: `${correct.livePrice + .0004} ↑` } },
   ]
