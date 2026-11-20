@@ -4,7 +4,6 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
-import { installChartPriceReader } from '../helpers/chart-price-label.mjs'
 import { MarketStore } from '../../electron/services/market-store.js'
 import { MetadataStore, DEFAULT_PREFERENCES } from '../../electron/services/metadata-store.js'
 import { createNativeExchange } from '../helpers/native-exchange.mjs'
@@ -30,7 +29,6 @@ test('default multi-timeframe charts share native prices, isolate history and re
     const errors = []
     page.on('pageerror', error => errors.push(error.message))
     await page.waitForLoadState('domcontentloaded')
-    await installChartPriceReader(page)
     assert.deepEqual(await electron.evaluate(({ BrowserWindow }) => {
       const window = BrowserWindow.getAllWindows()[0]
       return { visible: window.isVisible(), focused: window.isFocused(), focusable: window.isFocusable() }
@@ -83,8 +81,13 @@ test('default multi-timeframe charts share native prices, isolate history and re
     await page.waitForFunction(() => {
       const charts = [...document.querySelectorAll('[data-chart-inst]')]
       return Number(document.querySelector('[data-shared-chart-price]')?.textContent) === 138.75 && charts.length === 3
-        && charts.every(chart => window.__chartPriceLabel(chart.querySelector('[data-chart-price-label-value]')?.textContent) === 139.25
-          && chart.querySelector('[data-chart-countdown]'))
+        && charts.every(chart => {
+          const svg = chart.querySelector('svg[data-rendered-inst]'), snapshot = chart.__chartSnapshot
+          const firstOpen = snapshot?.bars.find(bar => bar.hour === Number(svg?.dataset.renderedStart))?.open
+          const percent = /^([+-]?[\d,]+(?:\.\d+)?)% [↑↓]$/.exec(svg?.querySelector('[data-chart-price-label-value]')?.textContent ?? '')?.[1]
+          return percent !== undefined && Math.abs(Number(percent.replaceAll(',', '')) - (139.25 / firstOpen - 1) * 100) < 0.005001
+            && chart.querySelector('[data-chart-countdown]')
+        })
     })
     await live(btc, 140.5, 30)
     // Each chart owns its own cursor; scrolling 15m must leave the other two live.
@@ -98,7 +101,10 @@ test('default multi-timeframe charts share native prices, isolate history and re
       const chart = document.querySelectorAll('[data-chart-inst]')[1], svg = chart.querySelector('svg[data-rendered-inst]')
       const last = chart.__chartSnapshot?.bars.find(bar => bar.hour === Number(svg?.dataset.renderedEnd))
       const label = svg?.querySelector('[data-chart-price-label-value]')?.textContent
-      return chart.dataset.chartLoading === 'false' && last?.confirmed && window.__chartPriceLabel(label) === last.close
+      const firstOpen = chart.__chartSnapshot?.bars.find(bar => bar.hour === Number(svg?.dataset.renderedStart))?.open
+      const percent = /^([+-]?[\d,]+(?:\.\d+)?)% [↑↓]$/.exec(label ?? '')?.[1]
+      return chart.dataset.chartLoading === 'false' && last?.confirmed && percent !== undefined
+        && Math.abs(Number(percent.replaceAll(',', '')) - (last.close / firstOpen - 1) * 100) < 0.005001
         && !svg.querySelector('[data-chart-countdown]')
     })
     await page.waitForTimeout(1000)
