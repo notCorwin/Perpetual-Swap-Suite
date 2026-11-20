@@ -1,7 +1,7 @@
 import { readDesignLengths } from '@/design-lengths'
 import { DeferredPanel } from '@/DeferredPanel'
 import { CHART_DEFAULT_SPACING, chartPitchSpan } from './chart-layout.ts'
-import { chartTimeTickStep, isChartTimeTick } from './chart-axis.ts'
+import { chartTimeTicks, chartTimeTickStep } from './chart-axis.ts'
 import { lazy, createContext, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { flushSync } from "react-dom"
 import { Camera } from "lucide-react"
@@ -194,7 +194,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
   const inspecting = inspected !== null || inspectedBar !== undefined
   const active = inspectedBar ?? bars[inspected ?? n - 1]
   const statistics = geometry.priceOnly ? null : inspectedBar ? chartStatisticsSamples([inspectedBar], 0) : chartStatisticsSamples(bars, inspected)
-  const { width, height, endHour, intervalMS, gutter, x, firstHour, candleHigh, candleLow, highIndex, lowIndex,
+  const { width, height, endHour, intervalMS, gutter, x, candleHigh, candleLow, highIndex, lowIndex,
     rocAxis, oiAxis,
     priceY, rsiY, rocZeroY, rocAreas, bollBands, rsiMarkers } = geometry
   const { panels, columns, axisStarts, headerY, right } = geometry.layout
@@ -249,20 +249,16 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
       </g>
     </g>
   }
-  const timeTickStep = chartTimeTickStep(geometry.barPitch, chartTextWidth(hourLabel(bars[n - 1].hour)), chartTokens.annotationSmall)
-  const timeTicks = bars.map((bar, index) => ({ bar, index })).filter(({ bar }) => isChartTimeTick(bar.hour, intervalMS, timeTickStep))
-  // Reserve the newest label first; older ticks are only useful when their
-  // measured text fits without colliding with the next retained label.
-  let nextTimeLabelStart = Infinity
-  const timeCandidates = timeTicks.at(-1)?.index === n - 1 ? [...timeTicks] : [...timeTicks, { bar: bars[n - 1], index: n - 1 }]
-  const timeLabels = timeCandidates.reverse().filter(({ bar, index }) => {
-    const width = chartTextWidth(hourLabel(bar.hour))
-    const start = x[index] + contentOffset - (index === 0 ? 0 : index === n - 1 ? width : width / 2)
-    const end = start + width
-    if (end + chartTokens.annotationSmall > nextTimeLabelStart || inspectedTime && !(end < inspectedTimeX - chartTokens.annotationXs || start > inspectedTimeX + inspectedTimeWidth + chartTokens.annotationXs)) return false
-    nextTimeLabelStart = start
-    return true
-  }).reverse()
+  // A viewport can straddle a month boundary where the day gains a digit.
+  const timeTickStep = chartTimeTickStep(geometry.barPitch, chartTextWidth(hourLabel(bars[n - 1].hour)) + chartTokens.textSize, chartTokens.annotationSmall)
+  const timeAtX = (position: number) => bars[0].hour + (position - x[0] - contentOffset) / geometry.barPitch * intervalMS
+  const timeTicks = chartTimeTicks(timeAtX(0), timeAtX(right), intervalMS, timeTickStep)
+    .map(hour => ({ hour, x: x[0] + (hour - bars[0].hour) / intervalMS * geometry.barPitch }))
+  const timeLabels = timeTicks.filter(tick => {
+    const halfWidth = chartTextWidth(hourLabel(tick.hour)) / 2
+    const center = tick.x + contentOffset
+    return !inspectedTime || center + halfWidth < inspectedTimeX - chartTokens.annotationXs || center - halfWidth > inspectedTimeX + inspectedTimeWidth + chartTokens.annotationXs
+  })
   return <>
     <defs>
       <pattern id={`${areaClipId}-sell-hatch`} width="4" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
@@ -288,7 +284,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     {rocZeroY > panels.roc[0] && rocZeroY < panels.roc[1] && <line x1={columns.roc[0]} x2={columns.roc[1]} y1={rocZeroY} y2={rocZeroY} stroke="var(--muted-foreground)" strokeOpacity="0.5" />}
     <g clipPath={`url(#${areaClipId}-content)`}>
       <g transform={`translate(${contentOffset},0)`} data-chart-wheel-content data-chart-wheel-offset={contentOffset}>
-    {timeTicks.flatMap(({ bar, index }) => panelKeys.map(key => <line key={`${bar.hour}-${key}`} x1={x[index]} x2={x[index]} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--border)" strokeOpacity="0.22" />))}
+    {timeTicks.flatMap(tick => panelKeys.map(key => <line key={`${tick.hour}-${key}`} x1={tick.x} x2={tick.x} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--border)" strokeOpacity="0.22" />))}
     <PlotPaths bars={bars} geometry={geometry} areaClipId={areaClipId} oiState={oiState} takerState={takerState} priceVisible={presentation.base !== null && presentation.geometryBase !== null} />
     {inspecting && panelKeys.map(key => <line key={key} x1={inspectionX} x2={inspectionX} y1={panels[key][0]} y2={panels[key][1]} stroke="var(--foreground)" strokeDasharray="3 5" opacity="0.3" />)}
     <g clipPath={`url(#${areaClipId}-price)`}>
@@ -307,7 +303,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     </g>
     <g clipPath={`url(#${areaClipId}-time-axis)`}>
       <g transform={`translate(${contentOffset},0)`}>
-        {timeLabels.map(({ bar, index }) => <text data-chart-time-label key={(bar.hour - firstHour) / intervalMS} x={x[index]} y={height - 4} textAnchor={index === 0 ? "start" : index === n - 1 ? "end" : "middle"} fill="var(--muted-foreground)">{hourLabel(bar.hour)}</text>)}
+        {timeLabels.map(tick => <text data-chart-time-label key={tick.hour} x={tick.x} y={height - 4} textAnchor="middle" fill="var(--muted-foreground)">{hourLabel(tick.hour)}</text>)}
       </g>
     </g>
     {tag.inViewport && <g data-chart-price-label>

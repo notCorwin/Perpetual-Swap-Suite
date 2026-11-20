@@ -34,11 +34,16 @@ export function chartTimeTickStep(barPitch: number, labelWidth: number, gap: num
   return [1, 2, 3, 4, 6, 12, 24].find(step => step >= minimum) ?? Math.ceil(minimum / 24) * 24
 }
 
-export function isChartTimeTick(time: number, intervalMS: number, step: number, offsetMinutes = new Date(time).getTimezoneOffset()) {
-  // Align to local clock boundaries where possible, while retaining actual
-  // candle boundaries for zones whose offsets are not a whole candle.
-  const localOffsetBars = Math.round(-offsetMinutes * 60_000 / intervalMS)
-  return (Math.round(time / intervalMS) + localOffsetBars) % step === 0
+/** Regular ticks over a time viewport, independent of available candles. */
+export function chartTimeTicks(start: number, end: number, intervalMS: number, step: number, offsetMinutes = new Date(start).getTimezoneOffset()) {
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start || !Number.isFinite(intervalMS) || intervalMS <= 0 || !Number.isFinite(offsetMinutes) || !Number.isInteger(step) || step < 1) return []
+  const offsetBars = Math.round(-offsetMinutes * 60_000 / intervalMS)
+  const firstBar = Math.ceil(start / intervalMS)
+  const remainder = ((firstBar + offsetBars) % step + step) % step
+  const first = (firstBar + (step - remainder) % step) * intervalMS
+  const ticks: number[] = []
+  for (let tick = first; tick <= end; tick += step * intervalMS) ticks.push(tick)
+  return ticks
 }
 
 export type LogChartAxis = { min: number; max: number; ticks: number[]; decimals: number; zeroInclusive: boolean }
