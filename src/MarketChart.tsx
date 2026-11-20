@@ -408,16 +408,15 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
   const zoomRef = useRef(zoom)
   const lastSourceBar = surface?.liveBar?.hour ?? surface?.bars.at(-1)?.hour
   const sharedEnd = sync?.value ? sharedChartEnd(sync.value, Date.now()) : null
-  const syncWidth = Math.max(1, plotSize.width - 100)
   const viewport = useMemo(() => sync?.value && sharedEnd !== null && lastSourceBar !== undefined
-    ? { ...sharedChartViewport(sharedEnd, sync.value.span, syncWidth, intervalMS, lastSourceBar), fixedGutter: 96 }
-    : zoom ?? { spacing: CHART_DEFAULT_SPACING, offset: 0 }, [sync?.value, sharedEnd, lastSourceBar, syncWidth, intervalMS, zoom])
+    ? { ...sharedChartViewport(sharedEnd, sync.value.spacing, intervalMS, lastSourceBar), fixedGutter: 96 }
+    : zoom ?? { spacing: CHART_DEFAULT_SPACING, offset: 0 }, [sync?.value, sharedEnd, lastSourceBar, intervalMS, zoom])
   const overscan = chartOverscan(surface, chartController)
   const preparedPlot = chartPlot(displayedIndicators.window, plotSize, overscan, currentPriceTickSz, priceOnly, viewport)
   const bars = preparedPlot?.bars ?? surface?.bars ?? EMPTY_BARS
   const plotGeometry = preparedPlot?.geometry ?? null
   const visibleBars = plotGeometry?.windowBars ?? chartPitchSpan(plotSize.width, viewport.spacing)
-  const demandBars = chartZoomDemand(sync?.value ? sync.value.span / intervalMS + 4 : visibleBars)
+  const demandBars = chartZoomDemand(visibleBars)
   useLayoutEffect(() => { if (isActive) chartController.setWindowBars(demandBars) }, [chartController, demandBars, isActive])
   useLayoutEffect(() => {
     if (!sync || sync.value || timeframe !== '1H' || !surface || !matchesSelection || !plotGeometry) return
@@ -430,8 +429,8 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     const nearNow = now >= last && now - last <= 2 * intervalMS
     const end = live ? Math.max(last, Math.min(surface.priceObservedAt ?? now, last + intervalMS))
       : nearNow ? now : plotGeometry.endHour + intervalMS * 0.34
-    const span = Math.min((1536 - 96) * 300_000, (plotGeometry.layout.right - plotGeometry.layout.left) / plotGeometry.barPitch * intervalMS)
-    sync.setValue(current => current ?? { end, span, follow: true, liveEnd: end, observedAt: now, advancing: false, oldest: 0 })
+    const spacing = plotGeometry.barPitch
+    sync.setValue(current => current ?? { end, spacing, follow: true, liveEnd: end, observedAt: now, advancing: false, oldest: 0 })
   }, [sync, timeframe, surface, matchesSelection, plotGeometry, intervalMS])
   useLayoutEffect(() => {
     if (!sync?.value || timeframe !== '1H' || !matchesSelection || !surface?.liveBar || !surface.priceObservedAt) return
@@ -621,7 +620,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
         const amount = zoomPixels.current
         zoomPixels.current = 0
         if (!getPresentation().active) return
-        sync.setValue(current => current ? sharedChartGesture(current, 'zoom', amount, plotGeometry.layout.right - plotGeometry.layout.left, anchor, Date.now()) : current)
+        sync.setValue(current => current ? sharedChartGesture(current, 'zoom', amount, plotGeometry.layout.right - plotGeometry.layout.left, intervalMS, anchor, Date.now()) : current)
         endInspection()
       })
       return
@@ -665,7 +664,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
         const progress = wheelBatch.current.consume(0)
         const amount = progress.steps * CHART_WHEEL_PIXELS_PER_BAR + progress.remainderPixels
         if (!getPresentation().active) return
-        sync.setValue(current => current ? sharedChartGesture(current, 'pan', amount, plotGeometry.layout.right - plotGeometry.layout.left, 0.5, Date.now()) : current)
+        sync.setValue(current => current ? sharedChartGesture(current, 'pan', amount, plotGeometry.layout.right - plotGeometry.layout.left, intervalMS, 0.5, Date.now()) : current)
         endInspection()
       })
       return
