@@ -8,7 +8,6 @@ import { _electron } from 'playwright'
 import { once } from 'node:events'
 import { inspectApp } from './electron-delivery.mjs'
 import { backgroundTestEnvironment, prepareBackgroundApp } from './electron-test-runtime.mjs'
-import { assertIndicatorLegends, openChart } from './chart-acceptance.mjs'
 import { runNativeMarketAcceptance } from '../tests/support/native-market-suite.mjs'
 
 async function deadline(work, label, milliseconds = 60_000) {
@@ -194,7 +193,6 @@ export async function smokeElectron({ app, revision, report: reportPath, operati
     assert.equal(await page.locator('[data-chart-indicator="ema"], [data-chart-legend="EMA(200)"]').count(), 0)
     for (const field of ['vwap', 'bollUpper', 'bollMiddle', 'bollLower']) assert.equal(await page.locator(`[data-chart-indicator="${field}"]`).count(), 3)
     report.checks.push('default 1h / 15min / 5min price-only SVGs with shared BOLL/VWAP legend')
-    await openChart(page, fixture)
     const prepared = await request({ chartHistory: { instId: fixture.instId, timeframe: fixture.timeframe, endHour: fixture.end } })
     assert.ok(prepared.bars.length >= 96, 'The packaged worker must prepare a complete chart.')
     const latest = prepared.bars.find(bar => bar.hour === fixture.end)
@@ -203,8 +201,7 @@ export async function smokeElectron({ app, revision, report: reportPath, operati
     assert.ok(Number.isFinite(latest.ema), 'Worker indicator calculations must be initialized.')
     assert.ok(Number.isFinite(latest.atrPercent), 'The packaged worker must initialize ATR%.')
     assert.ok(Number.isFinite(latest.bbw), 'The packaged worker must initialize BBW.')
-    await assertIndicatorLegends(page)
-    report.checks.push('packaged ATR% and BBW worker values and shared renderer panel')
+    report.checks.push('packaged ATR% and BBW worker values')
     const status = await request({ e2e: { action: 'smokeStatus' } })
     assert.ok(Number.isSafeInteger(status.preparedWorkerThreadId) && status.preparedWorkerThreadId > 0, 'Chart preparation must run in the packaged worker.')
     report.checks.push('packaged chart worker and initialized indicators')

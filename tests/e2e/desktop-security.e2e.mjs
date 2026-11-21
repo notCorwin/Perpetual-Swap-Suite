@@ -70,7 +70,6 @@ test('the real renderer exposes one bridge while Electron and Node capabilities 
 
 test('mixed and malformed commands reject the entire mutation without partial side effects', async () => {
   const previous = await request({ preferences: { action: 'read' } })
-  const analysis = await request({ analysisSettings: { action: 'read' } })
   const rankingLookback = previous.rankingLookback + 5
   const invalid = [
     null,
@@ -87,7 +86,6 @@ test('mixed and malformed commands reject the entire mutation without partial si
   for (const value of invalid) {
     await assert.rejects(() => request(value), /Invalid desktop bridge request/i)
     assert.deepEqual(await request({ preferences: { action: 'read' } }), previous, 'A rejected command must not partially change preferences.')
-    assert.deepEqual(await request({ analysisSettings: { action: 'read' } }), analysis, 'A rejected command must not partially change credentials.')
   }
 })
 
@@ -122,103 +120,6 @@ test('an untrusted renderer cannot use the real IPC channel even when supplied w
     assert.match(attempt.error, /restricted to the application main frame/i)
   }
   assert.deepEqual(await request({ preferences: { action: 'read' } }), previous)
-})
-
-test('public settings and market responses never contain the saved analysis credential', async () => {
-  const apiKey = 'desktop-security-fixture-key'
-  const model = 'desktop-security-fixture-model'
-  const previous = await request({ preferences: { action: 'read' } })
-  try {
-    assert.deepEqual(await request({ analysisSettings: { action: 'save', model, apiKey } }), { model, hasAPIKey: true })
-    const responses = [
-      await request({ analysisSettings: { action: 'read' } }),
-      await request({ preferences: { action: 'read' } }),
-      await request({ preferences: { action: 'update', values: { chartTimeframe: previous.chartTimeframe } } }),
-      await request({ snapshot: { sinceRevision: -1 } }),
-      await request({ dataAudit: { action: 'status' } }),
-    ]
-    for (const response of responses) {
-      const serialized = JSON.stringify(response)
-      assert.equal(serialized.includes(apiKey), false, 'The saved API key must remain outside the renderer.')
-      assert.doesNotMatch(serialized, /"(?:apiKey|analysis)"\s*:/)
-    }
-    assert.deepEqual(responses[0], { model, hasAPIKey: true })
-  } finally { await request({ analysisSettings: { action: 'removeKey' } }) }
-})
-
-test('Gateway cancellation and duplicate ownership apply while private credentials are still loading', async () => {
-  await electron.evaluate(() => {
-    const probe = globalThis.__gatewayCredentialProbe = { original: globalThis.__marketBackend.credentials, originalFetch: globalThis.fetch, entered: false, requests: 0 }
-    globalThis.__marketBackend.credentials = () => { probe.entered = true; return new Promise(resolve => { probe.release = () => resolve('fixture-key') }) }
-    globalThis.fetch = async () => { probe.requests++; return new Response() }
-  })
-  try {
-    await page.evaluate(() => { window.__pendingGateway = window.radarDesktop.request({ gatewayFetch: { id: 'credential-owner', body: '{}' } }).then(() => 'completed', error => error.message) })
-    await electron.evaluate(async () => {
-      const deadline = Date.now() + 2000
-      while (!globalThis.__gatewayCredentialProbe.entered) {
-        if (Date.now() >= deadline) throw new Error('The pending credential request was not admitted.')
-        await new Promise(resolve => setImmediate(resolve))
-      }
-    })
-    await assert.rejects(request({ gatewayFetch: { id: 'credential-owner', body: '{}' } }), /already running/)
-    await request({ cancelGatewayFetch: 'credential-owner' })
-    await electron.evaluate(() => globalThis.__gatewayCredentialProbe.release())
-    assert.match(await page.evaluate(() => window.__pendingGateway), /abort/i)
-    assert.equal(await electron.evaluate(() => globalThis.__gatewayCredentialProbe.requests), 0)
-  } finally {
-    await electron.evaluate(() => {
-      const probe = globalThis.__gatewayCredentialProbe
-      probe.release?.()
-      globalThis.__marketBackend.credentials = probe.original
-      globalThis.fetch = probe.originalFetch
-      delete globalThis.__gatewayCredentialProbe
-    })
-  }
-})
-
-test('navigating away cancels and drains the owning renderer Gateway stream', async () => {
-  await request({ analysisSettings: { action: 'save', model: 'offline-fixture', apiKey: 'offline-fixture-key' } })
-  await electron.evaluate(() => {
-    const probe = globalThis.__gatewayLifecycle = { originalFetch: globalThis.fetch, requests: 0, aborted: 0 }
-    globalThis.fetch = async (input, options) => {
-      assertURL(input)
-      probe.requests++
-      const body = new ReadableStream({ start(controller) {
-        options.signal.addEventListener('abort', () => {
-          probe.aborted++
-          controller.error(new Error('The fixture stream was cancelled.'))
-        }, { once: true })
-      } })
-      return new Response(body, { status: 200 })
-    }
-    function assertURL(input) {
-      if (String(input) !== 'https://ai-gateway.vercel.sh/v1/chat/completions') throw new Error('Unexpected fixture network request.')
-    }
-  })
-  try {
-    assert.equal((await request({ gatewayFetch: { id: 'lifecycle-fixture', body: '{}' } })).status, 200)
-    await page.reload({ waitUntil: 'domcontentloaded' })
-    assert.equal(await electron.evaluate(async () => {
-      await new Promise(resolve => setImmediate(resolve))
-      return globalThis.__gatewayLifecycle.aborted
-    }), 1)
-    // Reusing the ID proves the aborted stream released its main-process slot.
-    assert.equal((await request({ gatewayFetch: { id: 'lifecycle-fixture', body: '{}' } })).status, 200)
-    await request({ cancelGatewayFetch: 'lifecycle-fixture' })
-    assert.deepEqual(await electron.evaluate(async () => {
-      await new Promise(resolve => setImmediate(resolve))
-      const { requests, aborted } = globalThis.__gatewayLifecycle
-      return { requests, aborted }
-    }), { requests: 2, aborted: 2 })
-  } finally {
-    await request({ cancelGatewayFetch: 'lifecycle-fixture' })
-    await request({ analysisSettings: { action: 'removeKey' } })
-    await electron.evaluate(() => {
-      globalThis.fetch = globalThis.__gatewayLifecycle.originalFetch
-      delete globalThis.__gatewayLifecycle
-    })
-  }
 })
 
 test('fixture operations are rejected by a separately launched production-mode app', async t => {

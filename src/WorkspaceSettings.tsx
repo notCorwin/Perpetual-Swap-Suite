@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { ChevronLeft, ChevronRight, Database, Settings2, SlidersHorizontal, Sparkles } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Database, Settings2, SlidersHorizontal } from 'lucide-react'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Field, FieldContent, FieldDescription, FieldError, FieldGroup, FieldLabel, FieldLegend, FieldSet } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
@@ -8,7 +8,6 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { Switch } from '@/components/ui/switch'
 import { Spinner } from '@/components/ui/spinner'
 import { Progress } from '@/components/ui/progress'
-import { AnalysisSettings } from '@/AnalysisSettings'
 import { Separator } from '@/components/ui/separator'
 import { SETTINGS_SECTIONS, settingsHref, type SettingsNavigationState, type SettingsSection } from '@/settings-navigation'
 import { LIQUIDITY_FIELDS, preferencesDraft, validatePreferencesDraft, type Preferences } from '@/renderer-preferences'
@@ -139,7 +138,7 @@ type WorkspaceSettingsProps = {
   onSave: (values: Preferences) => Promise<void>
   onNavigationStateChange: (state: SettingsNavigationState) => void
 }
-const sectionIcons = { workspace: Settings2, liquidity: SlidersHorizontal, data: Database, analysis: Sparkles }
+const sectionIcons = { workspace: Settings2, liquidity: SlidersHorizontal, data: Database }
 
 export function WorkspaceSettings({ section, preferences, loaded, loadError, onSave, onNavigationStateChange }: WorkspaceSettingsProps) {
   const [draft, setDraft] = useState(() => preferencesDraft(preferences))
@@ -147,8 +146,6 @@ export function WorkspaceSettings({ section, preferences, loaded, loadError, onS
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState('')
   const [savedMessage, setSavedMessage] = useState('')
-  const [analysisDirty, setAnalysisDirty] = useState(false)
-  const [analysisBusy, setAnalysisBusy] = useState(false)
   const [visited, setVisited] = useState(() => new Set<SettingsSection>([section]))
   const heading = useRef<HTMLHeadingElement>(null)
   const scroll = useRef<HTMLDivElement>(null)
@@ -157,7 +154,6 @@ export function WorkspaceSettings({ section, preferences, loaded, loadError, onS
   const previousPreferences = useRef(preferences)
   const dirty = JSON.stringify(draft) !== JSON.stringify(preferencesDraft(preferences))
   const dataMounted = visited.has('data') || section === 'data'
-  const analysisMounted = visited.has('analysis') || section === 'analysis'
   const preferenceDisabled = saving || !loaded || Boolean(loadError)
   useEffect(() => {
     const previous = previousPreferences.current
@@ -172,7 +168,7 @@ export function WorkspaceSettings({ section, preferences, loaded, loadError, onS
       focusAfterValidation.current = null
     } else heading.current?.focus({ preventScroll: true })
   }, [section])
-  useEffect(() => { onNavigationStateChange({ dirty: dirty || analysisDirty, busy: saving || analysisBusy }) }, [dirty, analysisDirty, saving, analysisBusy, onNavigationStateChange])
+  useEffect(() => { onNavigationStateChange({ dirty, busy: saving }) }, [dirty, saving, onNavigationStateChange])
   useEffect(() => () => onNavigationStateChange({ dirty: false, busy: false }), [onNavigationStateChange])
   const [audit, setAudit] = useState<DataAudit>(emptyAudit)
   const [auditError, setAuditError] = useState('')
@@ -265,7 +261,7 @@ export function WorkspaceSettings({ section, preferences, loaded, loadError, onS
             <h2 ref={heading} id="settings-section-title" tabIndex={-1} className="text-xl font-semibold">{currentSection.label}</h2>
             {(loadError || saveError) && <p role="alert" className="text-sm text-destructive">{saveError || loadError}</p>}
             {!loaded && <p role="status" className="text-sm text-muted-foreground">Loading saved settings…</p>}
-            <form id="workspace-settings-form" hidden={section === 'analysis'} noValidate onSubmit={event => { event.preventDefault(); void save() }}>
+            <form id="workspace-settings-form" noValidate onSubmit={event => { event.preventDefault(); void save() }}>
               <div hidden={section !== 'workspace'} className="flex flex-col gap-8">
         <FieldSet disabled={preferenceDisabled} aria-labelledby="settings-section-title">
           <FieldGroup>
@@ -326,15 +322,12 @@ export function WorkspaceSettings({ section, preferences, loaded, loadError, onS
         </FieldSet>
               </div>
             </form>
-            <section hidden={section !== 'analysis'} aria-label="AI connection">
-              {analysisMounted && <AnalysisSettings onDirtyChange={setAnalysisDirty} onBusyChange={setAnalysisBusy} />}
-            </section>
           </div>
         </div>
-        {section !== 'analysis' && <footer className="shrink-0 border-t px-12 py-4"><div className="mx-auto flex w-full max-w-3xl items-center justify-between gap-4">
+        <footer className="shrink-0 border-t px-12 py-4"><div className="mx-auto flex w-full max-w-3xl items-center justify-between gap-4">
           <p role="status" className="text-sm text-muted-foreground">{saving ? 'Saving settings…' : dirty ? 'Unsaved changes' : savedMessage}</p>
           <div className="flex gap-2"><Button type="button" variant="outline" disabled={preferenceDisabled || !dirty} onClick={() => { setDraft(preferencesDraft(preferences)); setErrors({}); setSaveError(''); setSavedMessage('') }}>Discard changes</Button><Button type="submit" form="workspace-settings-form" disabled={preferenceDisabled}>{saving && <Spinner data-icon="inline-start" />}Save settings</Button></div>
-        </div></footer>}
+        </div></footer>
       </div>
     </div>
   </main>

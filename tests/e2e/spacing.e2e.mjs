@@ -54,20 +54,6 @@ test('shared spacing resolves calc lengths in the hidden renderer without changi
       return next.getBoundingClientRect().top - legend.getBoundingClientRect().bottom + parseFloat(getComputedStyle(legend).paddingBottom)
     })
     assert.ok(legendGap >= 6, 'Native fieldset legends must keep container-owned separation.')
-    const markdown = await page.evaluate(() => {
-      const container = document.createElement('div')
-      container.className = 'analysis-markdown flex flex-col gap-4'
-      container.innerHTML = '<p>Paragraph</p><div data-streamdown="code-block" class="my-4"><pre><code>code</code></pre></div><hr class="my-6"><ul><li>Nested<ul><li>Item</li></ul></li></ul>'
-      container.dataset.analysisAnswer = ''
-      document.body.append(container)
-      const result = { gap: getComputedStyle(container).gap, margins: [...container.children].map(child => getComputedStyle(child).marginBlock),
-        nestedGap: getComputedStyle(container.querySelector('ul ul')).gap }
-      container.remove()
-      return result
-    })
-    assert.equal(markdown.gap, '12px')
-    assert.deepEqual(markdown.margins, ['0px', '0px', '0px', '0px'])
-    assert.equal(markdown.nestedGap, '6px')
   } finally {
     await electron?.close()
     await rm(userData, { recursive: true, force: true })

@@ -10,7 +10,7 @@ import { createNativeExchange } from '../helpers/native-exchange.mjs'
 
 const frames = ['1H', '15m', '5m'], btc = 'BTC-USDT-SWAP', eth = 'ETH-USDT-SWAP'
 
-test('default multi-timeframe charts synchronize time navigation and retain selectable indicators', { timeout: 120_000 }, async () => {
+test('multi-timeframe charts synchronize navigation and copy all three charts', { timeout: 120_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'perp-multiframe-'))
   const exchange = await createNativeExchange()
   let electron
@@ -157,21 +157,36 @@ test('default multi-timeframe charts synchronize time navigation and retain sele
     await waitForSynchronizedViewports(null, null)
     console.log('multiframe: ETH ready')
     await live(eth, 142.75, 40)
-    await page.getByRole('button', { name: 'Indicators', exact: true }).click()
-    await page.waitForFunction(() => document.querySelectorAll('svg[data-rendered-inst]').length === 1 && document.querySelector('[data-chart-panel-header="rsi"]'))
-    for (const [timeframe, label] of [['1H', '1h'], ['15m', '15m'], ['5m', '5m']]) {
-      await page.locator('[aria-label="Chart timeframe"] button').filter({ hasText: new RegExp(`^${label}$`, 'i') }).click()
-      await page.waitForFunction(timeframe => document.querySelector('svg[data-rendered-inst]')?.getAttribute('data-rendered-timeframe') === timeframe, timeframe)
-      assert.equal(await page.locator('[data-chart-indicator="ema"], [data-chart-legend="EMA(200)"]').count(), 0)
-      for (const field of ['vwap', 'bollUpper', 'bollMiddle', 'bollLower']) assert.equal(await page.locator(`[data-chart-indicator="${field}"]`).count(), 1)
-    }
-    await page.waitForFunction(async () => (await window.radarDesktop.request({ preferences: { action: 'read' } })).chartDisplayMode === 'indicators')
+    // Observe the real capture while intercepting the final clipboard write so
+    // this background test never alters the user's clipboard.
+    await page.addInitScript(() => {
+      const define = Object.defineProperty
+      Object.defineProperty = function (target, key, descriptor) {
+        if (target === window && key === 'radarDesktop') {
+          Object.defineProperty = define
+          const original = descriptor.value
+          descriptor.value = Object.freeze({ ...original, request: (...args) => {
+            if (args[0]?.captureChart) window.__captureBounds = args[0].captureChart
+            if (args[0]?.copyImage) { window.__copiedImage = args[0].copyImage; return Promise.resolve({ ok: true }) }
+            return original.request(...args)
+          } })
+        }
+        return define(target, key, descriptor)
+      }
+    })
     await page.reload({ waitUntil: 'domcontentloaded' })
-    await page.waitForFunction(() => document.querySelector('[data-chart-display-mode="indicators"]'))
-    await page.getByRole('button', { name: 'Multi-timeframe', exact: true }).click()
-    await page.waitForFunction(async () => (await window.radarDesktop.request({ preferences: { action: 'read' } })).chartDisplayMode === 'multi')
-    await page.reload({ waitUntil: 'domcontentloaded' })
-    await page.waitForFunction(() => document.querySelectorAll('svg[data-rendered-inst]').length === 3)
+    await page.locator(`[aria-label="View ${eth} chart"]`).click()
+    await ready(eth)
+    await page.waitForFunction(() => [...document.querySelectorAll('[data-chart-inst]')].length === 3
+      && [...document.querySelectorAll('[data-chart-inst]')].every(chart => chart.dataset.chartLoading === 'false' && Number(chart.dataset.chartRenderedBars) > 0))
+    const bounds = await page.locator('[data-chart-capture]').boundingBox()
+    await page.getByRole('button', { name: 'Copy chart', exact: true }).click()
+    await page.getByRole('status').filter({ hasText: 'Chart copied to clipboard' }).waitFor()
+    const captured = await page.evaluate(() => ({ bounds: window.__captureBounds, image: window.__copiedImage }))
+    for (const key of ['x', 'y', 'width', 'height']) assert.ok(Math.abs(captured.bounds[key] - bounds[key]) < 1, `Capture ${key} must cover the entire multi-timeframe capture container.`)
+    assert.match(captured.image, /^data:image\/png;base64,/)
+    assert.equal(await page.getByRole('button', { name: 'Indicators', exact: true }).count(), 0)
+    assert.equal(await page.getByRole('button', { name: 'Analyze Long', exact: true }).count(), 0)
     assert.deepEqual(errors, [])
     assert.deepEqual(exchange.businessSubscriptions(), [`candle5m:${btc}`, `candle5m:${eth}`].sort())
   } finally {

@@ -145,7 +145,6 @@ export class MetadataStore {
         store.#importLegacy(legacy)
       }
       store.getSettings() // Validate persisted data on every open, not just writes.
-      store.getAnalysisSettings()
       return store
     } catch (error) { store.close(); throw error }
   }
@@ -175,7 +174,7 @@ export class MetadataStore {
         const current = this.getSettings()
         const preferences = validatePreferences(merge(current.preferences, patch))
         this.#database.prepare('UPDATE settings SET revision = ?, preferences = ? WHERE id = 1').run(current.revision + 1, JSON.stringify(preferences))
-        if (Object.hasOwn(legacy, 'analysis')) this.#database.prepare('UPDATE analysis_settings SET value = ? WHERE id = 1').run(JSON.stringify(validateAnalysis(legacy.analysis)))
+        if (Object.hasOwn(legacy, 'analysis')) this.#database.prepare('UPDATE analysis_settings SET value = ? WHERE id = 1').run(JSON.stringify(legacy.analysis))
       }
       this.#database.prepare('INSERT INTO migrations (id, value) VALUES (?, ?)').run('legacy-settings-v1', JSON.stringify({ schemaVersion: 1, imported: legacy !== undefined }))
     })

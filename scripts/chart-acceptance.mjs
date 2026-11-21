@@ -82,17 +82,20 @@ export async function foregroundPaintWindow(electron, page) {
 }
 
 export async function selectTimeframe(page, timeframe) {
-  const mode = page.locator('[data-chart-display-mode="multi"]')
-  if (await mode.count()) await page.getByRole('button', { name: 'Indicators', exact: true }).click()
-  const button = page.locator('[aria-label="Chart timeframe"] button')
-    .filter({ hasText: new RegExp(`^${timeframe}$`, 'i') })
-  await button.click()
+  const index = ['1H', '15m', '5m'].indexOf(timeframe)
+  assert.notEqual(index, -1, `Unsupported chart timeframe: ${timeframe}`)
+  await page.locator('[data-multi-timeframe-charts] > [data-chart-workspace]').nth(index).waitFor({ state: 'visible' })
+  await page.evaluate(({ index, timeframe }) => {
+    const charts = [...document.querySelectorAll('[data-multi-timeframe-charts] > [data-chart-workspace]')]
+    charts.forEach((chart, position) => chart.toggleAttribute('data-acceptance-target', position === index))
+    document.documentElement.dataset.acceptanceTimeframe = timeframe
+  }, { index, timeframe })
 }
 
 export async function waitForRendered(page, fixture, timeframe = fixture.timeframe, end = fixture.end) {
   try {
     await page.waitForFunction(({ instId, timeframe, end }) => {
-      const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
+      const chart = document.querySelector(`[data-acceptance-target] [data-chart-inst="${instId}"]`)
       const svg = chart?.querySelector('svg[data-rendered-inst]')
       return svg?.getAttribute('data-rendered-inst') === instId
         && svg.getAttribute('data-rendered-timeframe') === timeframe
@@ -103,7 +106,7 @@ export async function waitForRendered(page, fixture, timeframe = fixture.timefra
         && chart.getAttribute('data-chart-loading') === 'false'
     }, { instId: fixture.instId, timeframe, end }, { timeout: 20_000 })
   } catch (error) {
-    const state = await page.locator('[data-chart-inst]').evaluate(chart => ({
+    const state = await page.locator('[data-acceptance-target] [data-chart-inst]').evaluate(chart => ({
       attributes: Object.fromEntries([...chart.attributes].filter(attribute => attribute.name.startsWith('data-chart-')).map(attribute => [attribute.name, attribute.value])),
       inputs: window.__chartPaintProbe?.inputBursts,
       commits: window.__chartPaintProbe?.commits?.slice(-12),
@@ -117,7 +120,7 @@ export async function waitForRendered(page, fixture, timeframe = fixture.timefra
 // without treating the pending flag as a missing price frame.
 export async function waitForTargetSnapshot(page, fixture, timeframe, end) {
   await page.waitForFunction(({ instId, timeframe, end }) => {
-    const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
+    const chart = document.querySelector(`[data-acceptance-target] [data-chart-inst="${instId}"]`)
     const svg = chart?.querySelector('svg[data-rendered-inst]')
     return svg?.getAttribute('data-rendered-inst') === instId
       && svg.getAttribute('data-rendered-timeframe') === timeframe
@@ -182,72 +185,28 @@ export async function assertWorkspaceLayout(page) {
   return layout
 }
 
-export async function assertIndicatorLegends(page, { requireFittedVolatility = false } = {}) {
-  assert.equal(await page.locator('[data-chart-indicator="ema"], [data-chart-legend="EMA(200)"]').count(), 0, 'EMA must not appear on a main chart.')
-  const reading = await page.locator('svg[data-rendered-inst]').evaluate(svg => {
-    const fields = {
-      'VWAP(14)': 'vwap', 'BOLL(20,2)': 'bollMiddle',
-      'ROC(9)': 'roc', 'MAROC(9)': 'maroc', 'RSI(6)': 'rsi6', 'RSI(12)': 'rsi12', 'RSI(24)': 'rsi24',
-      'ATR%(14)': 'atrPercent', 'BBW(20,2)': 'bbw', 'OI (Contracts)': 'oi',
+export async function assertIndicatorLegends(page) {
+  const reading = await page.locator('[data-multi-timeframe-charts] svg[data-rendered-inst]').evaluateAll(charts => charts.map(svg => ({
+    timeframe: svg.dataset.renderedTimeframe,
+    panels: svg.querySelectorAll('[data-chart-panel-header]').length,
+    curves: ['vwap', 'bollUpper', 'bollMiddle', 'bollLower'].map(field => {
+      const curve = svg.querySelector(`[data-chart-indicator="${field}"]`)
+      return { field, path: curve?.getAttribute('d') ?? '', stroke: curve ? getComputedStyle(curve).stroke : null,
+        width: curve ? Number.parseFloat(getComputedStyle(curve).strokeWidth) : null }
+    }),
+  })))
+  assert.deepEqual(reading.map(chart => chart.timeframe), ['1H', '15m', '5m'])
+  const legend = await page.locator('[data-shared-chart-legend] [data-chart-legend]').evaluateAll(nodes => nodes.map(node => ({
+    label: node.dataset.chartLegend, stroke: getComputedStyle(node).stroke,
+  })))
+  assert.deepEqual(legend.map(item => item.label), ['VWAP(14)', 'BOLL(20,2)'])
+  for (const chart of reading) {
+    assert.equal(chart.panels, 0, `${chart.timeframe} should contain only its price chart.`)
+    for (const curve of chart.curves) {
+      assert.ok(curve.path, `${chart.timeframe} ${curve.field} must have a drawn curve.`)
+      assert.equal(curve.width, 1, `${chart.timeframe} ${curve.field} must use a 1 px stroke.`)
+      assert.equal(curve.stroke, legend[curve.field === 'vwap' ? 0 : 1].stroke, `${chart.timeframe} ${curve.field} must match its shared legend.`)
     }
-    const volatilityPanel = svg.querySelector('[data-chart-volatility-panel]')
-    const colorProbe = document.createElementNS('http://www.w3.org/2000/svg', 'text')
-    colorProbe.setAttribute('fill', 'var(--muted-foreground)')
-    svg.append(colorProbe)
-    const mutedForeground = getComputedStyle(colorProbe).fill
-    colorProbe.remove()
-    return {
-      foreground: getComputedStyle(document.body).color,
-      mutedForeground,
-      volatilityPanel: volatilityPanel ? { top: Number(volatilityPanel.getAttribute('data-chart-panel-top')), bottom: Number(volatilityPanel.getAttribute('data-chart-panel-bottom')) } : null,
-      volatilityCoordinates: svg.querySelectorAll('[data-chart-volatility-axis], [data-chart-axis-label], [data-chart-axis-tick]').length,
-      panels: [...svg.querySelectorAll('[data-chart-panel-header]')].map(header => ({ key: header.dataset.chartPanelHeader, y: header.getBBox().y })),
-      legends: Object.entries(fields).map(([label, field]) => {
-        const swatch = [...svg.querySelectorAll('[data-chart-legend]')].find(node => node.dataset.chartLegend === label)
-        const group = swatch?.parentElement, texts = group?.querySelectorAll('text')
-        const curve = svg.querySelector(`[data-chart-indicator="${field}"]`)
-        return { label, field, panel: group?.closest('[data-chart-panel-header]')?.getAttribute('data-chart-panel-header'),
-          labelFill: texts?.[0] ? getComputedStyle(texts[0]).fill : null,
-          valueFill: texts?.[1] ? getComputedStyle(texts[1]).fill : null,
-          swatchStroke: swatch ? getComputedStyle(swatch).stroke : null,
-          curveStroke: curve ? getComputedStyle(curve).stroke : null,
-          curveWidth: curve ? Number.parseFloat(getComputedStyle(curve).strokeWidth) : null,
-          curveDash: curve ? getComputedStyle(curve).strokeDasharray : null,
-          curve: curve?.getAttribute('d') ?? '', value: texts?.[1]?.textContent ?? '',
-        }
-      }),
-    }
-  })
-  assert.deepEqual(reading.panels.map(panel => panel.key), ['price', 'roc', 'rsi', 'atr', 'oi', 'taker'])
-  assert.ok(reading.panels.every((panel, index) => index === 0 || panel.y > reading.panels[index - 1].y), 'Panel titles must follow their visual order, with ATR% and BBW between RSI and OI.')
-  for (const legend of reading.legends) {
-    assert.ok(legend.curve, `${legend.label} must have a drawn curve.`)
-    assert.equal(legend.labelFill, legend.panel === 'rsi' ? reading.mutedForeground : legend.curveStroke,
-      `${legend.label} title must use ${legend.panel === 'rsi' ? 'muted text beside its colored swatch' : 'its curve color'}.`)
-    assert.equal(legend.swatchStroke, legend.curveStroke, `${legend.label} swatch must match its curve.`)
-    assert.equal(legend.valueFill, reading.foreground, `${legend.label} numeric value must retain the foreground text color.`)
-    assert.equal(legend.curveWidth, 1, `${legend.label} must use a 1 px stroke.`)
-    if (legend.field === 'atrPercent' || legend.field === 'bbw') {
-      assert.equal(legend.panel, 'atr', 'ATR% and BBW must share one indicator panel.')
-      assert.match(legend.value, /^\d+\.\d{2}%$/, `${legend.label} must show its percentage without a positive change sign.`)
-    }
-  }
-  assert.equal(reading.legends.find(legend => legend.field === 'atrPercent').curveDash, 'none')
-  assert.notEqual(reading.legends.find(legend => legend.field === 'bbw').curveDash, 'none', 'BBW must remain distinguishable by its dash pattern.')
-  assert.equal(reading.volatilityCoordinates, 0, 'ATR% and BBW must hide their vertical coordinates and axis titles.')
-  if (requireFittedVolatility) {
-    const panel = reading.volatilityPanel
-    assert.ok(panel && panel.bottom > panel.top, 'The volatility panel must expose its painted boundaries.')
-    reading.volatilityFits = ['atrPercent', 'bbw'].map(field => {
-      const curve = reading.legends.find(legend => legend.field === field).curve
-      const points = curve.match(/[ML][^ML]+/g).map(command => command.slice(1).trim().split(/\s+/).map(Number))
-      assert.ok(points.every(point => point.length === 2 && point.every(Number.isFinite)), `${field} must contain finite coordinates.`)
-      const ys = points.map(([, y]) => y), top = Math.min(...ys), bottom = Math.max(...ys), height = panel.bottom - panel.top
-      const fit = { field, top, bottom, fillRatio: (bottom - top) / height, topInset: (top - panel.top) / height, bottomInset: (panel.bottom - bottom) / height }
-      assert.ok(fit.fillRatio >= .8, `${field} must use most of its independent panel height: ${JSON.stringify(fit)}`)
-      assert.ok(fit.topInset >= .01 && fit.bottomInset >= .01, `${field} visible extrema need padding inside the panel: ${JSON.stringify(fit)}`)
-      return fit
-    })
   }
   return reading
 }
@@ -300,7 +259,7 @@ export function assertChartViewport(reading, { fullSlots = 96, endHour } = {}) {
 }
 
 export async function assertCompleteChartViewport(page, instId, options) {
-  return assertChartViewport(await page.locator(`[data-chart-inst="${instId}"]`).evaluate(captureChartViewport), options)
+  return assertChartViewport(await page.locator(`[data-acceptance-target] [data-chart-inst="${instId}"]`).evaluate(captureChartViewport), options)
 }
 
 export async function openChart(page, fixture, timeframe = fixture.timeframe, { liveOverlay = false } = {}) {
@@ -308,20 +267,15 @@ export async function openChart(page, fixture, timeframe = fixture.timeframe, { 
   // width and density coverage belongs to the workspace resize acceptance.
   await page.setViewportSize({ width: 1360, height: 1000 })
   await page.reload({ waitUntil: 'domcontentloaded' })
-  await page.locator('[aria-label="Chart display mode"]').waitFor({ state: 'visible' })
-  const indicators = page.getByRole('button', { name: 'Indicators', exact: true })
-  if (await indicators.count()) await indicators.click()
-  // Admission belongs to the requested timeframe's committed chart. A fixture
-  // can intentionally have no sources for the previously saved timeframe.
-  await selectTimeframe(page, timeframe)
   await page.locator(`[aria-label="View ${fixture.instId} chart"]`).click({ timeout: 15_000 })
-  await page.locator(`[data-chart-inst="${fixture.instId}"]`).waitFor({ state: 'visible' })
+  await selectTimeframe(page, timeframe)
+  await page.locator(`[data-acceptance-target] [data-chart-inst="${fixture.instId}"]`).waitFor({ state: 'visible' })
   await assertWorkspaceLayout(page)
   // Calibrate the viewport from actual drawable width, excluding its measured
   // axis gutter. Keep exactly 96 plotted candles, without changing production
   // spacing or relying on a particular sidebar/font width.
   for (let attempt = 0; attempt < 4; attempt++) {
-    const state = await page.locator(`[data-chart-inst="${fixture.instId}"]`).evaluate(chart => ({
+    const state = await page.locator(`[data-acceptance-target] [data-chart-inst="${fixture.instId}"]`).evaluate(chart => ({
       span: Number(chart.dataset.chartVisibleBars), spacing: Number(chart.dataset.chartBarSpacing),
       scale: Number(document.querySelector('[data-layout="market-workspace"]').dataset.uiScale),
     }))
@@ -331,11 +285,11 @@ export async function openChart(page, fixture, timeframe = fixture.timeframe, { 
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
   }
   await waitForRendered(page, fixture, timeframe)
-  const targetBars = Number(await page.locator(`[data-chart-inst="${fixture.instId}"]`).getAttribute('data-chart-target-bars'))
+  const targetBars = Number(await page.locator(`[data-acceptance-target] [data-chart-inst="${fixture.instId}"]`).getAttribute('data-chart-target-bars'))
   assert.ok(validChartWindowBars(targetBars), 'The selected chart must publish a supported prepared demand bucket.')
   fixture.currentWindowBars = Math.max(fixture.currentWindowBars ?? 96, targetBars)
   if (!liveOverlay) {
-    const count = Number(await page.locator(`[data-chart-inst="${fixture.instId}"]`).getAttribute('data-chart-rendered-bars'))
+    const count = Number(await page.locator(`[data-acceptance-target] [data-chart-inst="${fixture.instId}"]`).getAttribute('data-chart-rendered-bars'))
     assert.ok(count >= 96 && count <= 98, `Expected 96 full slots plus partially visible candles; got ${count}.`)
   }
 }
@@ -359,7 +313,7 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
   assert.ok(['fixture', 'finite', 'deferred-canonical'].includes(indicatorValidation), 'Unknown chart indicator validation contract.')
   assert.ok(!paintProbes.has(page), 'The previous paint probe must finish before starting another.')
   if (requireWarmStatistics) {
-    const { timeframe, bars } = await page.locator(`[data-chart-inst="${fixture.instId}"]`).evaluate(chart => ({
+    const { timeframe, bars } = await page.locator(`[data-acceptance-target] [data-chart-inst="${fixture.instId}"]`).evaluate(chart => ({
       timeframe: chart.__chartSnapshot?.timeframe,
       bars: (chart.__chartSnapshot?.bars ?? []).map(bar => ({
         hour: bar.hour, oi: bar.oi, buy: bar.buy, sell: bar.sell, oiObserved: bar.oiObserved,
@@ -371,13 +325,13 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
   }
   const cpu = await startRendererCPUCounter(page, { label: fixture.instId })
   try { await page.evaluate(({ instId, series, requireMatureData, requireWarmStatistics, indicatorValidation, cpuMarkerPrefix }) => {
-    const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
+    const chart = document.querySelector(`[data-acceptance-target] [data-chart-inst="${instId}"]`)
     if (!(chart instanceof HTMLElement)) throw new Error('No chart surface to inspect.')
     const expectedTimeframe = chart.__chartSnapshot?.timeframe
     if (!series[expectedTimeframe]) throw new Error('The initial chart needs a known fixture timeframe.')
-    const curveFields = ['vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi']
+    const curveFields = ['vwap', 'bollUpper', 'bollMiddle', 'bollLower']
     const probe = {
-      instId, expectedTimeframe, series, requireMatureData, requireWarmStatistics, indicatorValidation,
+      instId, expectedTimeframe, series, requireMatureData, requireWarmStatistics, indicatorValidation, priceOnly: true,
       active: true, frames: 0, pendingFrames: 0, paints: 0, minimumBars: Infinity, errors: [],
       frameGaps: [], frameSamples: [], validationSamples: [], inputBursts: [], commits: [], requestCommits: [], pendingWindows: [], previousFrame: null,
       phase: 'initial', quality: [], observations: [],
@@ -709,7 +663,8 @@ export function validateStoppedPaintCapture({ readyTarget = null, includeRequest
   const validationStartedAt = performance.now()
   const fields = ['open', 'high', 'low', 'close', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
   const indicatorFields = fields.slice(4, -3), statisticFields = ['oi', 'buy', 'sell']
-  const curveFields = ['vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi']
+  const curveFields = probe.priceOnly ? ['vwap', 'bollUpper', 'bollMiddle', 'bollLower']
+    : ['vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi']
   const { instId, requireMatureData, requireWarmStatistics, indicatorValidation } = probe
   const oracles = Object.fromEntries(Object.entries(series).map(([frame, entry]) => [frame, new Map(entry.bars.map(bar => [bar.hour, bar]))]))
   const expectedGeometry = new WeakMap(), svgGeometry = new WeakMap(), known = new Map(), seenErrors = new Set(probe.errors)
@@ -822,12 +777,12 @@ export function validateStoppedPaintCapture({ readyTarget = null, includeRequest
           if (/NaN|Infinity|undefined/.test(d)) fail('Nonfinite SVG geometry.')
         }
         if (requireMatureData) {
-          for (let index = 0; index < curveFields.length - 1; index += 1) if (!svg.curves[index]) fail(`${phase}: ${timeframe} ${snapshot.endHour} has no ${curveFields[index]} SVG curve for mature local history.`)
+          for (let index = 0; index < curveFields.length - (probe.priceOnly ? 0 : 1); index += 1) if (!svg.curves[index]) fail(`${phase}: ${timeframe} ${snapshot.endHour} has no ${curveFields[index]} SVG curve for mature local history.`)
           const expectsOI = bars.some(bar => Number.isFinite(oracles[timeframe]?.get(bar.hour)?.oi))
           const expectsTaker = bars.some(bar => Number.isFinite(oracles[timeframe]?.get(bar.hour)?.buy) && Number.isFinite(oracles[timeframe]?.get(bar.hour)?.sell))
-          if ((requireWarmStatistics ? expectsOI : bars.some(bar => bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1)))
+          if (!probe.priceOnly && (requireWarmStatistics ? expectsOI : bars.some(bar => bar.oiObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 1)))
             && svg.oi !== 'complete') fail(`${phase}: ${timeframe} ${snapshot.endHour} lost complete observed OI geometry.`)
-          if ((requireWarmStatistics ? expectsTaker : bars.some(bar => bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2)))
+          if (!probe.priceOnly && (requireWarmStatistics ? expectsTaker : bars.some(bar => bar.takerObserved ?? bar.statisticsObserved ?? Boolean((bar.statisticsSources ?? 0) & 2)))
             && svg.taker !== 'complete') fail(`${phase}: ${timeframe} ${snapshot.endHour} lost complete observed Taker geometry.`)
         }
         const oiCount = bars.filter(bar => bar.oi !== null).length
@@ -835,9 +790,9 @@ export function validateStoppedPaintCapture({ readyTarget = null, includeRequest
         const buyRectangles = bars.filter(bar => bar.buy !== null && bar.buy > 0).length
         const sellRectangles = bars.filter(bar => bar.sell !== null && bar.sell > 0).length
         if (Number(chart.oiSamples) !== oiCount || Number(chart.takerSamples) !== takerCount) fail('Published statistics sample counts disagree with the actual snapshot.')
-        if (Number(svg.oiSamples) !== oiCount) fail('The actual OI geometry does not cover the snapshot.')
-        if (Number(svg.buySamples) !== buyRectangles) fail('The actual Taker buy geometry does not cover the snapshot.')
-        if (Number(svg.sellSamples) !== sellRectangles) fail('The actual Taker sell geometry does not cover the snapshot.')
+        if (!probe.priceOnly && Number(svg.oiSamples) !== oiCount) fail('The actual OI geometry does not cover the snapshot.')
+        if (!probe.priceOnly && Number(svg.buySamples) !== buyRectangles) fail('The actual Taker buy geometry does not cover the snapshot.')
+        if (!probe.priceOnly && Number(svg.sellSamples) !== sellRectangles) fail('The actual Taker sell geometry does not cover the snapshot.')
       }
       if (snapshot.instId !== instId || chart.instId !== instId || svg.instId !== instId) fail('Mixed instrument in the rendered surface.')
       if (svg.timeframe !== timeframe) fail('SVG and snapshot timeframes disagree.')
@@ -848,7 +803,7 @@ export function validateStoppedPaintCapture({ readyTarget = null, includeRequest
       if (chart.candleState !== priceState || chart.indicatorState !== (snapshot.indicatorState ?? null)
         || chart.indicatorInput !== (snapshot.indicatorStatus?.inputVersion ?? null)
         || chart.oiState !== oiState || chart.takerState !== takerState || chart.statisticsState !== statisticsState
-        || chart.incomplete !== String(incomplete) || svg.oiState !== oiState || svg.takerState !== takerState) fail('Published source states disagree with the snapshot.')
+        || chart.incomplete !== String(incomplete) || !probe.priceOnly && (svg.oiState !== oiState || svg.takerState !== takerState)) fail('Published source states disagree with the snapshot.')
       for (const d of svg.pathData) if (/NaN|Infinity|undefined/.test(d)) fail('Nonfinite SVG geometry.')
       if (!newPaint) continue
       if (!Array.isArray(bars)) { fail('The rendered snapshot has no bars.'); continue }
@@ -977,7 +932,7 @@ function prefetchPerformanceChecks(latency) {
 
 export async function wheelBurst(page, { frames = 1, eventsPerFrame = 1, deltaY = 12, deltaX = 0, deltaMode = 0 }) {
   return page.evaluate(async options => {
-    const plot = document.querySelector('[data-chart-plot]')
+    const plot = document.querySelector('[data-acceptance-target] [data-chart-plot]') ?? document.querySelector('[data-chart-plot]')
     if (!(plot instanceof HTMLElement)) throw new Error('The chart plot is unavailable.')
     const inputs = []
     for (let frame = 0; frame < options.frames; frame += 1) {
@@ -1107,7 +1062,7 @@ export async function waitForLocalHistory(electron, page, fixture, timeframe = f
     // Keep the historical target active until both the calculated reserve and
     // its real viewport are ready. Returning to latest clears history publishing.
     await page.waitForFunction(({ instId, timeframe, end }) => {
-      const chart = document.querySelector(`[data-chart-inst="${instId}"]`), snapshot = chart?.__chartSnapshot
+      const chart = document.querySelector(`[data-acceptance-target] [data-chart-inst="${instId}"]`), snapshot = chart?.__chartSnapshot
       const bars = chart?.__chartRenderedBars ?? snapshot?.bars
       const fields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
       return snapshot?.instId === instId && snapshot.timeframe === timeframe && snapshot.endHour === end
@@ -1677,7 +1632,7 @@ export async function measureMissingWindow(electron, page, { timeframe = '15m', 
       ...continuation.map((_, index) => fixture.end - (fixture.targetDistance + (index + 1) * 6) * fixture.intervalMS),
       ...reversal.map((_, index) => fixture.end - (fixture.targetDistance + 36 - (index + 1) * 6) * fixture.intervalMS)]
     assert.equal(latestTargets.at(-1), latestEnd)
-    await page.waitForFunction(({ instId, end }) => Number(document.querySelector(`[data-chart-inst="${instId}"]`)?.dataset.chartRequestedEnd) === end,
+    await page.waitForFunction(({ instId, end }) => Number(document.querySelector(`[data-acceptance-target] [data-chart-inst="${instId}"]`)?.dataset.chartRequestedEnd) === end,
       { instId: fixture.instId, end: latestEnd }, { timeout: 5000 })
     const latestState = await readColdWindowState(page, fixture.instId)
     assert.equal(latestState.requestedEnd, latestEnd, 'The reverse gesture must update the pending target to the latest intent.')
@@ -1702,7 +1657,7 @@ export async function measureMissingWindow(electron, page, { timeframe = '15m', 
           && request.from <= fixture.targetEnd && request.through >= fixture.targetWindowStart)
       }
       await page.waitForFunction(({ instId, latestEnd }) => {
-        const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
+        const chart = document.querySelector(`[data-acceptance-target] [data-chart-inst="${instId}"]`)
         const alert = document.querySelector('[role="alert"]')?.textContent ?? ''
         return Number(chart?.dataset.chartRequestedEnd) === latestEnd && /price history failed/i.test(alert)
       }, { instId: fixture.instId, latestEnd }, { timeout: 5_000 }).catch(async error => {
@@ -1719,7 +1674,7 @@ export async function measureMissingWindow(electron, page, { timeframe = '15m', 
     } else {
       await waitForRendered(page, fixture, timeframe, latestEnd)
       await page.waitForFunction(instId => {
-        const snapshot = document.querySelector(`[data-chart-inst="${instId}"]`)?.__chartSnapshot
+        const snapshot = document.querySelector(`[data-acceptance-target] [data-chart-inst="${instId}"]`)?.__chartSnapshot
         return ['ready', 'unavailable'].includes(snapshot?.indicatorState) && snapshot.bars.every(bar => bar.indicatorsObserved)
       }, fixture.instId, { timeout: 10_000 })
       latency = await measureChartIntentLatency(page, { inputs: latestInputs, targets: latestTargets, requireForeground: false })
@@ -1818,7 +1773,7 @@ export async function measureMissingWindow(electron, page, { timeframe = '15m', 
 }
 
 async function readColdWindowState(page, instId) {
-  return page.locator(`[data-chart-inst="${instId}"]`).evaluate(chart => {
+  return page.locator(`[data-acceptance-target] [data-chart-inst="${instId}"]`).evaluate(chart => {
     const svg = chart.querySelector('svg[data-rendered-inst]')
     return { loading: chart.dataset.chartLoading === 'true', incomplete: chart.dataset.chartIncomplete === 'true',
       requestedEnd: Number(chart.dataset.chartRequestedEnd), completedEnd: Number(chart.dataset.chartCompletedEnd),
@@ -1922,7 +1877,7 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m', offscreen
       beforeMetrics = Object.fromEntries((await cdp.send('Performance.getMetrics')).metrics.map(metric => [metric.name, metric.value]))
     }
     await page.waitForFunction(instId => {
-      const chart = document.querySelector(`[data-chart-inst="${instId}"]`), status = chart?.querySelector('[data-chart-status]')
+      const chart = document.querySelector(`[data-acceptance-target] [data-chart-inst="${instId}"]`), status = chart?.querySelector('[data-chart-status]')
       return ['ready', 'unavailable'].includes(chart?.__chartSnapshot?.indicatorState) && status?.dataset.chartIndicatorStale !== 'true'
     }, fixture.instId)
     await startPaintProbe(page, fixture, { indicatorValidation: 'finite' })
@@ -1946,7 +1901,7 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m', offscreen
     inputs = await wheelBurst(page, { deltaY: (fixture.targetDistance - approachDistance) * 12 })
     phaseData.finalInputs = inputs
     await waitForTargetSnapshot(page, fixture, timeframe, fixture.targetEnd)
-    const initialTarget = await page.locator(`[data-chart-inst="${fixture.instId}"]`).evaluate(chart => ({
+    const initialTarget = await page.locator(`[data-acceptance-target] [data-chart-inst="${fixture.instId}"]`).evaluate(chart => ({
       loading: chart.dataset.chartLoading === 'true', incomplete: chart.dataset.chartIncomplete === 'true',
       renderedBars: Number(chart.dataset.chartRenderedBars), end: Number(chart.dataset.chartCompletedEnd),
     }))

@@ -85,12 +85,10 @@ export async function seedAndPrepare(electron, page, { count, periods }) {
 }
 
 export async function selectChart(page, instId, timeframe) {
-  if (await page.locator('[data-chart-display-mode="multi"]').count()) await page.getByRole('button', { name: 'Indicators', exact: true }).click()
+  await page.evaluate(timeframe => { window.__idleTimeframe = timeframe }, timeframe)
   await page.locator(`[aria-label="View ${instId} chart"]`).evaluate(node => node.click())
-  await page.waitForFunction(instId => document.querySelector('[data-chart-inst]')?.getAttribute('data-chart-inst') === instId, instId, { timeout: 30_000 })
-  await page.locator('[aria-label="Chart timeframe"] button').filter({ hasText: new RegExp(`^${timeframe}$`, 'i') }).evaluate(node => node.click())
   await page.waitForFunction(({ instId, timeframe }) => {
-    const chart = document.querySelector('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
+    const chart = [...document.querySelectorAll('[data-chart-inst]')].find(node => node.__chartSnapshot?.timeframe === timeframe), snapshot = chart?.__chartSnapshot
     const svg = chart?.querySelector('svg[data-rendered-inst]')
     return snapshot?.instId === instId && snapshot?.timeframe === timeframe && svg?.dataset.renderedInst === instId
       && svg?.dataset.renderedTimeframe === timeframe && Number(svg.dataset.renderedEnd) === snapshot.endHour
@@ -106,7 +104,7 @@ export async function installReadyRecorder(page) {
     if (window.__idleReadyRecorder) throw new Error('A presentation ready recorder is already installed.')
     const records = []
     const handler = event => {
-      const chart = document.querySelector('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
+      const chart = [...document.querySelectorAll('[data-chart-inst]')].find(node => node.__chartSnapshot?.timeframe === window.__idleTimeframe), snapshot = chart?.__chartSnapshot
       const svg = chart?.querySelector('svg[data-rendered-inst]')
       const row = snapshot?.instId ? document.querySelector(`[aria-label="View ${snapshot.instId} chart"]`) : null
       records.push({ epoch: event.detail?.epoch, at: Date.now(), marker: document.documentElement.dataset.presentationEpoch,

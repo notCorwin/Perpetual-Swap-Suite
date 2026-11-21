@@ -4,7 +4,6 @@ export const SETTINGS_SECTIONS = [
   { id: 'workspace', label: 'Workspace' },
   { id: 'liquidity', label: 'Liquidity filters' },
   { id: 'data', label: 'Market data' },
-  { id: 'analysis', label: 'AI analysis' },
 ] as const
 export type SettingsSection = typeof SETTINGS_SECTIONS[number]['id']
 export type SettingsNavigationState = { dirty: boolean; busy: boolean }
@@ -29,12 +28,9 @@ export function useSettingsSection(guard: RefObject<SettingsNavigationState>) {
       accepted.current = { section: next, hash: window.location.hash }
       setSection(next)
     }
-    const openAnalysis = () => { window.location.hash = settingsHref('analysis') }
     window.addEventListener('hashchange', navigate)
-    window.addEventListener('radar-analysis-settings', openAnalysis)
     return () => {
       window.removeEventListener('hashchange', navigate)
-      window.removeEventListener('radar-analysis-settings', openAnalysis)
     }
   }, [guard])
   useEffect(() => { document.title = section ? 'Settings — Perpetual Swap Suite' : 'Perpetual Swap Suite' }, [section])

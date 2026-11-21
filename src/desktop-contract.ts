@@ -1,9 +1,7 @@
-import type { AnalysisSettings, AnalysisSettingsRequest } from './chart-analysis.ts'
 import type { PreparedChartResponse } from './chart-data.ts'
 import type { Preferences, PreferencesPatch } from '../electron/services/preferences.js'
 import type { RadarTimeframe } from './timeframe.ts'
 import type { OperationContext, OperationJournalEvent } from '../electron/services/operations.js'
-import type { GatewayEvent } from './gateway-fetch.ts'
 
 export type OperationSourceIdentity = { sessionId: string; executionId: string; scenarioId?: string }
 export type OperationBatch = { executionId: string; batchId: string; firstSequence: number; events: OperationJournalEvent[] }
@@ -52,7 +50,7 @@ export type HistoryDownload = {
 }
 export type PresentationSnapshot = {
   market: MarketSnapshot; frames: PreparedChartResponse[]; preferences: Preferences
-  audit: DataAudit; download: HistoryDownload; gateway?: GatewayEvent[]
+  audit: DataAudit; download: HistoryDownload
 }
 export type PresentationUpdate = { epoch: number; active: boolean; startedAt: number; snapshot?: PresentationSnapshot; error?: string }
 export type DesktopCommands = {
@@ -60,9 +58,6 @@ export type DesktopCommands = {
   snapshot: { input: { sinceRevision?: number; serviceSession?: string }; output: MarketSnapshot | UnchangedSnapshot }
   dataAudit: { input: { action: 'start' | 'cancel' | 'status' | 'repair' }; output: DataAudit }
   historyDownload: { input: { action: 'start' | 'cancel' | 'status' }; output: HistoryDownload }
-  analysisSettings: { input: AnalysisSettingsRequest; output: AnalysisSettings }
-  gatewayFetch: { input: { id: string; body: string }; output: { status: number; headers: Record<string, string> } }
-  cancelGatewayFetch: { input: string; output: { ok: boolean } }
   copyText: { input: string; output: { ok: boolean } }
   copyImage: { input: string; output: { ok: boolean } }
   captureChart: { input: ChartCaptureBounds & { output?: 'png' }; output: { ok: boolean } }
@@ -86,9 +81,6 @@ export interface RadarDesktop {
   request(value: { snapshot: DesktopCommands['snapshot']['input'] }): Promise<DesktopCommands['snapshot']['output']>
   request(value: { dataAudit: DesktopCommands['dataAudit']['input'] }): Promise<DesktopCommands['dataAudit']['output']>
   request(value: { historyDownload: DesktopCommands['historyDownload']['input'] }): Promise<DesktopCommands['historyDownload']['output']>
-  request(value: { analysisSettings: DesktopCommands['analysisSettings']['input'] }): Promise<DesktopCommands['analysisSettings']['output']>
-  request(value: { gatewayFetch: DesktopCommands['gatewayFetch']['input'] }): Promise<DesktopCommands['gatewayFetch']['output']>
-  request(value: { cancelGatewayFetch: DesktopCommands['cancelGatewayFetch']['input'] }): Promise<DesktopCommands['cancelGatewayFetch']['output']>
   request(value: { copyText: DesktopCommands['copyText']['input'] }): Promise<DesktopCommands['copyText']['output']>
   request(value: { copyImage: DesktopCommands['copyImage']['input'] }): Promise<DesktopCommands['copyImage']['output']>
   request(value: { captureChart: ChartCaptureBounds & { output: 'png' } }): Promise<ChartImage>

@@ -31,12 +31,6 @@ test('desktop requests accept each supported operation and preserve the public p
     { captureChart: { x: 1.5, y: 2.5, width: 80.5, height: 60.5, backgroundRGB: [.1, .2, .3], output: 'png' } },
     { copyText: '' },
     { copyText: 'Chart analysis' },
-    { analysisSettings: { action: 'read' } },
-    { analysisSettings: { action: 'save', model: 'test-model', apiKey: 'test-key' } },
-    { analysisSettings: { action: 'save', model: 'test-model', apiKey: '' } },
-    { analysisSettings: { action: 'removeKey' } },
-    { gatewayFetch: { id: 'request-1', body: '{"messages":[]}' } },
-    { cancelGatewayFetch: 'request-1' },
   ]) assert.deepEqual(parseDesktopRequest(request), request)
 })
 

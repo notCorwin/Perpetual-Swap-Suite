@@ -20,7 +20,6 @@ import { MarketBackend } from './services/market-backend.js'
 import { backgroundWindowLaunch, windowToolbarLayout } from './window-layout.js'
 import { restoreWindowBounds, saveWindowBounds } from './window-state.js'
 import { PresentationLifecycle } from './services/presentation-lifecycle.js'
-import { PresentationDelivery } from './services/presentation-delivery.js'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const rendererURL = process.env.ELECTRON_RENDERER_URL || undefined
@@ -61,7 +60,6 @@ const security = createDesktopSecurity({ rendererURL, rendererFile: join(root, '
 const e2eLiveRefresh = testMode && process.env.PERPETUAL_SWAP_E2E_LIVE_REFRESH === '1'
 let window
 let backend
-const gatewayRequests = new Map()
 const desktopRequests = new Set()
 let shuttingDown = false
 let shutdownComplete = false
@@ -70,15 +68,10 @@ let stopTestOwner = () => {}
 let testOwnerExitTimer
 let presentation
 const windowNotifications = new Set()
-const presentationDelivery = new PresentationDelivery({
-  getState: () => presentation?.getState(),
-  notify: sendNotification,
-  isClosing: () => shuttingDown,
-})
-
 function publishPresentation(update) {
   if (!window || window.isDestroyed()) return
-  presentationDelivery.publish(window.webContents, update)
+  const value = update.snapshot ? { ...update, snapshot: encodeChartWire(update.snapshot) } : update
+  window.webContents.send('radar:presentation', value)
 }
 
 function sendNotification(sender, channel, detail) {
@@ -111,56 +104,6 @@ function drainRendererOperations(target) {
   })
 }
 
-async function gatewayFetch(event, { id, body }) {
-  if (gatewayRequests.has(id)) throw new Error('A Gateway request with this ID is already running.')
-  const controller = new AbortController()
-  let operation, receivedBytes = 0, httpStatus
-  let finish
-  const finished = new Promise(resolve => { finish = resolve })
-  const owner = event.sender
-  const abort = () => controller.abort()
-  const forget = () => { presentationDelivery.discard(id); abort() }
-  const navigation = details => { if (details.isMainFrame && !details.isSameDocument) abort() }
-  owner.once('destroyed', forget)
-  owner.on('did-start-navigation', navigation)
-  gatewayRequests.set(id, { controller, finished })
-  const release = () => {
-    owner.removeListener('destroyed', forget)
-    owner.removeListener('did-start-navigation', navigation)
-    gatewayRequests.delete(id)
-    finish()
-  }
-  try {
-    const apiKey = await backend.credentials()
-    controller.signal.throwIfAborted()
-    if (!apiKey) throw new Error('Save an AI Gateway API key in Configure analysis before starting analysis.')
-    if (operationRecording) operation = beginOperation({ category: 'ipc', name: 'gateway.stream', resource: 'https://ai-gateway.vercel.sh/v1/chat/completions', attributes: { method: 'POST', sentBytes: Buffer.byteLength(body) } })
-    const response = await fetch('https://ai-gateway.vercel.sh/v1/chat/completions', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` }, body, signal: controller.signal,
-    })
-    httpStatus = response.status
-    if (response.body) {
-      void (async () => {
-        const reader = response.body.getReader()
-        try {
-          while (true) {
-            const { done, value } = await reader.read()
-            if (done) break
-            receivedBytes += value.byteLength
-            presentationDelivery.chunk(owner, id, value)
-          }
-          operation?.end({ status: response.ok ? 'ok' : 'error', attributes: { receivedBytes, httpStatus } })
-          presentationDelivery.terminal(owner, { id, type: 'end' })
-        } catch (error) {
-          operation?.end({ status: controller.signal.aborted ? 'cancelled' : 'error', attributes: { receivedBytes, httpStatus, errorName: error.name } })
-          if (!controller.signal.aborted) presentationDelivery.terminal(owner, { id, type: 'error', message: error instanceof Error ? error.message : 'Gateway stream interrupted.' })
-        } finally { reader.releaseLock(); release() }
-      })()
-    } else { operation?.end({ status: response.ok ? 'ok' : 'error', attributes: { receivedBytes, httpStatus } }); release() }
-    return { status: response.status, headers: Object.fromEntries(response.headers.entries()) }
-  } catch (error) { operation?.end({ status: controller.signal.aborted ? 'cancelled' : 'error', attributes: { receivedBytes, errorName: error.name } }); release(); throw error }
-}
-
 async function copyImage(image) {
   if (image.isEmpty()) throw new Error('Invalid chart image.')
   const png = measureOperation({ category: 'cpu', name: 'chart.encode-png' }, () => image.toPNG())
@@ -180,8 +123,6 @@ async function handleRequest(event, payload, context) {
   }
   assertPresentation()
   const execute = async () => {
-  if (request.gatewayFetch) return gatewayFetch(event, request.gatewayFetch)
-  if (request.cancelGatewayFetch) { gatewayRequests.get(request.cancelGatewayFetch)?.controller.abort(); presentationDelivery.discard(request.cancelGatewayFetch); return { ok: true } }
   if ('copyText' in request) { await clipboard.writeText(request.copyText); return { ok: true } }
   if ('copyImage' in request) {
     const image = nativeImage.createFromDataURL(request.copyImage)
@@ -293,10 +234,8 @@ function subscribeWindowNotifications(target) {
   const entry = { attach, detach }
   windowNotifications.add(entry)
   target.once('closed', () => { detach(); windowNotifications.delete(entry) })
-  const owner = target.webContents
   target.webContents.once('destroyed', () => {
     detach()
-    presentationDelivery.discardOwner(owner)
   })
   target.webContents.on('render-process-gone', detach)
   target.webContents.on('did-start-loading', () => {
@@ -386,8 +325,6 @@ app.on('before-quit', event => {
   void (async () => {
     let recordingComplete = false
     try {
-      for (const { controller } of gatewayRequests.values()) controller.abort()
-      await Promise.allSettled([...gatewayRequests.values()].map(value => value.finished))
       await startupTask.catch(error => console.error('Desktop startup did not complete:', error))
       try { await backend?.dispose() }
       catch (error) { console.error('Market backend shutdown failed:', error) }

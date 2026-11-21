@@ -1,6 +1,8 @@
 import { lazy, memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { DeferredPanel } from '@/DeferredPanel'
-import { Settings2 } from 'lucide-react'
+import { Camera, Settings2 } from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import { captureStableChart, chartCaptureBounds } from '@/chart-capture'
 import { buttonVariants } from '@/components/ui/button'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
@@ -9,13 +11,11 @@ import { MarketRowsViewport } from '@/MarketRowsViewport'
 import { WorkspaceViewport } from '@/WorkspaceViewport'
 import { settingsHref, useSettingsSection, type SettingsNavigationState } from '@/settings-navigation'
 import { chartCoordinator, multiChartControllers, ingestPreparedChart } from '@/chart-controller'
-import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { reconcileMarketOrder, reconcileMarketRows } from '@/market-snapshot'
 import { SnapshotOrder } from '@/snapshot-order'
 import { DEFAULT_PREFERENCES, type Preferences } from '@/renderer-preferences'
 import type { MarketSnapshot, RankedMarketRow, UnchangedSnapshot } from '@/desktop-contract'
 import type { PreparedChartNotification } from '@/chart-data'
-import type { RadarTimeframe } from '@/timeframe'
 import { cn } from '@/lib/utils'
 import { formatCurrentPrice } from '@/price-format'
 import { getPresentation, subscribePresentationTransition, usePresentation, waitForPresentation } from '@/presentation-store'
@@ -184,8 +184,7 @@ function App() {
     : verificationUnavailable ? 'Market data could not verify the enabled conditions. Waiting for updated observations from the data service.' : 'Adjust the enabled liquidity conditions in Settings.'
   // A qualification change must not discard the user's chart or history cursor.
   const selectedRow = rows.find(row => row.instId === selected)
-  const multiChart = preferences.chartDisplayMode === 'multi'
-  const selectedPrice = multiChart ? selectedRow?.lastPrice : undefined
+  const selectedPrice = selectedRow?.lastPrice
   const sharedPrice = typeof selectedPrice === 'number' && Number.isFinite(selectedPrice) && selectedPrice > 0 ? selectedPrice : undefined
   const sharedPriceText = sharedPrice === undefined ? undefined : formatCurrentPrice(sharedPrice, selectedRow?.tickSz)
   const retainedChart = Boolean(selected && !selectedRow)
@@ -236,21 +235,53 @@ function App() {
     // Backend notifications own market updates; view preferences do not reload rows.
     setPreferences(saved); setPreferencesError('')
   }, [])
-  const changeTimeframe = useCallback((chartTimeframe: RadarTimeframe) => {
-    setPreferences(current => ({ ...current, chartTimeframe }))
-    void savePreferences({ chartTimeframe }).catch(cause => {
-      setPreferences(current => current.chartTimeframe === chartTimeframe ? { ...current, chartTimeframe: committedPreferences.current.chartTimeframe } : current)
-      setPreferencesError(message(cause))
-    })
-  }, [savePreferences])
-
-  const changeDisplayMode = useCallback((chartDisplayMode: Preferences['chartDisplayMode']) => {
-    setPreferences(current => ({ ...current, chartDisplayMode }))
-    void savePreferences({ chartDisplayMode }).catch(cause => {
-      setPreferences(current => current.chartDisplayMode === chartDisplayMode ? { ...current, chartDisplayMode: committedPreferences.current.chartDisplayMode } : current)
-      setPreferencesError(message(cause))
-    })
-  }, [savePreferences])
+  const chartsRef = useRef<HTMLDivElement>(null)
+  const copyOwner = useRef<object | null>(null)
+  const [copyState, setCopyState] = useState<{ status: 'idle' | 'copying' | 'copied' | 'failed'; error: string }>({ status: 'idle', error: '' })
+  useLayoutEffect(() => {
+    copyOwner.current = null
+    setCopyState({ status: 'idle', error: '' })
+    return () => { copyOwner.current = null }
+  }, [selectedID, settingsSection])
+  useEffect(() => {
+    if (copyState.status !== 'copied') return
+    const timer = window.setTimeout(() => setCopyState({ status: 'idle', error: '' }), 2000)
+    return () => window.clearTimeout(timer)
+  }, [copyState.status])
+  const copyChart = async () => {
+    const element = chartsRef.current
+    if (!element) return
+    const owner = {}
+    copyOwner.current = owner
+    setCopyState({ status: 'copying', error: '' })
+    try {
+      await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
+      if (copyOwner.current !== owner || chartsRef.current !== element) return
+      const charts = Array.from(element.querySelectorAll<HTMLElement>('[data-chart-inst]'))
+      if (charts.length !== 3 || charts.some(chart => chart.dataset.chartLoading !== 'false' || !(Number(chart.dataset.chartRenderedBars) > 0) || chart.dataset.chartInst !== selectedID)) throw new Error('Charts are still loading. Try again when all three are ready.')
+      const bounds = chartCaptureBounds(element)
+      const content = element.innerHTML
+      const current = () => {
+        if (copyOwner.current !== owner || chartsRef.current !== element || element.innerHTML !== content) return false
+        const rect = element.getBoundingClientRect()
+        return rect.x === bounds.x && rect.y === bounds.y && rect.width === bounds.width && rect.height === bounds.height
+      }
+      const image = await captureStableChart(() => window.radarDesktop.request({ captureChart: { ...bounds, output: 'png' } }), current)
+      if (copyOwner.current !== owner) return
+      if (!current()) throw new Error('Chart changed during capture. Start again.')
+      const result = await window.radarDesktop.request({ copyImage: image.imageDataURL })
+      if (!result.ok) throw new Error('Could not copy chart.')
+      if (copyOwner.current === owner) setCopyState({ status: 'copied', error: '' })
+    } catch (cause) {
+      if (copyOwner.current === owner) {
+        const detail = cause instanceof Error ? cause.message : ''
+        const error = detail === 'Charts are still loading. Try again when all three are ready.' ? detail
+          : detail === 'Chart changed before capture. Start again.' || detail === 'Chart changed during capture. Start again.' ? 'Charts changed during capture. Try again.'
+          : 'Could not copy the chart. Try again.'
+        setCopyState({ status: 'failed', error })
+      }
+    }
+  }
 
   return <WorkspaceViewport>
     {presentation.error && <p role="alert" className="px-4 py-2 text-sm text-destructive">{presentation.error}</p>}
@@ -272,23 +303,28 @@ function App() {
       </footer>
     </aside>
     <section data-chart-panel className="h-full min-w-0 flex-1" aria-label="Market chart workspace">
-      {selectedID ? <div data-chart-display-mode={preferences.chartDisplayMode} className="flex h-full min-h-0 flex-col">
+      {selectedID ? <div data-chart-display-mode="multi" className="flex h-full min-h-0 flex-col">
         <header data-chart-toolbar data-window-toolbar data-window-drag-region className="flex shrink-0 items-center gap-3 border-b px-4">
-          {multiChart && <div className="flex items-center gap-2">
-            <h2 data-chart-title data-shared-chart-title data-window-no-drag className="max-w-32 truncate" title={selectedID}>{selectedID.replace(/-SWAP$/, '')}</h2>
-            {sharedPriceText !== undefined && <><span className="sr-only">Market price</span><span data-shared-chart-price data-window-no-drag className="max-w-32 truncate" title={sharedPriceText}>{sharedPriceText}</span></>}
-          </div>}
-          <ToggleGroup variant="outline" size="sm" value={[preferences.chartDisplayMode]} onValueChange={values => { const mode = values[0]; if (mode === 'multi' || mode === 'indicators') changeDisplayMode(mode) }} aria-label="Chart display mode">
-            <ToggleGroupItem value="multi">Multi-timeframe</ToggleGroupItem><ToggleGroupItem value="indicators">Indicators</ToggleGroupItem>
-          </ToggleGroup>
-          {multiChart && <div data-window-no-drag className="ml-auto flex items-center gap-4 whitespace-nowrap text-xs text-muted-foreground">
-            <MultiChartLegend />
-            <span data-chart-price-scale="relative" title="Change from first visible open">Change %</span>
-          </div>}
+          <span className="mr-auto text-sm font-medium">Multi-timeframe</span>
+          <Button data-window-no-drag variant="outline" size="sm" disabled={copyState.status === 'copying'} onClick={() => { void copyChart() }}><Camera data-icon="inline-start" aria-hidden="true" />{copyState.status === 'copying' ? 'Copying…' : copyState.status === 'copied' ? 'Copied' : 'Copy chart'}</Button>
         </header>
-        {multiChart ? <ChartTimeSyncProvider key={selectedID}><div className="grid min-h-0 flex-1 grid-rows-3 divide-y" data-multi-timeframe-charts>
-          {(['1H', '15m', '5m'] as const).map((frame, index) => <MarketChart key={frame} controller={multiChartControllers[frame]} priceOnly navigation={index === 0} active={settingsSection === null} instId={selectedID} tickSz={selectedRow?.tickSz} timeframe={frame} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} />)}
-        </div></ChartTimeSyncProvider> : <MarketChart active={settingsSection === null} instId={selectedID} tickSz={selectedRow?.tickSz} timeframe={timeframe} candidateIds={candidateIds} onTimeframeChange={changeTimeframe} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} />}
+        {copyState.error && <p role="alert" className="shrink-0 border-b px-5 py-2 text-destructive">{copyState.error}</p>}
+        <span role="status" className="sr-only">{copyState.status === 'copied' ? 'Chart copied to clipboard' : ''}</span>
+        <div ref={chartsRef} data-chart-capture className="flex min-h-0 flex-1 flex-col">
+          <div className="flex shrink-0 items-center gap-3 border-b px-4 py-2">
+            <div className="flex items-center gap-2">
+              <h2 data-chart-title data-shared-chart-title className="max-w-32 truncate" title={selectedID}>{selectedID.replace(/-SWAP$/, '')}</h2>
+              {sharedPriceText !== undefined && <><span className="sr-only">Market price</span><span data-shared-chart-price className="max-w-32 truncate" title={sharedPriceText}>{sharedPriceText}</span></>}
+            </div>
+            <div className="ml-auto flex items-center gap-4 whitespace-nowrap text-xs text-muted-foreground">
+              <MultiChartLegend />
+              <span data-chart-price-scale="relative" title="Change from first visible open">Change %</span>
+            </div>
+          </div>
+          <ChartTimeSyncProvider key={selectedID}><div className="grid min-h-0 flex-1 grid-rows-3 divide-y" data-multi-timeframe-charts>
+            {(['1H', '15m', '5m'] as const).map((frame, index) => <MarketChart key={frame} controller={multiChartControllers[frame]} priceOnly navigation={index === 0} active={settingsSection === null} instId={selectedID} tickSz={selectedRow?.tickSz} timeframe={frame} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} />)}
+          </div></ChartTimeSyncProvider>
+        </div>
       </div> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}
     </section>
     </div>

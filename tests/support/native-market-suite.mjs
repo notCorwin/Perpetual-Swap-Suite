@@ -23,9 +23,10 @@ export async function runNativeMarketAcceptance({ directory, launch, close = ele
   }
   const timeoutError = new Error(`Native market acceptance exceeded its ${timeoutMS}ms work budget.`)
   const observations = []
-  const readPrice = () => page.evaluate(() => {
-    const workspace = document.querySelector('[data-chart-workspace]')
-    const chart = workspace?.querySelector('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
+  let selectedTimeframe = '15m'
+  const readPrice = () => page.evaluate(timeframe => {
+    const workspace = document.querySelector('[data-chart-panel]')
+    const chart = workspace?.querySelector(`svg[data-rendered-timeframe="${timeframe}"]`)?.closest('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
     const svg = chart?.querySelector('svg[data-rendered-inst]')
     const label = svg?.querySelector('[data-chart-price-label-value]')?.textContent ?? ''
     return { chartInstId: chart?.getAttribute('data-chart-inst'), chartTimeframe: chart?.getAttribute('data-chart-timeframe'),
@@ -37,15 +38,15 @@ export async function runNativeMarketAcceptance({ directory, launch, close = ele
         completed: snapshot.bars.length } : null,
       status: [...(workspace?.querySelectorAll('[role="status"]') ?? [])].map(value => value.textContent?.trim()),
     }
-  })
+  }, selectedTimeframe)
   const readCandles = ({ instId, timeframe, from, through }) => page.evaluate(async query => window.radarDesktop.request({ e2e: {
     action: 'readCandles', instrument: query.instId, timeframe: query.timeframe, from: query.from, through: query.through,
   } }), { instId, timeframe, from, through })
   const assertPrice = async expected => {
     try {
       await page.waitForFunction(expected => {
-        const workspace = document.querySelector('[data-chart-workspace]')
-        const chart = workspace?.querySelector('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
+        const workspace = document.querySelector('[data-chart-panel]')
+        const chart = workspace?.querySelector(`svg[data-rendered-timeframe="${expected.timeframe}"]`)?.closest('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
         const svg = chart?.querySelector('svg[data-rendered-inst]')
         const price = window.__chartPriceLabel(svg?.querySelector('[data-chart-price-label-value]')?.textContent)
         return snapshot?.instId === expected.instId && snapshot.timeframe === expected.timeframe
@@ -67,9 +68,9 @@ export async function runNativeMarketAcceptance({ directory, launch, close = ele
   }
   const select = async (instId, timeframe) => {
     await page.locator(`[aria-label="View ${instId} chart"]`).click()
-    await page.locator('[aria-label="Chart timeframe"] button').filter({ hasText: new RegExp(`^${timeframe}$`, 'i') }).click()
+    selectedTimeframe = timeframe
     await page.waitForFunction(({ instId, timeframe }) => {
-      const chart = document.querySelector('[data-chart-inst]')
+      const chart = document.querySelector(`svg[data-rendered-timeframe="${timeframe}"]`)?.closest('[data-chart-inst]')
       return chart?.__chartSnapshot?.instId === instId && chart.__chartSnapshot.timeframe === timeframe
     }, { instId, timeframe })
   }
@@ -103,7 +104,6 @@ export async function runNativeMarketAcceptance({ directory, launch, close = ele
       try {
         const preferences = structuredClone(DEFAULT_PREFERENCES)
         preferences.chartTimeframe = '15m'
-        preferences.chartDisplayMode = 'indicators'
         for (const condition of Object.values(preferences.liquidity)) condition.enabled = false
         metadata.updateSettings(preferences)
       } finally { metadata.close() }
@@ -128,7 +128,7 @@ export async function runNativeMarketAcceptance({ directory, launch, close = ele
       await page.locator(`[aria-label="View ${btc} chart"]`).waitFor({ state: 'visible' })
       await page.locator(`[aria-label="View ${eth} chart"]`).waitFor({ state: 'visible' })
       await select(btc, '15m')
-      await page.locator(`[data-chart-inst="${btc}"]`).waitFor({ state: 'visible' })
+      await page.locator(`svg[data-rendered-inst="${btc}"][data-rendered-timeframe="15m"]`).waitFor({ state: 'visible' })
       await exchange.waitForHeldHistory()
 
       // Current native prices must remain usable while the missing completed
@@ -151,7 +151,13 @@ export async function runNativeMarketAcceptance({ directory, launch, close = ele
       assert.equal(repairedParent[0].baseVolume, 300)
       assert.equal(repairedParent[0].quoteVolume, 30_000)
       const missingBase = await readCandles({ instId: btc, timeframe: '5m', from: exchange.missingBaseEnd, through: exchange.missingBaseEnd })
-      assert.deepEqual(missingBase, [], 'A coarse fallback must not fabricate the missing canonical 5m child.')
+      if (missingBase.length) {
+        assert.equal(missingBase.length, 1)
+        assert.equal(missingBase[0].confirmed, true)
+        assert.ok(exchange.requests.some(value => value.path === '/market/history-candles' && value.parameters.instId === btc
+          && value.parameters.bar === '5m' && Number(value.parameters.after) === exchange.missingBaseEnd + nativeIntervals['5m']),
+        'A simultaneously selected 5m chart must acquire its missing child from the native source.')
+      }
       // Observe actual UI commits during the source completion, without issuing a
       // chart refresh that could conceal a push-delivery or cache invalidation bug.
       for (let index = 0; index < 10; index++) {
@@ -185,8 +191,8 @@ export async function runNativeMarketAcceptance({ directory, launch, close = ele
       const disconnected = await exchange.disconnectBusiness({ holdAcknowledgments: true })
       assert.ok(disconnected > 0)
       await page.waitForFunction(() => {
-        const workspace = document.querySelector('[data-chart-workspace]')
-        const snapshot = workspace?.querySelector('[data-chart-inst]')?.__chartSnapshot
+        const workspace = document.querySelector('[data-chart-panel]')
+        const snapshot = workspace?.querySelector('svg[data-rendered-timeframe="15m"]')?.closest('[data-chart-inst]')?.__chartSnapshot
         return snapshot?.instId === 'BTC-USDT-SWAP' && snapshot.timeframe === '15m'
           && snapshot.realtimeState === 'stale'
           && [...workspace.querySelectorAll('[role="status"]')].some(value => value.textContent?.trim() === 'Cached price')

@@ -42,6 +42,27 @@ test('metadata schema migration drops obsolete sync demand once and preserves du
   } finally { store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
+test('retired analysis settings never prevent opening or importing metadata', async () => {
+  const root = await temporary()
+  const path = join(root, 'settings.json')
+  await writeFile(path, JSON.stringify({ historyDays: 45, analysis: { model: 42 } }))
+  let store = await MetadataStore.open(root)
+  try {
+    assert.equal(store.getSettings().preferences.historyDays, 45)
+    store.close()
+    const database = new DatabaseSync(join(root, 'metadata.sqlite'))
+    try {
+      assert.equal(database.prepare('SELECT value FROM analysis_settings WHERE id = 1').get()!.value, '{"model":42}')
+      database.prepare('UPDATE analysis_settings SET value = ? WHERE id = 1').run('42')
+    } finally { database.close() }
+    store = await MetadataStore.open(root)
+    assert.equal(store.getSettings().preferences.historyDays, 45)
+    const preserved = new DatabaseSync(join(root, 'metadata.sqlite'), { readOnly: true })
+    try { assert.equal(preserved.prepare('SELECT value FROM analysis_settings WHERE id = 1').get()!.value, '42') }
+    finally { preserved.close() }
+  } finally { store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
 test('preference schema owns immutable snapshots, reuses proven values and validates changed inputs', () => {
   const input = structuredClone(DEFAULT_PREFERENCES)
   const preferences = validatePreferences(input)

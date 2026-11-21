@@ -4,18 +4,16 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { _electron } from 'playwright'
-import { installChartPriceReader } from '../helpers/chart-price-label.mjs'
 
-test('qualified rows stay stable while one SVG surface handles canonical frames, corrections and resize', { timeout: 90_000 }, async () => {
+test('qualified rows stay stable while three timeframe surfaces load and resize', { timeout: 90_000 }, async () => {
   const userData = await mkdtemp(join(tmpdir(), 'perp-chart-prerender-'))
   let electron
   try {
-    await writeFile(join(userData, 'settings.json'), JSON.stringify({ chartDisplayMode: 'indicators', chartTimeframe: '15m' }))
+    await writeFile(join(userData, 'settings.json'), JSON.stringify({ chartDisplayMode: 'multi' }))
     electron = await _electron.launch({ args: ['.', '--headless', '--disable-gpu'], cwd: new URL('../..', import.meta.url).pathname,
       env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_USER_DATA: userData } })
     const page = await electron.firstWindow()
     await page.waitForLoadState('domcontentloaded')
-    await installChartPriceReader(page)
     const pageErrors = []
     page.on('pageerror', error => pageErrors.push(error.message))
     // Withhold chart delivery before the first fixture frame can be ingested.
@@ -99,166 +97,34 @@ test('qualified rows stay stable while one SVG surface handles canonical frames,
       row.click()
     })
     await page.waitForFunction(id => document.querySelector('[data-market-index][aria-selected="true"]')?.getAttribute('aria-label') === `View ${id} chart`, coldTarget)
-    await page.locator('[aria-label="Chart timeframe"] button').filter({ hasText: /^1h$/i }).click()
-    await page.waitForFunction(() => document.querySelector('[aria-label="Chart timeframe"] [aria-pressed="true"]')?.textContent?.toLowerCase() === '1h')
     assert.equal(await page.evaluate(() => { window.__prerenderProbe.inspect(); return document.querySelectorAll('svg[data-prepared-chart-inst]').length }), 0,
-      'Changing the current period while data delivery is held must leave the qualified list available before an SVG exists.')
+      'The contract list remains usable while chart delivery is held.')
     const cold = await electron.evaluate(() => ({ reads: globalThis.__prerenderGate.suppressedReads, pushes: globalThis.__prerenderGate.suppressedPushes }))
     assert.ok(cold.reads + cold.pushes > 0, 'The cold-readiness gate must actually withhold chart delivery.')
     await electron.evaluate(() => globalThis.__prerenderGate.release())
-    await page.waitForFunction(({ ids, timeframes }) => {
-      const ready = window.__prerenderProbe.canonicalFrames
-      return ids.every(id => timeframes.every(timeframe => ready.has(`${timeframe}:${id}`)))
-    }, { ids: fixture.instIds, timeframes: fixture.timeframes }, { timeout: 40_000 })
-    await page.waitForFunction(id => {
-      const svg = document.querySelector('svg[data-rendered-inst]')
-      return svg?.dataset.renderedInst === id && svg.dataset.renderedTimeframe === '1H'
-        && svg.closest('[data-chart-inst]')?.dataset.chartLoading === 'false'
-    }, coldTarget)
-    assert.deepEqual(await page.evaluate(() => ({ rendered: document.querySelectorAll('svg[data-rendered-inst]').length,
-      prepared: document.querySelectorAll('svg[data-prepared-chart-inst]').length })), { rendered: 1, prepared: 1 },
-    'Receiving the complete renderer universe must retain only the currently selected SVG surface.')
-    const sharedSurface = await page.locator('svg[data-rendered-inst]').elementHandle()
-    await page.evaluate(() => {
-      window.__sharedSurface = document.querySelector('svg[data-rendered-inst]')
-      window.__sharedVWAP = window.__sharedSurface.querySelector('[data-chart-indicator="vwap"]')
-    })
-    const assertSharedSurface = async phase => {
-      assert.equal(await page.locator('svg[data-rendered-inst]').count(), 1, `${phase} must leave exactly one active SVG.`)
-      assert.equal(await page.locator('svg[data-prepared-chart-inst]').count(), 1, `${phase} must expose exactly one current SVG surface.`)
-      assert.equal(await sharedSurface.evaluate(svg => svg.isConnected && svg === document.querySelector('svg[data-rendered-inst]')), true,
-        `${phase} must reuse the original SVG node.`)
-    }
-    await page.locator('[aria-label="Chart timeframe"] button').filter({ hasText: /^15m$/i }).click()
-    await page.waitForFunction(id => {
-      const svg = document.querySelector('svg[data-rendered-inst]')
-      return svg?.dataset.renderedInst === id && svg.dataset.renderedTimeframe === '15m'
-        && svg.closest('[data-chart-inst]')?.dataset.chartLoading === 'false'
-    }, coldTarget)
-    await assertSharedSurface('Timeframe switch')
-    const backgroundBeforeCorrection = await page.evaluate(() => {
-      const bar = document.querySelector('[data-chart-inst]').__chartSnapshot.bars.at(-1)
-      return { close: bar.close, ema: bar.ema,
-        path: document.querySelector('svg[data-rendered-inst] [data-chart-indicator="vwap"]').getAttribute('d') }
-    })
-    assert.equal(await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFocused()), false,
-      'The acceptance app must never take macOS window focus.')
+    const ready = id => page.waitForFunction(id => {
+      const charts = [...document.querySelectorAll('[data-multi-timeframe-charts] [data-chart-inst]')]
+      return charts.length === 3 && charts.every(chart => chart.dataset.chartLoading === 'false'
+        && chart.querySelector('svg[data-rendered-inst]')?.dataset.renderedInst === id)
+    }, id, { timeout: 40_000 })
+    await ready(coldTarget)
+    assert.deepEqual(await page.locator('[data-multi-timeframe-charts] svg[data-rendered-timeframe]').evaluateAll(nodes => nodes.map(node => node.dataset.renderedTimeframe)), ['1H', '15m', '5m'])
     const target = initial.ids.find(id => id !== coldTarget)
     await page.locator(`[aria-label="View ${target} chart"]`).evaluate(row => {
       window.__prerenderProbe.selected = row.getAttribute('aria-label').slice(5, -6)
       row.click()
     })
-    await page.waitForFunction(id => document.querySelector('svg[data-rendered-inst]')?.dataset.renderedInst === id
-      && document.querySelector('[data-chart-inst]')?.dataset.chartLoading === 'false', target)
-    await assertSharedSurface('Contract switch')
-
-    // An unselected candidate receives a durable price correction.
-    const background = coldTarget
-    const rows = await page.evaluate(({ instrument, timestamp }) => window.radarDesktop.request({ e2e: {
-      action: 'readCandles', instrument, timeframe: '15m', from: timestamp, through: timestamp,
-    } }), { instrument: background, timestamp: fixture.end })
-    const fields = ['instrument', 'timeframe', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'confirmed', 'baseVolume', 'quoteVolume', 'oi', 'buy', 'sell', 'statisticsVersion']
-    const correction = { ...Object.fromEntries(fields.map(key => [key, rows[0][key]])), close: rows[0].close + 1, high: rows[0].high + 2 }
-    const beforeCorrection = await page.evaluate(() => {
-      const svg = document.querySelector('svg[data-rendered-inst]')
-      const chart = document.querySelector('[data-chart-inst]')
-      window.__surfaceBeforeCorrection = svg
-      window.__snapshotBeforeCorrection = chart.__chartSnapshot
-      window.__vwapBeforeCorrection = svg.querySelector('[data-chart-indicator="vwap"]')
-      return { instId: svg.dataset.renderedInst, timeframe: svg.dataset.renderedTimeframe,
-        vwap: svg.querySelector('[data-chart-indicator="vwap"]')?.getAttribute('d') }
-    })
-    assert.equal(beforeCorrection.instId, target)
-    await page.evaluate(({ instId, hour, close }) => {
-      window.__prerenderProbe.expectedCorrection = { instId, timeframe: '15m', hour, close }
-    }, { instId: background, hour: fixture.end, close: correction.close })
-    await electron.evaluate((_electron, candle) => globalThis.__marketBackend.probe({ action: 'persistCandles', candles: [candle] }), correction)
-    await page.waitForFunction(() => window.__prerenderProbe.correctionReceived, null, { timeout: 20_000 })
-    assert.deepEqual(await page.evaluate(() => {
-      const svg = document.querySelector('svg[data-rendered-inst]')
-      const chart = document.querySelector('[data-chart-inst]')
-      return { instId: svg?.dataset.renderedInst, timeframe: svg?.dataset.renderedTimeframe,
-        count: document.querySelectorAll('svg[data-rendered-inst]').length,
-        vwap: svg?.querySelector('[data-chart-indicator="vwap"]')?.getAttribute('d'),
-        sameSurface: svg === window.__surfaceBeforeCorrection,
-        sameSnapshot: chart.__chartSnapshot === window.__snapshotBeforeCorrection,
-        sameVWAPPath: svg?.querySelector('[data-chart-indicator="vwap"]') === window.__vwapBeforeCorrection }
-    }), { ...beforeCorrection, count: 1, sameSurface: true, sameSnapshot: true, sameVWAPPath: true },
-    'A durable correction for an unselected contract must leave the current chart untouched.')
-
-    await page.locator(`[aria-label="View ${background} chart"]`).evaluate(row => {
-      window.__prerenderProbe.selected = row.getAttribute('aria-label').slice(5, -6)
-      row.click()
-    })
-    await page.waitForFunction(({ instId, hour, close }) => {
-      const chart = document.querySelector('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
-      return snapshot?.instId === instId && snapshot.timeframe === '15m'
-        && snapshot.bars.some(bar => bar.hour === hour && bar.close === close)
-        && chart.dataset.chartLoading === 'false'
-    }, { instId: background, hour: fixture.end, close: correction.close })
-    const expectedEMA = backgroundBeforeCorrection.ema + 2 / 201 * (correction.close - backgroundBeforeCorrection.close)
-    assert.equal(await page.evaluate(({ previousPath, hour, close, expectedEMA }) => {
-      const svg = document.querySelector('svg[data-rendered-inst]'), chart = document.querySelector('[data-chart-inst]')
-      const vwap = svg?.querySelector('[data-chart-indicator="vwap"]')
-      return svg === window.__sharedSurface && vwap === window.__sharedVWAP
-        && vwap?.getAttribute('d') !== previousPath && chart.__chartSnapshot.bars.some(bar => bar.hour === hour && bar.close === close
-          && Math.abs(bar.ema - expectedEMA) < 1e-10)
-    }, { previousPath: backgroundBeforeCorrection.path, hour: fixture.end, close: correction.close, expectedEMA }), true,
-    'Selecting the corrected contract must immediately redraw its indicator on the existing SVG and VWAP path nodes.')
-    await assertSharedSurface('Corrected contract switch')
-
-    // A selected contract consumes a canonical live update and selection in one
-    // turn. The current SVG node must show that frame at the next animation frame.
-    const liveTarget = target
-    const liveFrame = await electron.evaluate(async (_electron, instId) => {
-      const { decodeChartWire } = process.getBuiltinModule('module').createRequire(`${process.cwd()}/package.json`)('./electron/chart-wire.js')
-      const gate = globalThis.__prerenderGate
-      const { frames } = decodeChartWire(await gate.original(gate.event, { chartUniverse: {} }))
-      const frame = frames.find(value => value.instId === instId && value.timeframe === '15m')
-      // Isolate the synthetic input from real backend publications. A newer
-      // authoritative frame is allowed to supersede it after this measurement.
-      gate.held = true
-      return frame
-    }, liveTarget)
-    let liveSelection
-    try { liveSelection = await page.evaluate(({ instId, frame }) => {
-      const last = frame.bars.at(-1), price = last.close + 7
-      window.dispatchEvent(new CustomEvent('radar-chart-prepared', { detail: {
-        type: 'live', instId, timeframe: frame.timeframe, generation: frame.generation, revision: frame.revision + 1,
-        endHour: frame.endHour, liveBar: { ...last, hour: frame.endHour + frame.intervalMS,
-          open: price, high: price, low: price, close: price, confirmed: false },
-      } }))
-      window.__prerenderProbe.selected = instId
-      document.querySelector(`[aria-label="View ${instId} chart"]`).click()
-      return new Promise(resolve => requestAnimationFrame(() => {
-        const chart = document.querySelector('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
-        const svg = chart?.querySelector('svg[data-rendered-inst]')
-        const labelPrice = window.__chartPriceLabel(svg?.querySelector('[data-chart-price-label-value]')?.textContent)
-        resolve({ price, currentInst: snapshot?.instId, livePrice: snapshot?.liveBar?.close, labelPrice,
-          currentAtNextFrame: snapshot?.instId === instId && snapshot.liveBar?.close === price
-          && snapshot.bars.length === 96 && snapshot.bars.every(bar => bar.confirmed)
-          && svg === window.__sharedSurface && labelPrice === 0 })
-      }))
-    }, { instId: liveTarget, frame: liveFrame }) }
-    finally { await electron.evaluate(() => globalThis.__prerenderGate.release()) }
-    assert.equal(liveSelection.currentAtNextFrame, true,
-      `The current SVG must show the selected contract live price by the next frame: ${JSON.stringify(liveSelection)}`)
-    // Later authoritative backend frames may supersede this injected price;
-    // the assertion above inspects the complete SVG in the measured frame.
-
-    // Resizing may change list virtualization, but the chart keeps one surface.
+    await ready(target)
+    assert.equal(await page.locator('[data-multi-timeframe-charts] svg[data-prepared-chart-inst]').count(), 3)
     const stability = await page.evaluate(() => window.__prerenderProbe.stop())
     assert.ok(stability.inspections > 1)
     assert.deepEqual(stability.violations, [])
-
-    const previousHeight = await sharedSurface.evaluate(svg => svg.viewBox.baseVal.height)
+    await page.evaluate(() => { window.__resizeSurfaces = [...document.querySelectorAll('[data-multi-timeframe-charts] svg[data-rendered-inst]')] })
+    const previousHeight = await page.evaluate(() => window.__resizeSurfaces[1].viewBox.baseVal.height)
     await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setContentSize(1360, 700))
-    await page.waitForFunction(height => window.__sharedSurface.viewBox.baseVal.height !== height, previousHeight)
-    assert.equal(await page.evaluate(() => document.querySelector('svg[data-rendered-inst]') === window.__sharedSurface), true,
-      'Resizing must update the existing surface.')
-    await page.locator('[aria-label="Chart timeframe"] button').filter({ hasText: /^1h$/i }).click()
-    await page.waitForFunction(() => document.querySelector('svg[data-rendered-inst]')?.dataset.renderedTimeframe === '1H')
-    await assertSharedSurface('Final timeframe switch')
+    await page.waitForFunction(height => window.__resizeSurfaces[1].viewBox.baseVal.height !== height, previousHeight)
+    assert.equal(await page.evaluate(() => window.__resizeSurfaces.every((svg, index) => svg === document.querySelectorAll('[data-multi-timeframe-charts] svg[data-rendered-inst]')[index])), true,
+      'Resizing updates each existing timeframe surface.')
     assert.equal(await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFocused()), false,
       'The acceptance app must never take macOS window focus.')
     assert.deepEqual(pageErrors, [])

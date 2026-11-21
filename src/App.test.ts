@@ -7,14 +7,13 @@ import { parse } from '@babel/parser'
 import { reconcileMarketOrder, reconcileMarketRows } from './market-snapshot.ts'
 import { DEFAULT_PREFERENCES, type Preferences } from './renderer-preferences.ts'
 import { SnapshotOrder } from './snapshot-order.ts'
+import { formatCurrentPrice } from './price-format.ts'
 import type { MarketSnapshot, PresentationUpdate, RankedMarketRow } from './desktop-contract.ts'
-import type { RadarTimeframe } from './timeframe.ts'
 
 type View = {
   preferences: Preferences; rows: RankedMarketRow[]; turnoverOrder: string[]; ready: boolean; status: string; error: string
   selectedID: string | null
   savePreferences(values: Partial<Preferences>): Promise<void>
-  changeTimeframe(timeframe: RadarTimeframe): void
 }
 type Slot = { value?: unknown; dependencies?: unknown[]; cleanup?: void | (() => void) }
 
@@ -31,7 +30,7 @@ const declarations = ast.program.body.filter(node => node.type === 'VariableDecl
 const logic = stripTypeScriptTypes([
   ...declarations.map(node => source.slice(node.start!, node.end!)),
   source.slice(component.start!, renderReturn.start!),
-  'return { preferences, rows, turnoverOrder, ready, status, error, selectedID, savePreferences, changeTimeframe } }',
+  'return { preferences, rows, turnoverOrder, ready, status, error, selectedID, savePreferences } }',
 ].join('\n'))
 
 function fixture(snapshotFailure = false) {
@@ -79,7 +78,7 @@ function fixture(snapshotFailure = false) {
   const changed = (previous: unknown[] | undefined, next: unknown[]) => !previous || previous.length !== next.length || next.some((value, index) => !Object.is(value, previous[index]))
   const environment = {
     lazy,
-    window, document, DEFAULT_PREFERENCES, SnapshotOrder, reconcileMarketRows, reconcileMarketOrder,
+    window, document, DEFAULT_PREFERENCES, SnapshotOrder, reconcileMarketRows, reconcileMarketOrder, formatCurrentPrice,
     chartController: { ingestPrepared() {}, setPresentationActive() {}, getSnapshot: () => ({}), setUniverse: (...args: unknown[]) => { universeRequests.push(args) } },
     usePresentation: () => presentation,
     getPresentation: () => presentation,
@@ -217,65 +216,6 @@ test('price updates refresh rows without rebuilding chart membership or equal na
   app.state.revision++; app.notify(); await app.flush()
   assert.equal(app.view.selectedID, 'ETH-USDT-SWAP')
   assert.ok(app.universeRequests.length > universes)
-})
-
-test('switching every chart timeframe preserves the list and never reloads its snapshot', async context => {
-  const app = fixture(); context.after(() => app.close())
-  await app.flush()
-  const rows = app.view.rows, requests = app.snapshotRequests.length
-  for (const timeframe of ['1H', '5m', '15m'] as const) {
-    app.view.changeTimeframe(timeframe)
-    await app.flush()
-    assert.equal(app.view.preferences.chartTimeframe, timeframe)
-    assert.equal(app.view.rows, rows)
-    assert.equal(app.view.selectedID, 'BTC-USDT-SWAP')
-    assert.equal(app.view.status, 'Live')
-    assert.equal(app.snapshotRequests.length, requests)
-  }
-  assert.deepEqual(app.snapshotRequests, [{ sinceRevision: -1, serviceSession: undefined }])
-})
-
-test('consecutive failed timeframe writes roll back to the last committed value', async context => {
-  const app = fixture(); context.after(() => app.close())
-  await app.flush()
-  let release!: () => void
-  let calls = 0
-  app.state.beforeUpdate = async () => {
-    if (++calls === 1) await new Promise<void>(resolve => { release = resolve })
-    throw new Error('Write failed')
-  }
-  app.view.changeTimeframe('1H'); await app.flush()
-  app.view.changeTimeframe('5m'); await app.flush()
-  assert.equal(calls, 1)
-  release(); await app.flush()
-  assert.equal(calls, 2)
-  assert.equal(app.view.preferences.chartTimeframe, '15m')
-  assert.equal(app.state.preferences.chartTimeframe, '15m')
-})
-
-test('a failed newer timeframe write restores the preceding successful write', async context => {
-  const app = fixture(); context.after(() => app.close())
-  await app.flush()
-  let release!: () => void
-  let calls = 0
-  app.state.beforeUpdate = async () => {
-    if (++calls === 1) await new Promise<void>(resolve => { release = resolve })
-    else throw new Error('Write failed')
-  }
-  app.view.changeTimeframe('1H'); await app.flush()
-  app.view.changeTimeframe('5m'); await app.flush()
-  release(); await app.flush()
-  assert.equal(app.view.preferences.chartTimeframe, '1H')
-  assert.equal(app.state.preferences.chartTimeframe, '1H')
-})
-
-test('a failed response after commit reconciles the actual saved timeframe', async context => {
-  const app = fixture(); context.after(() => app.close())
-  await app.flush()
-  app.state.afterUpdate = async () => { throw new Error('Response failed') }
-  app.view.changeTimeframe('1H'); await app.flush()
-  assert.equal(app.state.preferences.chartTimeframe, '1H')
-  assert.equal(app.view.preferences.chartTimeframe, '1H')
 })
 
 test('backend exclusion is applied immediately without a renderer grace period', async context => {

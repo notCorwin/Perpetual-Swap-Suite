@@ -31,7 +31,7 @@ const receive = operationRecording
     if (notificationReceiver) notificationReceiver(channel, detail)
     else pendingNotifications.push([channel, detail, undefined, epoch])
   }
-for (const channel of ['radar:gateway-stream', 'radar:chart-prepared', 'radar:market-changed', 'radar:audit-changed', 'radar:history-download-changed']) {
+for (const channel of ['radar:chart-prepared', 'radar:market-changed', 'radar:audit-changed', 'radar:history-download-changed']) {
   ipcRenderer.on(channel, (_event, detail, context, epoch) => receive(channel, detail, context, epoch))
 }
 if (operationRecording) {

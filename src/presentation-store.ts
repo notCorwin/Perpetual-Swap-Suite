@@ -35,8 +35,6 @@ window.radarDesktop.subscribePresentation(update => {
     for (const listener of listeners) listener()
   })
   if (update.active) {
-    for (const detail of snapshot?.gateway ?? []) window.dispatchEvent(new CustomEvent('radar-gateway-stream', { detail }))
-    if (pendingSnapshot?.gateway) pendingSnapshot = { ...pendingSnapshot, gateway: undefined }
     for (const waiter of waiters) waiter()
     waiters.clear()
   }

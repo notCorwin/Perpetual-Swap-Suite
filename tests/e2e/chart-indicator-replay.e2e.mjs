@@ -9,7 +9,7 @@ test('indicator replay preserves visible paths while current prices update and t
   const userData = await mkdtemp(join(tmpdir(), 'perp-indicator-replay-'))
   let electron
   try {
-    await writeFile(join(userData, 'settings.json'), JSON.stringify({ chartDisplayMode: 'indicators', chartTimeframe: '15m' }))
+    await writeFile(join(userData, 'settings.json'), JSON.stringify({ chartDisplayMode: 'multi', chartTimeframe: '15m' }))
     electron = await _electron.launch({ args: ['.', '--headless', '--disable-gpu'], cwd: new URL('../..', import.meta.url).pathname,
       env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_USER_DATA: userData } })
     const page = await electron.firstWindow()
@@ -17,7 +17,7 @@ test('indicator replay preserves visible paths while current prices update and t
     const pageErrors = []
     page.on('pageerror', error => pageErrors.push(error.message))
     await page.evaluate(() => window.radarDesktop.request({ e2e: { action: 'seedInstrumentNavigationBenchmark' } }))
-    await page.waitForFunction(() => document.querySelector('[data-chart-inst]')?.__chartSnapshot?.indicatorState === 'ready')
+    await page.waitForFunction(() => document.querySelector('svg[data-rendered-timeframe="15m"]')?.closest('[data-chart-inst]')?.__chartSnapshot?.indicatorState === 'ready')
     await electron.evaluate(({ BrowserWindow }) => {
       const contents = BrowserWindow.getAllWindows()[0].webContents, send = contents.send
       contents.send = function(channel, ...args) {
@@ -25,7 +25,7 @@ test('indicator replay preserves visible paths while current prices update and t
       }
     })
     const replay = await page.evaluate(async () => {
-      const chart = document.querySelector('[data-chart-inst]'), frame = chart.__chartSnapshot
+      const chart = document.querySelector('svg[data-rendered-timeframe="15m"]')?.closest('[data-chart-inst]'), frame = chart.__chartSnapshot
       const fields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
       const svg = chart.querySelector('svg[data-rendered-inst]')
       const paths = [...svg.querySelectorAll('[data-chart-indicator]')].filter(path => path.getAttribute('d')).map(path => path.dataset.chartIndicator)
@@ -39,7 +39,6 @@ test('indicator replay preserves visible paths while current prices update and t
           continuous: paths.every(field => svg.querySelector(`[data-chart-indicator="${field}"]`).getAttribute('d')),
           sourceNull: source.bars.every(bar => bar.vwap === null), renderedVWAP: rendered.find(bar => bar.hour === source.bars.at(-1).hour)?.vwap,
           sourceClose: source.bars.at(-1).close, renderedClose: rendered.find(bar => bar.hour === source.bars.at(-1).hour)?.close,
-          copyDisabled: document.querySelector('button:has(svg.lucide-camera)')?.disabled,
           previousNotice: chart.querySelector('[data-chart-status]').textContent.includes('Showing previous indicators'),
           sameSurface: chart.querySelector('svg[data-rendered-inst]') === svg })
       }
@@ -53,7 +52,7 @@ test('indicator replay preserves visible paths while current prices update and t
       await send({ ...raw, revision: 3, indicatorState: 'unavailable', bars: raw.bars.map(bar => ({ ...bar, indicatorsObserved: true })) })
       return { observations, paths, price, oldVWAP: frame.bars.at(-1).vwap }
     })
-    assert.ok(replay.paths.includes('vwap') && replay.paths.includes('rsi6'))
+    assert.ok(replay.paths.includes('vwap') && replay.paths.includes('bollUpper'))
     for (const state of replay.observations.slice(0, 2)) {
       assert.equal(state.state, 'loading')
       assert.equal(state.stale, 'true')
@@ -61,7 +60,6 @@ test('indicator replay preserves visible paths while current prices update and t
       assert.equal(state.renderedVWAP, replay.oldVWAP)
       assert.equal(state.sourceClose, replay.price)
       assert.equal(state.renderedClose, replay.price, 'New candle prices must be displayed during indicator replay.')
-      assert.equal(state.copyDisabled, true, 'A stale indicator snapshot cannot be exported as a current chart.')
       assert.equal(state.previousNotice, true)
       assert.equal(state.sameSurface, true)
     }

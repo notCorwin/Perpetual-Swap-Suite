@@ -147,13 +147,6 @@ async function request(value) {
     return task.finally(() => service.barTasks.delete(task))
   }
   if (value.chartUniverse) return service.preparedCharts.residentFrames()
-  if (value.analysisSettings) {
-    const input = value.analysisSettings
-    if (input.action === 'save') metadata.updateAnalysisSettings({ model: input.model, apiKey: input.apiKey })
-    if (input.action === 'removeKey') metadata.updateAnalysisSettings({ apiKey: '' })
-    const current = metadata.getAnalysisSettings()
-    return { model: current.model ?? '', hasAPIKey: Boolean(current.apiKey) }
-  }
   if (value.e2e && workerData.testMode) {
     const input = value.e2e
     switch (input.action) {
@@ -441,7 +434,6 @@ onOperationMessage(parentPort, 'market-backend', async ({ id, method, value }) =
       return
     }
     else if (method === 'subscriptions') result = subscribeNotifications(value)
-    else if (method === 'credentials') result = metadata.getAnalysisSettings().apiKey ?? ''
     else if (method === 'probe') result = await probe(value)
     else if (method === 'dispose') {
       subscribeNotifications([])

@@ -9,7 +9,6 @@ test('presentation barriers suspend callbacks and animations, then publish the s
   const events: string[] = []
   const animation = { playState: 'running', pause() { events.push('pause'); this.playState = 'paused' }, play() { events.push('play'); this.playState = 'running' } }
   const target = new EventTarget()
-  target.addEventListener('radar-gateway-stream', () => events.push('gateway'))
   Object.defineProperty(globalThis, 'window', { configurable: true, value: Object.assign(target, {
     radarDesktop: { subscribePresentation(listener: typeof receive) { receive = listener; listener({ epoch: 0, active: true, startedAt: 0 }); return () => {} } },
   }) })
@@ -27,12 +26,12 @@ test('presentation barriers suspend callbacks and animations, then publish the s
     await Promise.resolve()
     assert.equal(released, false)
     assert.deepEqual(events, ['pause', 'idle'])
-    const snapshot = { gateway: [{ id: 'g', type: 'end' }] } as unknown as NonNullable<PresentationUpdate['snapshot']>
+    const snapshot = {} as unknown as NonNullable<PresentationUpdate['snapshot']>
     receive({ epoch: 2, active: false, startedAt: 2 })
     receive({ epoch: 2, active: true, startedAt: 2, snapshot })
     await waiting
     assert.equal(presentation.getPresentation().snapshot, undefined, 'The one-shot resume payload must be released.')
-    assert.deepEqual(events, ['pause', 'idle', 'idle', 'active', 'play', 'snapshot', 'subscriber', 'gateway', 'waiter'])
+    assert.deepEqual(events, ['pause', 'idle', 'idle', 'active', 'play', 'snapshot', 'subscriber', 'waiter'])
     receive({ epoch: 1, active: false, startedAt: 1 })
     assert.equal(presentation.getPresentation().epoch, 2)
   } finally {

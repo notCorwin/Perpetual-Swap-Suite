@@ -105,15 +105,6 @@ function captureChart(value) {
   })
 }
 
-function analysisSettings(value) {
-  const path = 'analysisSettings'
-  record(value, path, ['action', 'model', 'apiKey'], ['action'])
-  const action = choice(value.action, `${path}.action`, ['read', 'save', 'removeKey'])
-  if (action !== 'save') { record(value, path, ['action']); return { action } }
-  record(value, path, ['action', 'model', 'apiKey'], ['action', 'model', 'apiKey'])
-  return { action, model: text(value.model, `${path}.model`, { maximum: 256 }), apiKey: text(value.apiKey, `${path}.apiKey`, { empty: true, maximum: 16_384 }) }
-}
-
 function preferences(value) {
   const path = 'preferences'
   record(value, path, ['action', 'values'], ['action'])
@@ -199,7 +190,7 @@ function candle(value, index) {
 
 /** Validate the complete request before dispatching any operation or side effect. */
 export function parseDesktopRequest(value, { allowE2E = false } = {}) {
-  const operations = ['snapshot', 'preferences', 'dataAudit', 'historyDownload', 'chartFocus', 'chartWindow', 'chartLocal', 'chartHistory', 'chartUniverse', 'captureChart', 'copyText', 'copyImage', 'analysisSettings', 'gatewayFetch', 'cancelGatewayFetch', 'e2e']
+  const operations = ['snapshot', 'preferences', 'dataAudit', 'historyDownload', 'chartFocus', 'chartWindow', 'chartLocal', 'chartHistory', 'chartUniverse', 'captureChart', 'copyText', 'copyImage', 'e2e']
   record(value, 'request', operations)
   const keys = Object.keys(value)
   if (keys.length !== 1) invalid('request', 'must contain exactly one operation')
@@ -234,12 +225,6 @@ export function parseDesktopRequest(value, { allowE2E = false } = {}) {
       if (!/^data:image\/png;base64,(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(image)) invalid(operation, 'must be a PNG data URL')
       return { copyImage: image }
     }
-    case 'analysisSettings': return { analysisSettings: analysisSettings(input) }
-    case 'gatewayFetch': {
-      record(input, operation, ['id', 'body'], ['id', 'body'])
-      return { gatewayFetch: { id: text(input.id, 'gatewayFetch.id', { maximum: 256 }), body: text(input.body, 'gatewayFetch.body', { maximum: 33_554_432 }) } }
-    }
-    case 'cancelGatewayFetch': return { cancelGatewayFetch: text(input, operation, { maximum: 256 }) }
     case 'e2e':
       if (allowE2E !== true) invalid('e2e', 'is unavailable outside tests')
       return { e2e: e2e(input) }

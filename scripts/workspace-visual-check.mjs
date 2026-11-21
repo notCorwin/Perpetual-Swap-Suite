@@ -56,14 +56,13 @@ try {
       if (value.chartLocal) return encodeChartWire(prepared(value.chartLocal))
       if (value.chartHistory) return encodeChartWire(prepared(value.chartHistory))
       if (value.chartWindow) return encodeChartWire(prepared(value.chartWindow))
-      if (value.analysisSettings) return { model: '', hasAPIKey: false }
       if (value.dataAudit) return { phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '' }
       throw new Error(`Unsupported visual fixture operation: ${Object.keys(value).join(', ')}`)
     })
   })
   await page.setViewportSize({ width: 1600, height: 1000 })
   await page.reload({ waitUntil: 'domcontentloaded' })
-  await page.locator('svg[data-rendered-inst="BETA-USDT-SWAP"]').waitFor({ state: 'visible' })
+  await page.locator('svg[data-rendered-inst="BETA-USDT-SWAP"]').first().waitFor({ state: 'visible' })
   const client = await page.context().newCDPSession(page)
   const stablePaint = async () => {
     await page.evaluate(() => document.fonts.ready)
@@ -192,7 +191,7 @@ try {
     for (const dpr of [1, 2]) for (const width of [1200, 1600, 2000]) {
       await page.setViewportSize({ width, height: 1000 })
       await client.send('Emulation.setDeviceMetricsOverride', { width, height: 1000, deviceScaleFactor: dpr, mobile: false })
-      await page.waitForFunction(({ width, dpr }) => innerWidth === width && devicePixelRatio === dpr && Number(document.querySelector('[data-layout="market-workspace"]').dataset.uiScale) === width / 1600, { width, dpr })
+      await page.waitForFunction(({ width, dpr }) => innerWidth === width && devicePixelRatio === dpr && Number(document.querySelector('[data-layout="market-workspace"]').dataset.uiScale) === 1, { width, dpr })
       await stablePaint()
       await assertWorkspaceLayout(page)
       await screenshot(`workspace-${theme}-${width}-dpr${dpr}`, width, 1000, dpr)
@@ -200,19 +199,12 @@ try {
       await screenshot(`workspace-${theme}-gray-${width}-dpr${dpr}`, width, 1000, dpr)
       await client.send('Emulation.setEmulatedVisionDeficiency', { type: 'none' })
       if (width === 1600 && dpr === 1) {
-        const indicators = await assertIndicatorLegends(page, { requireFittedVolatility: true })
+        await assertIndicatorLegends(page)
         const measured = await measure()
-        measured.semantics.volatilityFits = indicators.volatilityFits
         assert.deepEqual(measured.semantics.positive, theme === 'light' ? [142, 188, 57] : [202, 253, 92])
         assert.deepEqual(measured.semantics.negative, [232, 85, 168])
         assert.equal(measured.semantics.upFill, 'hollow')
         assert.equal(measured.semantics.downFill, 'solid')
-        assert.notEqual(measured.semantics.emaDash, measured.semantics.vwapDash)
-        assert.equal(measured.semantics.takerLegends.length, 2)
-        for (const [index, legend] of measured.semantics.takerLegends.entries()) {
-          assert.deepEqual(legend.labelColor, index === 0 ? measured.semantics.positiveLabel : measured.semantics.negativeLabel, 'Taker titles must use the accessible financial label tokens.')
-          assert.deepEqual(legend.swatchColor, index === 0 ? measured.semantics.positive : measured.semantics.negative, 'Taker swatches must preserve the mandated market colors.')
-        }
         report.measurements.push({ theme, surface: 'workspace', ...measured })
         await page.getByRole('link', { name: 'Settings', exact: true }).click()
         const settings = page.getByRole('main', { name: 'Settings', exact: true })
