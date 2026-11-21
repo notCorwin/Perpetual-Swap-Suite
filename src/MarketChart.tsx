@@ -72,17 +72,6 @@ const bollOverlay = { label: 'BOLL(20,2)', color: 'var(--chart-1)', dash: undefi
   value: (bar: Bar, compact?: boolean) => `U ${formatIndicatorPrice(bar.bollUpper, compact)}\u00a0·\u00a0M ${formatIndicatorPrice(bar.bollMiddle, compact)}\u00a0·\u00a0L ${formatIndicatorPrice(bar.bollLower, compact)}` }
 const priceOverlays = [vwapOverlay, bollOverlay]
 
-export function MultiChartLegend() {
-  return <div data-shared-chart-legend role="group" aria-label="Price overlays" className="flex items-center gap-4 whitespace-nowrap text-xs text-muted-foreground">
-    {priceOverlays.map(({ label, color, dash }) => <span key={label} className="inline-flex items-center gap-2">
-      <svg aria-hidden="true" width={chartTokens.legendSymbol} height="1" strokeWidth="var(--chart-line-width)">
-        <line data-chart-legend={label} y1=".5" y2=".5" x2={chartTokens.legendSymbol} stroke={color} strokeDasharray={dash} />
-      </svg>
-      {label}
-    </span>)}
-  </div>
-}
-
 const legendContext = document.createElement("canvas").getContext("2d")
 const chartTextWidths = new Map<string, number>()
 const chartTextWidth = (text: string, fontSize: number = chartTokens.textSize) => {
@@ -756,7 +745,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     <div className="flex min-h-0 flex-1">
     <section ref={chartRef} data-chart-inst={displayedId} data-chart-time-end={plotGeometry ? plotGeometry.endHour + intervalMS * 0.34 - wheelContentOffset / plotGeometry.barPitch * intervalMS : undefined} data-chart-time-start={plotGeometry ? plotGeometry.endHour + intervalMS * 0.34 - (plotGeometry.layout.right - plotGeometry.layout.left + wheelContentOffset) / plotGeometry.barPitch * intervalMS : undefined} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={surface?.windowBars ?? 96} data-chart-visible-bars={visibleBars} data-chart-bar-spacing={viewport.spacing} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={priceState} data-chart-statistics-state={surface?.oiState === 'error' || surface?.takerState === 'error' ? 'error' : surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={priceState !== 'ready' || surface?.indicatorState !== 'ready' || oiState !== 'ready' || takerState !== 'ready' ? 'true' : 'false'} data-chart-loading={pending ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
       <div data-chart-summary className="flex shrink-0 items-center border-b px-4">
-        <h2 data-chart-title className="min-w-0 max-w-40 shrink-0 truncate" title={displayedId} aria-label={`${displayedId.replace(/-SWAP$/, '')} · ${timeframeLabel(displayedFrame)}`}>{priceOnly && matchesSelection ? timeframeLabel(displayedFrame) : `${displayedId.replace(/-SWAP$/, '')} · ${timeframeLabel(displayedFrame)}`}</h2>
+        {!priceOnly && <h2 data-chart-title className="min-w-0 max-w-40 shrink-0 truncate" title={displayedId} aria-label={`${displayedId.replace(/-SWAP$/, '')} · ${timeframeLabel(displayedFrame)}`}>{`${displayedId.replace(/-SWAP$/, '')} · ${timeframeLabel(displayedFrame)}`}</h2>}
         {priceOnly && !historical && <PriceStatus observedAt={surface?.priceObservedAt} realtime={surface?.realtimeState} active={isActive && windowVisible && presentation.active} />}
         <div data-chart-status data-chart-indicator-state={surface?.indicatorState} data-chart-indicator-stale={displayedIndicators.stale} data-chart-indicator-input={surface?.indicatorStatus?.inputVersion} role="status" aria-live="polite" aria-atomic="true" className="flex min-w-0 flex-1 items-center gap-2 text-xs text-muted-foreground">
           {statusLoading && <Spinner aria-hidden="true" role="presentation" />}

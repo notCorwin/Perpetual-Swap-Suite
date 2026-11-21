@@ -1743,11 +1743,10 @@ test('compact density reserves at least eighty-five percent of each stacked char
       }
       if (!baseline) {
         assert.equal(await page.locator('[data-shared-chart-title]').count(), 1)
-        assert.deepEqual(await page.locator('[data-chart-legend]').evaluateAll(swatches => swatches.map(swatch => swatch.dataset.chartLegend)), ['VWAP(14)', 'BOLL(20,2)'])
-        assert.equal(await page.locator('[data-chart-price-scale="relative"]').count(), 1)
+        assert.equal(await page.locator('[data-shared-chart-legend]').count(), 0)
         assert.equal(await page.locator('[data-chart-panel-header]').count(), 0)
         const chart = page.locator('[data-chart-workspace]').first()
-        assert.deepEqual(await page.locator('[data-chart-title]').allTextContents(), ['BETA-USDT', '1h', '15m', '5m'])
+        assert.deepEqual(await page.locator('[data-chart-title]').allTextContents(), ['BETA-USDT'])
         assert.equal(await chart.locator('[data-chart-inspection-readout]').isVisible(), false)
         const descriptions = await page.locator('svg[data-rendered-inst]').evaluateAll(svgs => svgs.map(svg => {
           const id = svg.getAttribute('aria-describedby'), readout = document.getElementById(id)

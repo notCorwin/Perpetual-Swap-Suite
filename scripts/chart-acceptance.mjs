@@ -196,17 +196,15 @@ export async function assertIndicatorLegends(page) {
     }),
   })))
   assert.deepEqual(reading.map(chart => chart.timeframe), ['1H', '15m', '5m'])
-  const legend = await page.locator('[data-shared-chart-legend] [data-chart-legend]').evaluateAll(nodes => nodes.map(node => ({
-    label: node.dataset.chartLegend, stroke: getComputedStyle(node).stroke,
-  })))
-  assert.deepEqual(legend.map(item => item.label), ['VWAP(14)', 'BOLL(20,2)'])
+  assert.equal(await page.locator('[data-shared-chart-legend]').count(), 0)
   for (const chart of reading) {
     assert.equal(chart.panels, 0, `${chart.timeframe} should contain only its price chart.`)
     for (const curve of chart.curves) {
       assert.ok(curve.path, `${chart.timeframe} ${curve.field} must have a drawn curve.`)
       assert.equal(curve.width, 1, `${chart.timeframe} ${curve.field} must use a 1 px stroke.`)
-      assert.equal(curve.stroke, legend[curve.field === 'vwap' ? 0 : 1].stroke, `${chart.timeframe} ${curve.field} must match its shared legend.`)
+      assert.equal(curve.stroke, reading[0].curves.find(first => first.field === curve.field).stroke, `${chart.timeframe} ${curve.field} must use the same color across timeframes.`)
     }
+    assert.ok(chart.curves[0].stroke !== chart.curves[1].stroke, `${chart.timeframe} VWAP and BOLL must remain visually distinct.`)
   }
   return reading
 }

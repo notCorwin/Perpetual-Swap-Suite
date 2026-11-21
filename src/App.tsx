@@ -2,11 +2,11 @@ import { lazy, memo, useCallback, useEffect, useLayoutEffect, useRef, useState }
 import { DeferredPanel } from '@/DeferredPanel'
 import { Camera, Settings2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { captureStableChart, chartCaptureBounds } from '@/chart-capture'
+import { captureStableChart, chartCaptureBounds, eraseCapturedAction } from '@/chart-capture'
 import { buttonVariants } from '@/components/ui/button'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
-import { ChartTimeSyncProvider, MarketChart, MultiChartLegend } from '@/MarketChart'
+import { ChartTimeSyncProvider, MarketChart } from '@/MarketChart'
 import { MarketRowsViewport } from '@/MarketRowsViewport'
 import { WorkspaceViewport } from '@/WorkspaceViewport'
 import { settingsHref, useSettingsSection, type SettingsNavigationState } from '@/settings-navigation'
@@ -236,6 +236,7 @@ function App() {
     setPreferences(saved); setPreferencesError('')
   }, [])
   const chartsRef = useRef<HTMLDivElement>(null)
+  const copyButtonRef = useRef<HTMLButtonElement>(null)
   const copyOwner = useRef<object | null>(null)
   const [copyState, setCopyState] = useState<{ status: 'idle' | 'copying' | 'copied' | 'failed'; error: string }>({ status: 'idle', error: '' })
   useLayoutEffect(() => {
@@ -257,19 +258,28 @@ function App() {
     try {
       await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
       if (copyOwner.current !== owner || chartsRef.current !== element) return
+      const button = copyButtonRef.current
+      if (!button) throw new Error('Copy action is unavailable.')
       const charts = Array.from(element.querySelectorAll<HTMLElement>('[data-chart-inst]'))
       if (charts.length !== 3 || charts.some(chart => chart.dataset.chartLoading !== 'false' || !(Number(chart.dataset.chartRenderedBars) > 0) || chart.dataset.chartInst !== selectedID)) throw new Error('Charts are still loading. Try again when all three are ready.')
       const bounds = chartCaptureBounds(element)
+      const buttonBounds = button.getBoundingClientRect()
       const content = element.innerHTML
       const current = () => {
-        if (copyOwner.current !== owner || chartsRef.current !== element || element.innerHTML !== content) return false
+        if (copyOwner.current !== owner || chartsRef.current !== element || copyButtonRef.current !== button || element.innerHTML !== content) return false
         const rect = element.getBoundingClientRect()
+        const action = button.getBoundingClientRect()
         return rect.x === bounds.x && rect.y === bounds.y && rect.width === bounds.width && rect.height === bounds.height
+          && action.x === buttonBounds.x && action.y === buttonBounds.y && action.width === buttonBounds.width && action.height === buttonBounds.height
       }
       const image = await captureStableChart(() => window.radarDesktop.request({ captureChart: { ...bounds, output: 'png' } }), current)
       if (copyOwner.current !== owner) return
       if (!current()) throw new Error('Chart changed during capture. Start again.')
-      const result = await window.radarDesktop.request({ copyImage: image.imageDataURL })
+      const background = getComputedStyle(document.documentElement).getPropertyValue('--background')
+      const dataURL = await eraseCapturedAction(image.imageDataURL, bounds, buttonBounds, background)
+      if (copyOwner.current !== owner) return
+      if (!current()) throw new Error('Chart changed during capture. Start again.')
+      const result = await window.radarDesktop.request({ copyImage: dataURL })
       if (!result.ok) throw new Error('Could not copy chart.')
       if (copyOwner.current === owner) setCopyState({ status: 'copied', error: '' })
     } catch (cause) {
@@ -304,23 +314,16 @@ function App() {
     </aside>
     <section data-chart-panel className="h-full min-w-0 flex-1" aria-label="Market chart workspace">
       {selectedID ? <div data-chart-display-mode="multi" className="flex h-full min-h-0 flex-col">
-        <header data-chart-toolbar data-window-toolbar data-window-drag-region className="flex shrink-0 items-center gap-3 border-b px-4">
-          <span className="mr-auto text-sm font-medium">Multi-timeframe</span>
-          <Button data-window-no-drag variant="outline" size="sm" disabled={copyState.status === 'copying'} onClick={() => { void copyChart() }}><Camera data-icon="inline-start" aria-hidden="true" />{copyState.status === 'copying' ? 'Copying…' : copyState.status === 'copied' ? 'Copied' : 'Copy chart'}</Button>
-        </header>
         {copyState.error && <p role="alert" className="shrink-0 border-b px-5 py-2 text-destructive">{copyState.error}</p>}
-        <span role="status" className="sr-only">{copyState.status === 'copied' ? 'Chart copied to clipboard' : ''}</span>
+        <span role="status" className="sr-only">{copyState.status === 'copying' ? 'Copying chart' : copyState.status === 'copied' ? 'Chart copied to clipboard' : ''}</span>
         <div ref={chartsRef} data-chart-capture className="flex min-h-0 flex-1 flex-col">
-          <div className="flex shrink-0 items-center gap-3 border-b px-4 py-2">
-            <div className="flex items-center gap-2">
+          <header data-chart-toolbar data-window-toolbar data-window-drag-region className="flex shrink-0 items-center gap-3 border-b px-4">
+            <div className="flex min-w-0 flex-1 items-center gap-2">
               <h2 data-chart-title data-shared-chart-title className="max-w-32 truncate" title={selectedID}>{selectedID.replace(/-SWAP$/, '')}</h2>
               {sharedPriceText !== undefined && <><span className="sr-only">Market price</span><span data-shared-chart-price className="max-w-32 truncate" title={sharedPriceText}>{sharedPriceText}</span></>}
             </div>
-            <div className="ml-auto flex items-center gap-4 whitespace-nowrap text-xs text-muted-foreground">
-              <MultiChartLegend />
-              <span data-chart-price-scale="relative" title="Change from first visible open">Change %</span>
-            </div>
-          </div>
+            <Button ref={copyButtonRef} data-window-no-drag variant="outline" size="sm" disabled={copyState.status === 'copying'} onClick={() => { void copyChart() }}><Camera data-icon="inline-start" aria-hidden="true" />{copyState.status === 'copying' ? 'Copying…' : copyState.status === 'copied' ? 'Copied' : 'Copy chart'}</Button>
+          </header>
           <ChartTimeSyncProvider key={selectedID}><div className="grid min-h-0 flex-1 grid-rows-3 divide-y" data-multi-timeframe-charts>
             {(['1H', '15m', '5m'] as const).map((frame, index) => <MarketChart key={frame} controller={multiChartControllers[frame]} priceOnly navigation={index === 0} active={settingsSection === null} instId={selectedID} tickSz={selectedRow?.tickSz} timeframe={frame} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} />)}
           </div></ChartTimeSyncProvider>
