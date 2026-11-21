@@ -8,11 +8,16 @@ import { reconcileMarketOrder, reconcileMarketRows } from './market-snapshot.ts'
 import { DEFAULT_PREFERENCES, type Preferences } from './renderer-preferences.ts'
 import { SnapshotOrder } from './snapshot-order.ts'
 import { formatCurrentPrice } from './price-format.ts'
-import type { MarketSnapshot, PresentationUpdate, RankedMarketRow } from './desktop-contract.ts'
+import type { DataAudit, HistoryDownload, MarketSnapshot, PresentationUpdate, RankedMarketRow } from './desktop-contract.ts'
 
 type View = {
   preferences: Preferences; rows: RankedMarketRow[]; turnoverOrder: string[]; ready: boolean; status: string; error: string
   selectedID: string | null
+  globalAudit: DataAudit | null; globalDownload: HistoryDownload | null
+  auditStatusUnavailable: boolean; downloadStatusUnavailable: boolean
+  issues: { id: string; detail: string }[]
+  receiveSettingsJob(kind: 'audit' | 'download', value: DataAudit | HistoryDownload): void
+  updateSettingsStatuses(values: { id: string; label: string; detail: string; severity: 'error' | 'warning' | 'info'; transient?: boolean }[]): void
   savePreferences(values: Partial<Preferences>): Promise<void>
 }
 type Slot = { value?: unknown; dependencies?: unknown[]; cleanup?: void | (() => void) }
@@ -30,13 +35,14 @@ const declarations = ast.program.body.filter(node => node.type === 'VariableDecl
 const logic = stripTypeScriptTypes([
   ...declarations.map(node => source.slice(node.start!, node.end!)),
   source.slice(component.start!, renderReturn.start!),
-  'return { preferences, rows, turnoverOrder, ready, status, error, selectedID, savePreferences } }',
+  'return { preferences, rows, turnoverOrder, ready, status, error, selectedID, savePreferences, globalAudit, globalDownload, auditStatusUnavailable, downloadStatusUnavailable, issues, updateSettingsStatuses, receiveSettingsJob } }',
 ].join('\n'))
 
 function fixture(snapshotFailure = false) {
   const slots: Slot[] = [], effects: (() => void)[] = []
   let cursor = 0, dirty = true, rendered: View, timers = 0
   const snapshotRequests: { sinceRevision: number; serviceSession?: string }[] = []
+  const jobRequests: string[] = []
   const universeRequests: unknown[][] = []
   const state = {
     preferences: structuredClone(DEFAULT_PREFERENCES), revision: 1, snapshotFailure, serviceSession: 'fixture',
@@ -45,6 +51,10 @@ function fixture(snapshotFailure = false) {
     afterUpdate: undefined as undefined | (() => Promise<void>),
     beforeUpdate: undefined as undefined | (() => Promise<void>),
     beforeSnapshot: undefined as undefined | (() => Promise<void>),
+    beforeJobs: undefined as undefined | (() => Promise<void>),
+    jobsFail: false,
+    audit: { revision: 1, serviceSession: 'fixture', phase: 'running', progress: { completed: 1, total: 3 }, issues: [], error: '' } as DataAudit,
+    download: { revision: 1, serviceSession: 'fixture', phase: 'running', progress: { checked: 1, total: 3 } } as HistoryDownload,
   }
   const window = Object.assign(new EventTarget(), {
     setTimeout() { return ++timers },
@@ -52,6 +62,7 @@ function fixture(snapshotFailure = false) {
     radarDesktop: { async request(command: {
       preferences?: { action: string; values?: Partial<Preferences> }
       snapshot?: { sinceRevision: number; serviceSession?: string }
+      dataAudit?: { action: string }; historyDownload?: { action: string }
     }) {
       if (command.preferences) {
         if (command.preferences.action === 'update') {
@@ -60,6 +71,14 @@ function fixture(snapshotFailure = false) {
           await state.afterUpdate?.()
         }
         return structuredClone(state.preferences)
+      }
+      if (command.dataAudit || command.historyDownload) {
+        const name = command.dataAudit ? 'audit' : 'download'
+        jobRequests.push(name)
+        const result = structuredClone(state[name])
+        await state.beforeJobs?.()
+        if (state.jobsFail) throw new Error('Worker unavailable')
+        return result
       }
       const query = command.snapshot!
       snapshotRequests.push(query)
@@ -114,10 +133,11 @@ function fixture(snapshotFailure = false) {
   const scope = { ...environment, chartCoordinator: environment.chartController, ingestPreparedChart: environment.chartController.ingestPrepared }
   const render = new Function(...Object.keys(scope), `${logic}\nreturn App`)(...Object.values(scope)) as () => View
   return {
-    state, snapshotRequests, universeRequests,
+    state, snapshotRequests, universeRequests, jobRequests,
     get view() { return rendered },
     get timers() { return timers },
     notify() { window.dispatchEvent(new Event('radar-market-changed')) },
+    notifyJob(name: 'audit' | 'download') { window.dispatchEvent(new CustomEvent(name === 'audit' ? 'radar-audit-changed' : 'radar-history-download-changed', { detail: structuredClone(state[name]) })) },
     present(update: PresentationUpdate) { presentation = update; for (const listener of transitions) listener(update); dirty = true },
     async flush() {
       for (let pass = 0; pass < 8; pass++) {
@@ -132,6 +152,52 @@ function fixture(snapshotFailure = false) {
     close() { for (const current of slots) if (current.cleanup) current.cleanup() },
   }
 }
+
+test('initial job status reads reuse newer pushed snapshots and never poll', async context => {
+  const app = fixture(); context.after(() => app.close())
+  const releases: (() => void)[] = []
+  app.state.beforeJobs = () => new Promise<void>(resolve => { releases.push(resolve) })
+  await app.flush()
+  assert.deepEqual(app.jobRequests.sort(), ['audit', 'download'])
+  app.state.audit = { ...app.state.audit, serviceSession: 'replacement', revision: 2, phase: 'completed' }
+  app.notifyJob('audit')
+  await app.flush()
+  releases.forEach(release => release())
+  await app.flush()
+  assert.equal(app.view.globalAudit?.revision, 2)
+  assert.equal(app.view.globalAudit?.serviceSession, 'replacement')
+  assert.equal(app.view.globalAudit?.phase, 'completed')
+  assert.equal(app.view.globalDownload?.revision, 1)
+  assert.equal(app.jobRequests.length, 2)
+})
+
+test('job status failures remain visible until a later authoritative update', async context => {
+  const app = fixture(); context.after(() => app.close())
+  app.state.jobsFail = true
+  await app.flush()
+  assert.equal(app.view.auditStatusUnavailable, true)
+  assert.equal(app.view.downloadStatusUnavailable, true)
+  app.view.receiveSettingsJob('audit', app.state.audit)
+  await app.flush()
+  assert.equal(app.view.auditStatusUnavailable, false)
+  assert.equal(app.view.downloadStatusUnavailable, true)
+  const obsolete = { ...app.state.audit, serviceSession: 'old', revision: 100 }
+  app.view.receiveSettingsJob('audit', obsolete)
+  await app.flush()
+  assert.equal(app.view.globalAudit?.serviceSession, 'fixture')
+})
+
+test('background job snapshots cannot be hidden by older settings state', async context => {
+  const app = fixture(); context.after(() => app.close())
+  await app.flush()
+  app.view.updateSettingsStatuses([{ id: 'data-audit', label: 'Data audit', detail: 'Audit complete.', severity: 'info' }])
+  await app.flush()
+  assert.ok(app.view.issues.some(issue => issue.id === 'data-audit' && issue.detail.includes('Audit running')))
+  assert.ok(!app.view.issues.some(issue => issue.id === 'settings-data-audit'))
+  app.view.updateSettingsStatuses([{ id: 'data-audit', label: 'Data audit', detail: 'Could not cancel audit.', severity: 'error', transient: true }])
+  await app.flush()
+  assert.ok(app.view.issues.some(issue => issue.id === 'settings-data-audit' && issue.detail.includes('Could not cancel')))
+})
 
 test('no-op and audit-only preference saves retain the active market loading state', async context => {
   const app = fixture(); context.after(() => app.close())
@@ -183,7 +249,7 @@ test('an old market request cannot replace the resume snapshot or the retained s
   assert.equal(app.view.rows[0].lastPrice, 100)
   const snapshot = {
     market: { ...app.state.metadata, revision: 3, serviceSession: app.state.serviceSession, rows: [{ ...app.state.rows[0], lastPrice: 102 }], turnoverOrder: ['BTC-USDT-SWAP'], updatedAt: 2 },
-    preferences: app.state.preferences, frames: [], audit: {}, download: {},
+    preferences: app.state.preferences, frames: [], audit: app.state.audit, download: app.state.download,
   } as unknown as PresentationUpdate['snapshot']
   app.present({ epoch: 2, active: true, startedAt: 2, snapshot })
   await app.flush()
@@ -239,7 +305,7 @@ test('a chart retained across idle survives later qualification updates without 
   app.state.rows = [{ ...app.state.rows[0], instId: 'ETH-USDT-SWAP' }]
   app.state.revision++
   const market = { ...app.state.metadata, rows: app.state.rows, turnoverOrder: [], revision: app.state.revision, serviceSession: app.state.serviceSession, updatedAt: 1 }
-  app.present({ epoch: 2, active: true, startedAt: 2, snapshot: { market, frames: [], preferences: app.state.preferences } as unknown as NonNullable<PresentationUpdate['snapshot']> })
+  app.present({ epoch: 2, active: true, startedAt: 2, snapshot: { market, frames: [], preferences: app.state.preferences, audit: app.state.audit, download: app.state.download } })
   await app.flush()
   app.state.revision++; app.notify(); await app.flush()
   assert.equal(app.view.selectedID, 'BTC-USDT-SWAP')

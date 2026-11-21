@@ -46,7 +46,7 @@ const readChart = () => page.evaluate(() => {
       endHour: snapshot.endHour, liveBar: snapshot.liveBar && { hour: snapshot.liveBar.hour, open: snapshot.liveBar.open, high: snapshot.liveBar.high,
         low: snapshot.liveBar.low, close: snapshot.liveBar.close, confirmed: snapshot.liveBar.confirmed }, priceObservedAt: snapshot.priceObservedAt,
       realtimeState: snapshot.realtimeState, bars: snapshot.bars.length, generation: snapshot.generation } : null,
-    statuses: [...(workspace?.querySelectorAll('[data-chart-status][data-timeframe="5m"]') ?? [])].map(value => value.textContent?.trim()) }
+    statuses: [...document.querySelectorAll('[data-market-status-row] [data-chart-shared-status-item="5m"]')].map(value => value.textContent?.trim()) }
 })
 try {
   const sentAt = Date.now(), clockResponse = await fetch('https://www.okx.com/api/v5/public/time', { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(7000)]) })

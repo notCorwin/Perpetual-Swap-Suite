@@ -2,7 +2,7 @@ import { readDesignLengths } from '@/design-lengths'
 import { CHART_DEFAULT_SPACING, chartPitchSpan } from './chart-layout.ts'
 import { chartTimeTicks, chartTimeTickStep } from './chart-axis.ts'
 import { createContext, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react"
-import { createPortal, flushSync } from "react-dom"
+import { flushSync } from "react-dom"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Spinner } from "@/components/ui/spinner"
@@ -41,19 +41,18 @@ const PriceStatus = memo(function PriceStatus({ observedAt, realtime, active, la
   return fresh ? null : <Badge variant="secondary" role="status" title={observedAt ? `Last price observation ${new Date(observedAt).toLocaleTimeString('en-US')}` : 'Waiting for a current price observation'}>{label ? `${label} ` : ''}Cached price</Badge>
 })
 
-const SharedChartStatus = memo(function SharedChartStatus({ timeframe, summary, error, loading, observedAt, realtime, active, historical, indicatorState, indicatorStale, indicatorInput }: {
-  timeframe: RadarTimeframe; summary: string; error: string; loading: boolean; observedAt?: number | null; realtime?: 'live' | 'stale'; active: boolean; historical: boolean; indicatorState?: string; indicatorStale: boolean; indicatorInput?: string
+export type SharedChartStatusValue = { detail: string; severity: 'error' | 'warning' | 'info' }
+const SharedChartStatus = memo(function SharedChartStatus({ timeframe, summary, error, warning, loading, observedAt, realtime, active, historical, onStatus }: {
+  timeframe: RadarTimeframe; summary: string; error: string; warning: boolean; loading: boolean; observedAt?: number | null; realtime?: 'live' | 'stale'; active: boolean; historical: boolean; onStatus: (timeframe: RadarTimeframe, value: SharedChartStatusValue | null) => void
 }) {
   const [now, setNow] = useState(Date.now)
   useEffect(() => watchPriceFreshness({ observedAt, realtime, active, displayedAt: now, isActive: presentationActive, onTime: setNow }), [active, observedAt, realtime, now])
   const cached = !historical && !isPriceFresh(observedAt, realtime, now)
-  const detail = [error || summary, cached ? 'Cached price' : ''].filter(Boolean).join(' · ')
-  if (!detail) return null
-  return <div data-chart-shared-status-item={timeframe} data-chart-status data-timeframe={timeframe} data-chart-indicator-state={indicatorState} data-chart-indicator-stale={indicatorStale} data-chart-indicator-input={indicatorInput} role={error ? 'alert' : 'status'} tabIndex={error ? 0 : undefined} aria-live="polite" aria-atomic="true" aria-label={`${timeframeLabel(timeframe)}: ${detail}`} title={`${timeframeLabel(timeframe)}: ${detail}`} className={cn('flex min-w-0 flex-1 basis-0 items-center gap-1 text-xs', error ? 'text-destructive' : 'text-muted-foreground')}>
-    <span className="shrink-0">{timeframeLabel(timeframe)}</span>
-    {loading && !error && <Spinner aria-hidden="true" role="presentation" />}
-    <span className="min-w-0 truncate">{detail}</span>
-  </div>
+  const detail = [error || summary, cached ? 'Cached price. Check the market connection for current prices.' : ''].filter(Boolean).join(' · ')
+  const severity = error ? 'error' : cached || warning ? 'warning' : 'info'
+  useEffect(() => { onStatus(timeframe, detail ? { detail, severity } : null) }, [onStatus, timeframe, detail, severity, loading])
+  useEffect(() => () => onStatus(timeframe, null), [onStatus, timeframe])
+  return null
 })
 
 const chartTimeFormatter = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })
@@ -368,7 +367,7 @@ const ChartSurface = memo(function ChartSurface({ instId, timeframe, hasComplete
   </PlotVisible>
 })
 
-export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, turnoverOrder, onSelect, controller: chartController = defaultChartController, priceOnly = false, navigation = true, statusTarget }: { controller?: ChartController; priceOnly?: boolean; navigation?: boolean; statusTarget?: HTMLElement | null; instId: string; tickSz?: string | null; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; candidateIds?: string[]; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
+export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, turnoverOrder, onSelect, controller: chartController = defaultChartController, priceOnly = false, navigation = true, onStatus }: { controller?: ChartController; priceOnly?: boolean; navigation?: boolean; onStatus?: (timeframe: RadarTimeframe, value: SharedChartStatusValue | null) => void; instId: string; tickSz?: string | null; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; candidateIds?: string[]; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
   const sync = useContext(ChartTimeSync)
   const presentation = usePresentation()
   const readoutId = useId()
@@ -738,7 +737,11 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
   const statusLoading = !error && ((pending) || priceState === 'loading' || priceState === 'partial' || priceState === 'stale')
     || surface?.indicatorState === 'loading' || !priceOnly && (oiState === 'loading' || takerState === 'loading')
   const statusSummary = statusMessages.join(' · ')
-  const sharedError = error || (priceState === 'error' ? sourceStatusText('Price history', priceState, surface?.priceStatus) : '') || (surface?.indicatorState === 'error' ? sourceStatusText('Indicators', 'error', surface.indicatorStatus) : '')
+  const sharedError = [
+    error ? 'Chart update failed. Check the data service and try again.' : '',
+    priceState === 'error' ? 'Price history could not be loaded. Check the market connection and data service.' : '',
+    surface?.indicatorState === 'error' ? 'Indicators could not be calculated. Check the data service.' : '',
+  ].filter(Boolean).join(' · ')
   const inspectionReadout = active && <div id={readoutId} data-chart-inspection-readout hidden={priceOnly && inspectedBar === undefined} aria-live="off" className={priceOnly ? 'pointer-events-none absolute left-0 right-0 top-0 z-10 flex flex-wrap gap-x-3 bg-background/90 px-4 text-xs' : undefined}>
     <p className="min-w-0 truncate" data-chart-inspected-hour={inspectedBar?.hour}><span className="text-muted-foreground">{inspectedBar === undefined ? historical ? 'Window end' : 'Latest' : 'Selected'}</span> {time(active.hour)}</p>
     {([['Open', active.open], ['High', active.high], ['Low', active.low], ['Close', active.close]] as const).map(([label, value]) => {
@@ -754,7 +757,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     <p className="min-w-0 truncate" title={error || statusSummary}>{error || statusSummary}</p>
   </div>
   return <section data-chart-workspace aria-label="Market chart workspace" className="flex h-full min-h-0 w-full min-w-0 flex-col overflow-hidden overscroll-none text-sm font-normal tabular-nums">
-    {priceOnly && statusTarget && createPortal(<SharedChartStatus timeframe={timeframe} summary={statusSummary} error={sharedError} loading={statusLoading} observedAt={surface?.priceObservedAt} realtime={surface?.realtimeState} active={isActive && windowVisible && presentation.active} historical={historical} indicatorState={surface?.indicatorState} indicatorStale={displayedIndicators.stale} indicatorInput={surface?.indicatorStatus?.inputVersion} />, statusTarget)}
+    {priceOnly && onStatus && <SharedChartStatus timeframe={timeframe} summary={sharedError ? '' : statusSummary} error={sharedError} warning={priceState === 'stale' || priceState === 'partial' || priceState === 'unavailable' || surface?.indicatorState === 'unavailable'} loading={statusLoading} observedAt={surface?.priceObservedAt} realtime={surface?.realtimeState} active={windowVisible && presentation.active} historical={historical} onStatus={onStatus} />}
     {!priceOnly && <header data-chart-toolbar data-window-toolbar data-window-drag-region className="flex items-center gap-3 border-b px-4">
       <ToggleGroup variant="outline" size="sm" className="mr-auto" value={[timeframe]} onValueChange={values => { const value = values[0]; if (value) onTimeframeChange?.(value as RadarTimeframe) }} aria-label="Chart timeframe">{RADAR_TIMEFRAMES.map(item => <ToggleGroupItem key={item.value} value={item.value}>{item.label}</ToggleGroupItem>)}</ToggleGroup>
       <Button variant="ghost" size="sm" onClick={() => controlsHelp.current?.showModal()}>Chart controls</Button>

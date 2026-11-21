@@ -6,7 +6,7 @@ import { captureStableChart, chartCaptureBounds, eraseCapturedAction } from '@/c
 import { buttonVariants } from '@/components/ui/button'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
-import { ChartTimeSyncProvider, MarketChart } from '@/MarketChart'
+import { ChartTimeSyncProvider, MarketChart, type SharedChartStatusValue } from '@/MarketChart'
 import { MarketRowsViewport } from '@/MarketRowsViewport'
 import { WorkspaceViewport } from '@/WorkspaceViewport'
 import { settingsHref, useSettingsSection, type SettingsNavigationState } from '@/settings-navigation'
@@ -14,11 +14,13 @@ import { chartCoordinator, multiChartControllers, ingestPreparedChart } from '@/
 import { reconcileMarketOrder, reconcileMarketRows } from '@/market-snapshot'
 import { SnapshotOrder } from '@/snapshot-order'
 import { DEFAULT_PREFERENCES, type Preferences } from '@/renderer-preferences'
-import type { MarketSnapshot, RankedMarketRow, UnchangedSnapshot } from '@/desktop-contract'
+import type { DataAudit, HistoryDownload, MarketSnapshot, RankedMarketRow, UnchangedSnapshot } from '@/desktop-contract'
 import type { PreparedChartNotification } from '@/chart-data'
 import { cn } from '@/lib/utils'
 import { formatCurrentPrice } from '@/price-format'
 import { getPresentation, subscribePresentationTransition, usePresentation, waitForPresentation } from '@/presentation-store'
+import { timeframeLabel, type RadarTimeframe } from '@/timeframe'
+import type { SettingsStatusValue } from '@/WorkspaceSettings'
 
 const WorkspaceSettings = lazy(() => import('@/WorkspaceSettings').then(module => ({ default: module.WorkspaceSettings })))
 
@@ -52,6 +54,8 @@ const MarketRowView = memo(function MarketRowView({ row, index, selected, lookba
 function App() {
   const settingsGuard = useRef<SettingsNavigationState>({ dirty: false, busy: false })
   const settingsSection = useSettingsSection(settingsGuard)
+  const lastVisibleSettings = useRef(settingsSection)
+  if (settingsSection) lastVisibleSettings.current = settingsSection
   const settingsLauncher = useRef<HTMLAnchorElement>(null)
   const lastSettingsSection = useRef(settingsSection)
   const updateSettingsGuard = useCallback((value: SettingsNavigationState) => { settingsGuard.current = value }, [])
@@ -72,6 +76,20 @@ function App() {
   const [realtime, setRealtime] = useState('Connecting')
   const [error, setError] = useState('')
   const [updatedAt, setUpdatedAt] = useState<number | null>(null)
+  const [globalAudit, setGlobalAudit] = useState<DataAudit | null>(null)
+  const [globalDownload, setGlobalDownload] = useState<HistoryDownload | null>(null)
+  const [auditStatusUnavailable, setAuditStatusUnavailable] = useState(false)
+  const [downloadStatusUnavailable, setDownloadStatusUnavailable] = useState(false)
+  const auditOrder = useRef(new SnapshotOrder())
+  const downloadOrder = useRef(new SnapshotOrder())
+  const receiveAudit = useCallback((value: DataAudit) => { if (auditOrder.current.accept(value)) { setGlobalAudit(value); setAuditStatusUnavailable(false) } }, [])
+  const receiveDownload = useCallback((value: HistoryDownload) => { if (downloadOrder.current.accept(value)) { setGlobalDownload(value); setDownloadStatusUnavailable(false) } }, [])
+  const receiveSettingsJob = useCallback((kind: 'audit' | 'download', value: DataAudit | HistoryDownload) => {
+    // The settings page can recover a failed initial read. Once a global
+    // snapshot exists, only the shared notification stream can replace it.
+    if (kind === 'audit' && auditOrder.current.revision < 0) receiveAudit(value as DataAudit)
+    if (kind === 'download' && downloadOrder.current.revision < 0) receiveDownload(value as HistoryDownload)
+  }, [receiveAudit, receiveDownload])
   const order = useRef(new SnapshotOrder())
   const retainSelection = useRef(false)
   const preferenceWrite = useRef(0)
@@ -106,10 +124,38 @@ function App() {
     if (update.snapshot) {
       chartCoordinator.setPresentationActive(true, update.snapshot.frames)
       applyMarket(update.snapshot.market, true)
+      receiveAudit(update.snapshot.audit)
+      receiveDownload(update.snapshot.download)
       committedPreferences.current = update.snapshot.preferences
       setPreferences(update.snapshot.preferences); setPreferencesError(''); setPreferencesLoaded(true)
     } else chartCoordinator.setPresentationActive(true)
-  }), [applyMarket])
+  }), [applyMarket, receiveAudit, receiveDownload])
+  useEffect(() => {
+    const audit = (event: Event) => receiveAudit((event as CustomEvent<DataAudit>).detail)
+    const download = (event: Event) => receiveDownload((event as CustomEvent<HistoryDownload>).detail)
+    window.addEventListener('radar-audit-changed', audit)
+    window.addEventListener('radar-history-download-changed', download)
+    // An already-active window may never receive an activation snapshot. Seed
+    // each missing job once; subsequent notifications and snapshots are ordered
+    // by session/revision, so a late response cannot replace newer state.
+    let stopped = false
+    const epoch = getPresentation().epoch
+    if (getPresentation().active && auditOrder.current.revision < 0) {
+      void window.radarDesktop.request({ dataAudit: { action: 'status' } }).then(value => {
+        if (!stopped && getPresentation().active && getPresentation().epoch === epoch && auditOrder.current.revision < 0) receiveAudit(value)
+      }).catch(() => {
+        if (!stopped && getPresentation().active && getPresentation().epoch === epoch && auditOrder.current.revision < 0) setAuditStatusUnavailable(true)
+      })
+    }
+    if (getPresentation().active && downloadOrder.current.revision < 0) {
+      void window.radarDesktop.request({ historyDownload: { action: 'status' } }).then(value => {
+        if (!stopped && getPresentation().active && getPresentation().epoch === epoch && downloadOrder.current.revision < 0) receiveDownload(value)
+      }).catch(() => {
+        if (!stopped && getPresentation().active && getPresentation().epoch === epoch && downloadOrder.current.revision < 0) setDownloadStatusUnavailable(true)
+      })
+    }
+    return () => { stopped = true; window.removeEventListener('radar-audit-changed', audit); window.removeEventListener('radar-history-download-changed', download) }
+  }, [receiveAudit, receiveDownload])
   useLayoutEffect(() => {
     if (!presentation.active) return
     const epoch = presentation.epoch
@@ -187,14 +233,25 @@ function App() {
   const selectedPrice = selectedRow?.lastPrice
   const sharedPrice = typeof selectedPrice === 'number' && Number.isFinite(selectedPrice) && selectedPrice > 0 ? selectedPrice : undefined
   const sharedPriceText = sharedPrice === undefined ? undefined : formatCurrentPrice(sharedPrice, selectedRow?.tickSz)
-  const [chartStatusTarget, setChartStatusTarget] = useState<HTMLDivElement | null>(null)
+  const [chartStatuses, setChartStatuses] = useState<Partial<Record<RadarTimeframe, SharedChartStatusValue>>>({})
+  const [settingsStatuses, setSettingsStatuses] = useState<SettingsStatusValue[]>([])
+  const updateSettingsStatuses = useCallback((items: SettingsStatusValue[]) => {
+    setSettingsStatuses(current => JSON.stringify(current) === JSON.stringify(items) ? current : items)
+  }, [])
+  const updateChartStatus = useCallback((frame: RadarTimeframe, value: SharedChartStatusValue | null) => {
+    setChartStatuses(current => {
+      const previous = current[frame]
+      if ((!previous && !value) || (previous && value && previous.detail === value.detail && previous.severity === value.severity)) return current
+      const next = { ...current }
+      if (value) next[frame] = value
+      else delete next[frame]
+      return next
+    })
+  }, [])
   const retainedChart = Boolean(selected && !selectedRow)
   const selectedID = selected
   const connectionProblem = !['live', 'connected'].includes(realtime.toLowerCase())
   const connectionFailure = ['reconnecting', 'disconnected'].includes(realtime.toLowerCase())
-  const marketProblem = preferencesError || error
-  const marketStatus = marketProblem || (connectionProblem ? realtime : !rows.length && status !== 'Live' ? status : status === 'Cached' ? 'Cached' : '')
-  const marketStatusDetail = [marketStatus, retainedChart ? 'Current chart remains available' : ''].filter(Boolean).join(' · ')
   const listOrder = candidateIds
   useEffect(() => { if (ready) void chartCoordinator.setUniverse(retainedChart && selectedID ? [...candidateIds, selectedID] : candidateIds, timeframe) }, [ready, candidateIds, timeframe, retainedChart, selectedID])
   const savePreferences = useCallback(async (values: Partial<Preferences>) => {
@@ -294,10 +351,44 @@ function App() {
     }
   }
 
+  const issues: { id: string; label: string; detail: string; severity: 'error' | 'warning' | 'info'; frame?: RadarTimeframe }[] = []
+  if (presentation.error) issues.push({ id: 'presentation', label: 'Application', detail: 'The data service could not restore the workspace. Check the data service and try again.', severity: 'error' })
+  if (preferencesError) issues.push({ id: 'preferences', label: 'Settings', detail: 'Settings could not be loaded. Check the local data service.', severity: 'error' })
+  if (error) issues.push({ id: 'market-error', label: 'Market', detail: 'Market data is unavailable. Check the connection and data service.', severity: 'error' })
+  if (connectionProblem) issues.push({ id: 'connection', label: 'Market', detail: `${connectionFailure ? 'Market connection interrupted' : 'Waiting for a live market connection'}. Check the connection for current prices.`, severity: 'warning' })
+  if (status !== 'Live' && status !== 'Connecting') issues.push({ id: 'catalog', label: 'Contracts', detail: status === 'Cached' ? 'Cached market data' : status, severity: status === 'Incomplete' || status === 'Unavailable' || status === 'Cached' ? 'warning' : 'info' })
+  if (copyState.error) issues.push({ id: 'copy', label: 'Copy chart', detail: copyState.error, severity: 'error' })
+  // App owns the authoritative job snapshots. Settings only contributes local
+  // requests and request errors so an older settings view cannot mask a newer
+  // background snapshot from another service session.
+  const transientSettingsStatuses = settingsStatuses.filter(item => !['data-audit', 'history-download'].includes(item.id) || item.transient)
+  for (const item of transientSettingsStatuses) issues.push({ ...item, id: `settings-${item.id}` })
+  if (auditStatusUnavailable && !transientSettingsStatuses.some(item => item.id === 'data-audit')) issues.push({ id: 'data-audit-status', label: 'Data audit', detail: 'Audit status unavailable. Check the data service in Data settings.', severity: 'warning' })
+  if (downloadStatusUnavailable && !transientSettingsStatuses.some(item => item.id === 'history-download')) issues.push({ id: 'history-download-status', label: 'History download', detail: 'Download status unavailable. Check the data service in Data settings.', severity: 'warning' })
+  if (globalAudit && !transientSettingsStatuses.some(item => item.id === 'data-audit')) {
+    if (globalAudit.error || globalAudit.phase === 'failed') issues.push({ id: 'data-audit', label: 'Data audit', detail: 'Audit failed. Check the data service and retry.', severity: 'error' })
+    else if (globalAudit.phase === 'running' || globalAudit.phase === 'validating') issues.push({ id: 'data-audit', label: 'Data audit', detail: globalAudit.phase === 'validating' ? 'Validating recent changes. Results are provisional.' : `Audit running · ${globalAudit.progress.completed} / ${globalAudit.progress.total}`, severity: 'info' })
+    else if (globalAudit.issues.length) issues.push({ id: 'data-audit', label: 'Data audit', detail: `${globalAudit.issues.length} issues found. Review them in Data settings.`, severity: 'warning' })
+    else if (globalAudit.phase === 'completed' || globalAudit.phase === 'cancelled') issues.push({ id: 'data-audit', label: 'Data audit', detail: globalAudit.phase === 'completed' ? 'Audit complete.' : 'Audit cancelled.', severity: 'info' })
+  }
+  if (globalDownload && !transientSettingsStatuses.some(item => item.id === 'history-download')) {
+    if (globalDownload.error || globalDownload.phase === 'failed') issues.push({ id: 'history-download', label: 'History download', detail: 'Download failed. Check the data service and retry.', severity: 'error' })
+    else if (globalDownload.phase === 'running') issues.push({ id: 'history-download', label: 'History download', detail: `Downloading history · ${globalDownload.progress.checked} / ${globalDownload.progress.total}`, severity: 'info' })
+    else if (globalDownload.phase === 'completed' && (globalDownload.progress.empty || globalDownload.progress.unavailable || globalDownload.progress.failed)) issues.push({ id: 'history-download', label: 'History download', detail: 'Download finished with incomplete coverage. Review Data settings.', severity: 'warning' })
+    else if (globalDownload.phase === 'completed' || globalDownload.phase === 'cancelled') issues.push({ id: 'history-download', label: 'History download', detail: globalDownload.phase === 'completed' ? 'Download complete.' : 'Download cancelled.', severity: 'info' })
+  }
+  for (const frame of ['1H', '15m', '5m'] as const) {
+    const value = chartStatuses[frame]
+    if (value) issues.push({ id: frame, label: timeframeLabel(frame), ...value, frame })
+  }
+  const rankedIssues = [...issues].sort((a, b) => ({ error: 0, warning: 1, info: 2 }[a.severity] - { error: 0, warning: 1, info: 2 }[b.severity]))
+  const primaryIssue = rankedIssues[0]
+  const statusText = primaryIssue ? `${rankedIssues.length > 1 ? `${rankedIssues.length} updates · ` : ''}${primaryIssue.label}: ${primaryIssue.detail}` : updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString('en-US')}` : 'Waiting for market data'
+
   return <WorkspaceViewport>
-    {presentation.error && <p role="alert" className="px-4 py-2 text-sm text-destructive">{presentation.error}</p>}
+    <div className="relative flex h-full min-w-0 flex-1">
     <div hidden={settingsSection !== null} inert={settingsSection !== null} className={cn('h-full min-w-0 flex-1', settingsSection === null ? 'flex' : 'hidden')}>
-    <aside data-market-list className="flex h-full w-[var(--market-list-width)] shrink-0 flex-col border-r" aria-label="Contract list">
+    <aside data-market-list className="flex h-full w-[var(--market-list-width)] shrink-0 flex-col border-r pb-7" aria-label="Contract list">
       <header data-sidebar-toolbar data-window-toolbar data-window-drag-region data-native-window-controls-row className="flex items-center gap-3 border-b px-4"><h1 className="min-w-0 flex-1 truncate text-sm font-medium">Perpetual Swap Suite</h1><a ref={settingsLauncher} href={settingsHref('workspace')} aria-label="Settings" title="Settings" className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}><Settings2 aria-hidden="true" /></a></header>
       <section data-market-scroll className="min-h-0 flex-1 overflow-y-auto [&>[data-slot=table-container]]:overflow-visible" aria-label="Perpetual swap markets">
         <Table className="table-fixed [&_tr:not([data-virtual-spacer])>:first-child]:pl-4 [&_tr:not([data-virtual-spacer])>:last-child]:pr-4" data-market-count={visible.length} data-total-market-count={rows.length} aria-rowcount={visible.length + 1}>
@@ -308,32 +399,39 @@ function App() {
           </TableCell></TableRow></TableBody>}
         </Table>
       </section>
-      <footer data-market-status-row className="flex min-w-0 shrink-0 items-center justify-between gap-3 border-t px-4 py-1 text-xs text-muted-foreground">
-        <span className="shrink-0">{rows.length} contracts</span>
-        <span data-market-status role={marketProblem ? 'alert' : marketStatus ? 'status' : undefined} className={cn('min-w-0 break-words text-right', visible.length > 0 && 'line-clamp-2', (marketProblem || connectionFailure) && 'text-destructive')} title={marketStatusDetail || undefined} aria-label={marketStatusDetail || undefined}>{marketStatus || (updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString('en-US')}` : 'Waiting for market data')}</span>
-      </footer>
     </aside>
     <section data-chart-panel className="h-full min-w-0 flex-1" aria-label="Market chart workspace">
       {selectedID ? <div data-chart-display-mode="multi" className="flex h-full min-h-0 flex-col">
-        {copyState.error && <p role="alert" className="shrink-0 border-b px-5 py-2 text-destructive">{copyState.error}</p>}
         <span role="status" className="sr-only">{copyState.status === 'copying' ? 'Copying chart' : copyState.status === 'copied' ? 'Chart copied to clipboard' : ''}</span>
         <div ref={chartsRef} data-chart-capture className="flex min-h-0 flex-1 flex-col">
           <header data-chart-toolbar data-window-toolbar data-window-drag-region className="flex shrink-0 items-center gap-3 border-b px-4">
             <div className="flex min-w-0 flex-1 items-center gap-2">
               <h2 data-chart-title data-shared-chart-title className="max-w-32 truncate" title={selectedID}>{selectedID.replace(/-SWAP$/, '')}</h2>
               {sharedPriceText !== undefined && <><span className="sr-only">Market price</span><span data-shared-chart-price className="max-w-32 truncate" title={sharedPriceText}>{sharedPriceText}</span></>}
-              <div ref={setChartStatusTarget} data-shared-chart-status className="flex min-w-0 flex-1 items-center gap-3 overflow-hidden" />
             </div>
             <Button ref={copyButtonRef} data-window-no-drag variant="outline" size="sm" disabled={copyState.status === 'copying'} onClick={() => { void copyChart() }}><Camera data-icon="inline-start" aria-hidden="true" />{copyState.status === 'copying' ? 'Copying…' : copyState.status === 'copied' ? 'Copied' : 'Copy chart'}</Button>
           </header>
           <ChartTimeSyncProvider key={selectedID}><div className="grid min-h-0 flex-1 grid-rows-3 divide-y" data-multi-timeframe-charts>
-            {(['1H', '15m', '5m'] as const).map((frame, index) => <MarketChart key={frame} controller={multiChartControllers[frame]} priceOnly statusTarget={chartStatusTarget} navigation={index === 0} active={settingsSection === null} instId={selectedID} tickSz={selectedRow?.tickSz} timeframe={frame} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} />)}
+            {(['1H', '15m', '5m'] as const).map((frame, index) => <MarketChart key={frame} controller={multiChartControllers[frame]} priceOnly onStatus={updateChartStatus} navigation={index === 0} active={settingsSection === null} instId={selectedID} tickSz={selectedRow?.tickSz} timeframe={frame} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} />)}
           </div></ChartTimeSyncProvider>
         </div>
       </div> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}
     </section>
     </div>
-    {settingsSection && <DeferredPanel name="Settings" className="p-4" onClose={() => { window.location.hash = '#/' }}><WorkspaceSettings section={settingsSection} preferences={preferences} loaded={preferencesLoaded} loadError={preferencesError} onSave={savePreferences} onNavigationStateChange={updateSettingsGuard} /></DeferredPanel>}
+    {lastVisibleSettings.current && <div hidden={!settingsSection} inert={!settingsSection} className={cn('h-full min-w-0 flex-1 pb-7', settingsSection ? 'flex' : 'hidden')}><DeferredPanel name="Settings" className="p-4 pb-8" onClose={() => { window.location.hash = '#/' }}><WorkspaceSettings section={settingsSection ?? lastVisibleSettings.current} active={settingsSection !== null} preferences={preferences} loaded={preferencesLoaded} loadError={preferencesError} onSave={savePreferences} onNavigationStateChange={updateSettingsGuard} onStatusChange={updateSettingsStatuses} onJobSnapshot={receiveSettingsJob} /></DeferredPanel></div>}
+    <footer data-market-status-row className="absolute bottom-0 left-0 z-20 w-[var(--market-list-width)] max-w-full bg-background px-4 py-1 text-xs text-muted-foreground">
+      <details className="relative">
+        <summary data-status-trigger className={cn('cursor-pointer list-none truncate focus-visible:outline-2 focus-visible:outline-ring', primaryIssue?.severity === 'error' && 'text-destructive')} title={statusText}>
+          <span data-market-status role={primaryIssue ? 'status' : undefined} aria-live={primaryIssue ? 'polite' : 'off'}>{statusText}</span>
+        </summary>
+        <div className="absolute bottom-full left-0 z-30 w-full pb-2">
+          <div data-status-details className="max-h-64 overflow-y-auto rounded-md border bg-popover p-3 text-popover-foreground shadow-md">
+            {rankedIssues.length ? rankedIssues.map(issue => <p key={issue.id} data-chart-shared-status-item={issue.frame} data-timeframe={issue.frame} data-chart-status={issue.frame !== undefined ? '' : undefined} className={cn('break-words py-1', issue.severity === 'error' && 'text-destructive')}><span className="font-medium">{issue.label}: </span>{issue.detail}</p>) : <p>{statusText}</p>}
+          </div>
+        </div>
+      </details>
+    </footer>
+    </div>
   </WorkspaceViewport>
 }
 export default App

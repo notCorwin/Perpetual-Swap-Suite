@@ -35,12 +35,12 @@ test('indicator replay preserves visible paths while current prices update and t
         await new Promise(resolve => requestAnimationFrame(resolve))
         await new Promise(resolve => requestAnimationFrame(resolve))
         const source = chart.__chartSnapshot, rendered = chart.__chartRenderedBars
-        const status = document.querySelector('[data-shared-chart-status] [data-chart-status][data-timeframe="15m"]')
-        observations.push({ state: source.indicatorState, stale: status.dataset.chartIndicatorStale,
+        const status = document.querySelector('[data-market-status-row] [data-chart-shared-status-item="15m"]')
+        observations.push({ state: source.indicatorState, stale: chart.dataset.chartIndicatorStale,
           continuous: paths.every(field => svg.querySelector(`[data-chart-indicator="${field}"]`).getAttribute('d')),
           sourceNull: source.bars.every(bar => bar.vwap === null), renderedVWAP: rendered.find(bar => bar.hour === source.bars.at(-1).hour)?.vwap,
           sourceClose: source.bars.at(-1).close, renderedClose: rendered.find(bar => bar.hour === source.bars.at(-1).hour)?.close,
-          previousNotice: status.textContent.includes('Showing previous indicators'),
+          previousNotice: status?.textContent.includes('Showing previous indicators') ?? false,
           sameSurface: chart.querySelector('svg[data-rendered-inst]') === svg })
       }
       const price = frame.bars.at(-1).close * 1.001

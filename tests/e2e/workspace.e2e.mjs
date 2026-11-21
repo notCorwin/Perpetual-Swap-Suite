@@ -944,6 +944,7 @@ test('settings validation returns to Market data for a fractional audit lookback
 test('leaving settings confirms before discarding an unsaved preference draft', async () => {
   const settings = await openSettings()
   const ranking = settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' })
+  const savedRanking = await ranking.inputValue()
   await ranking.fill('60')
   const rejectedDialog = page.waitForEvent('dialog')
   const rejectedNavigation = settings.getByRole('link', { name: 'Settings', exact: true }).click()
@@ -960,9 +961,12 @@ test('leaving settings confirms before discarding an unsaved preference draft', 
   await accepted.accept()
   await acceptedNavigation
   await settings.waitFor({ state: 'hidden' })
-  const reopened = await openSettings()
-  assert.equal(await reopened.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).inputValue(), '30')
-  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.preferences.rankingLookback), 30)
+  await page.getByRole('link', { name: 'Settings', exact: true }).click()
+  const reopened = settingsPage()
+  await reopened.waitFor({ state: 'visible' })
+  await page.waitForFunction(() => document.activeElement?.matches('main[aria-label="Settings"] h2'))
+  assert.equal(await reopened.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).inputValue(), savedRanking)
+  assert.equal(String(await electron.evaluate(() => globalThis.__workspaceFixture.preferences.rankingLookback)), savedRanking)
   await backToMarkets()
 })
 
@@ -1207,89 +1211,164 @@ test('constant Bollinger bands stay finite and negative lower bands retain the r
   } finally { await publishMode('standard') }
 })
 
-test('market status changes do not move the contract list', async () => {
+test('status footer keeps failures visible and preserves the contract list', async () => {
   const publish = values => electron.evaluate((_electron, values) => {
     const state = globalThis.__workspaceFixture
-    Object.assign(state, values)
-    state.revision += 1
-    state.notify()
+    Object.assign(state, values); state.revision += 1; state.notify()
   }, values)
-  const positions = async () => page.locator('[data-market-list]').evaluate(list => {
-    const toolbar = list.querySelector('[data-sidebar-toolbar]').getBoundingClientRect()
-    const scroll = list.querySelector('[data-market-scroll]').getBoundingClientRect()
-    const header = list.querySelector('thead').getBoundingClientRect()
-    const row = list.querySelector('[data-market-index]').getBoundingClientRect()
-    const footer = list.querySelector('[data-market-status-row]').getBoundingClientRect()
-    return { toolbarBottom: toolbar.bottom, header: header.top, row: row.top,
-      scrollBottom: scroll.bottom, footerTop: footer.top, footerBottom: footer.bottom, listBottom: list.getBoundingClientRect().bottom }
+  const footer = page.locator('[data-market-status-row]')
+  const summary = footer.locator('[data-status-trigger]')
+  const list = page.locator('[data-market-list]')
+  const positions = () => list.evaluate(element => {
+    const toolbar = element.querySelector('[data-sidebar-toolbar]').getBoundingClientRect()
+    const header = element.querySelector('thead').getBoundingClientRect()
+    const row = element.querySelector('[data-market-index]').getBoundingClientRect()
+    return { toolbarBottom: toolbar.bottom, header: header.top, row: row.top }
   })
   try {
     await publish({ rows: await electron.evaluate(() => globalThis.__workspaceFixture.initialRows), loading: false, error: '', realtimeState: 'live', catalogSource: 'live', catalogProgress: undefined })
-    await page.waitForFunction(() => document.querySelector('[data-market-status]')?.textContent.startsWith('Updated '))
     const baseline = await positions()
-    assert.ok(Math.abs(baseline.header - baseline.toolbarBottom) < 1, 'The table starts directly below the toolbar.')
-    assert.equal(baseline.footerTop, baseline.scrollBottom, 'The status footer follows the scrolling list.')
-    assert.equal(baseline.footerBottom, baseline.listBottom, 'The status footer stays at the bottom of the sidebar.')
-    for (const [index, pending] of [1, 4, 0, 3, 0].entries()) {
-      const updatedAt = 1_800_000_000_000 + (index + 1) * 60_000
-      await publish({ updatedAt, loading: pending > 0, catalogProgress: { total: 4, completed: 4, verified: 4, failed: 0, unknown: 0, pending } })
-      await page.waitForFunction(updatedAt => document.querySelector('[data-market-status]')?.textContent === `Updated ${new Date(updatedAt).toLocaleTimeString('en-US')}`, updatedAt)
-      assert.deepEqual(await positions(), baseline, 'Background acquisition must not move the table.')
-    }
-    await publish({ loading: false, error: 'Order book data is unavailable.', catalogProgress: undefined })
-    await page.locator('[data-market-status][role="alert"][title="Order book data is unavailable."]').waitFor()
-    assert.equal(await page.locator('[data-market-status]').evaluate(element => element.classList.contains('text-destructive')), true)
-    assert.deepEqual(await positions(), baseline, 'An error must not move the table.')
-    await publish({ error: '', realtimeState: 'connecting' })
-    await waitForMarketStatus('connecting')
-    assert.equal(await page.locator('[data-market-status]').evaluate(element => element.classList.contains('text-destructive')), false, 'Initial connection is a normal pending state.')
-    await publish({ realtimeState: 'reconnecting' })
-    await waitForMarketStatus('reconnecting')
-    assert.equal(await page.locator('[data-market-status]').evaluate(element => element.classList.contains('text-destructive')), true, 'A failed connection retains its warning color.')
-    await publish({ error: '', realtimeState: 'disconnected' })
-    await page.waitForFunction(() => document.querySelector('[data-market-status]')?.textContent.toLowerCase().includes('disconnect'))
-    assert.equal(await page.locator('[data-market-status]').evaluate(element => element.classList.contains('text-destructive')), true)
-    assert.deepEqual(await positions(), baseline, 'A connection failure must not move the table.')
-    await publish({ realtimeState: 'live' })
-    await page.waitForFunction(() => document.querySelector('[data-market-status]')?.textContent.startsWith('Updated '))
+    assert.ok(Math.abs(baseline.header - baseline.toolbarBottom) < 1)
+    assert.equal(await footer.evaluate(node => getComputedStyle(node).borderTopWidth), '0px')
+    assert.equal(await footer.getByText(/^\d+ contracts$/).count(), 0)
+    await publish({ error: 'Internal failure: do not expose this raw exception', realtimeState: 'disconnected' })
+    await page.waitForFunction(() => document.querySelector('[data-market-status]')?.textContent.includes('Market data is unavailable'))
+    assert.equal(await footer.locator('[data-market-status]').getAttribute('role'), 'status')
+    assert.doesNotMatch(await footer.textContent(), /Internal failure/)
+    assert.deepEqual(await positions(), baseline, 'A status change must not move the table.')
+    await summary.click()
+    const details = footer.locator('[data-status-details]')
+    await details.waitFor({ state: 'visible' })
+    assert.match(await details.textContent(), /Market:.*Check the connection/)
+    const chartStatus = details.locator('[data-chart-shared-status-item="15m"]')
+    await chartStatus.waitFor({ state: 'visible' })
+    assert.match(await chartStatus.textContent(), /15m:.*Cached price/)
+    assert.match(await footer.locator('[data-market-status]').textContent(), /\d+ updates/, 'The footer signals additional simultaneous issues.')
+    await summary.click()
+    await details.waitFor({ state: 'hidden' })
+    await publish({ error: '', realtimeState: 'live' })
+    await page.waitForFunction(() => !document.querySelector('[data-market-status]')?.textContent.includes('Market data is unavailable'))
     assert.deepEqual(await positions(), baseline, 'Recovery must not move the table.')
+    await list.locator('[data-market-scroll]').evaluate(node => { node.scrollTop = node.scrollHeight })
+    const bounds = await page.evaluate(() => ({ last: document.querySelector('[data-market-index]:last-of-type')?.getBoundingClientRect().bottom, footer: document.querySelector('[data-market-status-row]').getBoundingClientRect().top }))
+    if (bounds.last != null) assert.ok(bounds.last <= bounds.footer + 1, 'The footer must not cover the last market row.')
   } finally {
+    const details = footer.locator('details')
+    if (await details.evaluate(node => node.open)) await summary.click()
     await publish({ rows: await electron.evaluate(() => globalThis.__workspaceFixture.initialRows), loading: false, error: '', realtimeState: 'live', catalogSource: 'live', catalogProgress: undefined })
   }
 })
 
-test('long market errors remain fully visible when the list is empty', async () => {
-  const error = 'Market verification is unavailable for 17 contracts because the latest order book observations are incomplete.'
-  const publish = values => electron.evaluate((_electron, values) => {
-    const state = globalThis.__workspaceFixture
-    Object.assign(state, values)
-    state.revision += 1
-    state.notify()
-  }, values)
+test('chart freshness expires in the status footer while settings are open', async () => {
+  await page.waitForFunction(() => document.querySelector('svg[data-rendered-timeframe="15m"]')?.closest('[data-chart-inst]')?.__chartSnapshot)
   try {
-    await page.emulateMedia({ colorScheme: 'dark' })
-    await publish({ rows: [], loading: false, error, realtimeState: 'live', catalogSource: 'live', catalogProgress: undefined })
-    const status = page.locator('[data-market-status][role="alert"]')
-    await status.waitFor()
-    assert.equal(await status.textContent(), error)
-    for (const width of [800, 1600]) {
-      await page.setViewportSize({ width, height: 1000 })
-      const bounds = await status.evaluate(element => {
-        const rect = element.getBoundingClientRect(), parent = element.parentElement.getBoundingClientRect()
-        const table = document.querySelector('[data-market-scroll]').getBoundingClientRect()
-        return { width: element.clientWidth, scrollWidth: element.scrollWidth, height: element.clientHeight,
-          scrollHeight: element.scrollHeight, lineHeight: parseFloat(getComputedStyle(element).lineHeight),
-          top: rect.top, bottom: rect.bottom, parentBottom: parent.bottom, tableBottom: table.bottom }
-      })
-      assert.ok(bounds.height > bounds.lineHeight, `The long error must wrap at width ${width}.`)
-      assert.ok(bounds.scrollWidth <= bounds.width && bounds.scrollHeight <= bounds.height, `The error must not be clipped: ${JSON.stringify(bounds)}`)
-      assert.ok(bounds.top >= bounds.tableBottom && bounds.bottom <= bounds.parentBottom, `The error must fit in the footer: ${JSON.stringify(bounds)}`)
-      if (process.env.PERPETUAL_SWAP_UI_SCREENSHOTS) await page.locator('[data-market-list]').screenshot({ path: join(process.env.PERPETUAL_SWAP_UI_SCREENSHOTS, `market-error-${width}.png`) })
-    }
+    await electron.evaluate(async () => {
+      const state = globalThis.__workspaceFixture
+      const frame = await state.request(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
+      state.chartOverride = { ...frame, generation: frame.generation + 100, revision: frame.revision + 1,
+        realtimeState: 'live', priceObservedAt: Date.now() - 27_000 }
+      state.sendChart(state.chartOverride)
+    })
+    await page.waitForFunction(() => !document.querySelector('[data-chart-shared-status-item="15m"]')?.textContent.includes('Cached price'), null, { timeout: 2_000 }).catch(async error => {
+      console.error('freshness diagnostics:', await page.locator('[data-status-details]').textContent())
+      throw error
+    })
+    await openSettings()
+    await page.waitForFunction(() => document.querySelector('[data-chart-shared-status-item="15m"]')?.textContent.includes('Cached price'), null, { timeout: 5_000 })
+    await page.locator('[data-status-trigger]').click()
+    await page.locator('[data-status-details] [data-chart-shared-status-item="15m"]').getByText(/Cached price/).waitFor({ state: 'visible' })
   } finally {
-    await page.emulateMedia({ colorScheme: null })
-    await page.setViewportSize({ width: 800, height: 572 })
-    await publish({ rows: await electron.evaluate(() => globalThis.__workspaceFixture.initialRows), loading: false, error: '', realtimeState: 'live', catalogSource: 'live', catalogProgress: undefined })
+    if (await page.locator('[data-market-status-row] details').evaluate(node => node.open)) await page.locator('[data-status-trigger]').click()
+    if (await settingsPage().isVisible()) await backToMarkets()
+    await electron.evaluate(() => { delete globalThis.__workspaceFixture.chartOverride })
+    await page.reload({ waitUntil: 'domcontentloaded' })
+  }
+})
+
+test('background download status persists outside settings and recovers from failure', async () => {
+  const footer = page.locator('[data-market-status-row]')
+  const summary = footer.locator('[data-status-trigger]')
+  const details = footer.locator('[data-status-details]')
+  try {
+    await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({ phase: 'idle', error: '', progress: { checked: 0, total: 0, available: 0, empty: 0, unavailable: 0, failed: 0, reused: 0, pending: 0 } }) })
+    const settings = await openSettings('Market data')
+    await settings.getByRole('button', { name: 'Download all qualified history', exact: true }).click()
+    await page.waitForFunction(() => document.querySelector('[data-status-details]')?.textContent.includes('Downloading history'))
+    await backToMarkets()
+    await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({ phase: 'failed', error: 'Raw backend detail' }) })
+    await page.waitForFunction(() => document.querySelector('[data-market-status]')?.textContent.includes('Download failed'))
+    assert.doesNotMatch(await footer.textContent(), /Raw backend detail/)
+    await summary.click()
+    await details.getByText(/History download:.*Download failed/).waitFor({ state: 'visible' })
+    await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({ phase: 'running', error: '', progress: { checked: 20, total: 100, available: 20, empty: 0, unavailable: 0, failed: 0, reused: 0, pending: 80 } }) })
+    await details.getByText(/History download:.*Downloading history.*20\.0%/).waitFor({ state: 'visible' })
+    assert.doesNotMatch(await details.textContent(), /Download failed/)
+    await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({ phase: 'completed', error: '', progress: { checked: 100, total: 100, available: 100, empty: 0, unavailable: 0, failed: 0, reused: 0, pending: 0 } }) })
+    await details.getByText(/History download:.*Download complete/).waitFor({ state: 'visible' })
+  } finally {
+    if (await footer.locator('details').evaluate(node => node.open)) await summary.click()
+    if (await settingsPage().isVisible()) await backToMarkets()
+    await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({ phase: 'idle', error: '', progress: { checked: 0, total: 0, available: 0, empty: 0, unavailable: 0, failed: 0, reused: 0, pending: 0 } }) })
+  }
+})
+
+test('background audit failures are reported without exposing backend errors and clear on recovery', async () => {
+  const footer = page.locator('[data-market-status-row]')
+  const summary = footer.locator('[data-status-trigger]')
+  const details = footer.locator('[data-status-details]')
+  try {
+    await electron.evaluate(() => { globalThis.__workspaceFixture.publishAudit({ phase: 'failed', error: 'Sensitive backend diagnostic' }) })
+    await page.waitForFunction(() => document.querySelector('[data-market-status]')?.textContent.includes('Audit failed'))
+    await summary.click()
+    await details.getByText(/Data audit:.*Audit failed/).waitFor({ state: 'visible' })
+    assert.doesNotMatch(await footer.textContent(), /Sensitive backend diagnostic/)
+    await electron.evaluate(() => { globalThis.__workspaceFixture.publishAudit({ phase: 'running', error: '', progress: { completed: 1, total: 3 }, issues: [] }) })
+    await details.getByText(/Data audit:.*Audit running.*1 \/ 3/).waitFor({ state: 'visible' })
+    assert.doesNotMatch(await details.textContent(), /Audit failed/)
+    await electron.evaluate(() => { globalThis.__workspaceFixture.publishAudit({ phase: 'completed', error: '', progress: { completed: 3, total: 3 }, issues: [] }) })
+    await page.waitForFunction(() => !document.querySelector('[data-status-details]')?.textContent.includes('Audit running'))
+  } finally {
+    if (await footer.locator('details').evaluate(node => node.open)) await summary.click()
+    await electron.evaluate(() => { globalThis.__workspaceFixture.publishAudit({ phase: 'idle', error: '', progress: { completed: 0, total: 0 }, issues: [] }) })
+  }
+})
+
+test('new session job updates win over delayed initial settings responses', async () => {
+  const footer = page.locator('[data-market-status-row]')
+  const summary = footer.locator('[data-status-trigger]')
+  const details = footer.locator('[data-status-details]')
+  try {
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      state.holdAuditAction = 'status'; state.holdDownloadAction = 'status'
+    })
+    await openSettings('Market data')
+    await waitForAuditFixture(() => Boolean(globalThis.__workspaceFixture.releaseAudit && globalThis.__workspaceFixture.releaseDownload))
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      state.publishAudit({ serviceSession: 'new-audit-session', revision: 0, phase: 'running', progress: { completed: 2, total: 5 }, error: '', issues: [] })
+      state.publishDownload({ serviceSession: 'new-download-session', revision: 0, phase: 'running', error: '', progress: { checked: 25, total: 100, available: 25, empty: 0, unavailable: 0, failed: 0, reused: 0, pending: 75 } })
+    })
+    await summary.click()
+    await details.getByText(/Data audit:.*Audit running.*2 \/ 5/).waitFor({ state: 'visible' })
+    await details.getByText(/History download:.*Downloading history.*25 \/ 100/).waitFor({ state: 'visible' })
+    await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.releaseAudit(); state.releaseDownload() })
+    await waitForAuditFixture(() => !globalThis.__workspaceFixture.releaseAudit && !globalThis.__workspaceFixture.releaseDownload)
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+    assert.match(await details.textContent(), /Audit running.*2 \/ 5/)
+    assert.match(await details.textContent(), /Downloading history.*25 \/ 100/)
+    assert.equal(await settingsPage().getByRole('progressbar', { name: 'Data audit progress' }).getAttribute('aria-valuenow'), '40')
+    assert.equal(await settingsPage().getByRole('progressbar', { name: 'History download progress' }).getAttribute('aria-valuenow'), '25')
+  } finally {
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      state.holdAuditAction = null; state.holdDownloadAction = null
+      state.releaseAudit?.(); state.releaseDownload?.()
+      state.publishAudit({ phase: 'idle', error: '', progress: { completed: 0, total: 0 }, issues: [] })
+      state.publishDownload({ phase: 'idle', error: '', progress: { checked: 0, total: 0, available: 0, empty: 0, unavailable: 0, failed: 0, reused: 0, pending: 0 } })
+    })
+    if (await footer.locator('details').evaluate(node => node.open)) await summary.click()
+    if (await settingsPage().isVisible()) await backToMarkets()
   }
 })
 

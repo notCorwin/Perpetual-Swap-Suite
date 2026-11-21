@@ -17,7 +17,7 @@ import { SnapshotOrder } from '@/snapshot-order'
 import { getPresentation, subscribePresentationTransition, waitForPresentation } from '@/presentation-store'
 
 const emptyAudit: DataAudit = { phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '', revision: 0, serviceSession: '' }
-const errorMessage = (cause: unknown) => cause instanceof Error ? cause.message : 'The desktop service could not complete this request.'
+export type SettingsStatusValue = { id: string; label: string; detail: string; severity: 'error' | 'warning' | 'info'; transient?: boolean }
 const emptyDownload: HistoryDownload = {
   schemaVersion: 2, revision: 0, serviceSession: '', phase: 'idle', startedAt: null, updatedAt: null, finishedAt: null,
   contracts: { completed: 0, total: 0 }, streams: { completed: 0, total: 0 },
@@ -27,7 +27,7 @@ const emptyDownload: HistoryDownload = {
 const count = (value: number) => value.toLocaleString('en-US')
 const downloadTime = (value: number) => `${new Date(value).toLocaleString('en-US', { timeZone: 'UTC', hour12: false })} UTC`
 
-function HistoryDownloadSettings({ open }: { open: boolean }) {
+function HistoryDownloadSettings({ open, onStatusChange, onJobSnapshot }: { open: boolean; onStatusChange: (value: SettingsStatusValue | null) => void; onJobSnapshot?: (kind: 'audit' | 'download', value: DataAudit | HistoryDownload) => void }) {
   const [download, setDownload] = useState<HistoryDownload>(emptyDownload)
   const [ready, setReady] = useState(false)
   const [busy, setBusy] = useState<'start' | 'cancel' | 'status' | null>(null)
@@ -41,7 +41,8 @@ function HistoryDownloadSettings({ open }: { open: boolean }) {
     if (!order.current.accept(value)) return
     accepted.current += 1
     setDownload(value); setReady(true); setStatusError('')
-  }, [])
+    onJobSnapshot?.('download', value)
+  }, [onJobSnapshot])
   const request = useCallback(async (action: 'start' | 'cancel' | 'status') => {
     const currentLifecycle = lifecycle.current
     const currentSequence = ++sequence.current
@@ -51,13 +52,14 @@ function HistoryDownloadSettings({ open }: { open: boolean }) {
     try {
       const value = await window.radarDesktop.request({ historyDownload: { action } })
       await waitForPresentation()
-      if (currentLifecycle === lifecycle.current && currentSequence === sequence.current && (action !== 'status' || epoch === getPresentation().epoch)) accept(value)
-    } catch (cause) {
+      const superseded = before !== accepted.current && (action === 'status' || value.serviceSession !== order.current.serviceSession)
+      if (currentLifecycle === lifecycle.current && currentSequence === sequence.current && !superseded && (action !== 'status' || epoch === getPresentation().epoch)) accept(value)
+    } catch {
       await waitForPresentation()
       if (currentLifecycle !== lifecycle.current || currentSequence !== sequence.current) return
       if (action === 'status') {
-        if (epoch === getPresentation().epoch && before === accepted.current) setStatusError(errorMessage(cause))
-      } else setRequestError(errorMessage(cause))
+        if (epoch === getPresentation().epoch && before === accepted.current) setStatusError('Download status unavailable. Retry status in Data settings.')
+      } else setRequestError(`Could not ${action === 'start' ? 'start' : 'cancel'} the history download. Check the data service and retry.`)
     } finally {
       if (currentLifecycle === lifecycle.current && currentSequence === sequence.current) setBusy(null)
     }
@@ -78,12 +80,22 @@ function HistoryDownloadSettings({ open }: { open: boolean }) {
   const numericPercent = progress.total ? Math.min(100, progress.available / progress.total * 100) : 0
   const numericLabel = (Math.floor(numericPercent * 10) / 10).toFixed(1)
   const phase = download.phase === 'completed'
-    ? progress.empty > 0 ? 'Completed with temporarily missing data' : progress.unavailable > 0 ? 'Completed with verified unavailable data' : 'Download complete'
+    ? progress.failed > 0 ? 'Completed with failed requests' : progress.empty > 0 ? 'Completed with temporarily missing data' : progress.unavailable > 0 ? 'Completed with verified unavailable data' : 'Download complete'
     : { idle: 'Ready to download', running: 'Downloading history', cancelled: 'Download cancelled', failed: 'Download failed' }[download.phase]
+  useEffect(() => {
+    let value: SettingsStatusValue | null = null
+    if (requestError || statusError || download.error || download.phase === 'failed') value = { id: 'history-download', label: 'History download', detail: requestError || statusError || 'Download failed. Check the data service and retry.', severity: 'error', transient: Boolean(requestError || statusError) }
+    else if (busy === 'start' || busy === 'cancel') value = { id: 'history-download', label: 'History download', detail: busy === 'start' ? 'Starting download…' : 'Cancelling download…', severity: 'info', transient: true }
+    else if (open && !ready) value = { id: 'history-download', label: 'History download', detail: 'Waiting for download status…', severity: 'info' }
+    else if (download.phase === 'running') value = { id: 'history-download', label: 'History download', detail: `${phase} · ${percentLabel}%`, severity: 'info' }
+    else if (download.phase === 'completed' && (progress.empty > 0 || progress.unavailable > 0 || progress.failed > 0)) value = { id: 'history-download', label: 'History download', detail: `${phase}. Review coverage in Data settings.`, severity: 'warning' }
+    else if (download.phase === 'completed' || download.phase === 'cancelled') value = { id: 'history-download', label: 'History download', detail: phase, severity: 'info' }
+    onStatusChange(value)
+  }, [busy, download.error, download.phase, onStatusChange, open, percentLabel, phase, progress.empty, progress.failed, progress.unavailable, ready, requestError, statusError])
+  useEffect(() => () => onStatusChange(null), [onStatusChange])
   return <FieldSet>
     <FieldLegend>Qualified contract history</FieldLegend>
     <FieldDescription>Uses saved filters at the start. Save filter changes first. Continues in the background.</FieldDescription>
-    <p role="status" className="text-sm">{!ready ? busy === 'status' ? 'Reading download status…' : 'Download status unavailable' : `${phase} · ${percentLabel}%`}</p>
     <Progress aria-label="History download progress" aria-valuetext={`${count(progress.checked)} of ${count(progress.total)} source timestamps checked; ${count(progress.available)} available; ${count(progress.empty)} temporarily missing; ${count(progress.unavailable)} verified unavailable; ${count(progress.failed)} failed; ${count(progress.pending)} pending`} value={download.phase === 'running' && progress.total === 0 ? null : percent} />
     {ready && progress.total > 0 && <p className="text-sm text-muted-foreground">{count(progress.checked)} / {count(progress.total)} source timestamps checked</p>}
     {ready && (progress.empty > 0 || progress.unavailable > 0 || progress.failed > 0) && <p className="text-sm text-muted-foreground">{[
@@ -96,7 +108,6 @@ function HistoryDownloadSettings({ open }: { open: boolean }) {
       {(busy === 'cancel' || (busy !== 'start' && download.phase === 'running')) && <Button type="button" variant="outline" onClick={() => void request('cancel')} disabled={!ready || Boolean(busy)}>{busy === 'cancel' && <Spinner data-icon="inline-start" />}Cancel download</Button>}
       {statusError && <Button type="button" variant="outline" onClick={() => void request('status')} disabled={Boolean(busy)}>Retry status</Button>}
     </div>
-    {(requestError || statusError || download.error) && <p role="alert" className="text-sm text-destructive">{requestError || statusError || download.error}</p>}
     <details className="text-sm">
       <summary className="w-fit cursor-pointer rounded-sm focus-visible:outline-2 focus-visible:outline-ring">Download details and coverage</summary>
       <div className="flex flex-col gap-3 pt-3">
@@ -121,31 +132,35 @@ function HistoryDownloadSettings({ open }: { open: boolean }) {
       <strong>{task.instrument} · {task.timeframe} · {task.source}</strong>
       <p>{downloadTime(task.from)} – {downloadTime(task.through)}</p>
       <p>{task.status} · Consecutive failures: {count(task.attempts)}{task.nextAttemptAt !== null && ` · Next retry: ${downloadTime(task.nextAttemptAt)}`}</p>
-      {task.error && <p>{task.error}</p>}
+      {task.error && <p>{task.status === 'retry' && task.nextAttemptAt !== null ? 'Request failed. A retry is scheduled.' : 'Request failed. Check the data service.'}</p>}
     </li>)}</ul>}
     {download.failures.length > 0 && <ul className="flex max-h-48 flex-col gap-2 overflow-y-auto text-sm" aria-label="History download failures">{download.failures.map((failure, index) => <li key={`${failure.instrument}-${failure.timeframe}-${failure.source}-${failure.from}-${index}`}>
       <strong>{failure.instrument} · {failure.timeframe} · {failure.source}</strong>
-      <p>{downloadTime(failure.from)} – {downloadTime(failure.through)}</p><p>{failure.error}</p>
+      <p>{downloadTime(failure.from)} – {downloadTime(failure.through)}</p><p>Data request failed. Retry the download.</p>
     </li>)}</ul>}
   </FieldSet>
 }
 
 type WorkspaceSettingsProps = {
   section: SettingsSection
+  active: boolean
   preferences: Preferences
   loaded: boolean
   loadError: string
   onSave: (values: Preferences) => Promise<void>
   onNavigationStateChange: (state: SettingsNavigationState) => void
+  onStatusChange?: (items: SettingsStatusValue[]) => void
+  onJobSnapshot?: (kind: 'audit' | 'download', value: DataAudit | HistoryDownload) => void
 }
 const sectionIcons = { workspace: Settings2, liquidity: SlidersHorizontal, data: Database }
 
-export function WorkspaceSettings({ section, preferences, loaded, loadError, onSave, onNavigationStateChange }: WorkspaceSettingsProps) {
+export function WorkspaceSettings({ section, active, preferences, loaded, loadError, onSave, onNavigationStateChange, onStatusChange, onJobSnapshot }: WorkspaceSettingsProps) {
   const [draft, setDraft] = useState(() => preferencesDraft(preferences))
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState('')
   const [savedMessage, setSavedMessage] = useState('')
+  const [downloadStatus, setDownloadStatus] = useState<SettingsStatusValue | null>(null)
   const [visited, setVisited] = useState(() => new Set<SettingsSection>([section]))
   const heading = useRef<HTMLHeadingElement>(null)
   const scroll = useRef<HTMLDivElement>(null)
@@ -161,14 +176,20 @@ export function WorkspaceSettings({ section, preferences, loaded, loadError, onS
     setDraft(current => JSON.stringify(current) === JSON.stringify(preferencesDraft(previous)) ? preferencesDraft(preferences) : current)
   }, [preferences])
   useLayoutEffect(() => {
+    if (!active) {
+      setDraft(preferencesDraft(preferences))
+      setErrors({}); setSaveError(''); setSavedMessage('')
+      focusAfterValidation.current = null
+      return
+    }
     setVisited(current => current.has(section) ? current : new Set([...current, section]))
     scroll.current?.scrollTo(0, scrollPositions.current.get(section) ?? 0)
     if (focusAfterValidation.current) {
       document.getElementById(focusAfterValidation.current)?.focus()
       focusAfterValidation.current = null
     } else heading.current?.focus({ preventScroll: true })
-  }, [section])
-  useEffect(() => { onNavigationStateChange({ dirty, busy: saving }) }, [dirty, saving, onNavigationStateChange])
+  }, [active, section])
+  useEffect(() => { onNavigationStateChange({ dirty: active && dirty, busy: saving }) }, [active, dirty, saving, onNavigationStateChange])
   useEffect(() => () => onNavigationStateChange({ dirty: false, busy: false }), [onNavigationStateChange])
   const [audit, setAudit] = useState<DataAudit>(emptyAudit)
   const [auditError, setAuditError] = useState('')
@@ -182,7 +203,8 @@ export function WorkspaceSettings({ section, preferences, loaded, loadError, onS
     if (!auditOrder.current.accept(value)) return
     auditAccepted.current += 1
     setAudit(value); setAuditStatusError('')
-  }, [])
+    onJobSnapshot?.('audit', value)
+  }, [onJobSnapshot])
   useEffect(() => {
     if (!dataMounted) return
     const lifecycle = ++auditLifecycle.current
@@ -195,9 +217,9 @@ export function WorkspaceSettings({ section, preferences, loaded, loadError, onS
     const status = async () => {
       try {
         const value = await window.radarDesktop.request({ dataAudit: { action: 'status' } })
-        if (lifecycle === auditLifecycle.current && getPresentation().active && epoch === getPresentation().epoch) acceptAudit(value)
-      } catch (cause) {
-        if (lifecycle === auditLifecycle.current && getPresentation().active && epoch === getPresentation().epoch && accepted === auditAccepted.current) setAuditStatusError(errorMessage(cause))
+        if (lifecycle === auditLifecycle.current && getPresentation().active && epoch === getPresentation().epoch && accepted === auditAccepted.current) acceptAudit(value)
+      } catch {
+        if (lifecycle === auditLifecycle.current && getPresentation().active && epoch === getPresentation().epoch && accepted === auditAccepted.current) setAuditStatusError('Audit status unavailable. Check the data service and reopen Data settings.')
       }
     }
     if (getPresentation().active) void status()
@@ -206,12 +228,13 @@ export function WorkspaceSettings({ section, preferences, loaded, loadError, onS
   const auditAction = async (action: 'start' | 'cancel' | 'repair') => {
     const lifecycle = auditLifecycle.current
     const sequence = ++auditSequence.current
+    const before = auditAccepted.current
     setAuditBusy(true); setAuditError('')
     try {
       const value = await window.radarDesktop.request({ dataAudit: { action } })
       await waitForPresentation()
-      if (lifecycle === auditLifecycle.current && sequence === auditSequence.current) acceptAudit(value)
-    } catch (cause) { await waitForPresentation(); if (lifecycle === auditLifecycle.current && sequence === auditSequence.current) setAuditError(errorMessage(cause)) }
+      if (lifecycle === auditLifecycle.current && sequence === auditSequence.current && (before === auditAccepted.current || value.serviceSession === auditOrder.current.serviceSession)) acceptAudit(value)
+    } catch { await waitForPresentation(); if (lifecycle === auditLifecycle.current && sequence === auditSequence.current) setAuditError(`Could not ${action === 'repair' ? 'repair the audit issues' : `${action} the audit`}. Check the data service and retry.`) }
     finally { if (lifecycle === auditLifecycle.current && sequence === auditSequence.current) setAuditBusy(false) }
   }
   const changeNumber = (key: 'rankingLookback' | 'historyDays' | 'slippageNotional', value: string) => {
@@ -230,9 +253,23 @@ export function WorkspaceSettings({ section, preferences, loaded, loadError, onS
     }
     setSaving(true)
     try { await onSave(checked.values); setDraft(preferencesDraft(checked.values)); setSavedMessage('Settings saved.') }
-    catch (cause) { setSaveError(errorMessage(cause)) }
+    catch { setSaveError('Could not save settings. Check the data service and retry.') }
     finally { setSaving(false) }
   }
+  useEffect(() => {
+    const items: SettingsStatusValue[] = []
+    if (saveError) items.push({ id: 'settings-save', label: 'Settings', detail: saveError, severity: 'error' })
+    else if (saving) items.push({ id: 'settings-save', label: 'Settings', detail: 'Saving settings…', severity: 'info' })
+    else if (savedMessage) items.push({ id: 'settings-save', label: 'Settings', detail: savedMessage, severity: 'info' })
+    else if (dirty) items.push({ id: 'settings-save', label: 'Settings', detail: 'Unsaved changes', severity: 'info' })
+    if (downloadStatus) items.push(downloadStatus)
+    if (auditError || auditStatusError || audit.error || audit.phase === 'failed') items.push({ id: 'data-audit', label: 'Data audit', detail: auditError || auditStatusError || 'Audit failed. Check the data service and retry.', severity: 'error', transient: Boolean(auditError || auditStatusError) })
+    else if (auditBusy || audit.phase === 'running' || audit.phase === 'validating') items.push({ id: 'data-audit', label: 'Data audit', detail: audit.phase === 'validating' ? 'Validating recent changes. Results are provisional.' : `Audit running · ${audit.progress.completed} / ${audit.progress.total}`, severity: 'info', transient: auditBusy })
+    else if (audit.issues.length) items.push({ id: 'data-audit', label: 'Data audit', detail: `${audit.issues.length} issues found. Review them in Data settings.`, severity: 'warning' })
+    else if (audit.phase === 'completed' || audit.phase === 'cancelled') items.push({ id: 'data-audit', label: 'Data audit', detail: audit.phase === 'completed' ? 'Audit complete.' : 'Audit cancelled.', severity: 'info' })
+    onStatusChange?.(items)
+  }, [audit.error, audit.issues.length, audit.phase, audit.progress.completed, audit.progress.total, auditBusy, auditError, auditStatusError, dirty, downloadStatus, onStatusChange, saveError, savedMessage, saving])
+  useEffect(() => () => onStatusChange?.([]), [onStatusChange])
   const numericField = (key: 'rankingLookback' | 'historyDays' | 'slippageNotional', label: string, description?: string) => <Field orientation="horizontal" data-invalid={Boolean(errors[key])} data-disabled={preferenceDisabled} className="justify-between gap-6">
     <FieldContent className="self-center">
       <FieldLabel htmlFor={key}>{label}</FieldLabel>
@@ -259,8 +296,6 @@ export function WorkspaceSettings({ section, preferences, loaded, loadError, onS
         <div ref={scroll} onScroll={event => scrollPositions.current.set(section, event.currentTarget.scrollTop)} className="min-h-0 flex-1 overflow-y-auto px-12 py-8 [scrollbar-gutter:stable]">
           <div className="mx-auto flex w-full max-w-3xl flex-col gap-8">
             <h2 ref={heading} id="settings-section-title" tabIndex={-1} className="text-xl font-semibold">{currentSection.label}</h2>
-            {(loadError || saveError) && <p role="alert" className="text-sm text-destructive">{saveError || loadError}</p>}
-            {!loaded && <p role="status" className="text-sm text-muted-foreground">Loading saved settings…</p>}
             <form id="workspace-settings-form" noValidate onSubmit={event => { event.preventDefault(); void save() }}>
               <div hidden={section !== 'workspace'} className="flex flex-col gap-8">
         <FieldSet disabled={preferenceDisabled} aria-labelledby="settings-section-title">
@@ -301,21 +336,19 @@ export function WorkspaceSettings({ section, preferences, loaded, loadError, onS
         </FieldSet>
               </div>
               <div hidden={section !== 'data'} className="flex flex-col gap-8">
-        <HistoryDownloadSettings open={dataMounted} />
+        <HistoryDownloadSettings open={dataMounted} onStatusChange={setDownloadStatus} onJobSnapshot={onJobSnapshot} />
         <Separator />
         <FieldSet>
           <FieldLegend>Data integrity</FieldLegend>
           <FieldSet disabled={preferenceDisabled} aria-label="Audit range"><FieldGroup>
             {numericField('historyDays', 'Data audit lookback (days)')}
           </FieldGroup></FieldSet>
-          <p role="status" className="text-sm">{audit.phase === 'validating' ? 'Validating recent changes · results are provisional' : `${audit.phase} · ${audit.progress.completed} / ${audit.progress.total}`}</p>
           {audit.phase !== 'validating' && <Progress aria-label="Data audit progress" value={audit.progress.total ? audit.progress.completed / audit.progress.total * 100 : 0} />}
           <div className="flex flex-wrap gap-2">
             <Button type="button" variant="outline" onClick={() => void auditAction('start')} disabled={auditBusy || audit.phase === 'running' || audit.phase === 'validating'}>Start audit</Button>
             <Button type="button" variant="outline" onClick={() => void auditAction('cancel')} disabled={auditBusy || (audit.phase !== 'running' && audit.phase !== 'validating')}>Cancel audit</Button>
             <Button type="button" variant="outline" onClick={() => void auditAction('repair')} disabled={auditBusy || audit.phase === 'running' || audit.phase === 'validating' || !audit.issues.some(issue => issue.repairable)}>Repair issues</Button>
           </div>
-          {(auditError || auditStatusError || audit.error) && <p role="alert" className="text-sm text-destructive">{auditError || auditStatusError || audit.error}</p>}
           {audit.issues.length > 0 && <ul className="flex max-h-48 flex-col gap-2 overflow-y-auto text-sm" aria-label="Data audit issues">{audit.issues.map((issue, index) => <li key={`${issue.instrument}-${issue.timeframe}-${issue.from}-${index}`}>
             <strong>{issue.instrument} · {issue.timeframe}</strong><p>{new Date(issue.from).toLocaleString('en-US')} – {new Date(issue.through).toLocaleString('en-US')}</p><p>{issue.reason} · {issue.repairable ? 'Repairable' : 'Review required'}</p>
           </li>)}</ul>}
@@ -325,7 +358,7 @@ export function WorkspaceSettings({ section, preferences, loaded, loadError, onS
           </div>
         </div>
         <footer className="shrink-0 border-t px-12 py-4"><div className="mx-auto flex w-full max-w-3xl items-center justify-between gap-4">
-          <p role="status" className="text-sm text-muted-foreground">{saving ? 'Saving settings…' : dirty ? 'Unsaved changes' : savedMessage}</p>
+          <span />
           <div className="flex gap-2"><Button type="button" variant="outline" disabled={preferenceDisabled || !dirty} onClick={() => { setDraft(preferencesDraft(preferences)); setErrors({}); setSaveError(''); setSavedMessage('') }}>Discard changes</Button><Button type="submit" form="workspace-settings-form" disabled={preferenceDisabled}>{saving && <Spinner data-icon="inline-start" />}Save settings</Button></div>
         </div></footer>
       </div>
