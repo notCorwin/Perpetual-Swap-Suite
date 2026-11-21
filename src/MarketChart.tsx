@@ -24,7 +24,7 @@ import type { Bar, ChartSourceStatus, PreparedChartState, ReadyChartWindow } fro
 import { measureOperation } from '../electron/services/operations.js'
 import { getPresentation, usePresentation, usePresentedStore } from '@/presentation-store'
 import { isPriceFresh, watchPriceFreshness, watchPriceCountdown } from '@/price-clock'
-import { sharedChartEnd, sharedChartGesture, sharedChartViewport, type SharedChartTime } from '@/chart-time-sync'
+import { sharedChartEnd, sharedChartGesture, sharedChartLiveEnd, sharedChartViewport, type SharedChartTime } from '@/chart-time-sync'
 
 const ChartTimeSync = createContext<{ value: SharedChartTime | null; setValue: React.Dispatch<React.SetStateAction<SharedChartTime | null>>; gutter: number; reportGutter: (frame: RadarTimeframe, epoch: object | null, width: number | null) => void } | null>(null)
 export function ChartTimeSyncProvider({ children }: { children: React.ReactNode }) {
@@ -441,15 +441,15 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     // A completed frame may be presented before the forming candle arrives.
     // Do not navigate that fresh frame into history while waiting for its live update.
     const nearNow = now >= last && now - last <= 2 * intervalMS
-    const end = live ? Math.max(last, Math.min(surface.priceObservedAt ?? now, last + intervalMS))
-      : nearNow ? now : plotGeometry.endHour + intervalMS * 0.34
     const spacing = plotGeometry.barPitch
+    const end = live ? sharedChartLiveEnd(last, intervalMS, Math.max(last, Math.min(surface.priceObservedAt ?? now, last + intervalMS)), spacing)
+      : nearNow ? now : plotGeometry.endHour + intervalMS * 0.34
     sync.setValue(current => current ?? { end, spacing, follow: true, liveEnd: end, observedAt: now, advancing: false, oldest: 0 })
   }, [sync, timeframe, surface, matchesSelection, plotGeometry, intervalMS])
   useLayoutEffect(() => {
-    if (!sync?.value || timeframe !== '1H' || !matchesSelection || !surface?.liveBar || !surface.priceObservedAt) return
+    if (!sync?.value || !matchesSelection || !surface?.liveBar || !surface.priceObservedAt) return
     const last = surface.liveBar.hour
-    const observed = Math.max(last, Math.min(surface.priceObservedAt, last + intervalMS))
+    const observed = sharedChartLiveEnd(last, intervalMS, Math.max(last, Math.min(surface.priceObservedAt, last + intervalMS)), sync.value.spacing)
     sync.setValue(current => !current || observed <= current.liveEnd ? current : {
       ...current, end: current.follow ? observed : current.end, liveEnd: observed, observedAt: surface.priceObservedAt!, advancing: false,
     })

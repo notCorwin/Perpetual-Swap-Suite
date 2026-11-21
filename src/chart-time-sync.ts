@@ -1,10 +1,16 @@
 import { CHART_MAX_WINDOW_BARS } from '../electron/chart-viewport.js'
-import { CHART_MAX_SPACING, CHART_MIN_SPACING } from './chart-layout.ts'
+import { CHART_MAX_SPACING, CHART_MIN_SPACING, chartPitchBodyWidth } from './chart-layout.ts'
 
 export type SharedChartTime = { end: number; spacing: number; follow: boolean; liveEnd: number; observedAt: number; advancing: boolean; oldest: number }
 
 export function sharedChartEnd(value: SharedChartTime, now: number) {
   return value.follow && value.advancing ? value.liveEnd + Math.max(0, now - value.observedAt) : value.end
+}
+
+/** Keep the latest candle's entire body inside the shared live viewport. */
+export function sharedChartLiveEnd(lastBar: number, interval: number, observed: number, spacing: number) {
+  // One pixel also keeps the 1px candle outline inside the plot clip.
+  return Math.max(observed, lastBar + interval * (chartPitchBodyWidth(1) / 2 + 1 / spacing))
 }
 
 export function sharedChartGesture(value: SharedChartTime, kind: 'pan' | 'zoom', pixels: number, width: number, interval: number, anchor: number, now: number): SharedChartTime {
@@ -22,5 +28,5 @@ export function sharedChartGesture(value: SharedChartTime, kind: 'pan' | 'zoom',
 
 /** Match the existing candle-center geometry to a common plot-edge time. */
 export function sharedChartViewport(end: number, spacing: number, interval: number, lastBar: number) {
-  return { spacing, offset: (end - interval * 0.34 - lastBar) / interval }
+  return { spacing, offset: (end - interval * chartPitchBodyWidth(1) / 2 - lastBar) / interval }
 }

@@ -132,6 +132,40 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
       spacing: Number(chart.dataset.chartBarSpacing),
       width: Number(chart.querySelector('svg[data-chart-bar-width]')?.dataset.chartBarWidth),
     })))
+    // The shared latest boundary must leave the entire forming candle inside
+    // each plot, including at the beginning of an hour. Inspect actual SVG
+    // paths as well as the viewport so a clipped path cannot pass unnoticed.
+    const assertFormingCandlesFit = async () => {
+      await page.waitForFunction(() => [...document.querySelectorAll('[data-chart-inst]')].length === 3
+        && [...document.querySelectorAll('[data-chart-inst]')].every(chart => {
+          const svg = chart.querySelector('svg[data-rendered-inst]'), bar = chart.__chartSnapshot?.liveBar
+          if (!svg || !bar) return false
+          const intervals = { '1H': 3_600_000, '15m': 900_000, '5m': 300_000 }
+          const interval = intervals[svg.dataset.renderedTimeframe]
+          const right = Number(svg.dataset.chartPlotRight), width = Number(svg.dataset.chartBarWidth)
+          const domainEnd = Number(svg.dataset.chartDomainEnd), spacing = Number(chart.dataset.chartBarSpacing)
+          const offset = Number(svg.querySelector('[data-chart-wheel-content]')?.dataset.chartWheelOffset ?? 0)
+          const center = right - width / 2 + (bar.hour - domainEnd) / interval * spacing + offset
+          return Number.isFinite(center) && center + width / 2 <= right + .01
+        }), null, { timeout: 15_000 })
+      const candles = await page.locator('[data-chart-inst]').evaluateAll(charts => charts.map(chart => {
+        const svg = chart.querySelector('svg[data-rendered-inst]'), bar = chart.__chartSnapshot.liveBar
+        const intervals = { '1H': 3_600_000, '15m': 900_000, '5m': 300_000 }
+        const right = Number(svg.dataset.chartPlotRight), width = Number(svg.dataset.chartBarWidth)
+        const offset = Number(svg.querySelector('[data-chart-wheel-content]')?.dataset.chartWheelOffset ?? 0)
+        const center = right - width / 2 + (bar.hour - Number(svg.dataset.chartDomainEnd)) / intervals[svg.dataset.renderedTimeframe] * Number(chart.dataset.chartBarSpacing) + offset
+        const group = svg.querySelector('[data-chart-candle-direction]')?.parentElement
+        const paths = [...group.querySelectorAll('path')].map(path => path.getAttribute('d') ?? '')
+        const number = '[-+]?(?:\\d*\\.)?\\d+(?:e[-+]?\\d+)?'
+        const bodies = paths.slice(3).flatMap(d => [...d.matchAll(new RegExp(`M(${number}) (${number})h(${number})v(${number})h(${number})Z`, 'gi'))].map(match => ({ x: Number(match[1]) + offset, width: Number(match[3]) })))
+        const wicks = paths.slice(0, 3).flatMap(d => [...d.matchAll(new RegExp(`M(${number}) (${number})V(${number})`, 'gi'))].map(match => Number(match[1]) + offset))
+        return { frame: svg.dataset.renderedTimeframe, right, width, center, bodies, wicks }
+      }))
+      for (const candle of candles) {
+        assert.ok(candle.bodies.some(body => Math.abs(body.x + body.width / 2 - candle.center) < .01 && body.x + body.width <= candle.right + .01), `${candle.frame} forming candle body must be fully inside the plot.`)
+        assert.ok(candle.wicks.some(x => Math.abs(x - candle.center) < .01 && x <= candle.right), `${candle.frame} forming candle wick must be inside the plot.`)
+      }
+    }
     // The axis must be shared across frames, sized to what is actually drawn,
     // and never rely on SVG textLength to squeeze labels into a narrow gutter.
     const assertAxisLayout = async (requireCompact = false) => {
@@ -186,6 +220,7 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
       return viewports()
     }
     const initial = await waitForSynchronizedViewports(null, null)
+    await assertFormingCandlesFit()
     await assertAxisLayout(true)
     await page.locator('[data-chart-plot]').nth(1).evaluate(plot => plot.dispatchEvent(new WheelEvent('wheel', { deltaY: 240, bubbles: true, cancelable: true })))
     const panned = await waitForSynchronizedViewports(initial, 'pan')
@@ -201,6 +236,7 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
     await page.locator('[data-chart-plot]').first().evaluate(plot => plot.dispatchEvent(new WheelEvent('wheel', { deltaX: 100_000, bubbles: true, cancelable: true })))
     await waitForSynchronizedViewports(null, null)
     await live(btc, 141.25, 35)
+    await assertFormingCandlesFit()
     await page.evaluate(() => { location.hash = '#/settings/workspace' })
     await page.getByRole('main', { name: 'Settings', exact: true }).getByRole('link', { name: 'Settings', exact: true }).click()
     await page.waitForFunction(() => document.querySelectorAll('[data-multi-timeframe-charts] svg[data-rendered-inst]').length === 3)
@@ -211,6 +247,7 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
     await assertAxisLayout()
     console.log('multiframe: ETH ready')
     await live(eth, 142.75, 40)
+    await assertFormingCandlesFit()
     // Observe the real capture while intercepting the final clipboard write so
     // this background test never alters the user's clipboard.
     await page.addInitScript(() => {
