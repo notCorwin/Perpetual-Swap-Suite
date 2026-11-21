@@ -49,6 +49,9 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
       assert.equal(await page.locator('[data-chart-title]').count(), 1)
       assert.equal(await page.getByText('Multi-timeframe', { exact: true }).count(), 0)
       assert.equal(await page.locator('[data-chart-toolbar]').count(), 1)
+      assert.equal(await page.locator('[data-multi-timeframe-charts] [data-chart-summary]').count(), 0, 'Charts must not reserve a separate title or status row.')
+      const statuses = await page.locator('[data-chart-status]').evaluateAll(nodes => nodes.map(node => ({ timeframe: node.dataset.timeframe, shared: !!node.closest('[data-shared-chart-status]') })))
+      assert.ok(statuses.every(status => status.shared && frames.includes(status.timeframe)), 'Visible chart statuses belong in the shared toolbar and identify their timeframe.')
       assert.deepEqual(await page.locator('svg[data-rendered-inst]').evaluateAll(svgs => svgs.map(svg => svg.getAttribute('aria-label')?.match(/(?:1h|15m|5m)/i)?.[0]?.toLowerCase())), ['1h', '15m', '5m'])
       assert.equal(await page.locator('[data-chart-indicator="rsi6"]').count(), 0)
       assert.equal(await page.locator('[data-chart-indicator="ema"], [data-chart-legend="EMA(200)"]').count(), 0)
@@ -56,6 +59,11 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
       const positions = await page.locator('svg[data-rendered-inst]').evaluateAll(svgs => svgs.map(svg => ({ top: svg.getBoundingClientRect().top, height: svg.getBoundingClientRect().height })))
       assert.ok(positions.every(position => position.height > 60))
       assert.ok(positions[0].top < positions[1].top && positions[1].top < positions[2].top)
+      const geometry = await page.locator('[data-chart-inst]').evaluateAll(charts => charts.map(chart => ({
+        top: chart.getBoundingClientRect().top,
+        plotTop: chart.querySelector('[data-chart-plot]').getBoundingClientRect().top,
+      })))
+      assert.ok(geometry.every(({ top, plotTop }) => Math.abs(top - plotTop) < 1), 'Each plot starts at the top of its chart without a reserved header.')
     }
     const live = async (instId, close, volume) => {
       await Promise.all(['candle5m', 'tickers'].map(channel => exchange.waitForSubscription(instId, channel)))
@@ -89,6 +97,15 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
     await ready(btc)
     console.log('multiframe: three ready')
     await live(btc, 139.25, 20)
+    const inspectedChart = page.locator('[data-chart-inst]').nth(1)
+    const plotBeforeInspection = await inspectedChart.locator('[data-chart-plot]').boundingBox()
+    await page.mouse.move(plotBeforeInspection.x + plotBeforeInspection.width / 2, plotBeforeInspection.y + plotBeforeInspection.height / 2)
+    await page.mouse.down()
+    await inspectedChart.locator('[data-chart-inspection-readout]').waitFor({ state: 'visible' })
+    assert.match(await inspectedChart.locator('[data-chart-inspection-readout]').textContent(), /Open.*High.*Low.*Close/)
+    assert.deepEqual(await inspectedChart.locator('[data-chart-plot]').boundingBox(), plotBeforeInspection, 'Inspection must not reserve a row or resize the plot.')
+    await page.mouse.up()
+    await inspectedChart.locator('[data-chart-inspection-readout]').waitFor({ state: 'hidden' })
     exchange.sendTicker(btc, 138.75)
     await page.waitForFunction(() => {
       const charts = [...document.querySelectorAll('[data-chart-inst]')]

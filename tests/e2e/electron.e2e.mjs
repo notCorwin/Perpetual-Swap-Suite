@@ -629,7 +629,7 @@ test('DOM capture retains shared SVG evidence when curves, clips and bars change
         [svg, 'aria-label', 'svg', 'label'], [chart, 'data-chart-rendered-bars', 'chart', 'renderedBars'],
         [chart, 'data-chart-completed-end', 'chart', 'completedEnd'], [chart, 'data-chart-candle-state', 'chart', 'candleState'],
         [chart, 'data-chart-oi-samples', 'chart', 'oiSamples'],
-        [chart.querySelector('[data-chart-status]'), 'data-chart-indicator-input', 'chart', 'indicatorInput'],
+        [chart, 'data-chart-indicator-input', 'chart', 'indicatorInput'],
       ]
       const mappingFailures = []
       for (const [node, attribute, owner, field] of mappings) {

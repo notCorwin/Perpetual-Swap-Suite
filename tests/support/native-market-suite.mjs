@@ -55,7 +55,7 @@ export async function runNativeMarketAcceptance({ directory, launch, close = ele
           && svg?.getAttribute('data-rendered-inst') === expected.instId && svg.getAttribute('data-rendered-timeframe') === expected.timeframe
           && Number(svg.getAttribute('data-rendered-end')) === expected.hour
           && snapshot.priceObservedAt >= expected.sentAt && snapshot.realtimeState === 'live'
-          && ![...workspace.querySelectorAll('[role="status"]')].some(value => ['Live price', 'Cached price'].includes(value.textContent?.trim()))
+          && !workspace.querySelector(`[data-shared-chart-status] [data-chart-status][data-timeframe="${expected.timeframe}"]`)?.textContent?.includes('Cached price')
       }, expected, { timeout: 10_000 })
     } catch (error) {
       throw new Error(`Native price failed to reach the selected chart. Expected ${JSON.stringify(expected)}; actual ${JSON.stringify(await readPrice())}; exchange ${JSON.stringify({ errors: exchange.errors, requests: exchange.requests })}`, { cause: error })
@@ -195,7 +195,7 @@ export async function runNativeMarketAcceptance({ directory, launch, close = ele
         const snapshot = workspace?.querySelector('svg[data-rendered-timeframe="15m"]')?.closest('[data-chart-inst]')?.__chartSnapshot
         return snapshot?.instId === 'BTC-USDT-SWAP' && snapshot.timeframe === '15m'
           && snapshot.realtimeState === 'stale'
-          && [...workspace.querySelectorAll('[role="status"]')].some(value => value.textContent?.trim() === 'Cached price')
+          && workspace.querySelector('[data-shared-chart-status] [data-chart-status][data-timeframe="15m"]')?.textContent?.includes('Cached price')
       }, null, { timeout: 2_000 })
       const disconnectedPrice = await readPrice()
       assert.equal(disconnectedPrice.snapshot.livePrice, 136.25, 'Disconnecting must preserve the actual last price while revoking its live status.')

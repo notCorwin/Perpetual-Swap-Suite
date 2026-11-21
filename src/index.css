@@ -314,7 +314,7 @@ html[data-presentation-idle] *, html[data-presentation-idle] *::before, html[dat
 }
 [data-chart-summary] > :not([data-chart-status]), [data-chart-summary] [data-chart-ohlc],
 [data-chart-summary] [data-chart-inspection-readout] > * { flex-shrink: 0; }
-[data-chart-inspection-readout] { display: contents; }
+[data-chart-summary] [data-chart-inspection-readout] { display: contents; }
 
 [data-market-status-row] {
   line-height: var(--ui-line-meta);

@@ -38,7 +38,7 @@ const until = async (condition, timeoutMS, classification, message) => {
   while (true) { controller.signal.throwIfAborted(); const value = await condition(); if (value) return value; if (performance.now() >= deadline) throw new CheckFailure(classification, message); await sleep(100) }
 }
 const readChart = () => page.evaluate(() => {
-  const workspace = document.querySelector('[data-chart-workspace]'), chart = workspace?.querySelector('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
+  const workspace = document.querySelector('[data-chart-panel]'), chart = workspace?.querySelector('svg[data-rendered-timeframe="5m"]')?.closest('[data-chart-inst]'), snapshot = chart?.__chartSnapshot
   const svg = chart?.querySelector('svg[data-rendered-inst]'), label = svg?.querySelector('[data-chart-price-label-value]')?.textContent ?? ''
   return { instId: chart?.getAttribute('data-chart-inst'), timeframe: chart?.getAttribute('data-chart-timeframe'),
     svgInstId: svg?.getAttribute('data-rendered-inst'), svgTimeframe: svg?.getAttribute('data-rendered-timeframe'), svgEnd: Number(svg?.getAttribute('data-rendered-end')),
@@ -46,7 +46,7 @@ const readChart = () => page.evaluate(() => {
       endHour: snapshot.endHour, liveBar: snapshot.liveBar && { hour: snapshot.liveBar.hour, open: snapshot.liveBar.open, high: snapshot.liveBar.high,
         low: snapshot.liveBar.low, close: snapshot.liveBar.close, confirmed: snapshot.liveBar.confirmed }, priceObservedAt: snapshot.priceObservedAt,
       realtimeState: snapshot.realtimeState, bars: snapshot.bars.length, generation: snapshot.generation } : null,
-    statuses: [...(workspace?.querySelectorAll('[role="status"]') ?? [])].map(value => value.textContent?.trim()) }
+    statuses: [...(workspace?.querySelectorAll('[data-chart-status][data-timeframe="5m"]') ?? [])].map(value => value.textContent?.trim()) }
 })
 try {
   const sentAt = Date.now(), clockResponse = await fetch('https://www.okx.com/api/v5/public/time', { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(7000)]) })
@@ -117,7 +117,7 @@ try {
         && actual.svgEnd === Number(expected.raw[0]) && live?.hour === Number(expected.raw[0]) && live.confirmed === false
         && ['open', 'high', 'low', 'close'].every((field, index) => live[field] === Number(expected.raw[index + 1]))
         && actual.price === Number(expected.raw[4]) && actual.snapshot.priceObservedAt >= expected.forwardedAt
-        && Date.now() - actual.snapshot.priceObservedAt < 10_000 && actual.snapshot.realtimeState === 'live' && !actual.statuses.includes('Cached price') && !actual.statuses.includes('Live price')
+        && Date.now() - actual.snapshot.priceObservedAt < 10_000 && actual.snapshot.realtimeState === 'live' && !actual.statuses.some(status => status?.includes('Cached price'))
     }, 8_000, 'app-failure', `A genuine, delivered ${instId} candle failed to reach the selected SVG with exact OHLC, identity and freshness.`)
     assertionActive = false
     if (previous) assert.ok(actual.snapshot.priceObservedAt > previous.actual.snapshot.priceObservedAt, 'New real candle delivery must advance the observed timestamp even when price repeats.')

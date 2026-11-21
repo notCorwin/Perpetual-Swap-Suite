@@ -2,7 +2,7 @@ import { readDesignLengths } from '@/design-lengths'
 import { CHART_DEFAULT_SPACING, chartPitchSpan } from './chart-layout.ts'
 import { chartTimeTicks, chartTimeTickStep } from './chart-axis.ts'
 import { createContext, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react"
-import { flushSync } from "react-dom"
+import { createPortal, flushSync } from "react-dom"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Spinner } from "@/components/ui/spinner"
@@ -34,11 +34,26 @@ export function ChartTimeSyncProvider({ children }: { children: React.ReactNode 
 
 const presentationActive = () => getPresentation().active
 const EMPTY_BARS: readonly Bar[] = []
-const PriceStatus = memo(function PriceStatus({ observedAt, realtime, active }: { observedAt?: number | null; realtime?: 'live' | 'stale'; active: boolean }) {
+const PriceStatus = memo(function PriceStatus({ observedAt, realtime, active, label }: { observedAt?: number | null; realtime?: 'live' | 'stale'; active: boolean; label?: string }) {
   const [now, setNow] = useState(Date.now)
   useEffect(() => watchPriceFreshness({ observedAt, realtime, active, displayedAt: now, isActive: presentationActive, onTime: setNow }), [active, observedAt, realtime, now])
   const fresh = isPriceFresh(observedAt, realtime, now)
-  return fresh ? null : <Badge variant="secondary" role="status" title={observedAt ? `Last price observation ${new Date(observedAt).toLocaleTimeString('en-US')}` : 'Waiting for a current price observation'}>Cached price</Badge>
+  return fresh ? null : <Badge variant="secondary" role="status" title={observedAt ? `Last price observation ${new Date(observedAt).toLocaleTimeString('en-US')}` : 'Waiting for a current price observation'}>{label ? `${label} ` : ''}Cached price</Badge>
+})
+
+const SharedChartStatus = memo(function SharedChartStatus({ timeframe, summary, error, loading, observedAt, realtime, active, historical, indicatorState, indicatorStale, indicatorInput }: {
+  timeframe: RadarTimeframe; summary: string; error: string; loading: boolean; observedAt?: number | null; realtime?: 'live' | 'stale'; active: boolean; historical: boolean; indicatorState?: string; indicatorStale: boolean; indicatorInput?: string
+}) {
+  const [now, setNow] = useState(Date.now)
+  useEffect(() => watchPriceFreshness({ observedAt, realtime, active, displayedAt: now, isActive: presentationActive, onTime: setNow }), [active, observedAt, realtime, now])
+  const cached = !historical && !isPriceFresh(observedAt, realtime, now)
+  const detail = [error || summary, cached ? 'Cached price' : ''].filter(Boolean).join(' · ')
+  if (!detail) return null
+  return <div data-chart-shared-status-item={timeframe} data-chart-status data-timeframe={timeframe} data-chart-indicator-state={indicatorState} data-chart-indicator-stale={indicatorStale} data-chart-indicator-input={indicatorInput} role={error ? 'alert' : 'status'} tabIndex={error ? 0 : undefined} aria-live="polite" aria-atomic="true" aria-label={`${timeframeLabel(timeframe)}: ${detail}`} title={`${timeframeLabel(timeframe)}: ${detail}`} className={cn('flex min-w-0 flex-1 basis-0 items-center gap-1 text-xs', error ? 'text-destructive' : 'text-muted-foreground')}>
+    <span className="shrink-0">{timeframeLabel(timeframe)}</span>
+    {loading && !error && <Spinner aria-hidden="true" role="presentation" />}
+    <span className="min-w-0 truncate">{detail}</span>
+  </div>
 })
 
 const chartTimeFormatter = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })
@@ -353,7 +368,7 @@ const ChartSurface = memo(function ChartSurface({ instId, timeframe, hasComplete
   </PlotVisible>
 })
 
-export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, turnoverOrder, onSelect, controller: chartController = defaultChartController, priceOnly = false, navigation = true }: { controller?: ChartController; priceOnly?: boolean; navigation?: boolean; instId: string; tickSz?: string | null; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; candidateIds?: string[]; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
+export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, turnoverOrder, onSelect, controller: chartController = defaultChartController, priceOnly = false, navigation = true, statusTarget }: { controller?: ChartController; priceOnly?: boolean; navigation?: boolean; statusTarget?: HTMLElement | null; instId: string; tickSz?: string | null; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; candidateIds?: string[]; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
   const sync = useContext(ChartTimeSync)
   const presentation = usePresentation()
   const readoutId = useId()
@@ -718,10 +733,28 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
   }
   if (atBoundary && !pending) statusMessages.push('Start of available history')
   if (!statusMessages.length && error) statusMessages.push('Chart update failed')
+  if (priceOnly && historical && !inspectedBar && active) statusMessages.push(`Window end ${time(active.hour)}`)
+  if (priceOnly && priceScale === 'unavailable' && surface) statusMessages.push('Price scale unavailable')
   const statusLoading = !error && ((pending) || priceState === 'loading' || priceState === 'partial' || priceState === 'stale')
     || surface?.indicatorState === 'loading' || !priceOnly && (oiState === 'loading' || takerState === 'loading')
   const statusSummary = statusMessages.join(' · ')
+  const sharedError = error || (priceState === 'error' ? sourceStatusText('Price history', priceState, surface?.priceStatus) : '') || (surface?.indicatorState === 'error' ? sourceStatusText('Indicators', 'error', surface.indicatorStatus) : '')
+  const inspectionReadout = active && <div id={readoutId} data-chart-inspection-readout hidden={priceOnly && inspectedBar === undefined} aria-live="off" className={priceOnly ? 'pointer-events-none absolute left-0 right-0 top-0 z-10 flex flex-wrap gap-x-3 bg-background/90 px-4 text-xs' : undefined}>
+    <p className="min-w-0 truncate" data-chart-inspected-hour={inspectedBar?.hour}><span className="text-muted-foreground">{inspectedBar === undefined ? historical ? 'Window end' : 'Latest' : 'Selected'}</span> {time(active.hour)}</p>
+    {([['Open', active.open], ['High', active.high], ['Low', active.low], ['Close', active.close]] as const).map(([label, value]) => {
+      const text = label === 'Close' && active === surface?.liveBar ? formatCurrentPrice(value, currentPriceTickSz) : formatHistoricalPrice(value)
+      return <div key={label} data-chart-ohlc={label.toLowerCase()} className="min-w-0"><span className="text-muted-foreground">{label} </span><span title={text}>{text}</span></div>
+    })}
+    {priceOnly && inspectedBar && priceOverlays.map(({ label, value }) => <div key={label} data-chart-inspection-indicator={label}>
+      <span className="text-muted-foreground">{label} </span><span data-chart-legend-value title={value(inspectedBar)}>{value(inspectedBar, true)}</span>
+    </div>)}
+  </div>
+  const statusContent = <div data-chart-status data-timeframe={timeframe} data-chart-indicator-state={surface?.indicatorState} data-chart-indicator-stale={displayedIndicators.stale} data-chart-indicator-input={surface?.indicatorStatus?.inputVersion} role="status" aria-live="polite" aria-atomic="true" className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
+    {statusLoading && <Spinner aria-hidden="true" role="presentation" />}
+    <p className="min-w-0 truncate" title={error || statusSummary}>{error || statusSummary}</p>
+  </div>
   return <section data-chart-workspace aria-label="Market chart workspace" className="flex h-full min-h-0 w-full min-w-0 flex-col overflow-hidden overscroll-none text-sm font-normal tabular-nums">
+    {priceOnly && statusTarget && createPortal(<SharedChartStatus timeframe={timeframe} summary={statusSummary} error={sharedError} loading={statusLoading} observedAt={surface?.priceObservedAt} realtime={surface?.realtimeState} active={isActive && windowVisible && presentation.active} historical={historical} indicatorState={surface?.indicatorState} indicatorStale={displayedIndicators.stale} indicatorInput={surface?.indicatorStatus?.inputVersion} />, statusTarget)}
     {!priceOnly && <header data-chart-toolbar data-window-toolbar data-window-drag-region className="flex items-center gap-3 border-b px-4">
       <ToggleGroup variant="outline" size="sm" className="mr-auto" value={[timeframe]} onValueChange={values => { const value = values[0]; if (value) onTimeframeChange?.(value as RadarTimeframe) }} aria-label="Chart timeframe">{RADAR_TIMEFRAMES.map(item => <ToggleGroupItem key={item.value} value={item.value}>{item.label}</ToggleGroupItem>)}</ToggleGroup>
       <Button variant="ghost" size="sm" onClick={() => controlsHelp.current?.showModal()}>Chart controls</Button>
@@ -741,29 +774,16 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
         <div className="flex justify-end"><Button variant="outline" size="sm" onClick={() => controlsHelp.current?.close()}>Close</Button></div>
       </div>
     </dialog>
-    {error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}</div>}
+    {!priceOnly && error && <div role="alert" className="flex shrink-0 items-center gap-3 border-b px-5 py-2 text-destructive">{error}</div>}
     <div className="flex min-h-0 flex-1">
-    <section ref={chartRef} data-chart-inst={displayedId} data-chart-time-end={plotGeometry ? plotGeometry.endHour + intervalMS * 0.34 - wheelContentOffset / plotGeometry.barPitch * intervalMS : undefined} data-chart-time-start={plotGeometry ? plotGeometry.endHour + intervalMS * 0.34 - (plotGeometry.layout.right - plotGeometry.layout.left + wheelContentOffset) / plotGeometry.barPitch * intervalMS : undefined} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={surface?.windowBars ?? 96} data-chart-visible-bars={visibleBars} data-chart-bar-spacing={viewport.spacing} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={priceState} data-chart-statistics-state={surface?.oiState === 'error' || surface?.takerState === 'error' ? 'error' : surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={priceState !== 'ready' || surface?.indicatorState !== 'ready' || oiState !== 'ready' || takerState !== 'ready' ? 'true' : 'false'} data-chart-loading={pending ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
-      <div data-chart-summary className="flex shrink-0 items-center border-b px-4">
+    <section ref={chartRef} data-chart-inst={displayedId} data-chart-indicator-state={surface?.indicatorState} data-chart-indicator-stale={displayedIndicators.stale} data-chart-indicator-input={surface?.indicatorStatus?.inputVersion} data-chart-time-end={plotGeometry ? plotGeometry.endHour + intervalMS * 0.34 - wheelContentOffset / plotGeometry.barPitch * intervalMS : undefined} data-chart-time-start={plotGeometry ? plotGeometry.endHour + intervalMS * 0.34 - (plotGeometry.layout.right - plotGeometry.layout.left + wheelContentOffset) / plotGeometry.barPitch * intervalMS : undefined} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={surface?.windowBars ?? 96} data-chart-visible-bars={visibleBars} data-chart-bar-spacing={viewport.spacing} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={priceState} data-chart-statistics-state={surface?.oiState === 'error' || surface?.takerState === 'error' ? 'error' : surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={priceState !== 'ready' || surface?.indicatorState !== 'ready' || oiState !== 'ready' || takerState !== 'ready' ? 'true' : 'false'} data-chart-loading={pending ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
+      {!priceOnly && <div data-chart-summary className="flex shrink-0 items-center border-b px-4">
         {!priceOnly && <h2 data-chart-title className="min-w-0 max-w-40 shrink-0 truncate" title={displayedId} aria-label={`${displayedId.replace(/-SWAP$/, '')} · ${timeframeLabel(displayedFrame)}`}>{`${displayedId.replace(/-SWAP$/, '')} · ${timeframeLabel(displayedFrame)}`}</h2>}
-        {priceOnly && !historical && <PriceStatus observedAt={surface?.priceObservedAt} realtime={surface?.realtimeState} active={isActive && windowVisible && presentation.active} />}
-        <div data-chart-status data-chart-indicator-state={surface?.indicatorState} data-chart-indicator-stale={displayedIndicators.stale} data-chart-indicator-input={surface?.indicatorStatus?.inputVersion} role="status" aria-live="polite" aria-atomic="true" className="flex min-w-0 flex-1 items-center gap-2 text-xs text-muted-foreground">
-          {statusLoading && <Spinner aria-hidden="true" role="presentation" />}
-          <p className="min-w-0 truncate" title={statusSummary}>{statusMessages.map((message, index) => <span key={message}>{index > 0 && ' · '}<span>{message}</span></span>)}</p>
-        </div>
-      {priceOnly && historical && !inspectedBar && active && <p data-chart-window-end className="text-muted-foreground">Window end {time(active.hour)}</p>}
-      {active && <div id={readoutId} data-chart-inspection-readout hidden={priceOnly && inspectedBar === undefined} aria-live="off">
-        <p className="min-w-0 truncate" data-chart-inspected-hour={inspectedBar?.hour}><span className="text-muted-foreground">{inspectedBar === undefined ? historical ? 'Window end' : 'Latest' : 'Selected'}</span> {time(active.hour)}</p>
-        {([['Open', active.open], ['High', active.high], ['Low', active.low], ['Close', active.close]] as const).map(([label, value]) => {
-          const text = label === 'Close' && active === surface?.liveBar ? formatCurrentPrice(value, currentPriceTickSz) : formatHistoricalPrice(value)
-          return <div key={label} data-chart-ohlc={label.toLowerCase()} className="min-w-0"><span className="text-muted-foreground">{label} </span><span title={text}>{text}</span></div>
-        })}
-        {priceOnly && inspectedBar && priceOverlays.map(({ label, value }) => <div key={label} data-chart-inspection-indicator={label}>
-          <span className="text-muted-foreground">{label} </span><span data-chart-legend-value title={value(inspectedBar)}>{value(inspectedBar, true)}</span>
-        </div>)}
-      </div>}
+        {statusContent}
+        {inspectionReadout}
         {(!priceOnly || priceScale === 'unavailable') && <span data-chart-price-scale={priceScale} className="ml-auto text-muted-foreground" title={priceScale === 'unavailable' ? 'Price scale unavailable: first visible open must be positive' : 'Change from first visible open'}>{priceScale === 'unavailable' ? 'Unavailable' : 'Change %'}</span>}
-      </div>
+      </div>}
+      {priceOnly && inspectionReadout}
       <div ref={plotRef} data-chart-plot tabIndex={-1} className="relative min-h-0 flex-1 overflow-hidden outline-none" onKeyDown={event => {
         if (event.key === 'Escape') { endInspection(); return }
         if (priceOnly || !matchesSelection || !surface || !plotGeometry || !event.altKey || !(event.key === 'ArrowLeft' || event.key === 'ArrowRight')) return

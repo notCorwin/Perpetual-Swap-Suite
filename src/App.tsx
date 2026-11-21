@@ -187,6 +187,7 @@ function App() {
   const selectedPrice = selectedRow?.lastPrice
   const sharedPrice = typeof selectedPrice === 'number' && Number.isFinite(selectedPrice) && selectedPrice > 0 ? selectedPrice : undefined
   const sharedPriceText = sharedPrice === undefined ? undefined : formatCurrentPrice(sharedPrice, selectedRow?.tickSz)
+  const [chartStatusTarget, setChartStatusTarget] = useState<HTMLDivElement | null>(null)
   const retainedChart = Boolean(selected && !selectedRow)
   const selectedID = selected
   const connectionProblem = !['live', 'connected'].includes(realtime.toLowerCase())
@@ -321,11 +322,12 @@ function App() {
             <div className="flex min-w-0 flex-1 items-center gap-2">
               <h2 data-chart-title data-shared-chart-title className="max-w-32 truncate" title={selectedID}>{selectedID.replace(/-SWAP$/, '')}</h2>
               {sharedPriceText !== undefined && <><span className="sr-only">Market price</span><span data-shared-chart-price className="max-w-32 truncate" title={sharedPriceText}>{sharedPriceText}</span></>}
+              <div ref={setChartStatusTarget} data-shared-chart-status className="flex min-w-0 flex-1 items-center gap-3 overflow-hidden" />
             </div>
             <Button ref={copyButtonRef} data-window-no-drag variant="outline" size="sm" disabled={copyState.status === 'copying'} onClick={() => { void copyChart() }}><Camera data-icon="inline-start" aria-hidden="true" />{copyState.status === 'copying' ? 'Copying…' : copyState.status === 'copied' ? 'Copied' : 'Copy chart'}</Button>
           </header>
           <ChartTimeSyncProvider key={selectedID}><div className="grid min-h-0 flex-1 grid-rows-3 divide-y" data-multi-timeframe-charts>
-            {(['1H', '15m', '5m'] as const).map((frame, index) => <MarketChart key={frame} controller={multiChartControllers[frame]} priceOnly navigation={index === 0} active={settingsSection === null} instId={selectedID} tickSz={selectedRow?.tickSz} timeframe={frame} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} />)}
+            {(['1H', '15m', '5m'] as const).map((frame, index) => <MarketChart key={frame} controller={multiChartControllers[frame]} priceOnly statusTarget={chartStatusTarget} navigation={index === 0} active={settingsSection === null} instId={selectedID} tickSz={selectedRow?.tickSz} timeframe={frame} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={setSelected} />)}
           </div></ChartTimeSyncProvider>
         </div>
       </div> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}

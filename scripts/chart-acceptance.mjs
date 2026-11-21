@@ -430,7 +430,7 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
     let lastSurface = null
     const captureSurface = () => {
       const previous = lastSurface
-      const status = chart.querySelector('[data-chart-status]')
+      const status = document.querySelector(`[data-shared-chart-status] [data-chart-status][data-timeframe="${expectedTimeframe}"]`)
       const chartState = shareRecord(previous?.chart, {
         instId: chart.dataset.chartInst, label: chart.getAttribute('aria-label'), start: chart.dataset.chartStart, end: chart.dataset.chartEnd,
         completedEnd: chart.dataset.chartCompletedEnd, requestedEnd: chart.dataset.chartRequestedEnd, renderedBars: chart.dataset.chartRenderedBars,
@@ -438,7 +438,7 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
         candleState: chart.dataset.chartCandleState, statisticsState: chart.dataset.chartStatisticsState, statisticsEnd: chart.dataset.chartStatisticsEnd,
         oiState: chart.dataset.chartOiState, takerState: chart.dataset.chartTakerState, incomplete: chart.dataset.chartIncomplete,
         oiSamples: chart.dataset.chartOiSamples, takerSamples: chart.dataset.chartTakerSamples,
-        indicatorState: status?.getAttribute('data-chart-indicator-state'), indicatorStale: status?.getAttribute('data-chart-indicator-stale'), indicatorInput: status?.getAttribute('data-chart-indicator-input'), status: status?.textContent,
+        indicatorState: chart.getAttribute('data-chart-indicator-state'), indicatorStale: chart.getAttribute('data-chart-indicator-stale'), indicatorInput: chart.getAttribute('data-chart-indicator-input'), status: status?.textContent ?? '',
       })
       const svg = chart.querySelector('svg[data-rendered-inst]')
       if (!svg) {
@@ -546,6 +546,8 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
       sample(false, sampledAt, sampledAt, true)
     })
     probe.observer.observe(chart, { subtree: true, childList: true, attributes: true, characterData: true })
+    const sharedStatus = document.querySelector('[data-shared-chart-status]')
+    if (sharedStatus) probe.observer.observe(sharedStatus, { subtree: true, childList: true, attributes: true, characterData: true })
     const frame = timestamp => {
       const sampledAt = performance.now()
       if (!probe.active) return
@@ -1788,7 +1790,7 @@ async function readColdWindowState(page, instId) {
       renderedEnd: Number(svg?.dataset.renderedEnd), candleState: chart.dataset.chartCandleState,
       statisticsState: chart.dataset.chartStatisticsState, oiState: chart.dataset.chartOiState,
       takerState: chart.dataset.chartTakerState,
-      indicatorState: chart.querySelector('[data-chart-status]')?.dataset.chartIndicatorState ?? null,
+      indicatorState: chart.dataset.chartIndicatorState ?? null,
       alert: document.querySelector('[role="alert"]')?.textContent ?? '' }
   })
 }
@@ -1885,8 +1887,8 @@ async function nativeColdBoundary(electron, page, { timeframe = '15m', offscreen
       beforeMetrics = Object.fromEntries((await cdp.send('Performance.getMetrics')).metrics.map(metric => [metric.name, metric.value]))
     }
     await page.waitForFunction(instId => {
-      const chart = document.querySelector(`[data-acceptance-target] [data-chart-inst="${instId}"]`), status = chart?.querySelector('[data-chart-status]')
-      return ['ready', 'unavailable'].includes(chart?.__chartSnapshot?.indicatorState) && status?.dataset.chartIndicatorStale !== 'true'
+      const chart = document.querySelector(`[data-acceptance-target] [data-chart-inst="${instId}"]`)
+      return ['ready', 'unavailable'].includes(chart?.__chartSnapshot?.indicatorState) && chart?.dataset.chartIndicatorStale !== 'true'
     }, fixture.instId)
     await startPaintProbe(page, fixture, { indicatorValidation: 'finite' })
     paintStarted = true
