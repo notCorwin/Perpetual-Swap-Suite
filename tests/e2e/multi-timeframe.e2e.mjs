@@ -132,6 +132,30 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
       spacing: Number(chart.dataset.chartBarSpacing),
       width: Number(chart.querySelector('svg[data-chart-bar-width]')?.dataset.chartBarWidth),
     })))
+    // The axis must be shared across frames, sized to what is actually drawn,
+    // and never rely on SVG textLength to squeeze labels into a narrow gutter.
+    const assertAxisLayout = async (requireCompact = false) => {
+      await page.waitForFunction(() => {
+        const svgs = [...document.querySelectorAll('svg[data-rendered-inst]')]
+        if (svgs.length !== 3) return false
+        const edges = svgs.map(svg => Number(svg.dataset.chartPlotRight))
+        return edges.every(edge => Number.isFinite(edge) && Math.abs(edge - edges[0]) < .01)
+      }, null, { timeout: 10_000 })
+      const axes = await page.locator('svg[data-rendered-inst]').evaluateAll(svgs => svgs.map(svg => {
+        const width = svg.viewBox.baseVal.width
+        const labels = [...svg.querySelectorAll('[data-chart-price-tick] text, [data-chart-price-label-value], [data-chart-countdown]')]
+        return {
+          gutter: width - Number(svg.dataset.chartPlotRight) - 4,
+          labels: labels.map(label => ({ text: label.textContent, x: Number(label.getAttribute('x')),
+            naturalWidth: label.getComputedTextLength(), compressed: label.hasAttribute('textLength') })), width,
+        }
+      }))
+      for (const axis of axes) for (const label of axis.labels) {
+        assert.equal(label.compressed, false, `Axis label ${label.text} must not be compressed.`)
+        assert.ok(label.x + label.naturalWidth <= axis.width + .5, `Axis label ${label.text} must fit in its SVG.`)
+      }
+      if (requireCompact) assert.ok(axes.every(axis => axis.gutter < 96), 'Short labels must not reserve the old 96px fixed gutter.')
+    }
     const waitForSynchronizedViewports = async (previous, mode) => {
       await page.waitForFunction(({ previous, mode }) => {
         const charts = [...document.querySelectorAll('[data-chart-inst]')]
@@ -162,14 +186,17 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
       return viewports()
     }
     const initial = await waitForSynchronizedViewports(null, null)
+    await assertAxisLayout(true)
     await page.locator('[data-chart-plot]').nth(1).evaluate(plot => plot.dispatchEvent(new WheelEvent('wheel', { deltaY: 240, bubbles: true, cancelable: true })))
     const panned = await waitForSynchronizedViewports(initial, 'pan')
+    await assertAxisLayout()
     // Zooming any one chart changes candle width in all three.
     await page.locator('[data-chart-plot]').nth(2).evaluate(plot => {
       const rect = plot.getBoundingClientRect()
       plot.dispatchEvent(new WheelEvent('wheel', { ctrlKey: true, deltaY: -19, clientX: rect.left + rect.width * .4, bubbles: true, cancelable: true }))
     })
     await waitForSynchronizedViewports(panned, 'zoom')
+    await assertAxisLayout()
     // Return to the latest time and verify all three resume native updates.
     await page.locator('[data-chart-plot]').first().evaluate(plot => plot.dispatchEvent(new WheelEvent('wheel', { deltaX: 100_000, bubbles: true, cancelable: true })))
     await waitForSynchronizedViewports(null, null)
@@ -177,10 +204,11 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
     await page.evaluate(() => { location.hash = '#/settings/workspace' })
     await page.getByRole('main', { name: 'Settings', exact: true }).getByRole('link', { name: 'Settings', exact: true }).click()
     await page.waitForFunction(() => document.querySelectorAll('[data-multi-timeframe-charts] svg[data-rendered-inst]').length === 3)
-    await page.locator('[data-chart-plot]').first().evaluate(plot => plot.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true })))
+    await page.locator(`[aria-label="View ${eth} chart"]`).click()
     await page.waitForFunction(() => [...document.querySelectorAll('[data-chart-inst]')].every(chart => chart.__chartSnapshot?.instId === 'ETH-USDT-SWAP'))
     await ready(eth)
     await waitForSynchronizedViewports(null, null)
+    await assertAxisLayout()
     console.log('multiframe: ETH ready')
     await live(eth, 142.75, 40)
     // Observe the real capture while intercepting the final clipboard write so
@@ -249,6 +277,13 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
     const lightBackground = await assertCapture()
     assert.notDeepEqual(lightBackground, darkBackground, 'Capture must be checked against both theme backgrounds.')
+    // A sudden large move produces a much longer real-time percentage. All
+    // three axes must grow together rather than clipping or squeezing it.
+    const normalGutter = await page.locator('svg[data-rendered-inst]').first().evaluate(svg => svg.viewBox.baseVal.width - Number(svg.dataset.chartPlotRight) - 4)
+    await live(eth, 123_456_789, 50)
+    await page.waitForFunction(previous => [...document.querySelectorAll('svg[data-rendered-inst]')].every(svg =>
+      svg.viewBox.baseVal.width - Number(svg.dataset.chartPlotRight) - 4 > previous), normalGutter)
+    await assertAxisLayout()
     assert.equal(await page.getByRole('button', { name: 'Indicators', exact: true }).count(), 0)
     assert.equal(await page.getByRole('button', { name: 'Analyze Long', exact: true }).count(), 0)
     assert.deepEqual(errors, [])

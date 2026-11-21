@@ -26,10 +26,27 @@ import { getPresentation, usePresentation, usePresentedStore } from '@/presentat
 import { isPriceFresh, watchPriceFreshness, watchPriceCountdown } from '@/price-clock'
 import { sharedChartEnd, sharedChartGesture, sharedChartViewport, type SharedChartTime } from '@/chart-time-sync'
 
-const ChartTimeSync = createContext<{ value: SharedChartTime | null; setValue: React.Dispatch<React.SetStateAction<SharedChartTime | null>> } | null>(null)
+const ChartTimeSync = createContext<{ value: SharedChartTime | null; setValue: React.Dispatch<React.SetStateAction<SharedChartTime | null>>; gutter: number; reportGutter: (frame: RadarTimeframe, epoch: object | null, width: number | null) => void } | null>(null)
 export function ChartTimeSyncProvider({ children }: { children: React.ReactNode }) {
   const [value, setValue] = useState<SharedChartTime | null>(null)
-  return <ChartTimeSync.Provider value={{ value, setValue }}>{children}</ChartTimeSync.Provider>
+  const [gutter, setGutter] = useState(64)
+  const measurements = useRef(new Map<RadarTimeframe, { epoch: object; width: number }>())
+  const reportGutter = useCallback((frame: RadarTimeframe, epoch: object | null, width: number | null) => {
+    const previous = measurements.current.get(frame)
+    if (width === null) measurements.current.delete(frame)
+    else if (epoch) {
+      // Within one input epoch, changing the gutter can change which candle is
+      // visible and hence its rebased labels. Grow monotonically until stable;
+      // a new input epoch permits the gutter to shrink again.
+      const next = previous?.epoch === epoch ? Math.max(previous.width, width) : width
+      if (previous?.epoch === epoch && previous.width === next) return
+      measurements.current.set(frame, { epoch, width: next })
+    }
+    const widths = [...measurements.current.values()].map(item => item.width)
+    setGutter(widths.length ? Math.max(...widths) : 64)
+  }, [])
+  const context = useMemo(() => ({ value, setValue, gutter, reportGutter }), [value, gutter, reportGutter])
+  return <ChartTimeSync.Provider value={context}>{children}</ChartTimeSync.Provider>
 }
 
 const presentationActive = () => getPresentation().active
@@ -403,9 +420,11 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
   const zoomRef = useRef(zoom)
   const lastSourceBar = surface?.liveBar?.hour ?? surface?.bars.at(-1)?.hour
   const sharedEnd = sync?.value ? sharedChartEnd(sync.value, Date.now()) : null
+  const hasSync = sync !== null
   const viewport = useMemo(() => sync?.value && sharedEnd !== null && lastSourceBar !== undefined
-    ? { ...sharedChartViewport(sharedEnd, sync.value.spacing, intervalMS, lastSourceBar), fixedGutter: 96 }
-    : zoom ?? { spacing: CHART_DEFAULT_SPACING, offset: 0 }, [sync?.value, sharedEnd, lastSourceBar, intervalMS, zoom])
+    ? { ...sharedChartViewport(sharedEnd, sync.value.spacing, intervalMS, lastSourceBar), fixedGutter: sync.gutter }
+    : hasSync ? { ...(zoom ?? { spacing: CHART_DEFAULT_SPACING, offset: 0 }), fixedGutter: sync?.gutter }
+      : zoom ?? { spacing: CHART_DEFAULT_SPACING, offset: 0 }, [hasSync, sync?.value, sync?.gutter, sharedEnd, lastSourceBar, intervalMS, zoom])
   const overscan = chartOverscan(surface, chartController)
   const preparedPlot = chartPlot(displayedIndicators.window, plotSize, overscan, currentPriceTickSz, priceOnly, viewport)
   const bars = preparedPlot?.bars ?? surface?.bars ?? EMPTY_BARS
@@ -490,6 +509,24 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     ? chartPresentedWheelFraction(wheelFraction, view.pending && !requestedEndMatches ? requestedEnd : surface?.endHour, surface?.endHour, intervalMS) : 0
   const wheelContentOffset = chartWheelContentOffset(activeWheelFraction, plotGeometry?.barPitch ?? 0,
     Boolean(preparedPlot?.before), Boolean(preparedPlot?.after))
+  // Do not include the measured geometry or shared gutter in this epoch:
+  // both change as the shared width converges. New market data, navigation,
+  // fractional scrolling, and size changes invalidate the measurement.
+  const gutterEpoch = useMemo(() => ({ window: displayedIndicators.window, sync: sync?.value, fraction: activeWheelFraction, width: plotSize.width, height: plotSize.height, instId, timeframe }), [displayedIndicators.window, sync?.value, activeWheelFraction, plotSize.width, plotSize.height, instId, timeframe])
+  const reportGutter = sync?.reportGutter
+  useLayoutEffect(() => {
+    if (!reportGutter) return
+    if (!plotGeometry || !matchesSelection || !bars.length) { reportGutter(timeframe, null, null); return }
+    const ticks = chartPricePresentation(plotGeometry, wheelContentOffset).ticks.map(tick => tick.label)
+    const quote = surface?.liveBar && surface.liveBar.hour <= plotGeometry.endHour + intervalMS * 0.34 ? surface.liveBar : bars.at(-1)!
+    const change = formatCandleChange(quote.open, quote.close)
+    // PriceCountdown can exceed two minute digits for future-dated candles.
+    const seconds = Math.max(0, Math.floor((quote.hour + intervalMS - Date.now()) / 1000))
+    const minutes = Math.max(Math.ceil(intervalMS / 60_000), Math.floor(seconds / 60))
+    const countdown = `${String(minutes).padStart(2, '0')}:00`
+    reportGutter(timeframe, gutterEpoch, Math.ceil(Math.max(...[...ticks, change, countdown].map(legendWidth)) + 16))
+  }, [reportGutter, timeframe, gutterEpoch, plotGeometry, wheelContentOffset, matchesSelection, bars, surface?.liveBar, intervalMS])
+  useEffect(() => () => reportGutter?.(timeframe, null, null), [reportGutter, timeframe])
   const navigationId = useRef(instId)
   const navigationTask = useRef<object | null>(null)
   useLayoutEffect(() => {
