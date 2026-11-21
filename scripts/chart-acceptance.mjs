@@ -243,8 +243,8 @@ export function chartViewportX(reading, hour) {
   return reading.plotRight - reading.barWidth / 2 + (hour - reading.domainEnd) / reading.intervalMS * reading.barSpacing
 }
 
-export function assertChartViewport(reading, { fullSlots = 96, endHour } = {}) {
-  const expectedHours = chartViewportHours(reading)
+export function assertChartViewport(reading, { fullSlots = 96, endHour, availableThrough = Infinity } = {}) {
+  const expectedHours = chartViewportHours(reading).filter(hour => hour <= availableThrough)
   assert.ok(Number.isFinite(reading.visibleBars) && reading.visibleBars > 0, 'The chart must publish its continuous visible span.')
   if (fullSlots !== null) assert.equal(Math.floor(reading.visibleBars), fullSlots, 'The full-slot workload must match its calibrated viewport.')
   const full = fullSlots ?? Math.floor(reading.visibleBars)
@@ -1043,9 +1043,18 @@ export async function measureChartIntentLatency(page, { inputs, targets, require
 }
 
 export async function waitForLocalHistory(electron, page, fixture, timeframe = fixture.timeframe, { requireIndicators = false } = {}) {
-  await wheelBurst(page, { deltaY: 12 })
-  const deadline = Date.now() + 20_000
   const intervalMS = fixture.series[timeframe].intervalMS, warmEnd = fixture.end - intervalMS
+  const geometry = await page.locator('[data-acceptance-target] [data-chart-inst]').evaluate(chart => ({
+    edge: Number(chart.dataset.chartTimeEnd), spacing: Number(chart.dataset.chartBarSpacing),
+  }))
+  assert.ok(Number.isFinite(geometry.edge) && Number.isFinite(geometry.spacing) && geometry.spacing > 0)
+  // The shared edge starts after the latest candle and follows physical candle
+  // width; a fixed 12 px gesture does not necessarily enter history.
+  const warmEdge = warmEnd + intervalMS / 2
+  const distance = (geometry.edge - warmEdge) / intervalMS * geometry.spacing
+  assert.ok(distance > 0, 'The warm target must be behind the initial shared edge.')
+  await wheelBurst(page, { deltaY: distance })
+  const deadline = Date.now() + 20_000
   let resident = 0, historyFrame
   const calculatedReserve = () => historyFrame && historyFrame.bars >= resident && historyFrame.calculated === historyFrame.bars
     && historyFrame.first <= warmEnd - 95 * intervalMS && historyFrame.end >= warmEnd
@@ -1073,9 +1082,10 @@ export async function waitForLocalHistory(electron, page, fixture, timeframe = f
   }
   await page.evaluate(async () => { for (let frame = 0; frame < 2; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
   await assertCompleteChartViewport(page, fixture.instId, { endHour: warmEnd })
-  await wheelBurst(page, { deltaY: -12 })
+  // Go past the original edge to resume the shared live-follow state.
+  await wheelBurst(page, { deltaY: -distance - geometry.spacing })
   await waitForRendered(page, fixture, timeframe)
-  await assertCompleteChartViewport(page, fixture.instId, { endHour: fixture.end })
+  await assertCompleteChartViewport(page, fixture.instId, { endHour: fixture.end, availableThrough: fixture.end })
   return resident
 }
 

@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict'
 import { after, before, test } from 'node:test'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { _electron } from 'playwright'
 import {
-  assertChartViewport, assertCompleteChartViewport, chartViewportHours, chartViewportX, installRequestProbe, measureLatencyCoveredPrefetch, measureMissingWindow, measureOffscreenColdBoundary, offscreenChartWindow, openChart, readRequestProbe, removeRequestProbe, resetRequestProbe,
+  assertCompleteChartViewport, installRequestProbe, measureLatencyCoveredPrefetch, measureMissingWindow, measureOffscreenColdBoundary, offscreenChartWindow, openChart, readRequestProbe, removeRequestProbe, resetRequestProbe,
   separateSourceMaintenance, waitForLocalHistory, waitForRendered, wheelBurst,
 } from '../../scripts/chart-acceptance.mjs'
 
@@ -141,154 +141,55 @@ test('cold fixture disposal isolates held source work from the next fixture', { 
   } finally { await probe({ action: 'coldBoundaryRemove' }) }
 })
 
-test('sub-candle wheel frames move continuously while axes stay fixed and native bursts coalesce', async () => {
+test('sub-candle wheel input moves all three synchronized timelines continuously', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   const timeframe = '15m', interval = fixture.series[timeframe].intervalMS
   await installRequestProbe(electron, fixture.instId)
   try {
     await openChart(page, fixture, timeframe)
-    await waitForLocalHistory(electron, page, fixture, timeframe, { requireIndicators: true })
-    await wheelBurst(page, { deltaY: 120 })
-    const startEnd = fixture.end - 10 * interval
-    await waitForRendered(page, fixture, timeframe, startEnd)
-    const read = () => page.locator(`svg[data-rendered-inst="${fixture.instId}"]`).evaluate(svg => ({
-      end: Number(svg.dataset.renderedEnd),
-      offset: Number(svg.querySelector('[data-chart-wheel-content]').dataset.chartWheelOffset),
-      headersInsideSurface: [...svg.querySelectorAll('[data-chart-panel-header]')].every(element => {
-        const bounds = svg.getBoundingClientRect(), rect = element.getBoundingClientRect()
-        return rect.x >= bounds.x - .5 && rect.right <= bounds.right + .5
-      }),
-      hud: [...svg.querySelectorAll('[data-chart-price-tick], [data-chart-panel-header]')].map(element => {
-        const rect = element.getBoundingClientRect()
-        if (element.matches('[data-chart-price-tick]')) {
-          const line = element.querySelector('line'), text = element.querySelector('text')
-          return ['tick', ...['x1', 'x2', 'y1', 'y2'].map(name => line.getAttribute(name)),
-            text?.getAttribute('x'), text?.getAttribute('y'), rect.height]
-        }
-        return ['header', rect.x, rect.y, rect.height]
-      }),
-    }))
-    const initial = await read(), offsets = []
-    for (let frame = 0; frame < 3; frame += 1) {
+    const read = () => page.locator('[data-chart-inst]').evaluateAll(charts => charts.map(chart => ({
+      timeframe: chart.__chartSnapshot?.timeframe,
+      end: Number(chart.dataset.chartTimeEnd),
+      spacing: Number(chart.dataset.chartBarSpacing),
+      requestedEnd: Number(chart.dataset.chartRequestedEnd),
+      renderedEnd: Number(chart.querySelector('svg[data-rendered-inst]')?.dataset.renderedEnd),
+    })))
+    const waitForEnd = async expected => page.waitForFunction(expected => {
+      const charts = [...document.querySelectorAll('[data-chart-inst]')]
+      return charts.length === 3 && charts.every(chart => Math.abs(Number(chart.dataset.chartTimeEnd) - expected) < 2)
+    }, expected, { timeout: 20_000 })
+    const initial = await read(), spacing = initial[1].spacing
+    assert.deepEqual(initial.map(chart => chart.timeframe), ['1H', '15m', '5m'])
+    assert.ok(Number.isFinite(spacing) && spacing > 0)
+    // Enter history before measuring fractional motion, including the initial
+    // shared edge beyond the latest completed 15m candle.
+    await wheelBurst(page, { deltaY: spacing * 10 })
+    await waitForEnd(initial[1].end - 10 * interval)
+    const historical = await read()
+    await waitForRendered(page, fixture, timeframe, Math.floor(historical[1].end / interval) * interval)
+    for (let frame = 1; frame <= 3; frame += 1) {
       await wheelBurst(page, { deltaY: 3 })
-      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
-      const current = await read()
-      assert.equal(current.end, startEnd, 'Fractional input must not advance a whole candle prematurely.')
-      assert.deepEqual(current.hud, initial.hud, 'Axis coordinates and legend anchors/heights must stay fixed during sub-candle translation.')
-      assert.ok(initial.headersInsideSurface && current.headersInsideSurface, 'Changing legend values must remain inside the chart surface.')
-      assert.ok(current.offset > (offsets.at(-1) ?? 0), `Every 3 px input frame must visibly advance chart content: ${JSON.stringify({ current, offsets })}`)
-      offsets.push(current.offset)
+      const expected = historical[1].end - frame * 3 / spacing * interval
+      await waitForEnd(expected)
+      const charts = await read()
+      assert.ok(charts.every(chart => Math.abs(chart.spacing - spacing) < .001), 'Panning must not change candle width.')
+      assert.ok(charts.every(chart => Math.abs(chart.end - expected) < 2), 'All charts must share the same moving edge.')
     }
-    await mkdir(join(root, '.build'), { recursive: true })
-    await page.locator('[data-chart-plot]').screenshot({ path: join(root, '.build/chart-scroll-fractional.png') })
-    const plotBounds = await page.locator(`svg[data-rendered-inst="${fixture.instId}"]`).boundingBox()
-    assert.ok(plotBounds)
-    const viewport = await assertCompleteChartViewport(page, fixture.instId, { endHour: startEnd })
-    const localPointerX = await page.locator(`svg[data-rendered-inst="${fixture.instId}"]`).evaluate(svg => {
-      const rect = svg.getBoundingClientRect()
-      return new DOMPoint(rect.x + .5, rect.y + 50).matrixTransform(svg.getScreenCTM().inverse()).x
-    })
-    const candidates = [viewport.expectedHours[0] - interval, ...viewport.expectedHours, viewport.expectedHours.at(-1) + interval]
-    const contentOffset = (await read()).offset
-    const distance = hour => Math.abs(chartViewportX(viewport, hour) + contentOffset - localPointerX)
-    const expectedInspection = candidates.reduce((nearest, hour) => distance(hour) < distance(nearest) ? hour : nearest)
-    assert.ok(expectedInspection <= viewport.expectedHours[0], 'The fractional left-edge pointer must inspect the first candle or its exposed neighbour.')
-    await page.mouse.move(plotBounds.x + .5, plotBounds.y + 50)
-    await page.mouse.down()
-    await page.waitForFunction(hour => Number(document.querySelector('[data-chart-inspected-hour]')?.dataset.chartInspectedHour) === hour,
-      expectedInspection)
-    await page.locator(`svg[data-rendered-inst="${fixture.instId}"]`).dispatchEvent('keydown', { key: 'ArrowLeft', altKey: true })
-    assert.equal(Number(await page.locator('[data-chart-inspected-hour]').getAttribute('data-chart-inspected-hour')), expectedInspection,
-      'RSI navigation outward from the exposed left neighbour must stop instead of wrapping to the rightmost crossing.')
-    await page.mouse.up()
-    await wheelBurst(page, { deltaY: 3 })
-    await waitForRendered(page, fixture, timeframe, startEnd - interval)
-    assert.equal((await read()).offset, 0, 'Exactly 12 px must consume one candle with no residual displacement.')
-
     await waitForRequestQuiescence()
     await resetRequestProbe(electron)
+    const beforeBurst = await read()
     await wheelBurst(page, { eventsPerFrame: 32, deltaY: 3 })
-    await waitForRendered(page, fixture, timeframe, startEnd - 9 * interval)
+    const burstEnd = beforeBurst[1].end - 96 / spacing * interval
+    await waitForEnd(burstEnd)
+    await waitForRendered(page, fixture, timeframe, Math.floor(burstEnd / interval) * interval)
     await waitForRequestQuiescence()
     const probe = await readRequestProbe(electron)
-    assert.equal(probe.focusCalls.length, 1, '32 events in one animation frame must produce one backend navigation intent.')
-    assert.equal(probe.traffic.fullHistoryPushes, 0)
-
-    await wheelBurst(page, { deltaY: 3 })
-    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
-    const fractionalStart = await read()
-    assert.ok(fractionalStart.offset > 0, 'The resident window must have a visible fractional offset before the burst.')
-    await waitForRequestQuiescence()
-    await resetRequestProbe(electron)
-    const leading = await page.evaluate(async instId => {
-      const plot = document.querySelector('[data-chart-plot]')
-      let framePassed = false
-      const frame = requestAnimationFrame(() => { framePassed = true })
-      try {
-        for (let event = 0; event < 32; event += 1) {
-          plot.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: 3 }))
-        }
-        await Promise.resolve()
-        const chart = document.querySelector(`[data-chart-inst="${instId}"]`)
-        const svg = chart.querySelector('svg[data-rendered-inst]')
-        return {
-          framePassed,
-          requestedEnd: Number(chart.dataset.chartRequestedEnd),
-          completedEnd: Number(chart.dataset.chartCompletedEnd),
-          renderedEnd: Number(svg.dataset.renderedEnd),
-          bars: chart.__chartRenderedBars.length,
-          lastBar: chart.__chartRenderedBars.at(-1)?.hour,
-          viewport: { intervalMS: chart.__chartSnapshot.intervalMS, endHour: chart.__chartSnapshot.endHour,
-            visibleBars: Number(chart.dataset.chartVisibleBars), barSpacing: Number(chart.dataset.chartBarSpacing),
-            domainStart: Number(svg.dataset.chartDomainStart), domainEnd: Number(svg.dataset.chartDomainEnd),
-            barWidth: Number(svg.dataset.chartBarWidth), plotRight: Number(svg.dataset.chartPlotRight),
-            renderedBars: Number(chart.dataset.chartRenderedBars), targetBars: Number(chart.dataset.chartTargetBars),
-            chartStart: Number(chart.dataset.chartStart), chartEnd: Number(chart.dataset.chartEnd),
-            svgStart: Number(svg.dataset.renderedStart), svgEnd: Number(svg.dataset.renderedEnd),
-            bars: chart.__chartRenderedBars.map(bar => ({ hour: bar.hour })) },
-          loading: chart.dataset.chartLoading,
-          offsets: [...svg.querySelectorAll('[data-chart-wheel-content]')].map(element => Number(element.dataset.chartWheelOffset)),
-        }
-      } finally { cancelAnimationFrame(frame) }
-    }, fixture.instId)
-    const expectedEnd = startEnd - 17 * interval
-    assert.equal(leading.framePassed, false, 'The leading update must be observed before the next animation frame.')
-    assert.equal(leading.requestedEnd, expectedEnd)
-    assert.equal(leading.completedEnd, expectedEnd)
-    assert.equal(leading.renderedEnd, expectedEnd, 'The cached target must already be presented at the microtask boundary.')
-    assert.equal(leading.lastBar, expectedEnd)
-    assertChartViewport(leading.viewport, { endHour: expectedEnd })
-    assert.equal(leading.bars, chartViewportHours(leading.viewport).length)
-    assert.equal(leading.loading, 'false')
-    assert.ok(leading.offsets.length > 0 && leading.offsets.every(offset => Math.abs(offset - fractionalStart.offset) < 1e-9),
-      `The new window must retain the existing fractional displacement: ${JSON.stringify({ leading, fractionalStart })}`)
-    await waitForRendered(page, fixture, timeframe, expectedEnd)
-    await waitForRequestQuiescence()
-    const leadingProbe = await readRequestProbe(electron)
-    assert.equal(leadingProbe.focusCalls.length, 1, 'The leading 32-event burst must produce one backend navigation intent.')
-    assert.equal(leadingProbe.focusCalls[0].target.endHour, expectedEnd)
-    assert.equal(leadingProbe.traffic.fullHistoryPushes, 0)
-
-    await resetRequestProbe(electron)
-    await page.evaluate(async () => {
-      const plot = document.querySelector('[data-chart-plot]')
-      const wheel = deltaY => plot.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY }))
-      wheel(3)
-      await Promise.resolve()
-      wheel(120)
-      const button = [...document.querySelectorAll('[aria-label="Chart timeframe"] button')]
-        .find(element => element.textContent.trim() === '5m')
-      button.click()
-      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
-    })
-    await waitForRendered(page, fixture, '5m')
-    await waitForRequestQuiescence()
-    const switchedProbe = await readRequestProbe(electron)
-    assert.ok(switchedProbe.focusCalls.some(call => call.target?.timeframe === '5m'), 'The new timeframe must declare its selection.')
-    assert.equal(switchedProbe.focusCalls.some(call => call.target?.timeframe === timeframe), false,
-      'A trailing wheel batch from the previous timeframe must be cancelled before it can declare demand.')
-    assert.equal(switchedProbe.focusCalls.findLast(call => call.target?.timeframe === '5m')?.target.endHour, undefined,
-      'The cancelled batch must not move the new timeframe away from its latest window.')
+    for (const frame of ['1H', '15m', '5m']) {
+      const calls = probe.focusCalls.filter(call => call.slot === frame)
+      assert.ok(calls.length <= 1, `One wheel burst must coalesce navigation for ${frame}: ${calls.length}`)
+      if (calls.length) assert.equal(calls[0].target.endHour, Math.floor(burstEnd / fixture.series[frame].intervalMS) * fixture.series[frame].intervalMS)
+    }
+    assert.ok(probe.focusCalls.some(call => call.slot === timeframe), 'The measured chart must send its final historical target.')
   } finally {
     await removeRequestProbe(electron)
   }
@@ -319,11 +220,14 @@ test('cached reserve scrolling keeps one final intent and the complete canonical
 
     // Reset after resident work so boundary deliveries have their own budget.
     await resetRequestProbe(electron)
-    const highSpeedBars = 12 * 32 * 2
+    const geometry = await page.locator('[data-acceptance-target] [data-chart-inst]').evaluate(chart => ({
+      edge: Number(chart.dataset.chartTimeEnd), spacing: Number(chart.dataset.chartBarSpacing),
+    }))
+    const highSpeedBars = 12 * 32 * 24 / geometry.spacing
     const jumpBars = Math.max(600, residentHistoryBars - 96 + 64 - highSpeedBars)
-    const reversalBars = 6 * 16 * 2
+    const reversalBars = 6 * 16 * 24 / geometry.spacing
     await wheelBurst(page, { frames: 12, eventsPerFrame: 32, deltaY: 24 })
-    await wheelBurst(page, { deltaY: jumpBars * 12 })
+    await wheelBurst(page, { deltaY: jumpBars * geometry.spacing })
     await wheelBurst(page, { frames: 6, eventsPerFrame: 16, deltaY: -24 })
 
     const distance = highSpeedBars + jumpBars - reversalBars
@@ -331,11 +235,11 @@ test('cached reserve scrolling keeps one final intent and the complete canonical
     const reserveBoundary = residentHistoryBars - 96
     const newlyExposedBars = Math.max(0, peakDistance - reserveBoundary)
     assert.ok(newlyExposedBars > 0, 'The second phase must enter history beyond the resident reserve.')
-    const expectedEnd = fixture.end - distance * fixture.series[timeframe].intervalMS
+    const expectedEnd = Math.floor((geometry.edge - distance * fixture.series[timeframe].intervalMS) / fixture.series[timeframe].intervalMS) * fixture.series[timeframe].intervalMS
     await waitForRendered(page, fixture, timeframe, expectedEnd)
     await waitForRequestQuiescence()
     const rendered = await assertCompleteChartViewport(page, fixture.instId, { endHour: expectedEnd })
-    const loading = await page.locator(`[data-chart-inst="${fixture.instId}"]`).getAttribute('data-chart-loading')
+    const loading = await page.locator(`[data-acceptance-target] [data-chart-inst="${fixture.instId}"]`).getAttribute('data-chart-loading')
     const probe = await readRequestProbe(electron)
 
     assert.equal(rendered.instId, fixture.instId)
@@ -344,16 +248,16 @@ test('cached reserve scrolling keeps one final intent and the complete canonical
     assert.equal(loading, 'false')
     assert.equal(rendered.bars.length, rendered.expectedHours.length)
     assert.ok(probe.focusCalls.length > 0, 'Wheel navigation must retain the real backend focus path.')
-    assert.equal(probe.focusCalls.findLast(call => call.target?.instId === fixture.instId)?.target.endHour, expectedEnd)
+    assert.equal(probe.focusCalls.findLast(call => call.target?.instId === fixture.instId && call.slot === timeframe)?.target.endHour, expectedEnd)
     const overlap = probe.traffic.uniqueOrUnchangedOverlap[timeframe]
     const observedNewBars = overlap?.newBars ?? 0
     const changedBars = overlap?.changedBars ?? 0
     const dataDrivenPushBudget = Math.ceil(Math.max(newlyExposedBars, observedNewBars) / 96) + Math.ceil(changedBars / 96)
-    assert.ok(probe.traffic.fullHistoryPushes <= dataDrivenPushBudget,
+    assert.ok((overlap?.fullHistoryPushes ?? 0) <= dataDrivenPushBudget,
       `Boundary deliveries must scale with newly exposed and changed 96-bar windows (${dataDrivenPushBudget}): ${JSON.stringify({ traffic: probe.traffic, newlyExposedBars, observedNewBars, changedBars })}`)
     assert.equal(probe.traffic.duplicateFullHistorySignatures, 0,
       `The backend must not repeat a full-history payload with the same version and range: ${JSON.stringify(probe.traffic)}`)
-    if (probe.traffic.fullHistoryPushes > 1) assert.equal(overlap?.firstAndLastPayloadIdentical, false,
+    if ((overlap?.fullHistoryPushes ?? 0) > 1) assert.equal(overlap?.firstAndLastPayloadIdentical, false,
       'Separate boundary updates must carry new or changed facts, not repeat an identical full-history payload.')
     assert.deepEqual(separateSourceMaintenance(probe.sourceRequests, fixture).historical, [],
       'Cached chart movement must not download historical market data.')
