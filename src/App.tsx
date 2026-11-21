@@ -52,6 +52,17 @@ const MarketRowView = memo(function MarketRowView({ row, index, selected, lookba
 })
 
 function App() {
+  const statusRow = useRef<HTMLElement>(null)
+  const [statusHeight, setStatusHeight] = useState(0)
+  useLayoutEffect(() => {
+    const row = statusRow.current
+    if (!row) return
+    const update = () => setStatusHeight(row.offsetHeight)
+    update()
+    const observer = new ResizeObserver(update)
+    observer.observe(row)
+    return () => observer.disconnect()
+  }, [])
   const settingsGuard = useRef<SettingsNavigationState>({ dirty: false, busy: false })
   const settingsSection = useSettingsSection(settingsGuard)
   const lastVisibleSettings = useRef(settingsSection)
@@ -382,13 +393,23 @@ function App() {
     if (value) issues.push({ id: frame, label: timeframeLabel(frame), ...value, frame })
   }
   const rankedIssues = [...issues].sort((a, b) => ({ error: 0, warning: 1, info: 2 }[a.severity] - { error: 0, warning: 1, info: 2 }[b.severity]))
-  const primaryIssue = rankedIssues[0]
-  const statusText = primaryIssue ? `${rankedIssues.length > 1 ? `${rankedIssues.length} updates · ` : ''}${primaryIssue.label}: ${primaryIssue.detail}` : updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString('en-US')}` : 'Waiting for market data'
+  const errorKey = JSON.stringify(rankedIssues.filter(issue => issue.severity === 'error').map(({ id, label, detail }) => ({ id, label, detail })))
+  const previousErrors = useRef(new Map<string, string>())
+  const [errorAnnouncement, setErrorAnnouncement] = useState('')
+  useLayoutEffect(() => {
+    const errors = JSON.parse(errorKey) as { id: string; label: string; detail: string }[]
+    const added = errors.filter(error => !previousErrors.current.has(error.id))
+    const changed = errors.filter(error => previousErrors.current.get(error.id) !== error.detail)
+    if (added.length && statusRow.current) statusRow.current.scrollTop = 0
+    setErrorAnnouncement(changed.map(error => `${error.label}: ${error.detail}`).join('. '))
+    previousErrors.current = new Map(errors.map(error => [error.id, error.detail]))
+  }, [errorKey])
+  const statusText = updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString('en-US')}` : 'Waiting for market data'
 
   return <WorkspaceViewport>
     <div className="relative flex h-full min-w-0 flex-1">
     <div hidden={settingsSection !== null} inert={settingsSection !== null} className={cn('h-full min-w-0 flex-1', settingsSection === null ? 'flex' : 'hidden')}>
-    <aside data-market-list className="flex h-full w-[var(--market-list-width)] shrink-0 flex-col border-r pb-7" aria-label="Contract list">
+    <aside data-market-list className="flex w-[var(--market-list-width)] shrink-0 flex-col border-r" style={{ height: `calc(100% - ${statusHeight}px)` }} aria-label="Contract list">
       <header data-sidebar-toolbar data-window-toolbar data-window-drag-region data-native-window-controls-row className="flex items-center gap-3 border-b px-4"><h1 className="min-w-0 flex-1 truncate text-sm font-medium">Perpetual Swap Suite</h1><a ref={settingsLauncher} href={settingsHref('workspace')} aria-label="Settings" title="Settings" className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}><Settings2 aria-hidden="true" /></a></header>
       <section data-market-scroll className="min-h-0 flex-1 overflow-y-auto [&>[data-slot=table-container]]:overflow-visible" aria-label="Perpetual swap markets">
         <Table className="table-fixed [&_tr:not([data-virtual-spacer])>:first-child]:pl-4 [&_tr:not([data-virtual-spacer])>:last-child]:pr-4" data-market-count={visible.length} data-total-market-count={rows.length} aria-rowcount={visible.length + 1}>
@@ -418,18 +439,20 @@ function App() {
       </div> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}
     </section>
     </div>
-    {lastVisibleSettings.current && <div hidden={!settingsSection} inert={!settingsSection} className={cn('h-full min-w-0 flex-1 pb-7', settingsSection ? 'flex' : 'hidden')}><DeferredPanel name="Settings" className="p-4 pb-8" onClose={() => { window.location.hash = '#/' }}><WorkspaceSettings section={settingsSection ?? lastVisibleSettings.current} active={settingsSection !== null} preferences={preferences} loaded={preferencesLoaded} loadError={preferencesError} onSave={savePreferences} onNavigationStateChange={updateSettingsGuard} onStatusChange={updateSettingsStatuses} onJobSnapshot={receiveSettingsJob} /></DeferredPanel></div>}
-    <footer data-market-status-row className="absolute bottom-0 left-0 z-20 w-[var(--market-list-width)] max-w-full bg-background px-4 py-1 text-xs text-muted-foreground">
-      <details className="relative">
-        <summary data-status-trigger className={cn('cursor-pointer list-none truncate focus-visible:outline-2 focus-visible:outline-ring', primaryIssue?.severity === 'error' && 'text-destructive')} title={statusText}>
-          <span data-market-status role={primaryIssue ? 'status' : undefined} aria-live={primaryIssue ? 'polite' : 'off'}>{statusText}</span>
-        </summary>
-        <div className="absolute bottom-full left-0 z-30 w-full pb-2">
-          <div data-status-details className="max-h-64 overflow-y-auto rounded-md border bg-popover p-3 text-popover-foreground shadow-md">
-            {rankedIssues.length ? rankedIssues.map(issue => <p key={issue.id} data-chart-shared-status-item={issue.frame} data-timeframe={issue.frame} data-chart-status={issue.frame !== undefined ? '' : undefined} className={cn('break-words py-1', issue.severity === 'error' && 'text-destructive')}><span className="font-medium">{issue.label}: </span>{issue.detail}</p>) : <p>{statusText}</p>}
-          </div>
-        </div>
-      </details>
+    {lastVisibleSettings.current && <div hidden={!settingsSection} inert={!settingsSection} className={cn('min-w-0 flex-1', settingsSection ? 'flex' : 'hidden')} style={{ height: `calc(100% - ${statusHeight}px)` }}><DeferredPanel name="Settings" className="p-4 pb-8" onClose={() => { window.location.hash = '#/' }}><WorkspaceSettings section={settingsSection ?? lastVisibleSettings.current} active={settingsSection !== null} preferences={preferences} loaded={preferencesLoaded} loadError={preferencesError} onSave={savePreferences} onNavigationStateChange={updateSettingsGuard} onStatusChange={updateSettingsStatuses} onJobSnapshot={receiveSettingsJob} /></DeferredPanel></div>}
+    <footer ref={statusRow} data-market-status-row tabIndex={0} aria-label="Application status" onKeyDown={event => {
+      const row = event.currentTarget
+      if (row.scrollHeight <= row.clientHeight) return
+      const offset = event.key === 'ArrowDown' ? row.clientHeight / 4 : event.key === 'ArrowUp' ? -row.clientHeight / 4
+        : event.key === 'PageDown' ? row.clientHeight : event.key === 'PageUp' ? -row.clientHeight : null
+      if (offset !== null) { event.preventDefault(); row.scrollTop += offset }
+      else if (event.key === 'Home' || event.key === 'End') { event.preventDefault(); row.scrollTop = event.key === 'Home' ? 0 : row.scrollHeight }
+    }} className="absolute bottom-0 left-0 z-20 max-h-[40%] w-[var(--market-list-width)] max-w-full overflow-y-auto bg-background px-4 py-1 text-xs text-muted-foreground focus-visible:outline-2 focus-visible:outline-ring">
+      <span role="status" aria-atomic="true" className="sr-only">{errorAnnouncement}</span>
+      <div data-status-details data-market-status>
+        {rankedIssues.map(issue => <p key={issue.id} role={issue.severity === 'error' ? undefined : 'status'} aria-atomic="true" data-chart-shared-status-item={issue.frame} data-timeframe={issue.frame} data-chart-status={issue.frame !== undefined ? '' : undefined} className={cn('break-words py-1', issue.severity === 'error' && 'text-destructive')}><span className="font-medium">{issue.label}: </span>{issue.detail}</p>)}
+        <p aria-live="off">{statusText}</p>
+      </div>
     </footer>
     </div>
   </WorkspaceViewport>
