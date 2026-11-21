@@ -52,7 +52,7 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
       assert.equal(await page.locator('[data-multi-timeframe-charts] [data-chart-summary]').count(), 0, 'Charts must not reserve a separate title or status row.')
       assert.equal(await page.locator('[data-shared-chart-status]').count(), 0, 'The chart toolbar does not duplicate status messages.')
       const footer = page.locator('[data-market-status-row]')
-      assert.equal(await footer.evaluate(node => getComputedStyle(node).borderTopWidth), '0px', 'The status area has no top divider.')
+      assert.equal(await footer.evaluate(node => getComputedStyle(node).borderTopWidth), '1px', 'The status area is separated from the contract list.')
       assert.equal(await footer.getByText(/^\d+ contracts$/).count(), 0, 'The status area does not show a contract count.')
       assert.equal(await footer.locator('[data-status-trigger], details, summary').count(), 0, 'Status information is shown without an expand action.')
       assert.equal(await footer.locator('[data-status-details]').isVisible(), true, 'The shared status information is visible by default.')
@@ -304,10 +304,45 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
       }, captured)
       assert.ok(masked.blank, 'The entire button, including its border, must match the toolbar background in the copied image.')
       assert.equal(captured.title, 'ETH-USDT', 'The copied image must identify its contract.')
+      // Compare the restored pixels against a reference capture of the same
+      // chart with the panel hidden in the test only. The live copy path keeps
+      // the panel visible and usable throughout the asynchronous request.
+      const reference = await page.evaluate(async bounds => {
+        const overlay = document.querySelector('[data-market-overlay]')
+        const rect = overlay.getBoundingClientRect()
+        overlay.style.visibility = 'hidden'
+        try {
+          await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+          const image = await window.radarDesktop.request({ captureChart: { ...bounds, output: 'png' } })
+          return { image: image.imageDataURL, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }, chartTop: document.querySelector('svg[data-rendered-inst]').getBoundingClientRect().top }
+        } finally { overlay.style.removeProperty('visibility') }
+      }, captured.bounds)
+      const comparison = await page.evaluate(async ({ captured, reference }) => {
+        const load = async src => { const image = new Image(); image.src = src; await image.decode(); return image }
+        const [actual, expected] = await Promise.all([load(captured.image), load(reference.image)])
+        const canvas = document.createElement('canvas'); canvas.width = actual.naturalWidth; canvas.height = actual.naturalHeight
+        const ctx = canvas.getContext('2d'); ctx.drawImage(actual, 0, 0); const a = ctx.getImageData(0, 0, canvas.width, canvas.height).data
+        ctx.clearRect(0, 0, canvas.width, canvas.height); ctx.drawImage(expected, 0, 0); const b = ctx.getImageData(0, 0, canvas.width, canvas.height).data
+        const sx = canvas.width / (Math.ceil(captured.bounds.x + captured.bounds.width) - Math.floor(captured.bounds.x))
+        const sy = canvas.height / (Math.ceil(captured.bounds.y + captured.bounds.height) - Math.floor(captured.bounds.y))
+        const x0 = Math.max(0, Math.ceil((reference.rect.x - 16 - captured.bounds.x) * sx)), x1 = Math.min(canvas.width, Math.floor((reference.rect.x + reference.rect.width + 16 - captured.bounds.x) * sx))
+        const y0 = Math.max(0, Math.ceil((Math.max(reference.chartTop, reference.rect.y - 16) - captured.bounds.y) * sy)), y1 = Math.min(canvas.height, Math.floor((reference.rect.y + reference.rect.height + 16 - captured.bounds.y) * sy))
+        let different = 0, total = 0
+        for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
+          const i = (y * canvas.width + x) * 4
+          if (Math.max(...[0, 1, 2].map(channel => Math.abs(a[i + channel] - b[i + channel]))) > 30) different++
+          total++
+        }
+        return { different, total }
+      }, { captured, reference })
+      assert.ok(comparison.total > 0 && comparison.different / comparison.total < .03, `Restored chart pixels must match the unobstructed chart: ${JSON.stringify(comparison)}`)
       return masked.background
     }
     await page.emulateMedia({ colorScheme: 'dark' })
     const darkBackground = await assertCapture()
+    await page.getByRole('button', { name: 'Hide contract list' }).click()
+    await assertCapture()
+    await page.getByRole('button', { name: /^Show contract list/ }).click()
     await page.emulateMedia({ colorScheme: 'light' })
     await page.setViewportSize({ width: 1373, height: 917 })
     await page.waitForFunction(() => [...document.querySelectorAll('[data-chart-inst]')].every(chart => chart.dataset.chartLoading === 'false'))

@@ -1212,7 +1212,7 @@ test('constant Bollinger bands stay finite and negative lower bands retain the r
   } finally { await publishMode('standard') }
 })
 
-test('contract overlay can be collapsed without covering chart controls', async () => {
+test('contract overlay can be collapsed while chart remains full width', async () => {
   const overlay = page.locator('[data-market-overlay]')
   const chart = page.locator('[data-chart-capture]')
   const before = await chart.boundingBox()
@@ -1225,7 +1225,7 @@ test('contract overlay can be collapsed without covering chart controls', async 
   assert.equal(await page.locator('[data-market-list]').isVisible(), false)
   const after = await chart.boundingBox()
   const panel = await overlay.boundingBox()
-  assert.ok(after.width > before.width && panel.x + panel.width <= after.x + 1)
+  assert.ok(Math.abs(after.width - before.width) < 1 && before.x === 0 && after.x === 0 && panel.x > after.x)
   await page.keyboard.press('Enter')
   assert.equal(await hide.evaluate(node => document.activeElement === node), true)
   assert.equal(await page.locator('[data-market-list]').isVisible(), true)

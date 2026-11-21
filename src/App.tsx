@@ -2,7 +2,7 @@ import { lazy, memo, useCallback, useEffect, useLayoutEffect, useRef, useState }
 import { DeferredPanel } from '@/DeferredPanel'
 import { Camera, PanelLeftClose, PanelLeftOpen, Settings2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { captureStableChart, chartCaptureBounds, eraseCapturedAction } from '@/chart-capture'
+import { captureStableChart, chartCaptureBounds, eraseCapturedAction, snapshotCoveredCharts } from '@/chart-capture'
 import { buttonVariants } from '@/components/ui/button'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
@@ -317,6 +317,7 @@ function App() {
     marketTogglePending.current = true
     setMarketExpanded(value => !value)
   }
+  const marketOverlayRef = useRef<HTMLDivElement>(null)
   const chartsRef = useRef<HTMLDivElement>(null)
   const copyButtonRef = useRef<HTMLButtonElement>(null)
   const copyOwner = useRef<object | null>(null)
@@ -347,8 +348,15 @@ function App() {
       const bounds = chartCaptureBounds(element)
       const buttonBounds = button.getBoundingClientRect()
       const content = element.innerHTML
+      const overlay = marketOverlayRef.current
+      if (!overlay) throw new Error('Contract list is unavailable.')
+      const overlayBounds = overlay.getBoundingClientRect()
+      const overlayExpanded = marketExpanded
+      const coveredCharts = snapshotCoveredCharts(element, overlayBounds)
       const current = () => {
-        if (copyOwner.current !== owner || chartsRef.current !== element || copyButtonRef.current !== button || element.innerHTML !== content) return false
+        if (copyOwner.current !== owner || chartsRef.current !== element || copyButtonRef.current !== button || element.innerHTML !== content || marketOverlayRef.current !== overlay) return false
+        const overlayRect = overlay.getBoundingClientRect()
+        if (overlay.dataset.expanded !== String(overlayExpanded) || overlayRect.x !== overlayBounds.x || overlayRect.y !== overlayBounds.y || overlayRect.width !== overlayBounds.width || overlayRect.height !== overlayBounds.height) return false
         const rect = element.getBoundingClientRect()
         const action = button.getBoundingClientRect()
         return rect.x === bounds.x && rect.y === bounds.y && rect.width === bounds.width && rect.height === bounds.height
@@ -358,7 +366,7 @@ function App() {
       if (copyOwner.current !== owner) return
       if (!current()) throw new Error('Chart changed during capture. Start again.')
       const background = getComputedStyle(document.documentElement).getPropertyValue('--background')
-      const dataURL = await eraseCapturedAction(image.imageDataURL, bounds, buttonBounds, background)
+      const dataURL = await eraseCapturedAction(image.imageDataURL, bounds, buttonBounds, background, coveredCharts)
       if (copyOwner.current !== owner) return
       if (!current()) throw new Error('Chart changed during capture. Start again.')
       const result = await window.radarDesktop.request({ copyImage: dataURL })
@@ -422,8 +430,7 @@ function App() {
   return <WorkspaceViewport>
     <div className="relative flex h-full min-w-0 flex-1">
     <span role="status" aria-atomic="true" className="sr-only">{errorAnnouncement}</span>
-    {settingsSection === null && <div data-window-drag-region className={cn("absolute left-0 top-0 h-[var(--window-toolbar-height)]", marketExpanded ? "w-[var(--space-market-expanded)]" : "w-[var(--space-market-collapsed)]")} />}
-    <div data-market-overlay data-expanded={marketExpanded} className={cn("absolute left-4 z-20 flex max-w-[calc(100%-var(--space-8))] flex-col overflow-hidden rounded-lg border bg-background shadow-md", settingsSection === null ? marketExpanded ? "top-[calc(var(--window-toolbar-height)+var(--space-4))] h-[min(60%,calc(100%-var(--window-toolbar-height)-var(--space-8)))] w-[var(--market-list-width)]" : "top-[calc(var(--window-toolbar-height)+var(--space-4))]" : "bottom-0 max-h-[40%] w-[var(--market-list-width)]")}>
+    <div ref={marketOverlayRef} data-market-overlay data-expanded={marketExpanded} className={cn("absolute left-4 z-20 flex max-w-[calc(100%-var(--space-8))] flex-col overflow-hidden rounded-lg border bg-background shadow-md", settingsSection === null ? marketExpanded ? "top-[calc(var(--window-toolbar-height)+var(--space-4))] h-[min(60%,calc(100%-var(--window-toolbar-height)-var(--space-8)))] w-[var(--market-list-width)]" : "top-[calc(var(--window-toolbar-height)+var(--space-4))]" : "bottom-0 max-h-[40%] w-[var(--market-list-width)]")}>
     {settingsSection === null && !marketExpanded && <Button ref={marketToggleRef} variant="ghost" size="icon-sm" aria-label={rankedIssues.length ? `Show contract list (${rankedIssues.length} status messages)` : "Show contract list"} title={rankedIssues.length ? `${rankedIssues.length} status messages` : "Show contract list"} aria-expanded={false} onClick={toggleMarket}><PanelLeftOpen aria-hidden="true" />{rankedIssues.length > 0 && <span aria-hidden="true" className="absolute right-1 top-1 size-1.5 rounded-full bg-foreground" />}</Button>}
     <aside data-market-list hidden={settingsSection !== null || !marketExpanded} inert={settingsSection !== null || !marketExpanded} className={cn("min-h-0 flex-1 flex-col", settingsSection === null && marketExpanded ? "flex" : "hidden")} aria-label="Contract list">
       <header data-sidebar-toolbar data-window-toolbar data-window-drag-region className="flex items-center gap-3 border-b px-4"><h1 className="min-w-0 flex-1 truncate text-sm font-medium">Perpetual Swap Suite</h1><a ref={settingsLauncher} href={settingsHref('workspace')} aria-label="Settings" title="Settings" className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}><Settings2 aria-hidden="true" /></a><Button ref={marketExpanded ? marketToggleRef : undefined} variant="ghost" size="icon-sm" aria-label="Hide contract list" aria-expanded={true} onClick={toggleMarket}><PanelLeftClose aria-hidden="true" /></Button></header>
@@ -452,7 +459,7 @@ function App() {
     </footer>
     </div>
     <div hidden={settingsSection !== null} inert={settingsSection !== null} className={cn('h-full min-w-0 flex-1', settingsSection === null ? 'flex' : 'hidden')}>
-    <section data-chart-panel data-market-expanded={marketExpanded} className={cn("h-full min-w-0 flex-1", marketExpanded ? "pl-[var(--space-market-expanded)]" : "pl-[var(--space-market-collapsed)]")} aria-label="Market chart workspace">
+    <section data-chart-panel className="h-full min-w-0 flex-1" aria-label="Market chart workspace">
       {selectedID ? <div data-chart-display-mode="multi" className="flex h-full min-h-0 flex-col">
         <span role="status" className="sr-only">{copyState.status === 'copying' ? 'Copying chart' : copyState.status === 'copied' ? 'Chart copied to clipboard' : ''}</span>
         <div ref={chartsRef} data-chart-capture className="flex min-h-0 flex-1 flex-col">

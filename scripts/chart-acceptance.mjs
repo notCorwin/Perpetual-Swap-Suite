@@ -160,11 +160,11 @@ export async function assertWorkspaceLayout(page) {
   assert.ok(layout.overlay && layout.chart, 'The contract overlay and chart must remain mounted together.')
   assert.ok(layout.overlay.x > 0 && layout.overlay.y > 0, 'The floating contract panel must have an inset from the window edges.')
   assert.ok(layout.overlay.x + layout.overlay.width <= layout.viewport.width && layout.overlay.y + layout.overlay.height <= layout.viewport.height, 'The floating panel must remain inside the window.')
-  assert.ok(layout.chart.y === 0 && Math.abs(layout.chart.height - layout.viewport.height) < 1, 'The chart workspace must fill the window height.')
+  assert.ok(layout.chart.x === 0 && layout.chart.y === 0 && Math.abs(layout.chart.width - layout.viewport.width) < 1 && Math.abs(layout.chart.height - layout.viewport.height) < 1, 'The chart workspace must fill the window.')
   if (layout.expanded) assert.ok(Math.abs(layout.overlay.width - Math.min(300, layout.viewport.width * .35)) < 2, 'The contract overlay must follow its responsive width token.')
   if (layout.toolbar) {
     assert.ok(layout.toolbar.y === 0 && Math.abs(layout.toolbar.height - 36) < 1, 'The chart toolbar must remain at the top of the window.')
-    assert.ok(layout.overlay.x + layout.overlay.width <= layout.toolbar.x + 1, 'The overlay must not cover chart content or controls.')
+    assert.ok(layout.overlay.y >= layout.toolbar.y + layout.toolbar.height, 'The overlay must not cover the chart toolbar.')
     const center = layout.toolbar.y + layout.toolbar.height / 2
     assert.ok(layout.toolbarControls.every(control => Math.abs(control.y + control.height / 2 - center) < 1), 'Chart toolbar controls must share the vertical center.')
     if (layout.nativeControls && layout.title) assert.ok(layout.title.x >= 84 - 1, 'The chart title must clear the native window controls.')
