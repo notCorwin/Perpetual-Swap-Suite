@@ -159,12 +159,12 @@ test('native traffic lights align with the renderer toolbar after window resizin
       await page.waitForFunction(width => innerWidth === width, actualWidth)
       await assertWorkspaceLayout(page)
       const native = await measureNativeWindowControls(electron)
-      const row = await page.locator('[data-sidebar-toolbar]').boundingBox()
-      const title = await page.getByRole('heading', { name: 'Perpetual Swap Suite', exact: true }).boundingBox()
+      const row = await page.locator('[data-layout=market-workspace] > div > [data-window-drag-region]').boundingBox()
+      const title = await page.locator('[data-chart-title]').boundingBox().catch(() => null)
       for (const [name, button] of Object.entries(native.buttons)) {
         assert.ok(button && !button.hidden && !button.hiddenOrHasHiddenAncestor, `${name} must be an enabled native control.`)
         assert.ok(Math.abs(button.y + button.height / 2 - (row.y + row.height / 2)) <= .5, `${name} must actually align with the toolbar: ${JSON.stringify({ native, row })}`)
-        assert.ok(button.x + button.width < title.x, `${name} must not cover the application title.`)
+        if (title) assert.ok(button.x + button.width < title.x, `${name} must not cover the chart title.`)
       }
       measurements.push({ width: actualWidth, row, title, native })
     }

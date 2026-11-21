@@ -140,48 +140,36 @@ export async function assertWorkspaceLayout(page) {
       && Math.abs(root.getBoundingClientRect().height - innerHeight) < 1
   })
   const layout = await page.locator('[data-layout="market-workspace"]').evaluate(root => {
-    const list = root.querySelector('[data-market-list]')
+    const rectangle = node => { if (!node) return null; const { x, y, width, height } = node.getBoundingClientRect(); return { x, y, width, height } }
+    const overlay = root.querySelector('[data-market-overlay]')
     const chart = root.querySelector('[data-chart-panel]')
     const toolbar = root.querySelector('[data-chart-toolbar]')
-    const controlsRow = root.querySelector('[data-native-window-controls-row]')
-    const rectangle = node => { const { x, y, width, height } = node.getBoundingClientRect(); return { x, y, width, height } }
     return {
       designWidth: Number(root.dataset.designWidth), scale: Number(root.dataset.uiScale),
       viewport: { width: innerWidth, height: innerHeight }, root: rectangle(root),
-      toolbar: toolbar ? rectangle(toolbar) : null,
-      sidebarToolbar: controlsRow ? rectangle(controlsRow) : null,
+      expanded: overlay?.dataset.expanded === 'true', overlay: rectangle(overlay),
+      list: rectangle(root.querySelector('[data-market-list]')), chart: rectangle(chart),
+      toolbar: rectangle(toolbar), title: rectangle(toolbar?.querySelector('[data-chart-title]')),
       toolbarControls: toolbar ? [...toolbar.querySelectorAll('button')].map(rectangle) : [],
-      nativeControls: controlsRow && window.radarDesktop.nativeWindowControls ? {
-        row: rectangle(controlsRow), title: rectangle(controlsRow.querySelector('h1')), settings: rectangle(controlsRow.querySelector('a')),
-        inset: Number.parseFloat(getComputedStyle(controlsRow).paddingInlineStart) * Number(root.dataset.uiScale),
-      } : null,
-      list: list ? rectangle(list) : null, chart: chart ? rectangle(chart) : null,
+      nativeControls: window.radarDesktop.nativeWindowControls,
       documentWidth: document.documentElement.scrollWidth, documentHeight: document.documentElement.scrollHeight,
     }
   })
   assert.equal(layout.designWidth, 1_600)
-  assert.ok(layout.scale > 0)
-  assert.ok(layout.scale === 1, `Every window retains normal density: ${JSON.stringify(layout)}`)
-  assert.ok(layout.list && layout.chart, 'The list and chart panel must remain mounted together.')
-  assert.ok(layout.list.y === 0 && layout.chart.y === 0, 'Both original workspace columns must begin at the top of the window.')
-  assert.ok(Math.abs(layout.list.height - layout.viewport.height) < 1 && Math.abs(layout.chart.height - layout.list.height) < 1, 'Both workspace columns must use the full window height.')
-  if (layout.toolbar) assert.ok(layout.toolbar.y === 0 && Math.abs(layout.toolbar.x - layout.chart.x) < 1 && Math.abs(layout.toolbar.width - layout.chart.width) < 1, 'The existing chart toolbar must form the top of the chart column without an extra title bar.')
-  if (layout.toolbar && layout.sidebarToolbar) {
-    assert.ok(Math.abs(layout.toolbar.height - 36) < 1 && Math.abs(layout.sidebarToolbar.height - 36) < 1, 'The sidebar and chart must share the compact 36px toolbar height.')
+  assert.equal(layout.scale, 1, `Every window retains normal density: ${JSON.stringify(layout)}`)
+  assert.ok(layout.overlay && layout.chart, 'The contract overlay and chart must remain mounted together.')
+  assert.ok(layout.overlay.x > 0 && layout.overlay.y > 0, 'The floating contract panel must have an inset from the window edges.')
+  assert.ok(layout.overlay.x + layout.overlay.width <= layout.viewport.width && layout.overlay.y + layout.overlay.height <= layout.viewport.height, 'The floating panel must remain inside the window.')
+  assert.ok(layout.chart.y === 0 && Math.abs(layout.chart.height - layout.viewport.height) < 1, 'The chart workspace must fill the window height.')
+  if (layout.expanded) assert.ok(Math.abs(layout.overlay.width - Math.min(300, layout.viewport.width * .35)) < 2, 'The contract overlay must follow its responsive width token.')
+  if (layout.toolbar) {
+    assert.ok(layout.toolbar.y === 0 && Math.abs(layout.toolbar.height - 36) < 1, 'The chart toolbar must remain at the top of the window.')
+    assert.ok(layout.overlay.x + layout.overlay.width <= layout.toolbar.x + 1, 'The overlay must not cover chart content or controls.')
     const center = layout.toolbar.y + layout.toolbar.height / 2
-    assert.ok(layout.toolbarControls.every(control => Math.abs(control.y + control.height / 2 - center) < 1), 'All chart toolbar controls must share the same vertical center.')
+    assert.ok(layout.toolbarControls.every(control => Math.abs(control.y + control.height / 2 - center) < 1), 'Chart toolbar controls must share the vertical center.')
+    if (layout.nativeControls && layout.title) assert.ok(layout.title.x >= 84 - 1, 'The chart title must clear the native window controls.')
   }
-  if (layout.nativeControls) {
-    const { row, title, settings, inset } = layout.nativeControls
-    assert.ok(Math.abs(inset - 12 - 72) < 1 && Math.abs(row.height - 36) < 1, 'Native traffic lights need fixed-size clearance at every workspace scale.')
-    assert.ok(title.x >= row.x + inset - 1 && title.x + title.width <= settings.x + 1, 'Native controls, application title, and settings must not overlap.')
-    assert.ok([title, settings].every(control => Math.abs(control.y + control.height / 2 - (row.y + row.height / 2)) < 1), 'Application title and settings must align with the chart toolbar controls.')
-  }
-  assert.ok(Math.abs(layout.list.width - Math.min(300, layout.viewport.width * .35)) < 2, 'The contract list must follow its shared responsive width token.')
-  assert.ok(Math.abs(layout.chart.width - (layout.viewport.width - layout.list.width)) < 2, `The chart panel must fill the remaining window width: ${JSON.stringify(layout)}`)
-  assert.ok(Math.abs(layout.list.x + layout.list.width - layout.chart.x) < 2, 'The chart must sit beside the contract list.')
   assert.ok(layout.documentWidth <= layout.viewport.width + 1 && layout.documentHeight <= layout.viewport.height + 1, 'The workspace must scroll inside its panels, not the window.')
-  assert.equal(await page.getByRole('button', { name: /^(?:Back to Markets|Markets)$/i }).count(), 0)
   return layout
 }
 

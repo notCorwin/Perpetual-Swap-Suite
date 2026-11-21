@@ -103,6 +103,8 @@
   --ui-inline-gap: var(--space-4);
   --market-list-max-width: 300px;
   --market-list-width: min(var(--market-list-max-width), 35vw);
+  --space-market-expanded: calc(var(--market-list-width) + var(--space-8));
+  --space-market-collapsed: calc(var(--space-8) + var(--space-unit) * 7 + var(--space-pixel) * 2);
   --chart-summary-height: 22px;
   --chart-panel-header-height: 18px;
   --chart-panel-header-baseline: 11px;
@@ -268,7 +270,11 @@
   flex-shrink: 0;
 }
 
+[data-chart-panel][data-market-expanded="true"] { --space-market-chart-inset: var(--space-market-expanded); }
+[data-chart-panel][data-market-expanded="false"] { --space-market-chart-inset: var(--space-market-collapsed); }
+
 [data-chart-toolbar] {
+  padding-inline-start: max(var(--space-4), calc(var(--space-4) + var(--native-window-controls-width, 0px) - var(--space-market-chart-inset)));
   min-width: 0;
   overflow-x: auto;
   scrollbar-width: none;

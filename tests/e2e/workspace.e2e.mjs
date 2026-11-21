@@ -1212,6 +1212,25 @@ test('constant Bollinger bands stay finite and negative lower bands retain the r
   } finally { await publishMode('standard') }
 })
 
+test('contract overlay can be collapsed without covering chart controls', async () => {
+  const overlay = page.locator('[data-market-overlay]')
+  const chart = page.locator('[data-chart-capture]')
+  const before = await chart.boundingBox()
+  const hide = page.getByRole('button', { name: 'Hide contract list' })
+  await hide.focus()
+  await page.keyboard.press('Enter')
+  const show = page.getByRole('button', { name: /^Show contract list/ })
+  await show.waitFor({ state: 'visible' })
+  assert.equal(await show.evaluate(node => document.activeElement === node), true)
+  assert.equal(await page.locator('[data-market-list]').isVisible(), false)
+  const after = await chart.boundingBox()
+  const panel = await overlay.boundingBox()
+  assert.ok(after.width > before.width && panel.x + panel.width <= after.x + 1)
+  await page.keyboard.press('Enter')
+  assert.equal(await hide.evaluate(node => document.activeElement === node), true)
+  assert.equal(await page.locator('[data-market-list]').isVisible(), true)
+})
+
 test('status footer keeps failures visible and preserves the contract list', async () => {
   const publish = values => electron.evaluate((_electron, values) => {
     const state = globalThis.__workspaceFixture
@@ -1229,7 +1248,7 @@ test('status footer keeps failures visible and preserves the contract list', asy
     await publish({ rows: await electron.evaluate(() => globalThis.__workspaceFixture.initialRows), loading: false, error: '', realtimeState: 'live', catalogSource: 'live', catalogProgress: undefined })
     const baseline = await positions()
     assert.ok(Math.abs(baseline.header - baseline.toolbarBottom) < 1)
-    assert.equal(await footer.evaluate(node => getComputedStyle(node).borderTopWidth), '0px')
+    assert.equal(await footer.evaluate(node => getComputedStyle(node).borderTopWidth), '1px')
     assert.equal(await footer.getByText(/^\d+ contracts$/).count(), 0)
     await publish({ error: 'Internal failure: do not expose this raw exception', realtimeState: 'disconnected' })
     await page.waitForFunction(() => document.querySelector('[data-market-status]')?.textContent.includes('Market data is unavailable'))

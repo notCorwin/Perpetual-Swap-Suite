@@ -1,6 +1,6 @@
 import { lazy, memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { DeferredPanel } from '@/DeferredPanel'
-import { Camera, Settings2 } from 'lucide-react'
+import { Camera, PanelLeftClose, PanelLeftOpen, Settings2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { captureStableChart, chartCaptureBounds, eraseCapturedAction } from '@/chart-capture'
 import { buttonVariants } from '@/components/ui/button'
@@ -304,6 +304,19 @@ function App() {
     // Backend notifications own market updates; view preferences do not reload rows.
     setPreferences(saved); setPreferencesError('')
   }, [])
+  const [marketExpanded, setMarketExpanded] = useState(true)
+  const marketToggleRef = useRef<HTMLButtonElement>(null)
+  const marketTogglePending = useRef(false)
+  useLayoutEffect(() => {
+    if (marketTogglePending.current) {
+      marketTogglePending.current = false
+      marketToggleRef.current?.focus()
+    }
+  }, [marketExpanded])
+  const toggleMarket = () => {
+    marketTogglePending.current = true
+    setMarketExpanded(value => !value)
+  }
   const chartsRef = useRef<HTMLDivElement>(null)
   const copyButtonRef = useRef<HTMLButtonElement>(null)
   const copyOwner = useRef<object | null>(null)
@@ -408,9 +421,12 @@ function App() {
 
   return <WorkspaceViewport>
     <div className="relative flex h-full min-w-0 flex-1">
-    <div hidden={settingsSection !== null} inert={settingsSection !== null} className={cn('h-full min-w-0 flex-1', settingsSection === null ? 'flex' : 'hidden')}>
-    <aside data-market-list className="flex w-[var(--market-list-width)] shrink-0 flex-col border-r" style={{ height: `calc(100% - ${statusHeight}px)` }} aria-label="Contract list">
-      <header data-sidebar-toolbar data-window-toolbar data-window-drag-region data-native-window-controls-row className="flex items-center gap-3 border-b px-4"><h1 className="min-w-0 flex-1 truncate text-sm font-medium">Perpetual Swap Suite</h1><a ref={settingsLauncher} href={settingsHref('workspace')} aria-label="Settings" title="Settings" className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}><Settings2 aria-hidden="true" /></a></header>
+    <span role="status" aria-atomic="true" className="sr-only">{errorAnnouncement}</span>
+    {settingsSection === null && <div data-window-drag-region className={cn("absolute left-0 top-0 h-[var(--window-toolbar-height)]", marketExpanded ? "w-[var(--space-market-expanded)]" : "w-[var(--space-market-collapsed)]")} />}
+    <div data-market-overlay data-expanded={marketExpanded} className={cn("absolute left-4 z-20 flex max-w-[calc(100%-var(--space-8))] flex-col overflow-hidden rounded-lg border bg-background shadow-md", settingsSection === null ? marketExpanded ? "top-[calc(var(--window-toolbar-height)+var(--space-4))] h-[min(60%,calc(100%-var(--window-toolbar-height)-var(--space-8)))] w-[var(--market-list-width)]" : "top-[calc(var(--window-toolbar-height)+var(--space-4))]" : "bottom-0 max-h-[40%] w-[var(--market-list-width)]")}>
+    {settingsSection === null && !marketExpanded && <Button ref={marketToggleRef} variant="ghost" size="icon-sm" aria-label={rankedIssues.length ? `Show contract list (${rankedIssues.length} status messages)` : "Show contract list"} title={rankedIssues.length ? `${rankedIssues.length} status messages` : "Show contract list"} aria-expanded={false} onClick={toggleMarket}><PanelLeftOpen aria-hidden="true" />{rankedIssues.length > 0 && <span aria-hidden="true" className="absolute right-1 top-1 size-1.5 rounded-full bg-foreground" />}</Button>}
+    <aside data-market-list hidden={settingsSection !== null || !marketExpanded} inert={settingsSection !== null || !marketExpanded} className={cn("min-h-0 flex-1 flex-col", settingsSection === null && marketExpanded ? "flex" : "hidden")} aria-label="Contract list">
+      <header data-sidebar-toolbar data-window-toolbar data-window-drag-region className="flex items-center gap-3 border-b px-4"><h1 className="min-w-0 flex-1 truncate text-sm font-medium">Perpetual Swap Suite</h1><a ref={settingsLauncher} href={settingsHref('workspace')} aria-label="Settings" title="Settings" className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}><Settings2 aria-hidden="true" /></a><Button ref={marketExpanded ? marketToggleRef : undefined} variant="ghost" size="icon-sm" aria-label="Hide contract list" aria-expanded={true} onClick={toggleMarket}><PanelLeftClose aria-hidden="true" /></Button></header>
       <section data-market-scroll className="min-h-0 flex-1 overflow-y-auto [&>[data-slot=table-container]]:overflow-visible" aria-label="Perpetual swap markets">
         <Table className="table-fixed [&_tr:not([data-virtual-spacer])>:first-child]:pl-4 [&_tr:not([data-virtual-spacer])>:last-child]:pr-4" data-market-count={visible.length} data-total-market-count={rows.length} aria-rowcount={visible.length + 1}>
           <colgroup><col className="w-[35%]" /><col className="w-[33%]" /><col className="w-[32%]" /></colgroup>
@@ -421,7 +437,22 @@ function App() {
         </Table>
       </section>
     </aside>
-    <section data-chart-panel className="h-full min-w-0 flex-1" aria-label="Market chart workspace">
+    <footer ref={statusRow} hidden={settingsSection === null && !marketExpanded} data-market-status-row tabIndex={0} aria-label="Application status" onKeyDown={event => {
+      const row = event.currentTarget
+      if (row.scrollHeight <= row.clientHeight) return
+      const offset = event.key === 'ArrowDown' ? row.clientHeight / 4 : event.key === 'ArrowUp' ? -row.clientHeight / 4
+        : event.key === 'PageDown' ? row.clientHeight : event.key === 'PageUp' ? -row.clientHeight : null
+      if (offset !== null) { event.preventDefault(); row.scrollTop += offset }
+      else if (event.key === 'Home' || event.key === 'End') { event.preventDefault(); row.scrollTop = event.key === 'Home' ? 0 : row.scrollHeight }
+    }} className={cn("min-h-0 shrink-0 overflow-y-auto border-t bg-background px-4 py-1 text-xs text-muted-foreground focus-visible:outline-2 focus-visible:outline-ring", settingsSection === null ? marketExpanded ? "max-h-[40%]" : "hidden" : "flex-1")}>
+      <div data-status-details data-market-status>
+        {rankedIssues.map(issue => <p key={issue.id} role={issue.severity === 'error' ? undefined : 'status'} aria-atomic="true" data-chart-shared-status-item={issue.frame} data-timeframe={issue.frame} data-chart-status={issue.frame !== undefined ? '' : undefined} className={cn('break-words py-1', issue.severity === 'error' && 'text-destructive')}><span className="font-medium">{issue.label}: </span>{issue.detail}</p>)}
+        <p aria-live="off">{statusText}</p>
+      </div>
+    </footer>
+    </div>
+    <div hidden={settingsSection !== null} inert={settingsSection !== null} className={cn('h-full min-w-0 flex-1', settingsSection === null ? 'flex' : 'hidden')}>
+    <section data-chart-panel data-market-expanded={marketExpanded} className={cn("h-full min-w-0 flex-1", marketExpanded ? "pl-[var(--space-market-expanded)]" : "pl-[var(--space-market-collapsed)]")} aria-label="Market chart workspace">
       {selectedID ? <div data-chart-display-mode="multi" className="flex h-full min-h-0 flex-col">
         <span role="status" className="sr-only">{copyState.status === 'copying' ? 'Copying chart' : copyState.status === 'copied' ? 'Chart copied to clipboard' : ''}</span>
         <div ref={chartsRef} data-chart-capture className="flex min-h-0 flex-1 flex-col">
@@ -440,20 +471,6 @@ function App() {
     </section>
     </div>
     {lastVisibleSettings.current && <div hidden={!settingsSection} inert={!settingsSection} className={cn('min-w-0 flex-1', settingsSection ? 'flex' : 'hidden')} style={{ height: `calc(100% - ${statusHeight}px)` }}><DeferredPanel name="Settings" className="p-4 pb-8" onClose={() => { window.location.hash = '#/' }}><WorkspaceSettings section={settingsSection ?? lastVisibleSettings.current} active={settingsSection !== null} preferences={preferences} loaded={preferencesLoaded} loadError={preferencesError} onSave={savePreferences} onNavigationStateChange={updateSettingsGuard} onStatusChange={updateSettingsStatuses} onJobSnapshot={receiveSettingsJob} /></DeferredPanel></div>}
-    <footer ref={statusRow} data-market-status-row tabIndex={0} aria-label="Application status" onKeyDown={event => {
-      const row = event.currentTarget
-      if (row.scrollHeight <= row.clientHeight) return
-      const offset = event.key === 'ArrowDown' ? row.clientHeight / 4 : event.key === 'ArrowUp' ? -row.clientHeight / 4
-        : event.key === 'PageDown' ? row.clientHeight : event.key === 'PageUp' ? -row.clientHeight : null
-      if (offset !== null) { event.preventDefault(); row.scrollTop += offset }
-      else if (event.key === 'Home' || event.key === 'End') { event.preventDefault(); row.scrollTop = event.key === 'Home' ? 0 : row.scrollHeight }
-    }} className="absolute bottom-0 left-0 z-20 max-h-[40%] w-[var(--market-list-width)] max-w-full overflow-y-auto bg-background px-4 py-1 text-xs text-muted-foreground focus-visible:outline-2 focus-visible:outline-ring">
-      <span role="status" aria-atomic="true" className="sr-only">{errorAnnouncement}</span>
-      <div data-status-details data-market-status>
-        {rankedIssues.map(issue => <p key={issue.id} role={issue.severity === 'error' ? undefined : 'status'} aria-atomic="true" data-chart-shared-status-item={issue.frame} data-timeframe={issue.frame} data-chart-status={issue.frame !== undefined ? '' : undefined} className={cn('break-words py-1', issue.severity === 'error' && 'text-destructive')}><span className="font-medium">{issue.label}: </span>{issue.detail}</p>)}
-        <p aria-live="off">{statusText}</p>
-      </div>
-    </footer>
     </div>
   </WorkspaceViewport>
 }
