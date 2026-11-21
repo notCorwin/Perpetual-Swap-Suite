@@ -67,7 +67,7 @@ test('preference schema owns immutable snapshots, reuses proven values and valid
   const input = structuredClone(DEFAULT_PREFERENCES)
   const preferences = validatePreferences(input)
   assert.deepEqual(preferences, {
-    chartTimeframe: '15m', chartDisplayMode: 'multi', rankingLookback: 15, historyDays: 30,
+    chartTimeframe: '15m', chartDisplayMode: 'multi', priceScaleMode: 'fixed', priceScalePixelsPerPercent: 20, rankingLookback: 15, historyDays: 30,
     liquidity: {
       spread: { enabled: true, maxPercent: 0.05 }, depth: { enabled: true, minUSDT: 100_000 },
       slippage: { enabled: true, maxPercent: 0.1, notionalUSDT: 100_000 }, volume24h: { enabled: true, minUSDT: 30_000_000 },
@@ -86,6 +86,7 @@ test('preference schema owns immutable snapshots, reuses proven values and valid
   assert.equal(Object.isFrozen(DEFAULT_PREFERENCES.liquidity.slippage), true)
   assert.equal(validatePreferences({ ...DEFAULT_PREFERENCES, historyDays: 3650 }).historyDays, 3650)
   for (const invalid of [
+    { ...DEFAULT_PREFERENCES, priceScaleMode: 'bad' }, { ...DEFAULT_PREFERENCES, priceScalePixelsPerPercent: 0 }, { ...DEFAULT_PREFERENCES, priceScalePixelsPerPercent: 501 },
     { ...DEFAULT_PREFERENCES, rankingLookback: 7 }, { ...DEFAULT_PREFERENCES, rankingLookback: 0 }, { ...DEFAULT_PREFERENCES, rankingLookback: 9_007_199_254_740_990 },
     { ...DEFAULT_PREFERENCES, historyDays: 0 }, { ...DEFAULT_PREFERENCES, historyDays: 1.5 }, { ...DEFAULT_PREFERENCES, historyDays: 3651 },
     { ...DEFAULT_PREFERENCES, chartTimeframe: '1m' }, { ...DEFAULT_PREFERENCES, frostedBackgroundEnabled: true },

@@ -24,7 +24,7 @@ const axisFormatter = (decimals: number) => {
 }
 
 type Range = readonly [number, number]
-export type ChartGeometryOptions = Readonly<{ width: number; height: number; endHour: number; intervalMS: number; liveClose?: number; currentPriceTickSz?: string | null; priceOnly?: boolean; windowBars?: number; layoutDensity?: ChartLayoutDensity; barSpacing?: number; fixedGutter?: number }>
+export type ChartGeometryOptions = Readonly<{ width: number; height: number; endHour: number; intervalMS: number; liveClose?: number; currentPriceTickSz?: string | null; priceOnly?: boolean; windowBars?: number; layoutDensity?: ChartLayoutDensity; barSpacing?: number; fixedGutter?: number; priceScaleMode?: 'fixed' | 'auto'; priceScalePixelsPerPercent?: number; priceScaleBase?: number | null }>
 export type ChartGeometryOverscan = Readonly<{ before?: Bar; after?: Bar }>
 const linearScale = (min: number, max: number, panel: Range) => {
   const span = max - min || 1, height = panel[1] - panel[0]
@@ -59,13 +59,17 @@ function chartAxes(bars: readonly Bar[], options: ChartGeometryOptions, measureT
   // once and shared by both the gutter measurement and the final plot.
   const { panels } = chartLayout(0, height, 64, options.priceOnly, options.layoutDensity)
   const priceLabels = axisLabelLimit(panels.price, 9)
-  const base = bars.flatMap(bar => [bar.open, bar.high, bar.low, bar.close]).find(value => finite(value) && value > 0) ?? null
+  const base = options.priceScaleBase === undefined ? bars.flatMap(bar => [bar.open, bar.high, bar.low, bar.close]).find(value => finite(value) && value > 0) ?? null : options.priceScaleBase
   if (!Number.isFinite(priceMin) || !Number.isFinite(priceMax)) { priceMin = base ?? 0; priceMax = base ?? 1 }
   const relative = (value: number) => (value / base! - 1) * 100
   const priceLow = base === null ? -1 : relative(priceMin), priceHigh = base === null ? 1 : relative(priceMax)
   // Reserve breathing room based on the visible data, not on a rounded tick.
   const pricePadding = (priceHigh - priceLow || Math.max(Math.abs(priceHigh) * 0.01, 0.01)) * 0.05
-  const priceAxis = { ...chartAxisForLabels(priceLow - pricePadding, priceHigh + pricePadding, priceLabels), kind: 'relative' as const, base }
+  const fixed = options.priceScaleMode === 'fixed' && finite(options.priceScalePixelsPerPercent) && options.priceScalePixelsPerPercent > 0 && base !== null
+  const lastClose = bars.at(-1)!.close
+  const center = fixed ? relative(finite(liveClose) && liveClose > 0 ? liveClose : finite(lastClose) && lastClose > 0 ? lastClose : base!) : 0
+  const halfSpan = fixed ? (panels.price[1] - panels.price[0]) / options.priceScalePixelsPerPercent! / 2 : 0
+  const priceAxis = { ...chartAxisForLabels(fixed ? center - halfSpan : priceLow - pricePadding, fixed ? center + halfSpan : priceHigh + pricePadding, priceLabels), kind: 'relative' as const, base }
   const axisPrice = axisFormatter(priceAxis.decimals)
   const rocRange = (rocExtent || 1) * 1.05
   const rocAxis = chartAxisForLabels(-rocRange, rocRange, axisLabelLimit(panels.roc, 7))
@@ -224,7 +228,7 @@ function buildGeometry(sourceBars: readonly Bar[], options: ChartGeometryOptions
     if (takerAvailable && sell > 0) sells.push(rectangle(center - barWidth / 2, totalY, barWidth, buyY - totalY))
   }
   return Object.freeze({
-    ...options, windowBars, bars, before, after, layout, gutter, x, barPitch, barWidth, priceAxis, rocAxis, atrRange, bbwRange, oiAxis, takerAxis, priceY, rsiY, rocY, atrY, bbwY, oiY, takerY, rocZeroY, rsiMarkers,
+    ...options, windowBars, bars, before, after, layout, gutter, measuredGutter: axes.gutter, x, barPitch, barWidth, priceAxis, rocAxis, atrRange, bbwRange, oiAxis, takerAxis, priceY, rsiY, rocY, atrY, bbwY, oiY, takerY, rocZeroY, rsiMarkers,
     priceTicks: priceAxis.base === null ? [] : priceAxis.ticks.map((value, index) => ({ y: relativeY(value), label: priceLabelsText[index] })),
     oiTicks: oiAxis?.ticks.map((value, index) => ({ y: oiY(value), label: oiLabelsText[index] })) ?? [],
     takerTicks: takerAxis.ticks.map((value, index) => ({ y: takerY(value), label: takerLabelsText[index] })),
@@ -275,7 +279,8 @@ export function createChartGeometryCache(measureText: (text: string) => number) 
   const axesFor = (bars: readonly Bar[], options: ChartGeometryOptions) => {
     const variants = axisCache.get(bars) ?? []
     const cached = variants.find(({ options: prior }) => prior.height === options.height && prior.liveClose === options.liveClose
-      && prior.priceOnly === options.priceOnly && prior.currentPriceTickSz === options.currentPriceTickSz && prior.layoutDensity === options.layoutDensity)
+      && prior.priceOnly === options.priceOnly && prior.currentPriceTickSz === options.currentPriceTickSz && prior.layoutDensity === options.layoutDensity
+      && prior.priceScaleMode === options.priceScaleMode && prior.priceScalePixelsPerPercent === options.priceScalePixelsPerPercent && prior.priceScaleBase === options.priceScaleBase)
     if (cached) return cached.axes
     const axes = chartAxes(bars, options, measureText)
     variants.push({ options, axes })
@@ -292,6 +297,7 @@ export function createChartGeometryCache(measureText: (text: string) => number) 
     const index = variants.findIndex(({ value, before, after }) => value.width === options.width && value.height === options.height
       && value.endHour === options.endHour && value.intervalMS === options.intervalMS && value.liveClose === liveClose
       && value.barSpacing === options.barSpacing && value.fixedGutter === options.fixedGutter && value.layoutDensity === options.layoutDensity && (options.barSpacing !== undefined || (value.windowBars ?? 96) === (options.windowBars ?? 96)) && value.currentPriceTickSz === options.currentPriceTickSz && value.priceOnly === options.priceOnly
+      && value.priceScaleMode === options.priceScaleMode && value.priceScalePixelsPerPercent === options.priceScalePixelsPerPercent && value.priceScaleBase === options.priceScaleBase
       && before === overscan.before && after === overscan.after)
     if (index >= 0) {
       const [variant] = variants.splice(index, 1)

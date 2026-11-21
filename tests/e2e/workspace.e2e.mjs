@@ -20,7 +20,7 @@ before(async () => {
   // of source downloads, persistence workers, and any configured AI service.
   await electron.evaluate(async ({ ipcMain, BrowserWindow }) => {
     const { encodeChartWire } = process.getBuiltinModule('module').createRequire(`${process.cwd()}/package.json`)('./electron/chart-wire.js')
-    const preferences = { chartDisplayMode: 'multi', chartTimeframe: '15m', rankingLookback: 15, historyDays: 30, liquidity: {
+    const preferences = { chartDisplayMode: 'multi', chartTimeframe: '15m', priceScaleMode: 'fixed', priceScalePixelsPerPercent: 20, rankingLookback: 15, historyDays: 30, liquidity: {
       spread: { enabled: true, maxPercent: .05 }, depth: { enabled: true, minUSDT: 100_000 },
       slippage: { enabled: true, maxPercent: .1, notionalUSDT: 100_000 }, volume24h: { enabled: true, minUSDT: 30_000_000 },
       openInterest: { enabled: true, minUSDT: 5_000_000 }, volumeStability: { enabled: false, maxRatio: 2 },
@@ -868,6 +868,33 @@ test('settings is a separate grouped page with keyboard navigation and a retaine
   assert.deepEqual(await page.locator('[data-chart-inst]').evaluateAll(charts => charts.map(chart => [chart.dataset.chartInst, chart.querySelector('svg[data-rendered-timeframe]')?.dataset.renderedTimeframe])), before.charts)
 })
 
+test('price scale preferences validate and persist', async () => {
+  const settings = await openSettings()
+  const mode = settings.getByRole('combobox', { name: 'Price scale' })
+  const pixels = settings.getByRole('spinbutton', { name: 'Fixed height per 1% (px)' })
+  assert.equal(await mode.locator('[data-slot=select-value]').textContent(), 'Fixed')
+  assert.equal(await pixels.inputValue(), '20')
+  await pixels.fill('501')
+  await settings.getByRole('button', { name: 'Save settings', exact: true }).click()
+  await settings.getByText('Enter a number from 1 through 500.', { exact: true }).waitFor()
+  await pixels.fill('35.5')
+  await mode.click()
+  await page.getByRole('option', { name: 'Automatic', exact: true }).click()
+  await settings.getByRole('button', { name: 'Save settings', exact: true }).click()
+  await page.locator('[data-market-status-row]').getByRole('status').filter({ hasText: 'Settings saved.' }).waitFor()
+  assert.deepEqual(await electron.evaluate(() => ({ mode: globalThis.__workspaceFixture.preferences.priceScaleMode, pixels: globalThis.__workspaceFixture.preferences.priceScalePixelsPerPercent })), { mode: 'auto', pixels: 35.5 })
+  await backToMarkets()
+  const reopened = await openSettings()
+  assert.equal(await reopened.getByRole('combobox', { name: 'Price scale' }).locator('[data-slot=select-value]').textContent(), 'Automatic')
+  assert.equal(await reopened.getByRole('spinbutton', { name: 'Fixed height per 1% (px)' }).inputValue(), '35.5')
+  await reopened.getByRole('combobox', { name: 'Price scale' }).click()
+  await page.getByRole('option', { name: 'Fixed', exact: true }).click()
+  await reopened.getByRole('spinbutton', { name: 'Fixed height per 1% (px)' }).fill('20')
+  await reopened.getByRole('button', { name: 'Save settings', exact: true }).click()
+  await page.locator('[data-market-status-row]').getByRole('status').filter({ hasText: 'Settings saved.' }).waitFor()
+  await backToMarkets()
+})
+
 test('preference drafts survive category changes and validation returns to the first invalid group', async () => {
   const updatesBefore = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.preferences?.action === 'update').length)
   const settings = await openSettings()
@@ -898,7 +925,7 @@ test('preference drafts survive category changes and validation returns to the f
   await settings.getByRole('alert').filter({ hasText: 'The preferences could not be saved.' }).waitFor()
   assert.equal(await settings.isVisible(), true)
   await settings.getByRole('button', { name: 'Save settings', exact: true }).click()
-  await settings.getByRole('status').filter({ hasText: 'Settings saved.' }).waitFor()
+  await page.locator('[data-market-status-row]').getByRole('status').filter({ hasText: 'Settings saved.' }).waitFor()
   assert.equal(await settings.isVisible(), true, 'Saving preferences must keep the settings page open.')
   const preferences = await electron.evaluate(() => globalThis.__workspaceFixture.preferences)
   assert.equal(preferences.rankingLookback, 30)
@@ -976,7 +1003,7 @@ test('saving only the ranking lookback keeps the chosen chart and qualified mark
   const settings = await openSettings()
   await settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).fill('45')
   await settings.getByRole('button', { name: 'Save settings', exact: true }).click()
-  await settings.getByRole('status').filter({ hasText: 'Settings saved.' }).waitFor()
+  await page.locator('[data-market-status-row]').getByRole('status').filter({ hasText: 'Settings saved.' }).waitFor()
   await backToMarkets()
   await page.getByRole('columnheader', { name: '45m change By magnitude', exact: true }).waitFor()
   assert.equal(await selected().getAttribute('aria-label'), 'View BETA-USDT-SWAP chart')

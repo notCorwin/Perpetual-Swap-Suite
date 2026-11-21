@@ -338,3 +338,17 @@ test('nonfinite OHLC never produces invalid cached price paths', () => {
   assert.equal(unavailable.priceAxis.base, null)
   assert.deepEqual(unavailable.priceTicks, [])
 })
+
+test('fixed price scale maps one percent of its reference to the requested CSS pixels', () => {
+  const bars = rows(), get = createChartGeometryCache(text => text.length * 6)
+  for (const height of [240, 700]) for (const pixels of [5, 20, 120]) for (const base of [100, 150]) {
+    const geometry = get(bars, { ...viewport, height, priceOnly: true, priceScaleMode: 'fixed', priceScalePixelsPerPercent: pixels, priceScaleBase: base })
+    close(geometry.priceY(base) - geometry.priceY(base * 1.01), pixels)
+    close(geometry.priceY(bars.at(-1)!.close), (geometry.layout.panels.price[0] + geometry.layout.panels.price[1]) / 2)
+    assert.equal(get(bars, { ...viewport, height, priceOnly: true, priceScaleMode: 'fixed', priceScalePixelsPerPercent: pixels, priceScaleBase: base }), geometry)
+  }
+  const fixed = get(bars, { ...viewport, priceScaleMode: 'fixed', priceScalePixelsPerPercent: 20 })
+  const automatic = get(bars, { ...viewport, priceScaleMode: 'auto', priceScalePixelsPerPercent: 20 })
+  assert.notEqual(fixed, automatic)
+  assert.notEqual(fixed.priceAxis.max - fixed.priceAxis.min, automatic.priceAxis.max - automatic.priceAxis.min)
+})

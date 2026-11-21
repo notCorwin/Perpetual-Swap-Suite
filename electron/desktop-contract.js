@@ -112,10 +112,12 @@ function preferences(value) {
   if (action === 'read') { record(value, path, ['action']); return { action } }
   record(value, path, ['action', 'values'], ['action', 'values'])
   const valuesPath = `${path}.values`
-  const values = record(value.values, valuesPath, ['chartTimeframe', 'chartDisplayMode', 'rankingLookback', 'historyDays', 'liquidity'])
+  const values = record(value.values, valuesPath, ['chartTimeframe', 'chartDisplayMode', 'priceScaleMode', 'priceScalePixelsPerPercent', 'rankingLookback', 'historyDays', 'liquidity'])
   if (Object.keys(values).length === 0) invalid(valuesPath, 'must contain an update')
   const result = {}
   optional(result, values, 'chartDisplayMode', input => choice(input, `${valuesPath}.chartDisplayMode`, ['multi', 'indicators']))
+  optional(result, values, 'priceScaleMode', input => choice(input, `${valuesPath}.priceScaleMode`, ['auto', 'fixed']))
+  optional(result, values, 'priceScalePixelsPerPercent', input => number(input, `${valuesPath}.priceScalePixelsPerPercent`, 1, 500))
   optional(result, values, 'chartTimeframe', input => choice(input, `${valuesPath}.chartTimeframe`, TIMEFRAMES))
   optional(result, values, 'rankingLookback', input => {
     number(input, `${valuesPath}.rankingLookback`, 5, Number.MAX_SAFE_INTEGER, true)

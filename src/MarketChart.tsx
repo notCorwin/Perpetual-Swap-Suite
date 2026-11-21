@@ -384,7 +384,7 @@ const ChartSurface = memo(function ChartSurface({ instId, timeframe, hasComplete
   </PlotVisible>
 })
 
-export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, turnoverOrder, onSelect, controller: chartController = defaultChartController, priceOnly = false, navigation = true, onStatus }: { controller?: ChartController; priceOnly?: boolean; navigation?: boolean; onStatus?: (timeframe: RadarTimeframe, value: SharedChartStatusValue | null) => void; instId: string; tickSz?: string | null; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; candidateIds?: string[]; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
+export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, turnoverOrder, onSelect, controller: chartController = defaultChartController, priceOnly = false, navigation = true, onStatus, priceScaleMode = 'fixed', priceScalePixelsPerPercent = 20 }: { priceScaleMode?: 'fixed' | 'auto'; priceScalePixelsPerPercent?: number; controller?: ChartController; priceOnly?: boolean; navigation?: boolean; onStatus?: (timeframe: RadarTimeframe, value: SharedChartStatusValue | null) => void; instId: string; tickSz?: string | null; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; candidateIds?: string[]; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
   const sync = useContext(ChartTimeSync)
   const presentation = usePresentation()
   const readoutId = useId()
@@ -425,8 +425,16 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     ? { ...sharedChartViewport(sharedEnd, sync.value.spacing, intervalMS, lastSourceBar), fixedGutter: sync.gutter }
     : hasSync ? { ...(zoom ?? { spacing: CHART_DEFAULT_SPACING, offset: 0 }), fixedGutter: sync?.gutter }
       : zoom ?? { spacing: CHART_DEFAULT_SPACING, offset: 0 }, [hasSync, sync?.value, sync?.gutter, sharedEnd, lastSourceBar, intervalMS, zoom])
+  const [wheelFraction, setWheelFraction] = useState(0)
+  const [wheelOwner, setWheelOwner] = useState<{ session: object; instId: string; timeframe: RadarTimeframe; generation: number } | null>(null)
+  const wheelOwnerRef = useRef<typeof wheelOwner>(null)
+  const wheelOwnerMatches = Boolean(wheelOwner?.session === wheelSession && wheelOwner.generation === surface?.generation)
+  const requestedEndMatches = Boolean(surface && view.requested && view.requested.instId === surface.instId
+    && view.requested.timeframe === surface.timeframe && (view.requested.end ?? view.latestEnd) === surface.endHour)
+  const activeWheelFraction = matchesSelection && wheelOwnerMatches
+    ? chartPresentedWheelFraction(wheelFraction, view.pending && !requestedEndMatches ? requestedEnd : surface?.endHour, surface?.endHour, intervalMS) : 0
   const overscan = chartOverscan(surface, chartController)
-  const preparedPlot = chartPlot(displayedIndicators.window, plotSize, overscan, currentPriceTickSz, priceOnly, viewport)
+  const preparedPlot = chartPlot(displayedIndicators.window, plotSize, overscan, currentPriceTickSz, priceOnly, viewport, { mode: priceScaleMode, pixelsPerPercent: priceScalePixelsPerPercent, wheelFraction: activeWheelFraction })
   const bars = preparedPlot?.bars ?? surface?.bars ?? EMPTY_BARS
   const plotGeometry = preparedPlot?.geometry ?? null
   const visibleBars = plotGeometry?.windowBars ?? chartPitchSpan(plotSize.width, viewport.spacing)
@@ -499,20 +507,12 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     requestFrame: callback => window.requestAnimationFrame(callback),
     cancelFrame: handle => window.cancelAnimationFrame(handle),
   }))
-  const [wheelFraction, setWheelFraction] = useState(0)
-  const [wheelOwner, setWheelOwner] = useState<{ session: object; instId: string; timeframe: RadarTimeframe; generation: number } | null>(null)
-  const wheelOwnerRef = useRef<typeof wheelOwner>(null)
-  const wheelOwnerMatches = Boolean(wheelOwner?.session === wheelSession && wheelOwner.generation === surface?.generation)
-  const requestedEndMatches = Boolean(surface && view.requested && view.requested.instId === surface.instId
-    && view.requested.timeframe === surface.timeframe && (view.requested.end ?? view.latestEnd) === surface.endHour)
-  const activeWheelFraction = matchesSelection && wheelOwnerMatches
-    ? chartPresentedWheelFraction(wheelFraction, view.pending && !requestedEndMatches ? requestedEnd : surface?.endHour, surface?.endHour, intervalMS) : 0
   const wheelContentOffset = chartWheelContentOffset(activeWheelFraction, plotGeometry?.barPitch ?? 0,
     Boolean(preparedPlot?.before), Boolean(preparedPlot?.after))
   // Do not include the measured geometry or shared gutter in this epoch:
   // both change as the shared width converges. New market data, navigation,
   // fractional scrolling, and size changes invalidate the measurement.
-  const gutterEpoch = useMemo(() => ({ window: displayedIndicators.window, sync: sync?.value, fraction: activeWheelFraction, width: plotSize.width, height: plotSize.height, instId, timeframe }), [displayedIndicators.window, sync?.value, activeWheelFraction, plotSize.width, plotSize.height, instId, timeframe])
+  const gutterEpoch = useMemo(() => ({ window: displayedIndicators.window, sync: sync?.value, fraction: activeWheelFraction, width: plotSize.width, height: plotSize.height, instId, timeframe, priceScaleMode, priceScalePixelsPerPercent }), [displayedIndicators.window, sync?.value, activeWheelFraction, plotSize.width, plotSize.height, instId, timeframe, priceScaleMode, priceScalePixelsPerPercent])
   const reportGutter = sync?.reportGutter
   useLayoutEffect(() => {
     if (!reportGutter) return

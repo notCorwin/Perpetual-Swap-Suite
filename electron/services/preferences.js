@@ -10,6 +10,8 @@ function freeze(value) {
 export const DEFAULT_PREFERENCES = freeze({
   chartTimeframe: '15m',
   chartDisplayMode: 'multi',
+  priceScaleMode: 'fixed',
+  priceScalePixelsPerPercent: 20,
   rankingLookback: 15,
   historyDays: 30,
   liquidity: {
@@ -46,6 +48,10 @@ export function validatePreferenceFields(value, partial = false) {
     if (partial && !Object.hasOwn(value, key)) continue
     if (key === 'chartDisplayMode') {
       if (!['multi', 'indicators'].includes(value[key])) throw new TypeError('chartDisplayMode must be multi or indicators.')
+    } else if (key === 'priceScaleMode') {
+      if (!['auto', 'fixed'].includes(value[key])) throw new TypeError('priceScaleMode must be auto or fixed.')
+    } else if (key === 'priceScalePixelsPerPercent') {
+      if (typeof value[key] !== 'number' || !Number.isFinite(value[key]) || value[key] < 1 || value[key] > 500) throw new TypeError('priceScalePixelsPerPercent must be between 1 and 500.')
     } else if (key === 'chartTimeframe') {
       if (!TIMEFRAMES.has(value[key])) throw new TypeError('chartTimeframe must be 5m, 15m, or 1H.')
     } else if (key === 'rankingLookback') {

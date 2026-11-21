@@ -235,3 +235,25 @@ test('visible new highs can widen the price gutter without stretching candle spa
   assert.equal(expanded.geometry.barWidth, normal.geometry.barWidth)
   assert.ok(expanded.geometry.priceAxis.max >= 9_999_999)
 })
+
+test('fixed percentage scale follows the visible reference during fractional scrolling and reuses matching geometry', async () => {
+  const { chartPricePresentation } = await import('./chart-geometry.ts')
+  const { chartWheelContentOffset } = await import('./chart-navigation.ts')
+  const original = window(), frame = { ...original, bars: original.bars.map((bar, index) => ({ ...bar, open: 100 + index, high: 103 + index, low: 99 + index, close: 102 + index })) }
+  const plots = createChartPlotCache(text => text.length * 6)
+  const size = { width: 400, height: 300 }
+  for (const fixedGutter of [undefined, 70]) {
+  const viewport = { spacing: 20, offset: 0, fixedGutter }
+  const results = [-0.9, -0.4, 0, 0.4, 0.9].map(wheelFraction => {
+    const plot = plots(frame, size, {}, null, true, viewport, { mode: 'fixed', pixelsPerPercent: 20, wheelFraction })!
+    const offset = chartWheelContentOffset(wheelFraction, plot.geometry.barPitch, Boolean(plot.before), Boolean(plot.after))
+    const base = chartPricePresentation(plot.geometry, offset).base!
+    assert.ok(base > 0)
+    assert.ok(Math.abs(plot.geometry.priceY(base) - plot.geometry.priceY(base * 1.01) - 20) < 1e-8)
+    return plot.geometry
+  })
+  assert.ok(results.some(geometry => geometry !== results[0]))
+  const again = plots(frame, size, {}, null, true, viewport, { mode: 'fixed', pixelsPerPercent: 20, wheelFraction: 0.9 })!
+  assert.equal(again.geometry, results.at(-1))
+  }
+})

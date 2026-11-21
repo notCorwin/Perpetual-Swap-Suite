@@ -102,6 +102,23 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
     console.log('multiframe: history released')
     await ready(btc)
     console.log('multiframe: three ready')
+    const assertFixedScale = async pixels => {
+      const axes = await page.locator('svg[data-rendered-inst]').evaluateAll(svgs => svgs.map(svg => {
+        const ticks = [...svg.querySelectorAll('[data-chart-price-tick]')].flatMap(tick => {
+          const text = tick.querySelector('text'), line = tick.querySelector('line')
+          const value = Number(text?.textContent?.replaceAll(',', '').replace('%', ''))
+          return text && line && Number.isFinite(value) ? [{ value, y: Number(line.getAttribute('y1')) }] : []
+        })
+        return { frame: svg.dataset.renderedTimeframe, ticks, scale: svg.getBoundingClientRect().height / svg.viewBox.baseVal.height }
+      }))
+      for (const { frame, ticks, scale } of axes) {
+        assert.ok(ticks.length >= 2, `${frame} needs two visible percentage labels to verify its scale`)
+        const [first, second] = ticks
+        const actual = Math.abs((second.y - first.y) * scale / (second.value - first.value))
+        assert.ok(Math.abs(actual - pixels) < 0.2, `${frame} should render ${pixels} px per 1%, got ${actual}`)
+      }
+    }
+    await assertFixedScale(20)
     await live(btc, 139.25, 20)
     const inspectedChart = page.locator('[data-chart-inst]').nth(1)
     const plotBeforeInspection = await inspectedChart.locator('[data-chart-plot]').boundingBox()
@@ -224,6 +241,7 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
     await assertAxisLayout(true)
     await page.locator('[data-chart-plot]').nth(1).evaluate(plot => plot.dispatchEvent(new WheelEvent('wheel', { deltaY: 240, bubbles: true, cancelable: true })))
     const panned = await waitForSynchronizedViewports(initial, 'pan')
+    await assertFixedScale(20)
     await assertAxisLayout()
     // Zooming any one chart changes candle width in all three.
     await page.locator('[data-chart-plot]').nth(2).evaluate(plot => {

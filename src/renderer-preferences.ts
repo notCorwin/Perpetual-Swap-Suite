@@ -15,6 +15,8 @@ export const LIQUIDITY_FIELDS: { key: LiquidityKey; label: string; description?:
 ]
 export type PreferencesDraft = {
   chartDisplayMode: Preferences['chartDisplayMode']
+  priceScaleMode: Preferences['priceScaleMode']
+  priceScalePixelsPerPercent: string
   chartTimeframe: RadarTimeframe
   rankingLookback: string
   historyDays: string
@@ -23,6 +25,7 @@ export type PreferencesDraft = {
 }
 export function preferencesDraft(value: Preferences): PreferencesDraft {
   return {
+    priceScaleMode: value.priceScaleMode, priceScalePixelsPerPercent: String(value.priceScalePixelsPerPercent),
     chartDisplayMode: value.chartDisplayMode, chartTimeframe: value.chartTimeframe, rankingLookback: String(value.rankingLookback), historyDays: String(value.historyDays),
     liquidity: Object.fromEntries(LIQUIDITY_FIELDS.map(field => [field.key, { enabled: value.liquidity[field.key].enabled, threshold: String((value.liquidity[field.key] as unknown as Record<string, number>)[field.parameter]) }])) as PreferencesDraft['liquidity'],
     slippageNotional: String(value.liquidity.slippage.notionalUSDT),
@@ -35,6 +38,8 @@ export function validatePreferencesDraft(draft: PreferencesDraft): { values?: Pr
     if (!Number.isFinite(value) || value < minimum || (integer && !Number.isSafeInteger(value))) errors[key] = `Enter ${integer ? 'a whole number' : 'a number'} of at least ${minimum}.`
     return value
   }
+  const priceScalePixelsPerPercent = number('priceScalePixelsPerPercent', draft.priceScalePixelsPerPercent, 1)
+  if (priceScalePixelsPerPercent > 500) errors.priceScalePixelsPerPercent = 'Enter a number from 1 through 500.'
   const rankingLookback = number('rankingLookback', draft.rankingLookback, 5, true)
   if (Number.isFinite(rankingLookback) && rankingLookback % 5 !== 0) errors.rankingLookback = 'Use a multiple of 5 minutes.'
   const historyDays = number('historyDays', draft.historyDays, 1, true)
@@ -49,5 +54,5 @@ export function validatePreferencesDraft(draft: PreferencesDraft): { values?: Pr
   if (liquidity.volumeStability.maxRatio <= 1) errors.volumeStability = 'Enter a ratio greater than 1.'
   liquidity.slippage.notionalUSDT = number('slippageNotional', draft.slippageNotional, Number.MIN_VALUE)
   if (errors.slippageNotional) errors.slippageNotional = 'Enter a trade size greater than 0.'
-  return { values: Object.keys(errors).length ? undefined : validatePreferences({ chartDisplayMode: draft.chartDisplayMode, chartTimeframe: draft.chartTimeframe, rankingLookback, historyDays, liquidity }), errors }
+  return { values: Object.keys(errors).length ? undefined : validatePreferences({ priceScaleMode: draft.priceScaleMode, priceScalePixelsPerPercent, chartDisplayMode: draft.chartDisplayMode, chartTimeframe: draft.chartTimeframe, rankingLookback, historyDays, liquidity }), errors }
 }

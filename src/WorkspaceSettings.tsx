@@ -237,7 +237,7 @@ export function WorkspaceSettings({ section, active, preferences, loaded, loadEr
     } catch { await waitForPresentation(); if (lifecycle === auditLifecycle.current && sequence === auditSequence.current) setAuditError(`Could not ${action === 'repair' ? 'repair the audit issues' : `${action} the audit`}. Check the data service and retry.`) }
     finally { if (lifecycle === auditLifecycle.current && sequence === auditSequence.current) setAuditBusy(false) }
   }
-  const changeNumber = (key: 'rankingLookback' | 'historyDays' | 'slippageNotional', value: string) => {
+  const changeNumber = (key: 'rankingLookback' | 'historyDays' | 'slippageNotional' | 'priceScalePixelsPerPercent', value: string) => {
     setDraft(current => ({ ...current, [key]: value })); setErrors(current => ({ ...current, [key]: '' })); setSaveError(''); setSavedMessage('')
   }
   const save = async () => {
@@ -270,13 +270,13 @@ export function WorkspaceSettings({ section, active, preferences, loaded, loadEr
     onStatusChange?.(items)
   }, [audit.error, audit.issues.length, audit.phase, audit.progress.completed, audit.progress.total, auditBusy, auditError, auditStatusError, dirty, downloadStatus, onStatusChange, saveError, savedMessage, saving])
   useEffect(() => () => onStatusChange?.([]), [onStatusChange])
-  const numericField = (key: 'rankingLookback' | 'historyDays' | 'slippageNotional', label: string, description?: string) => <Field orientation="horizontal" data-invalid={Boolean(errors[key])} data-disabled={preferenceDisabled} className="justify-between gap-6">
+  const numericField = (key: 'rankingLookback' | 'historyDays' | 'slippageNotional' | 'priceScalePixelsPerPercent', label: string, description?: string) => <Field orientation="horizontal" data-invalid={Boolean(errors[key])} data-disabled={preferenceDisabled} className="justify-between gap-6">
     <FieldContent className="self-center">
       <FieldLabel htmlFor={key}>{label}</FieldLabel>
       {description && <FieldDescription id={`${key}-description`}>{description}</FieldDescription>}
       {errors[key] && <FieldError id={`${key}-error`}>{errors[key]}</FieldError>}
     </FieldContent>
-    <Input id={key} name={key} autoComplete="off" type="number" step={key === 'slippageNotional' ? 'any' : 1} inputMode="decimal" value={draft[key]} onChange={event => changeNumber(key, event.target.value)} aria-invalid={Boolean(errors[key])} aria-describedby={[description && `${key}-description`, errors[key] && `${key}-error`].filter(Boolean).join(' ') || undefined} disabled={preferenceDisabled} className="w-52 shrink-0 self-center" />
+    <Input id={key} name={key} autoComplete="off" type="number" step={key === 'slippageNotional' || key === 'priceScalePixelsPerPercent' ? 'any' : 1} inputMode="decimal" value={draft[key]} onChange={event => changeNumber(key, event.target.value)} aria-invalid={Boolean(errors[key])} aria-describedby={[description && `${key}-description`, errors[key] && `${key}-error`].filter(Boolean).join(' ') || undefined} disabled={preferenceDisabled} className="w-52 shrink-0 self-center" />
   </Field>
   const currentSection = SETTINGS_SECTIONS.find(value => value.id === section)!
   return <main aria-label="Settings" data-layout="settings-workspace" className="flex h-full min-w-0 flex-1 flex-col bg-background">
@@ -306,6 +306,13 @@ export function WorkspaceSettings({ section, active, preferences, loaded, loadEr
                 <SelectContent><SelectGroup>{RADAR_TIMEFRAMES.map(frame => <SelectItem value={frame.value} key={frame.value}>{frame.label}</SelectItem>)}</SelectGroup></SelectContent>
               </Select>
             </Field>
+            <Field orientation="horizontal" className="justify-between gap-6"><FieldLabel htmlFor="price-scale-mode">Price scale</FieldLabel>
+              <Select value={draft.priceScaleMode} onValueChange={value => { if (value === 'fixed' || value === 'auto') { setDraft(current => ({ ...current, priceScaleMode: value })); setSaveError(''); setSavedMessage('') } }}>
+                <SelectTrigger id="price-scale-mode" className="w-52"><SelectValue>{draft.priceScaleMode === 'fixed' ? 'Fixed' : 'Automatic'}</SelectValue></SelectTrigger>
+                <SelectContent><SelectGroup><SelectItem value="fixed">Fixed</SelectItem><SelectItem value="auto">Automatic</SelectItem></SelectGroup></SelectContent>
+              </Select>
+            </Field>
+            {numericField('priceScalePixelsPerPercent', 'Fixed height per 1% (px)', 'From 1 to 500 pixels.')}
             {numericField('rankingLookback', 'Ranking lookback (minutes)', 'Completed 5m closes.')}
           </FieldGroup>
         </FieldSet>

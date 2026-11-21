@@ -1,6 +1,8 @@
 export type ChartTimeframe = '5m' | '15m' | '1H'
 export type Preferences = {
   chartDisplayMode: 'multi' | 'indicators'
+  priceScaleMode: 'auto' | 'fixed'
+  priceScalePixelsPerPercent: number
   chartTimeframe: ChartTimeframe
   rankingLookback: number
   /** Whole days, from 1 through 3650 inclusive. */
@@ -16,6 +18,8 @@ export type Preferences = {
 }
 export type PreferencesPatch = {
   chartDisplayMode?: 'multi' | 'indicators'
+  priceScaleMode?: 'auto' | 'fixed'
+  priceScalePixelsPerPercent?: number
   chartTimeframe?: ChartTimeframe
   rankingLookback?: number
   historyDays?: number
