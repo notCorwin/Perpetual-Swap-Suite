@@ -97,7 +97,6 @@ const fixture = async (context: TestContext, instruments = [instrument()], optio
   const services = new Set([service])
   const prepare = (value: MarketService) => {
     value.preparedCharts.setUniverse = () => ({ frames: [] })
-    value.updateRanking = async () => undefined
     for (const lane of value.requestLanes.values()) { lane.interval = 0; lane.nextAt = 0 }
   }
   await service.ready; prepare(service); bootstrap.resolve()

@@ -8,7 +8,8 @@ import { CHART_PRIMARY_TIMEFRAME } from './preferences.js'
 import { MarketHistory } from './market-history.js'
 import { HistoryDownload } from './history-download.js'
 import { eligibleInstrument, evaluateLiquidity, createLiquidityEvaluator, quoteTurnover24h } from './liquidity.js'
-import { rankingFromCandles, compareRanking } from './ranking.js'
+import { compareRanking } from './ranking.js'
+import { signedRelativeChange } from './market-metrics.js'
 import { RealtimeMarket } from './realtime-market.js'
 import { RealtimePublicMarket } from './realtime-public-market.js'
 import { LiveStatistics } from './live-statistics.js'
@@ -342,15 +343,6 @@ export class MarketService {
     this.observations = new Map()
     this.liquidityHistoryRevisions = new Map()
     this.evaluateLiquidity = createLiquidityEvaluator()
-    this.rankings = new Map()
-    this.rankingTasks = new Map()
-    this.rankingWindows = new Map()
-    this.rankingVersions = new Map()
-    this.rankingReads = new Map()
-    this.rankingRepairs = new Map()
-    this.persistedRankings = new Map()
-    this.pendingRankings = new Map()
-    this.rankingPersistenceImmediate = null
     this.listUpdatedAt = null
     this.canonicalList = null
     this.canonicalOrdering = null
@@ -363,6 +355,8 @@ export class MarketService {
     this.subscriptionDeadlines = new DeadlineIndex()
     this.statisticsTasks = new Map()
     this.liveCandles = new Map()
+    this.listPrefixAttempts = new Map()
+    this.listQuoteTimer = null
     this.liveCandleSources = new Map()
     this.derivedLivePrices = new WeakSet()
     this.livePrefixTasks = new Map()
@@ -512,7 +506,7 @@ export class MarketService {
         if (record) this.rememberHistoricalAssessment(record)
       },
       onForming: (row, context) => {
-        this.track(this.candleDerivations.observe(row, context))
+        this.track(this.candleDerivations.observe(row, context).then(() => this.ensureListHourPrefix(row.instrument)))
         // The source has admitted its raw fact synchronously. Background chart
         // publication has a separate completion and must not hold the next
         // same-series socket event or its selected higher-timeframe derivative.
@@ -611,12 +605,6 @@ export class MarketService {
         if (entry.instrumentObservation) { this.#markMarketDeadlineDirty(entry.instrument.instId); this.instrumentObservations.set(entry.instrument.instId, entry.instrumentObservation) }
       }
       if (entry.observations) { this.#markMarketDeadlineDirty(entry.instrumentID); this.observations.set(entry.instrumentID, entry.observations) }
-      const ranking = entry.lastRanking
-      if (ranking?.lookback === this.prefs().rankingLookback && typeof ranking.rankingChange === 'number' && Number.isFinite(ranking.rankingChange)
-        && Number.isSafeInteger(ranking.rankingAsOf) && ranking.rankingAsOf >= 0 && ranking.rankingAsOf % FIVE_MINUTES === 0 && ranking.rankingAsOf <= closedBoundary('5m')) {
-        this.rankings.set(entry.instrumentID, { lookback: ranking.lookback, rankingChange: ranking.rankingChange, rankingAsOf: ranking.rankingAsOf })
-        this.persistedRankings.set(entry.instrumentID, JSON.stringify(ranking))
-      }
       if (entry.configKey === this.catalogCriteriaKey()) {
         this.catalogChecks.set(entry.instrumentID, entry)
         if (entry.status === 'verified' || entry.renewalTarget === true) this.renewalTargets.set(entry.instrumentID, entry.instrument)
@@ -639,11 +627,7 @@ export class MarketService {
 
   catalogRecord(entry, timestamp = Date.now()) {
     const configKey = entry.configKey ?? this.catalogCriteriaKey()
-    const ranking = this.rankings.get(entry.instrument.instId)
-    const lastRanking = ranking?.lookback === this.prefs().rankingLookback && ranking.rankingChange !== null
-      ? { lookback: ranking.lookback, rankingChange: ranking.rankingChange, rankingAsOf: ranking.rankingAsOf } : entry.lastRanking
     return { ...entry, instrumentID: entry.instrument.instId, schemaVersion: 1,
-      ...(lastRanking ? { lastRanking } : {}),
       status: entry.status ?? (entry.result?.eligible ? 'verified' : 'failed'),
       observedAt: entry.observedAt ?? timestamp, expiresAt: entry.expiresAt ?? timestamp + OBSERVATION_TTL,
       preferencesRevision: entry.preferencesRevision ?? this.metadata?.getSettings().revision ?? 0, configKey }
@@ -665,7 +649,7 @@ export class MarketService {
     for (const entry of next.values()) this.instruments.set(entry.instrument.instId, entry.instrument)
     if (changed) { this.catalogRevision += 1; this.touchList() }
     this.updateListedUniverse(now)
-    for (const instId of next.keys()) if (!previous.has(instId)) this.track(this.updateRanking(instId, { ensure: true }))
+    for (const instId of next.keys()) if (!previous.has(instId)) this.ensureListHourPrefix(instId)
     this.updateSubscriptions()
     this.scheduleMarketDeadline()
     return changed
@@ -699,13 +683,15 @@ export class MarketService {
     const ids = new Set(this.listedCatalogEntries(now).keys())
     if (ids.size === this.listedUniverse.size && [...ids].every(id => this.listedUniverse.has(id))) return
     this.listedUniverse = ids
+    for (const instId of this.listPrefixAttempts.keys()) if (!ids.has(instId)) this.listPrefixAttempts.delete(instId)
     this.preparedCharts.setUniverse([...ids])
+    this.scheduleListQuoteExpiry()
     this.scheduleSubscriptions()
   }
 
   /** Reuse one canonical projection until its market facts or freshness proof change. */
   canonicalMarketList(now = Date.now()) {
-    const lookback = this.prefs().rankingLookback, configKey = this.catalogCriteriaKey(), asOf = closedBoundary('5m', now)
+    const lookback = 60, configKey = this.catalogCriteriaKey(), asOf = closedBoundary('1H', now)
     const cached = this.canonicalList
     if (cached?.revision === this.revision && cached.lookback === lookback && cached.configKey === configKey
       && now >= cached.observedAt && now < cached.expiresAt) return cached
@@ -713,15 +699,18 @@ export class MarketService {
     let qualifiedCount = 0
     for (const entry of this.catalog.values()) if (this.validCatalogEntry(entry, now)) qualifiedCount++
     const projected = entries.map(entry => {
-      const instId = entry.instrument.instId, ranking = this.rankings.get(instId)
-      const current = ranking?.lookback === lookback && ranking.rankingAsOf === asOf
+      const instId = entry.instrument.instId, key = `${instId}:1H`
+      const live = this.liveCandles.get(key), observedAt = this.liveReceivedAt.get(key)
+      const current = live?.timestamp === asOf && Number.isFinite(observedAt) && observedAt <= now
+        && now < observedAt + 30_000 && this.priceStreaming(instId, '1H')
+      const change = current ? signedRelativeChange(live.close, live.open) : null
       // A metadata reassessment may have no ticker dependency. Quote display
       // still owns the last shared market observation, independently of filters.
       const ticker = this.observations.get(instId)?.ticker?.value ?? this.tickerCache?.values.get(instId)?.value ?? entry.ticker
       const instrument = this.instruments.get(instId) ?? entry.instrument
       return { instId, tickSz: typeof instrument.tickSz === 'string' ? instrument.tickSz : null,
         lastPrice: number(ticker.last), turnover24hUSDT: number(this.catalogChecks.get(instId)?.result.turnover ?? entry.result.turnover),
-        rankingChange: current ? ranking.rankingChange : null, rankingAsOf: current ? ranking.rankingAsOf : null }
+        rankingChange: change, rankingAsOf: change === null ? null : observedAt }
     })
     const previousOrder = this.canonicalOrdering, byId = new Map(projected.map(row => [row.instId, row]))
     let sameRanking = previousOrder?.keys.size === byId.size, sameTurnover = sameRanking
@@ -738,7 +727,8 @@ export class MarketService {
         .map(row => row.instId))
     this.canonicalOrdering = { keys: new Map(projected.map(row => [row.instId, { rankingChange: row.rankingChange, turnover24hUSDT: row.turnover24hUSDT }])),
       ranking: sameRanking ? previousOrder.ranking : rows.map(row => row.instId), turnover: sameTurnover ? previousOrder.turnover : turnoverOrder.slice() }
-    let expiresAt = asOf + FIVE_MINUTES
+    let expiresAt = asOf + 3_600_000
+    for (const row of projected) if (row.rankingAsOf !== null) expiresAt = Math.min(expiresAt, row.rankingAsOf + 30_000)
     for (const entry of entries) {
       const expiry = this.catalogEntryExpiry(entry, now)
       expiresAt = Math.min(expiresAt, this.listRemovals.get(entry.instrument.instId)?.removeAt ?? (expiry > now ? expiry : expiry + LIST_REMOVAL_DELAY_MS))
@@ -751,129 +741,6 @@ export class MarketService {
 
   /** Observational read: never admits source, history, or indicator work. */
   listRowsFor(now = Date.now()) { return this.canonicalMarketList(now).rows }
-
-  cacheRankingCandles(instId, candles) {
-    const rows = this.rankingWindows.get(instId)?.rows ?? new Map()
-    const through = closedBoundary('5m') - FIVE_MINUTES
-    const from = Math.max(0, through - Math.max(1_440, this.prefs().rankingLookback) * 60_000)
-    let changed = false
-    for (const row of candles) {
-      if (row.instrument !== instId || row.timeframe !== '5m' || row.confirmed !== true || row.timestamp < from || row.timestamp > through) continue
-      const previous = rows.get(row.timestamp)
-      if (previous && Object.is(previous.close, row.close)) continue
-      rows.set(row.timestamp, { instrument: instId, timeframe: '5m', timestamp: row.timestamp, close: row.close, confirmed: true })
-      changed = true
-    }
-    for (const timestamp of rows.keys()) if (timestamp < from || timestamp > through) { rows.delete(timestamp); changed = true }
-    if (changed) {
-      this.rankingVersions.set(instId, (this.rankingVersions.get(instId) ?? 0) + 1)
-      this.rankingReads.delete(instId)
-      this.rankingWindows.set(instId, { rows })
-      if (this.catalog.has(instId) || this.listRemovals.has(instId)) this.publishRanking(instId, this.prefs().rankingLookback, closedBoundary('5m'))
-    }
-  }
-
-  cachedRanking(instId, lookback = this.prefs().rankingLookback, asOf = closedBoundary('5m')) {
-    const window = this.rankingWindows.get(instId), version = this.rankingVersions.get(instId) ?? 0
-    let result = window?.evaluation
-    if (!result || result.version !== version || result.lookback !== lookback || result.asOf !== asOf) {
-      result = { version, lookback, asOf, ...rankingFromCandles([...(window?.rows.values() ?? [])], lookback, asOf) }
-      if (window) window.evaluation = result
-    }
-    const previous = this.rankings.get(instId)
-    // A saved current-boundary ranking can paint while its local cache warms.
-    // It cannot substitute for missing data in a new boundary or changed cache.
-    const ranking = !window && result.rankingChange === null && previous?.lookback === lookback && previous.rankingAsOf === asOf
-      ? previous : { rankingChange: result.rankingChange, rankingAsOf: result.rankingAsOf, lookback }
-    this.rankings.set(instId, ranking)
-    return ranking
-  }
-
-  publishRanking(instId, lookback, asOf) {
-    const previous = this.rankings.get(instId)
-    const { rankingChange, rankingAsOf } = this.cachedRanking(instId, lookback, asOf)
-    if ((this.catalog.has(instId) || this.listRemovals.has(instId)) && (previous?.lookback !== lookback || !Object.is(previous?.rankingChange, rankingChange) || previous?.rankingAsOf !== rankingAsOf)) {
-      this.listUpdatedAt = Date.now()
-      this.touchList()
-    }
-    if (rankingChange !== null) {
-      const lastRanking = { lookback, rankingChange, rankingAsOf }, signature = JSON.stringify(lastRanking)
-      const current = this.catalog.get(instId)
-      if (current) current.lastRanking = lastRanking
-      if (this.persistedRankings.get(instId) === signature) this.pendingRankings.delete(instId)
-      else {
-        this.pendingRankings.set(instId, lastRanking)
-        if (!this.rankingPersistenceImmediate && !this.disposed) {
-          this.rankingPersistenceImmediate = setImmediate(() => {
-            this.rankingPersistenceImmediate = null
-            this.track(Promise.resolve().then(() => this.flushRankingPersistence()))
-          })
-          this.rankingPersistenceImmediate.unref?.()
-        }
-      }
-    }
-  }
-
-  flushRankingPersistence() {
-    if (this.rankingPersistenceImmediate) clearImmediate(this.rankingPersistenceImmediate)
-    this.rankingPersistenceImmediate = null
-    if (!this.pendingRankings.size || !this.metadata) return
-    const pending = this.pendingRankings
-    this.pendingRankings = new Map()
-    try {
-      // Update only ranking JSON inside one transaction. Qualification may have
-      // changed since publication; never replace its current observations.
-      const updated = this.metadata.saveCatalogRankings([...pending].map(([instrumentID, ranking]) => ({ instrumentID, ...ranking })))
-      for (const instId of updated) this.persistedRankings.set(instId, JSON.stringify(pending.get(instId)))
-    } catch (error) {
-      for (const [instId, ranking] of pending) if (!this.pendingRankings.has(instId)) this.pendingRankings.set(instId, ranking)
-      throw error
-    }
-  }
-
-  repairRanking(instId, lookback, asOf) {
-    const key = `${instId}:${lookback}:${asOf}`
-    if (this.rankingRepairs.has(key) || this.closing || this.disposed) return
-    const through = asOf - FIVE_MINUTES, from = Math.max(0, through - lookback * 60_000)
-    const task = Promise.resolve().then(() => this.history.ensurePriceCoverage(instId, '5m', from, through, 'background'))
-      .then(() => {
-        this.rankingReads.delete(instId)
-        return this.updateRanking(instId, { asOf })
-      }).finally(() => { if (this.rankingRepairs.get(key) === task) this.rankingRepairs.delete(key) })
-    this.rankingRepairs.set(key, task)
-    this.track(task)
-  }
-
-  async updateRanking(instId, { ensure = false, asOf = closedBoundary('5m') } = {}) {
-    if (this.disposed || this.closing || asOf !== closedBoundary('5m')) return
-    const lookback = this.prefs().rankingLookback, key = `${instId}:${lookback}:${asOf}`
-    this.publishRanking(instId, lookback, asOf)
-    const evaluation = this.rankingWindows.get(instId)?.evaluation
-    if (evaluation?.rankingChange !== null && evaluation?.rankingChange !== undefined) return
-    const version = this.rankingVersions.get(instId) ?? 0, read = this.rankingReads.get(instId)
-    if (read?.version === version && read.lookback === lookback && read.asOf === asOf) {
-      if (ensure) this.repairRanking(instId, lookback, asOf)
-      return
-    }
-    if (this.rankingTasks.has(key)) return this.rankingTasks.get(key)
-    const task = (async () => {
-      const through = asOf - FIVE_MINUTES, from = Math.max(0, through - Math.max(1_440, lookback) * 60_000)
-      const rows = await this.store.candles({ instrument: instId, timeframe: '5m', from, through }, 'background')
-      // A completed write that raced this read owns newer close observations.
-      if (this.disposed) return
-      if ((this.rankingVersions.get(instId) ?? 0) !== version) {
-        this.publishRanking(instId, this.prefs().rankingLookback, closedBoundary('5m'))
-        return
-      }
-      this.cacheRankingCandles(instId, rows)
-      this.rankingReads.set(instId, { version: this.rankingVersions.get(instId) ?? 0, lookback, asOf })
-      if (this.prefs().rankingLookback !== lookback || asOf !== closedBoundary('5m')) return
-      this.publishRanking(instId, lookback, asOf)
-      if (this.rankingWindows.get(instId)?.evaluation?.rankingChange == null && (ensure || this.catalog.has(instId))) this.repairRanking(instId, lookback, asOf)
-    })().finally(() => { if (this.rankingTasks.get(key) === task) this.rankingTasks.delete(key) })
-    this.rankingTasks.set(key, task)
-    return task
-  }
 
   track(promise) {
     const source = Promise.resolve(promise), existing = this.backgroundTaskSources.get(source)
@@ -1220,7 +1087,6 @@ export class MarketService {
       if (!changed.length) return false
       this.invalidateLiquidityHistory(instrument, changed)
       this.markChartDataChanged(instrument)
-      this.cacheRankingCandles(instrument, changed)
       for (const timeframe of new Set(changed.map(row => row.timeframe))) this.scheduleQualification(instrument, timeframe)
       const base = changed.filter(row => row.timeframe === '5m')
       if (base.length) {
@@ -1232,7 +1098,6 @@ export class MarketService {
           if (from <= through) await this.materializePricesLocked({ instrument, timeframe, from, through, invalidateIncomplete: true }, priority)
         }
       }
-      if (confirmed.some(row => row.timeframe === '5m')) void this.updateRanking(instrument).catch(() => undefined)
       return true
     })
     // Writer recovery also belongs to an in-flight attempt that has rejected
@@ -1278,7 +1143,6 @@ export class MarketService {
       const live = this.liveCandles.get(`${row.instrument}:${timeframe}`)
       if (!live || live.timestamp <= stamp) this.track(Promise.resolve(this.setLive(row.instrument, timeframe, null)))
     }
-    this.track(this.updateRanking(row.instrument))
   }
 
   confirmStatistics(row) {
@@ -1372,9 +1236,36 @@ export class MarketService {
   }
 
 
+  ensureListHourPrefix(instId) {
+    if (this.closing || this.disposed || !this.listedUniverse.has(instId)) return
+    const base = this.liveCandleSources.get(`${instId}:5m`), hour = closedBoundary('1H')
+    if (!base || base.timestamp !== closedBoundary('5m') || !this.realtime?.isSubscribed(instId, '5m')
+      || this.liveCandles.get(`${instId}:1H`)?.timestamp === hour) return
+    if (this.listPrefixAttempts.get(instId) === base.timestamp) return
+    this.listPrefixAttempts.set(instId, base.timestamp)
+    this.track(this.latestChartPrice(instId, '1H', 'background').catch(() => {}))
+  }
+
+  scheduleListQuoteExpiry() {
+    if (this.listQuoteTimer || this.closing || this.disposed) return
+    const now = Date.now()
+    let next = Infinity
+    for (const instId of this.listedUniverse) {
+      const observedAt = this.liveReceivedAt.get(`${instId}:1H`)
+      if (observedAt != null && observedAt + 30_000 > now) next = Math.min(next, observedAt + 30_000)
+    }
+    if (!Number.isFinite(next)) return
+    this.listQuoteTimer = setTimeout(() => {
+      this.listQuoteTimer = null
+      this.touchList()
+      this.scheduleListQuoteExpiry()
+    }, Math.max(1, next - now))
+    this.listQuoteTimer.unref?.()
+  }
+
   setLive(instId, timeframe, row, { receivedAt } = {}) {
     if (this.disposed) return
-    const key = `${instId}:${timeframe}`, current = this.liveCandles.get(key)
+    const key = `${instId}:${timeframe}`, current = this.liveCandles.get(key), previousReceivedAt = this.liveReceivedAt.get(key)
     // REST initialization can resolve after a newer stream event. Same-volume
     // price corrections remain valid; older timestamps/cumulative volume do not.
     if (row && current && (row.timestamp < current.timestamp || row.timestamp === current.timestamp && row.volume < current.volume)) return Promise.resolve(null)
@@ -1389,6 +1280,11 @@ export class MarketService {
     } else {
       this.liveCandleSources.delete(key)
       this.liveCandles.delete(key)
+    }
+    if (timeframe === '1H' && this.listedUniverse.has(instId)) {
+      if (!current || !row || current.timestamp !== row.timestamp || current.open !== row.open || current.close !== row.close
+        || previousReceivedAt == null || Date.now() - previousReceivedAt >= 30_000) this.touchList()
+      this.scheduleListQuoteExpiry()
     }
     // Collection covers the exchange universe. Only visible/cached charts need
     // indicator projections; an undisplayed contract must not seed a chart on every tick.
@@ -1717,31 +1613,13 @@ export class MarketService {
   onHistoryProgress(task) {
     if (this.disposed) return
     this.historyDownload?.observe(task)
-    if (['completed', 'unavailable'].includes(task.status) && task.timeframe === '5m') this.track(this.updateRanking(task.instrument))
-  }
-
-  invalidateRanking(instId) {
-    this.rankingWindows.delete(instId)
-    this.rankingReads.delete(instId)
-    this.rankingVersions.set(instId, (this.rankingVersions.get(instId) ?? 0) + 1)
-    this.rankings.delete(instId)
-    this.pendingRankings.delete(instId)
-    this.persistedRankings.delete(instId)
-    for (const record of new Set([this.catalog.get(instId), this.catalogChecks.get(instId)])) if (record) delete record.lastRanking
-    // A replacement revokes the persisted proof too; a restart must not revive
-    // a same-boundary result computed from the superseded source candles.
-    const saved = this.metadata?.getCatalogEntry(instId)
-    if (saved?.lastRanking) { delete saved.lastRanking; this.metadata.putCatalogEntry(saved) }
-    if (this.catalog.has(instId) || this.listRemovals.has(instId)) this.touchList()
   }
 
   onHistoryReplaced(instId, timeframe) {
     this.invalidateLiquidityHistory(instId, null, timeframe)
     this.markChartDataChanged(instId)
     this.preparedCharts.invalidate(instId, timeframe)
-    if (timeframe === '5m') this.invalidateRanking(instId)
     this.scheduleQualification(instId, timeframe)
-    if (timeframe === '5m') this.track(this.updateRanking(instId))
   }
 
   // A bounded REST snapshot can periodically reassess an unqualified book
@@ -2302,7 +2180,6 @@ export class MarketService {
       if (asOf !== this.marketBoundary) {
         this.marketBoundary = asOf
         this.touchList()
-        for (const instId of new Set([...this.catalog.keys(), ...this.listRemovals.keys()])) this.track(this.updateRanking(instId, { asOf }))
         for (const instId of this.catalogChecks.keys()) this.scheduleQualification(instId)
       }
       // A worker can still own an earlier immutable observation. Its published
@@ -2764,7 +2641,6 @@ export class MarketService {
       if (end !== closedBoundary(timeframe)) continue
       value ??= calculate(rows, end, from)
       this.historicalWindows.set(`${instId}:${timeframe}`, { rows: new Map(rows.map(row => [row.timestamp, row])), revision, storeRevision: this.store.candlePriceRevision(instId, timeframe) })
-      if (key === 'turnover') this.cacheRankingCandles(instId, rows)
       const observation = { value: { asOf: end, ...value }, observedAt: Date.now(), expiresAt: end + step }
       this.historicalInputs.set(observation, new Map(rows.map(row => [row.timestamp, row.quoteVolume])))
       this.#markMarketDeadlineDirty(instId)
@@ -2852,7 +2728,6 @@ export class MarketService {
     this.#markMarketDeadlineDirty(instId)
     this.observations.set(instId, observations)
     const now = Date.now()
-    const currentAsOf = closedBoundary('5m')
     const record = this.observedCandidate(instrument, config, configKey, observations, errors, now)
     record.preferencesRevision = this.metadata.getSettings().revision
     const { status } = record
@@ -2885,9 +2760,6 @@ export class MarketService {
     })
     await this.catalogPublicationTask
     if (this.catalogChecks.get(instId) !== record || !this.currentCandidate(instrument, configKey, signal)) return
-    if (status === 'verified' && this.validCatalogEntry(record)) {
-      this.track(this.updateRanking(instId, { ensure: true, asOf: currentAsOf }))
-    }
   }
 
   currentCandidate(instrument, configKey, signal) {
@@ -3189,7 +3061,7 @@ export class MarketService {
     await this.ready
     const current = this.prefs(), previous = validatePreferences(previousPreferences)
     const liquidityChanged = liquidityConfigKey(previous.liquidity) !== liquidityConfigKey(current.liquidity)
-    if (!liquidityChanged && previous.rankingLookback === current.rankingLookback) return
+    if (!liquidityChanged) return
     if (liquidityChanged) {
       this.historicalAssessments = new WeakMap()
       this.historicalValidations = new WeakSet()
@@ -3205,9 +3077,6 @@ export class MarketService {
       if (this.autoRefresh) this.track(Promise.allSettled([this.refreshing, this.renewing].filter(Boolean)).then(() => {
         if (!this.closing && !this.disposed && this.catalogCriteriaKey() === configKey) return this.refresh({ reuse: true })
       }))
-    }
-    if (previous.rankingLookback !== current.rankingLookback) {
-      for (const instId of new Set([...this.catalog.keys(), ...this.listRemovals.keys()])) this.track(this.updateRanking(instId, { ensure: true }))
     }
     this.touchList()
     this.scheduleMarketDeadline()
@@ -3322,6 +3191,7 @@ export class MarketService {
   // Caller must await ready. A resume barrier captures every component and
   // posts its response in this same turn, before attaching live subscribers.
   currentSnapshot({ sinceRevision, serviceSession } = {}) {
+    const previousList = this.canonicalList
     const { rows, turnoverOrder, qualifiedCount, current: listCurrent } = this.canonicalMarketList()
     const configKey = this.catalogCriteriaKey()
     const pendingIDs = new Set([...this.pendingCandidates.values()].filter(value => value.configKey === configKey).map(value => value.instId))
@@ -3353,7 +3223,7 @@ export class MarketService {
     const metadata = { ...status, revision: this.revision, serviceSession: this.serviceSession }
     // A source or retirement deadline can reach IPC before its callback. Never
     // hide a changed projection or ranking boundary behind a version hit.
-    const current = this.marketBoundary === closedBoundary('5m') && listCurrent
+    const current = this.marketBoundary === closedBoundary('5m') && listCurrent && previousList === this.canonicalList
     if (current && serviceSession === this.serviceSession && sinceRevision === this.revision) return { ...metadata, unchanged: true }
     return { ...metadata, rows, turnoverOrder }
   }
@@ -3387,6 +3257,7 @@ export class MarketService {
     this.marketDeadlineDirty.clear()
     if (this.qualificationImmediate) clearImmediate(this.qualificationImmediate)
     if (this.marketPublicationTimer) clearTimeout(this.marketPublicationTimer)
+    if (this.listQuoteTimer) clearTimeout(this.listQuoteTimer)
     if (this.streamQualificationTimer) clearTimeout(this.streamQualificationTimer)
     if (this.liveStatisticsTimer) clearTimeout(this.liveStatisticsTimer)
     this.marketListeners.clear()
@@ -3413,8 +3284,7 @@ export class MarketService {
       await settle([() => this.historyDownload.close()])
       await settle([() => this.history.close()])
       await settle([() => this.preparedCharts.dispose()])
-      await Promise.allSettled([this.refreshing, this.renewing, this.drainRequestQueues(), ...this.candidateTasks.values(), ...this.barTasks, ...this.backgroundTasks, ...this.rankingTasks.values(), ...this.candleMutations.values(), ...this.livePrefixTasks.values()].filter(Boolean))
-      await settle([() => this.flushRankingPersistence()])
+      await Promise.allSettled([this.refreshing, this.renewing, this.drainRequestQueues(), ...this.candidateTasks.values(), ...this.barTasks, ...this.backgroundTasks, ...this.candleMutations.values(), ...this.livePrefixTasks.values()].filter(Boolean))
       if (this.ownsMetadata) await settle([() => this.metadata.close()])
       if (failures.length) throw new AggregateError(failures, `Market service shutdown failed: ${failures.map(error => error?.message ?? String(error)).join('; ')}`)
     })()

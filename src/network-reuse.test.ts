@@ -46,7 +46,6 @@ const fixture = async (automatic = false, sources: { book?: () => Response | Pro
     throw new Error(`Unexpected source request: ${path}`)
   }, automatic, { webSocketFactory: () => { const socket = new Socket(); sockets.push(socket); return socket } })
   service.preparedCharts.setUniverse = () => ({ frames: [] })
-  service.updateRanking = async () => undefined
   await service.ready
   for (const lane of service.requestLanes.values()) lane.interval = 0
   return { service, preferences, requests, sockets, async close() { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) } }

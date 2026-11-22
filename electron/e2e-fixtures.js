@@ -457,14 +457,13 @@ export async function createChartColdBoundaryFixture(store, marketService, {
 
       if (ownsInstrument) {
         const owned = map => [...map].filter(([key]) => key.startsWith(`${instId}:`)).map(([, task]) => task)
-        // A list-ranking read can admit a history repair after catalog removal.
-        // Finish those reads before retiring all history targets for this fixture.
-        await Promise.allSettled(owned(marketService.rankingTasks))
+        // Finish admitted live-prefix work before retiring history targets.
+        await Promise.allSettled(owned(marketService.livePrefixTasks))
         const sync = marketService.history.sync
         const activeHistory = () => [...sync.active.values()].filter(entry => entry.group.instrument === instId).map(entry => entry.promise)
         const admitted = activeHistory()
         await marketService.history.removeTargets([instId])
-        await Promise.allSettled([...admitted, ...activeHistory(), ...owned(marketService.rankingRepairs)])
+        await Promise.allSettled([...admitted, ...activeHistory()])
       }
       await Promise.allSettled([...pending])
       if (marketService.get === fixtureGet) marketService.get = original

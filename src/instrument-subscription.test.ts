@@ -30,7 +30,6 @@ const projectionIsolation = (service: MarketService) => {
   // These tests exercise collection, membership and durable writes. Rendering
   // and indicator projection have their own source-window integration tests.
   service.preparedCharts.setUniverse = () => ({ frames: [] })
-  service.updateRanking = async () => undefined
   for (const lane of service.requestLanes.values()) lane.interval = 0
 }
 const settle = async (service: MarketService) => {

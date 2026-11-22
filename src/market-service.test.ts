@@ -138,6 +138,12 @@ const localCatalog = (service: MarketService, ids = [instId]) => service.replace
   instrument: { ...instrument, instId: id }, ticker: { ...ticker, instId: id }, result: { eligible: true, status: 'verified', turnover: 40_000_000 },
 })))
 
+const setHour = (service: MarketService, id: string, change: number, now = Date.now()) => {
+  const key = `${id}:1H`, timestamp = Math.floor(now / hour) * hour
+  service.liveCandles.set(key, { ...nativeCandle(timestamp, '1H', 100 + change), instrument: id, open: 100 })
+  service.liveReceivedAt.set(key, now)
+}
+
 test('no-op and audit-only configuration changes preserve the market revision and cached rows', async () => {
   const f = await fixture()
   try {
@@ -161,7 +167,7 @@ test('history retention preferences cause no market revision, publication, reads
     const unsubscribe = f.service.subscribeMarket(() => { publications++ })
     const detach = attachOperationSink(event => { operations.push(event.name) })
     const original = new Map<string, (...args: any[]) => unknown>()
-    for (const method of ['touchList', 'listRowsFor', 'updateSubscriptions', 'updateRanking', 'scheduleMarketDeadline', 'replaceCatalog']) {
+    for (const method of ['touchList', 'listRowsFor', 'updateSubscriptions', 'scheduleMarketDeadline', 'replaceCatalog']) {
       original.set(method, f.service[method])
       f.service[method] = () => { throw new Error(`A history retention preference called ${method}.`) }
     }
@@ -186,12 +192,11 @@ test('history retention preferences cause no market revision, publication, reads
 test('canonical rows contain only list facts and own both ranking and turnover order', async () => {
   const f = await fixture(), ids = [instId, 'ETH-USDT-SWAP', 'SOL-USDT-SWAP', 'XRP-USDT-SWAP']
   try {
-    f.service.updateRanking = async () => undefined
     localCatalog(f.service, ids)
-    const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
+    f.service.priceStreaming = () => true
     for (const [index, id] of ids.entries()) {
       f.service.catalog.get(id).result.turnover = [20, 40, 40, null][index]
-      f.service.rankings.set(id, { lookback: f.preferences.rankingLookback, rankingChange: [2, -4, 1, 99][index], rankingAsOf: index === 3 ? asOf - fiveMinutes : asOf })
+      if (index !== 3) setHour(f.service, id, [2, -4, 1][index])
     }
     const snapshot = await f.service.snapshot()
     assert.deepEqual(snapshot.rows.map(row => row.instId), [ids[1], ids[0], ids[2], ids[3]])
@@ -208,12 +213,11 @@ test('canonical rows contain only list facts and own both ranking and turnover o
 test('price-only updates reuse ordering while changed keys and membership rebuild the right order', async () => {
   const f = await fixture(), ids = [instId, 'ETH-USDT-SWAP', 'SOL-USDT-SWAP']
   try {
-    f.service.updateRanking = async () => undefined
     localCatalog(f.service, ids)
-    const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
+    f.service.priceStreaming = () => true
     for (const [index, id] of ids.entries()) {
       f.service.catalog.get(id).result.turnover = 10 + index
-      f.service.rankings.set(id, { lookback: f.preferences.rankingLookback, rankingChange: index, rankingAsOf: asOf })
+      setHour(f.service, id, index)
     }
     const operations: string[] = [], detach = attachOperationSink(event => { operations.push(event.name) })
     try {
@@ -228,7 +232,7 @@ test('price-only updates reuse ordering while changed keys and membership rebuil
       assert.deepEqual(price.turnoverOrder, first.turnoverOrder)
       assert.equal(operations.filter(name => name === 'market.list.sort').length, 1)
       assert.equal(operations.filter(name => name === 'market.list.turnover-sort').length, 1)
-      f.service.rankings.set(ids[0], { lookback: f.preferences.rankingLookback, rankingChange: 10, rankingAsOf: asOf })
+      setHour(f.service, ids[0], 10)
       f.service.touchList()
       assert.equal(f.service.canonicalMarketList().rows[0].instId, ids[0])
       assert.equal(operations.filter(name => name === 'market.list.sort').length, 2)
@@ -241,6 +245,51 @@ test('price-only updates reuse ordering while changed keys and membership rebuil
       assert.deepEqual(f.service.canonicalMarketList(Date.now() + 31_000).rows, [])
     } finally { detach() }
   } finally { await f.close() }
+})
+
+test('list uses current hourly chart open and close, expires, and refreshes even at the same price', async context => {
+  const boundary = Math.floor(Date.now() / hour) * hour + hour
+  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: boundary - 90_000 })
+  const f = await fixture()
+  try {
+    localCatalog(f.service, [instId, 'ETH-USDT-SWAP'])
+    f.service.priceStreaming = () => true
+    const candle = { ...nativeCandle(boundary - hour, '1H', 102), open: 100, confirmed: false }
+    await f.service.setLive(instId, '1H', candle, { receivedAt: Date.now() })
+    let row = f.service.listRowsFor().find(row => row.instId === instId)!
+    assert.equal(row.rankingChange, 2)
+    const initial = await f.service.snapshot()
+    context.mock.timers.tick(30_000)
+    const expired = await f.service.snapshot({ sinceRevision: initial.revision, serviceSession: initial.serviceSession })
+    assert.equal('unchanged' in expired, false)
+    assert.equal('rows' in expired && expired.rows.find(row => row.instId === instId)?.rankingChange, null)
+    await f.service.setLive(instId, '1H', { ...candle }, { receivedAt: Date.now() })
+    assert.equal(f.service.listRowsFor().find(row => row.instId === instId)?.rankingChange, 2)
+    await f.service.setLive(instId, '1H', { ...candle, close: 97 }, { receivedAt: Date.now() })
+    assert.equal(f.service.listRowsFor().find(row => row.instId === instId)?.rankingChange, -3)
+    context.mock.timers.tick(60_000)
+    row = f.service.listRowsFor().find(row => row.instId === instId)!
+    assert.equal(row.rankingChange, null)
+    await f.service.setLive(instId, '1H', { ...candle, timestamp: boundary, open: 97, close: 98 }, { receivedAt: Date.now() })
+    assert.equal(f.service.listRowsFor().find(row => row.instId === instId)?.rankingChange, 100 / 97)
+  } finally { context.mock.timers.reset(); await f.close() }
+})
+
+test('missing hourly prefix is requested once per current five minute candle for each listed contract', async context => {
+  const now = Math.floor(Date.now() / hour) * hour + 4 * fiveMinutes
+  context.mock.method(Date, 'now', () => now)
+  const f = await fixture(), gate = deferred()
+  try {
+    const other = 'ETH-USDT-SWAP', calls: string[] = []
+    localCatalog(f.service, [instId, other])
+    f.service.realtime.isSubscribed = () => true
+    f.service.latestChartPrice = async (id: string) => { calls.push(id); await gate.promise; return null }
+    for (const id of [instId, other]) f.service.liveCandleSources.set(`${id}:5m`, { ...rawCandle(now), instrument: id })
+    for (const id of [instId, other, instId, other]) f.service.ensureListHourPrefix(id)
+    assert.deepEqual(calls.sort(), [instId, other].sort())
+    gate.resolve()
+    await Promise.allSettled([...f.service.backgroundTasks])
+  } finally { gate.resolve(); await f.close() }
 })
 
 test('catalog replacement detects membership and record changes without false revisions', async () => {
@@ -294,11 +343,11 @@ test('canonical list reads reuse both sort orders and expire before stale eligib
   context.mock.method(Date, 'now', () => currentTime)
   const f = await fixture(), operations: string[] = []
   try {
-    f.service.updateRanking = async () => undefined
     localCatalog(f.service)
     const expiry = now + 1_000
     f.service.catalog.get(instId).expiresAt = expiry
-    f.service.rankings.set(instId, { lookback: 15, rankingChange: 2, rankingAsOf: now - 10_000 })
+    f.service.priceStreaming = () => true
+    setHour(f.service, instId, 2)
     const detach = attachOperationSink(event => { operations.push(event.name) })
     try {
       const first = await f.service.snapshot()
@@ -322,7 +371,7 @@ test('canonical list reads reuse both sort orders and expire before stale eligib
       localCatalog(f.service)
       f.service.catalog.get(instId).expiresAt = now + 2 * fiveMinutes
       const current = await f.service.snapshot()
-      currentTime = now - 10_000 + fiveMinutes
+      currentTime = now + 30_000
       const staleRank = await f.service.snapshot({ sinceRevision: current.revision, serviceSession: current.serviceSession })
       assert.equal('unchanged' in staleRank, false)
       assert.equal('rows' in staleRank && staleRank.rows.length === 1 && staleRank.rows.every(row => row.rankingChange === null && row.rankingAsOf === null), true)
@@ -422,7 +471,6 @@ test('snapshot versions omit unchanged rows, detect status changes, and isolate 
 test('history progress does not publish market rows or create list indicator work', async () => {
   const f = await fixture()
   try {
-    f.service.updateRanking = async () => undefined
     localCatalog(f.service)
     const before = await f.service.snapshot(), revision = f.service.revision
     for (const timeframe of ['5m', '15m', '1H']) for (const status of ['queued', 'running', 'retry', 'unavailable', 'completed']) {
@@ -439,7 +487,6 @@ test('backend listed membership owns chart preparation and prepared reads never 
   context.mock.method(Date, 'now', () => now)
   const f = await fixture(), universes: string[][] = []
   try {
-    f.service.updateRanking = async () => undefined
     f.service.preparedCharts.setUniverse = (ids: string[]) => { universes.push([...ids]) }
     f.service.preparedCharts.residentFrames = () => ({ frames: [] })
     localCatalog(f.service)
@@ -619,7 +666,6 @@ test('qualified contracts renew independently while discovery waits for another 
   })
   let refresh: Promise<void> | undefined
   try {
-    f.service.updateRanking = async () => undefined
     const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
     await f.store.appendCandles(Array.from({ length: 288 }, (_, index) => ({ ...rawCandle(asOf - (288 - index) * fiveMinutes), quoteVolume: 200_000 })))
     f.service.history.ensurePrices = async (id: string, timeframe: string, from: number, through: number) => {
@@ -654,7 +700,6 @@ test('expired qualification stays hidden after unavailable observations and reco
   let unavailable = false
   const f = await fixture(configuration, discovery(url => url.pathname.endsWith('/public/open-interest') ? response(unavailable ? [] : [{ instId, oiUsd: '6000000' }]) : null))
   try {
-    f.service.updateRanking = async () => undefined
     for (const lane of f.service.requestLanes.values()) lane.interval = 0
     await f.service.refresh()
     const observed = f.service.observations.get(instId).openInterest
@@ -705,7 +750,6 @@ test('bulk OI excludes candidates before history and only the ticker aged during
   })
   let refresh: Promise<void> | undefined
   try {
-    f.service.updateRanking = async () => undefined
     const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
     await f.store.appendCandles(Array.from({ length: 287 }, (_, index) => ({ ...rawCandle(asOf - (287 - index) * fiveMinutes), quoteVolume: 200_000 })))
     f.service.history.ensurePrices = async (id: string, timeframe: string, from: number, through: number) => {
@@ -738,7 +782,6 @@ test('overlapping discovery and renewal checks share one instrument observation 
   }))
   let first: Promise<unknown> | undefined, second: Promise<unknown> | undefined
   try {
-    f.service.updateRanking = async () => undefined
     const put = f.service.metadata.putCatalogEntry.bind(f.service.metadata)
     f.service.metadata.putCatalogEntry = (record: unknown) => { writes += 1; return put(record) }
     const observedAt = Date.now()
@@ -799,7 +842,6 @@ test('candidate qualification survives cancellation of one shared consumer', asy
   const firstController = new AbortController(), secondController = new AbortController()
   let first: Promise<unknown> | undefined, second: Promise<unknown> | undefined
   try {
-    f.service.updateRanking = async () => undefined
     const observedAt = Date.now()
     f.service.instrumentObservations.set(instId, { observedAt, expiresAt: observedAt + 90_000 })
     const key = f.service.catalogCriteriaKey()
@@ -944,156 +986,6 @@ test('SQLite catalogue restore enforces config key and expiry while historical c
   } finally { await restored?.dispose(); await f.close() }
 })
 
-test('ranking uses one completed 5m boundary independently of history retention', async () => {
-  const f = await fixture()
-  const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
-  try {
-    localCatalog(f.service, [instId, 'ETH-USDT-SWAP', 'SOL-USDT-SWAP'])
-    for (const [id, change] of [[instId, 10], ['ETH-USDT-SWAP', -20]] as const) {
-      const candles = Array.from({ length: 7 }, (_, index) => ({ ...rawCandle(asOf - (7 - index) * fiveMinutes, index >= 6 ? 100 + change : 100), instrument: id }))
-      await f.service.persistCandles(id, candles)
-      await f.service.updateRanking(id)
-    }
-    const before = await f.service.snapshot()
-    assert.deepEqual(before.rows.map(row => row.instId), ['ETH-USDT-SWAP', instId, 'SOL-USDT-SWAP'])
-    assert.equal(before.rows[0].rankingAsOf, asOf)
-    const previous = structuredClone(f.preferences)
-    f.preferences.historyDays += 1
-    await f.service.reconfigure(previous)
-    assert.deepEqual((await f.service.snapshot()).rows.map(row => [row.instId, row.rankingChange]), before.rows.map(row => [row.instId, row.rankingChange]))
-    const old = structuredClone(f.preferences); f.preferences.rankingLookback = 30
-    await f.service.reconfigure(old)
-    await waitFor(() => f.service.rankings.get(instId)?.rankingAsOf === asOf)
-    assert.notEqual(f.service.rankings.get(instId)?.rankingChange, null)
-  } finally { await f.close() }
-})
-
-test('ranking reads completed local data before any repair and memoizes repeated unchanged snapshots', async () => {
-  const f = await fixture(), asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
-  let reads = 0, repairs = 0
-  try {
-    f.service.preparedCharts.setUniverse = () => ({ frames: [] })
-    await f.store.appendCandles(Array.from({ length: 7 }, (_, index) => rawCandle(asOf - (7 - index) * fiveMinutes, 100 + index)))
-    const read = f.store.candles.bind(f.store)
-    f.store.candles = async (...args) => { reads += 1; return read(...args) }
-    f.service.history.ensurePriceCoverage = async () => { repairs += 1; throw new Error('Complete local ranking must not wait for network history.') }
-    localCatalog(f.service)
-    await f.service.updateRanking(instId, { ensure: true })
-    const expected = (106 - 103) / 103 * 100
-    assert.equal(f.service.listRowsFor()[0].rankingChange, expected)
-    assert.equal(repairs, 0)
-    assert.equal(reads, 1)
-    for (let index = 0; index < 10; index += 1) await f.service.snapshot()
-    assert.equal(reads, 1, 'Snapshot reads must not admit local ranking reads.')
-    assert.equal(repairs, 0)
-  } finally { await f.close() }
-})
-
-test('confirmed candle cache gives the first list row and lookback changes immediate rankings without I/O', async () => {
-  const f = await fixture(), asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
-  let reads = 0
-  try {
-    f.service.preparedCharts.setUniverse = () => ({ frames: [] })
-    await f.service.persistCandles(instId, Array.from({ length: 7 }, (_, index) => rawCandle(asOf - (7 - index) * fiveMinutes, 100 + index)))
-    const read = f.store.candles.bind(f.store)
-    f.store.candles = async (...args) => { reads += 1; return read(...args) }
-    localCatalog(f.service)
-    assert.equal(f.service.listRowsFor()[0].rankingChange, (106 - 103) / 103 * 100)
-    const previous = structuredClone(f.preferences)
-    f.preferences.rankingLookback = 30
-    await f.service.reconfigure(previous)
-    assert.equal(f.service.listRowsFor()[0].rankingChange, 6)
-    assert.equal(f.service.listRowsFor()[0].rankingAsOf, asOf)
-    assert.equal(reads, 0)
-    assert.equal(f.service.rankingRepairs.size, 0)
-    const correction = rawCandle(asOf - fiveMinutes, 110)
-    await f.service.persistCandles(instId, [correction])
-    assert.equal(f.service.listRowsFor()[0].rankingChange, 10, 'A confirmed close correction invalidates the memoized ranking immediately.')
-    const persistenceReads = reads
-    await f.service.updateRanking(instId)
-    await f.service.snapshot()
-    assert.equal(reads, persistenceReads, 'Ranking reuses the committed correction cache without admitting another database read.')
-  } finally { await f.close() }
-})
-
-test('a changed lookback with incomplete cache stays unavailable without blocking on local or network work', async () => {
-  const f = await fixture(), asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
-  let release!: () => void, started = false
-  const readGate = new Promise<void>(resolve => { release = resolve })
-  try {
-    f.service.preparedCharts.setUniverse = () => ({ frames: [] })
-    await f.service.persistCandles(instId, Array.from({ length: 7 }, (_, index) => rawCandle(asOf - (7 - index) * fiveMinutes, 100 + index)))
-    localCatalog(f.service)
-    const read = f.store.candles.bind(f.store)
-    f.store.candles = async (...args) => { started = true; await readGate; return read(...args) }
-    f.service.history.ensurePriceCoverage = async () => undefined
-    const previous = structuredClone(f.preferences)
-    f.preferences.rankingLookback = 60
-    await f.service.reconfigure(previous)
-    assert.equal(started, true)
-    const row = f.service.listRowsFor()[0]
-    assert.equal(row.rankingChange, null, 'A 15-minute ranking cannot masquerade as a 60-minute ranking.')
-    assert.equal(row.rankingAsOf, null)
-    assert.equal(f.service.rankingTasks.size, 1, 'Settings complete while local ranking preparation is still pending.')
-  } finally { release(); await f.close() }
-})
-
-test('a missing new boundary clears the previous ranking and an older read cannot overwrite a new close', async () => {
-  const f = await fixture(), asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
-  let release!: () => void
-  const readGate = new Promise<void>(resolve => { release = resolve })
-  let pending: Promise<unknown> | undefined
-  try {
-    f.service.preparedCharts.setUniverse = () => ({ frames: [] })
-    const rows = Array.from({ length: 7 }, (_, index) => rawCandle(asOf - (8 - index) * fiveMinutes, 100 + index))
-    await f.store.appendCandles(rows)
-    f.service.cacheRankingCandles(instId, rows)
-    f.service.cachedRanking(instId, 15, asOf - fiveMinutes)
-    localCatalog(f.service)
-    const previous = f.service.listRowsFor()[0]
-    assert.equal(previous.rankingAsOf, null)
-    assert.equal(previous.rankingChange, null)
-    const read = f.store.candles.bind(f.store)
-    f.store.candles = async (query, priority) => {
-      if (query.from !== query.through) { await readGate; return rows }
-      return read(query, priority)
-    }
-    pending = f.service.updateRanking(instId, { ensure: true })
-    assert.equal(f.service.listRowsFor()[0].rankingAsOf, null)
-    assert.equal(await f.service.persistCandles(instId, [{ ...rawCandle(asOf - fiveMinutes, 999), confirmed: false }]), false)
-    assert.equal(f.service.listRowsFor()[0].rankingChange, previous.rankingChange, 'Forming candles never enter the rank cache.')
-    await f.service.persistCandles(instId, [rawCandle(asOf - fiveMinutes, 110)])
-    const latest = f.service.listRowsFor()[0]
-    assert.equal(latest.rankingAsOf, asOf)
-    assert.equal(latest.rankingChange, (110 - 104) / 104 * 100)
-    release(); await pending
-    assert.equal(f.service.listRowsFor()[0].rankingChange, latest.rankingChange)
-  } finally { release(); await pending; await f.close() }
-})
-
-test('the exact next 5m boundary clears a ranking without a final WS event and a committed close restores it', async context => {
-  const boundary = Math.floor(Date.now() / fiveMinutes) * fiveMinutes + fiveMinutes
-  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: boundary - 1_000 })
-  const f = await fixture(), asOf = boundary - fiveMinutes
-  try {
-    f.service.preparedCharts.setUniverse = () => ({ frames: [] })
-    f.service.history.ensurePriceCoverage = async () => undefined
-    await f.service.persistCandles(instId, Array.from({ length: 7 }, (_, index) => rawCandle(asOf - (7 - index) * fiveMinutes, 100 + index)))
-    localCatalog(f.service)
-    assert.equal(f.service.listRowsFor()[0].rankingAsOf, asOf)
-    context.mock.timers.tick(999)
-    assert.equal(f.service.listRowsFor()[0].rankingAsOf, asOf)
-    const previousRevision = f.service.revision
-    context.mock.timers.tick(1)
-    assert.equal(f.service.listRowsFor()[0].rankingChange, null)
-    assert.equal(f.service.listRowsFor()[0].rankingAsOf, null)
-    assert.ok(f.service.revision > previousRevision, 'The deadline itself publishes the unavailable new ranking.')
-    await f.service.persistCandles(instId, [rawCandle(asOf, 110)])
-    assert.equal(f.service.listRowsFor()[0].rankingAsOf, boundary)
-    assert.equal(f.service.listRowsFor()[0].rankingChange, (110 - 104) / 104 * 100)
-  } finally { await f.close() }
-})
-
 for (const status of ['verified', 'failed'] as const) test(`a published ${status} book assessment expires independently of newer raw observations while requalification is pending`, async context => {
   const now = Math.floor(Date.now() / fiveMinutes) * fiveMinutes + 10_000
   context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
@@ -1103,7 +995,6 @@ for (const status of ['verified', 'failed'] as const) test(`a published ${status
   const f = await fixture(preferences), gate = deferred()
   try {
     f.service.preparedCharts.setUniverse = () => ({ frames: [] })
-    f.service.updateRanking = async () => undefined
     f.service.instruments.set(instId, instrument)
     f.service.candidateIDs = new Set([instId])
     f.service.instrumentObservations.set(instId, { observedAt: now, expiresAt: now + 200_000 })
@@ -1163,7 +1054,6 @@ for (const source of ['book', 'ticker', 'openInterest'] as const) test(`a late f
   const f = await fixture(preferences), gate = deferred()
   try {
     f.service.preparedCharts.setUniverse = () => ({ frames: [] })
-    f.service.updateRanking = async () => undefined
     f.service.instruments.set(instId, instrument)
     f.service.candidateIDs = new Set([instId])
     f.service.instrumentObservations.set(instId, { observedAt: now, expiresAt: now + 90_000 })
@@ -1188,130 +1078,6 @@ for (const source of ['book', 'ticker', 'openInterest'] as const) test(`a late f
     gate.resolve(); await evaluation
     assert.equal(f.service.catalogChecks.get(instId).status, 'unknown', 'An old slippage failure cannot survive any expired input evidence.')
     assert.equal(f.service.catalog.has(instId), false)
-  } finally { gate.resolve(); await f.close() }
-})
-
-test('persisted confirmed ranking is available on restart and never reused for a different lookback', async () => {
-  const f = await fixture(), asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
-  let restored: MarketService | undefined
-  try {
-    f.service.preparedCharts.setUniverse = () => ({ frames: [] })
-    await f.service.persistCandles(instId, Array.from({ length: 7 }, (_, index) => rawCandle(asOf - (7 - index) * fiveMinutes, 100 + index)))
-    localCatalog(f.service)
-    await f.service.persistCatalog([...f.service.catalog.values()])
-    await f.service.updateRanking(instId)
-    await f.service.flushRankingPersistence()
-    const ranking = f.service.metadata.getCatalogEntry(instId).lastRanking
-    assert.deepEqual(ranking, { lookback: 15, rankingChange: (106 - 103) / 103 * 100, rankingAsOf: asOf })
-    await f.service.dispose()
-    let requests = 0
-    const offline: typeof fetch = async () => { requests += 1; throw new Error('Offline') }
-    restored = new MarketService(f.store, () => f.preferences, offline, false)
-    isolateChartPreparation(restored)
-    restored.preparedCharts.setUniverse = () => ({ frames: [] })
-    await restored.ready
-    assert.equal(restored.listRowsFor()[0].rankingChange, ranking.rankingChange)
-    assert.equal(restored.listRowsFor()[0].rankingAsOf, asOf)
-    assert.equal(requests, 0, 'Cached ranking restore needs neither market requests nor a history download.')
-    await restored.dispose()
-    f.preferences.rankingLookback = 30
-    restored = new MarketService(f.store, () => f.preferences, offline, false)
-    isolateChartPreparation(restored)
-    restored.preparedCharts.setUniverse = () => ({ frames: [] })
-    await restored.ready
-    assert.equal(restored.listRowsFor()[0].rankingChange, null)
-    assert.equal(requests, 0)
-  } finally { await restored?.dispose(); await f.close() }
-})
-
-test('ranking publication defers and coalesces durability with latest values flushed before disposal', async () => {
-  const f = await fixture(), asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
-  let batches = 0, reads = 0
-  const saved: Array<Array<{ instrumentID: string; lookback: number; rankingChange: number; rankingAsOf: number }>> = []
-  try {
-    f.service.preparedCharts.setUniverse = () => ({ frames: [] })
-    await f.service.persistCandles(instId, Array.from({ length: 7 }, (_, index) => rawCandle(asOf - (7 - index) * fiveMinutes, 100 + index)))
-    localCatalog(f.service)
-    await f.service.persistCatalog([...f.service.catalog.values()])
-    await f.service.updateRanking(instId)
-    await f.service.flushRankingPersistence()
-    const get = f.service.metadata.getCatalogEntry.bind(f.service.metadata)
-    const save = f.service.metadata.saveCatalogRankings.bind(f.service.metadata)
-    f.service.metadata.getCatalogEntry = (id: string) => { reads += 1; return get(id) }
-    f.service.metadata.saveCatalogRankings = (entries: typeof saved[number]) => { batches += 1; saved.push(entries); return save(entries) }
-    for (const lookback of [30, 15, 30]) {
-      const previous = structuredClone(f.preferences)
-      f.preferences.rankingLookback = lookback
-      await f.service.reconfigure(previous)
-    }
-    assert.equal(f.service.listRowsFor()[0].rankingChange, 6)
-    assert.equal(reads, 0, 'The immediate ranking path must not read SQLite catalog blobs.')
-    assert.equal(batches, 0, 'Publication completes before the deferred persistence turn.')
-    await f.service.flushRankingPersistence()
-    assert.equal(batches, 1)
-    assert.deepEqual(saved[0], [{ instrumentID: instId, lookback: 30, rankingChange: 6, rankingAsOf: asOf }])
-    assert.equal(get(instId).lastRanking.lookback, 30)
-    const previous = structuredClone(f.preferences)
-    f.preferences.rankingLookback = 15
-    await f.service.reconfigure(previous)
-    await f.service.dispose()
-    const metadata = await MetadataStore.open(join(f.root, 'Metadata'))
-    try {
-      const entry = metadata.getCatalogEntry(instId)
-      assert.ok(entry)
-      assert.equal((entry.lastRanking as { lookback: number }).lookback, 15)
-    }
-    finally { metadata.close() }
-    assert.equal(f.service.pendingRankings.size, 0)
-    assert.equal(f.service.rankingPersistenceImmediate, null)
-  } finally { await f.close() }
-})
-
-test('history replacement invalidates the rank window while a different native timeframe preserves it', async () => {
-  const f = await fixture(), asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
-  try {
-    f.service.preparedCharts.setUniverse = () => ({ frames: [] })
-    await f.service.persistCandles(instId, Array.from({ length: 7 }, (_, index) => rawCandle(asOf - (7 - index) * fiveMinutes, 100 + index)))
-    localCatalog(f.service)
-    const cached = f.service.rankingWindows.get(instId)
-    const hourlyTimestamp = Math.floor(asOf / hour) * hour - hour
-    await f.service.replaceCandles({ instrument: instId, timeframe: '1H', from: hourlyTimestamp, through: hourlyTimestamp }, [nativeCandle(hourlyTimestamp, '1H', 999)])
-    assert.equal(f.service.rankingWindows.get(instId), cached)
-    assert.equal(f.service.listRowsFor()[0].rankingChange, (106 - 103) / 103 * 100)
-    const timestamp = asOf - fiveMinutes
-    await f.service.replaceCandles({ instrument: instId, timeframe: '5m', from: timestamp, through: timestamp }, [rawCandle(timestamp, 120)])
-    await waitFor(() => f.service.listRowsFor()[0].rankingChange === (120 - 103) / 103 * 100)
-    assert.notEqual(f.service.rankingWindows.get(instId), cached)
-  } finally { await f.close() }
-})
-
-for (const outcome of ['empty', 'failed', 'repaired'] as const) test(`history replacement revokes ranking proof while a held ${outcome} rebuild finishes`, async () => {
-  const f = await fixture(), gate = deferred(), asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
-  try {
-    await f.service.persistCandles(instId, Array.from({ length: 7 }, (_, index) => rawCandle(asOf - (7 - index) * fiveMinutes, 100 + index)))
-    localCatalog(f.service)
-    await f.service.updateRanking(instId)
-    await f.service.persistCatalog([...f.service.catalog.values()])
-    await f.service.flushRankingPersistence()
-    const before = await f.service.snapshot()
-    assert.notEqual(before.rows[0].rankingChange, null)
-    assert.ok(f.service.metadata.getCatalogEntry(instId).lastRanking)
-    const read = f.store.candles.bind(f.store)
-    f.store.candles = async (query, priority) => {
-      await gate.promise
-      if (outcome === 'failed') throw new Error('Historical read unavailable.')
-      return outcome === 'empty' ? [] : read(query, priority)
-    }
-    f.service.onHistoryReplaced(instId, '5m')
-    const invalidated = await f.service.snapshot({ sinceRevision: before.revision, serviceSession: before.serviceSession })
-    assert.ok('rows' in invalidated)
-    assert.deepEqual(invalidated.rows.map(row => [row.rankingChange, row.rankingAsOf]), [[null, null]])
-    assert.ok(invalidated.revision > before.revision)
-    assert.equal(f.service.metadata.getCatalogEntry(instId).lastRanking, undefined, 'Restart cannot restore proof revoked by the source replacement.')
-    gate.resolve()
-    await Promise.allSettled([...f.service.backgroundTasks, ...f.service.rankingTasks.values()])
-    const after = await f.service.snapshot()
-    assert.equal(after.rows[0].rankingChange, outcome === 'repaired' ? before.rows[0].rankingChange : null)
   } finally { gate.resolve(); await f.close() }
 })
 
@@ -1748,7 +1514,6 @@ test('an explicit REST confirmed revision invalidates the prepared generation an
 
 const isolateQualification = (service: MarketService) => {
   service.preparedCharts.setUniverse = () => ({ frames: [] })
-  service.updateRanking = async () => undefined
   for (const lane of service.requestLanes.values()) lane.interval = 0
 }
 

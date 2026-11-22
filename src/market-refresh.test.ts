@@ -36,7 +36,6 @@ const fixture = async (config: ReturnType<typeof preferences>, fetcher: typeof f
   const service = new MarketService(store, () => config, fetcher, false)
   await service.ready
   service.preparedCharts.setUniverse = () => ({ frames: [] })
-  service.updateRanking = async () => undefined
   for (const lane of service.requestLanes.values()) lane.interval = 0
   const close = async () => { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) }
   return { service, store, close }

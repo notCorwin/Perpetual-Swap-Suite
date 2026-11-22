@@ -21,7 +21,6 @@ const fixture = async () => {
   service.preparedCharts.setRealtimeSubscriptions = () => undefined
   await service.ready
   service.preparedCharts.setUniverse = () => ({ frames: [] })
-  service.updateRanking = async () => undefined
   const admit = (expiresAt = Date.now() + 90_000) => {
     service.instruments.set(instrument.instId, instrument)
     service.candidateIDs = new Set([instrument.instId])
@@ -37,11 +36,12 @@ test('canonical snapshot and prepared frame reads never admit source or calculat
   const f = await fixture(), service = f.service
   try {
     f.admit()
-    const asOf = Math.floor(Date.now() / step) * step
-    service.rankings.set(instrument.instId, { lookback: f.preferences.rankingLookback, rankingChange: 2, rankingAsOf: asOf })
-    service.rankingWindows.set(instrument.instId, { marker: 'unchanged' })
-    const revision = service.revision, ranking = structuredClone([...service.rankings]), windows = structuredClone([...service.rankingWindows])
-    for (const method of ['refresh', 'updateSubscriptions', 'updateRanking', 'cachedRanking', 'pruneCatalog']) {
+    const asOf = Date.now(), key = `${instrument.instId}:1H`
+    service.liveCandles.set(key, { open: 100, close: 102, timestamp: Math.floor(asOf / 3_600_000) * 3_600_000 })
+    service.liveReceivedAt.set(key, asOf)
+    service.priceStreaming = () => true
+    const revision = service.revision, candles = structuredClone([...service.liveCandles])
+    for (const method of ['refresh', 'updateSubscriptions', 'ensureListHourPrefix', 'pruneCatalog']) {
       service[method] = () => { throw new Error(`An observational read called ${method}.`) }
     }
     service.preparedCharts.setUniverse = () => { throw new Error('A read changed the preparation universe.') }
@@ -57,8 +57,7 @@ test('canonical snapshot and prepared frame reads never admit source or calculat
     const next = await service.snapshot({ sinceRevision: first.revision, serviceSession: first.serviceSession })
     assert.equal('unchanged' in next, true)
     assert.equal(service.revision, revision)
-    assert.deepEqual([...service.rankings], ranking)
-    assert.deepEqual([...service.rankingWindows], windows)
+    assert.deepEqual([...service.liveCandles], candles)
     assert.deepEqual(await service.preparedCharts.residentFrames(), { frames: [] })
     assert.equal(f.requests(), 0)
   } finally { await f.close() }

@@ -19,7 +19,6 @@ async function fixture(t: TestContext, count: number) {
   const service = new MarketService(store, () => preferences, fetch, false)
   await service.ready
   service.preparedCharts.setUniverse = () => undefined
-  service.updateRanking = async () => undefined
   t.after(async () => { await service.dispose(); await store.close(); await rm(root, { recursive: true, force: true }) })
   const instruments = Array.from({ length: count }, (_, index) => instrument(index))
   service.installInstruments(new Map(instruments.map(value => [value.instId, value])))

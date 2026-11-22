@@ -159,7 +159,8 @@ test('automatic startup gates 289 candidates on shared tickers and OI before acq
     for (const row of snapshot.rows) {
       assert.equal(row.turnover24hUSDT, 57_600_000)
       assert.equal(row.lastPrice, 100)
-      assert.ok(Number.isFinite(row.rankingChange))
+      assert.equal(row.rankingChange, null, 'No live candle has arrived to establish an hourly change.')
+      assert.equal(row.rankingAsOf, null)
       assert.equal(market.validCatalogEntry(market.catalog.get(row.instId)), true)
       assert.deepEqual(Object.keys(row).sort(), ['instId', 'tickSz', 'lastPrice', 'turnover24hUSDT', 'rankingChange', 'rankingAsOf'].sort())
     }

@@ -58,7 +58,6 @@ const fixture = async (now: number, options: { webSocketFactory?: WebSocketFacto
   service.preparedCharts.setRealtimeSubscriptions = () => undefined
   await service.ready
   service.preparedCharts.setUniverse = () => ({ frames: [] })
-  service.updateRanking = async () => undefined
   const ensurePrices = service.history.ensurePrices.bind(service.history)
   service.history.ensurePrices = async () => { throw new Error('Complete durable qualification data must not need acquisition.') }
   service.scheduleRefresh = () => undefined

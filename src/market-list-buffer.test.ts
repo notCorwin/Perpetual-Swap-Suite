@@ -27,7 +27,6 @@ const fixture = async (enabled?: 'depth' | 'spread') => {
   await service.ready
   const universes: string[][] = []
   service.preparedCharts.setUniverse = (ids: string[]) => { universes.push([...ids].sort()); return { frames: [] } }
-  service.updateRanking = async () => undefined
   const admit = (ids: string[], expiresAt = Date.now() + 120_000) => {
     for (const id of ids) {
       const definition = instrument(id)
@@ -46,6 +45,13 @@ const fixture = async (enabled?: 'depth' | 'spread') => {
   return { service, preferences, admit, universes, requests: () => requests, close }
 }
 
+const setHour = (service: MarketService, id: string, change: number, now = Date.now()) => {
+  const key = `${id}:1H`
+  service.priceStreaming = () => true
+  service.liveCandles.set(key, { instrument: id, timeframe: '1H', timestamp: Math.floor(now / 3_600_000) * 3_600_000, open: 100, close: 100 + change })
+  service.liveReceivedAt.set(key, now)
+}
+
 test('confirmed ineligibility removes catalog membership immediately and retains the row and chart universe for 30 seconds', async context => {
   const f = await fixture(), service = f.service
   const now = Math.floor(Date.now() / fiveMinutes) * fiveMinutes + 10_000
@@ -53,9 +59,8 @@ test('confirmed ineligibility removes catalog membership immediately and retains
   try {
     context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
     f.admit([btc, eth])
-    const asOf = Math.floor(now / fiveMinutes) * fiveMinutes
-    service.rankings.set(btc, { lookback: f.preferences.rankingLookback, rankingChange: 3, rankingAsOf: asOf })
-    service.rankings.set(eth, { lookback: f.preferences.rankingLookback, rankingChange: -1, rankingAsOf: asOf })
+    setHour(service, btc, 3)
+    setHour(service, eth, -1)
     service.subscribeMarket(() => { notifications++ })
 
     service.instruments.set(btc, instrument(btc, 'suspend'))
@@ -89,9 +94,7 @@ test('removal deadlines are independent, unchanged absence does not extend them,
   try {
     context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
     f.admit([btc, eth, sol])
-    const asOf = Math.floor(now / fiveMinutes) * fiveMinutes
-    for (const [id, rankingChange] of [[btc, 1], [eth, 2], [sol, 3]] as const)
-      service.rankings.set(id, { lookback: f.preferences.rankingLookback, rankingChange, rankingAsOf: asOf })
+    for (const [id, rankingChange] of [[btc, 1], [eth, 2], [sol, 3]] as const) setHour(service, id, rankingChange)
 
     service.instruments.set(btc, instrument(btc, 'suspend'))
     service.verifyCatalog()
@@ -108,7 +111,7 @@ test('removal deadlines are independent, unchanged absence does not extend them,
     service.verifyCatalog()
     context.mock.timers.tick(18_000)
     await tick()
-    assert.deepEqual(service.listRowsFor().map(row => row.instId), [sol, eth], 'BTC expires at its first removal + 30 seconds.')
+    assert.deepEqual(service.listRowsFor().map(row => row.instId).sort(), [eth, sol], 'BTC expires at its first removal + 30 seconds.')
 
     // Requalify ETH, then remove it again; the canceled first deadline is not reused.
     service.instruments.set(eth, instrument(eth))
@@ -120,7 +123,7 @@ test('removal deadlines are independent, unchanged absence does not extend them,
     service.verifyCatalog()
     context.mock.timers.tick(12_000)
     await tick()
-    assert.deepEqual(service.listRowsFor().map(row => row.instId), [sol, eth], 'Reappearance cancels retirement and the next absence receives a fresh 30 second window.')
+    assert.deepEqual(service.listRowsFor().map(row => row.instId).sort(), [eth, sol], 'Reappearance cancels retirement and the next absence receives a fresh 30 second window.')
     context.mock.timers.tick(18_000)
     await tick()
     assert.deepEqual(service.listRowsFor().map(row => row.instId), [sol])
@@ -153,14 +156,13 @@ test('projection reads honor known expiry before a delayed maintenance callback 
   } finally { context.mock.timers.reset(); await f.close() }
 })
 
-test('buffered rows receive prices immediately and never carry a ranking across its completed-candle boundary', async context => {
+test('buffered rows receive prices immediately and never carry a ranking across its hour boundary', async context => {
   const f = await fixture(), service = f.service
-  const boundary = Math.floor(Date.now() / fiveMinutes) * fiveMinutes + fiveMinutes, now = boundary - 10_000
+  const boundary = Math.floor(Date.now() / 3_600_000) * 3_600_000 + 3_600_000, now = boundary - 10_000
   try {
     context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
     f.admit([btc, eth])
-    for (const [id, rankingChange] of [[btc, 2], [eth, 1]] as const)
-      service.rankings.set(id, { lookback: f.preferences.rankingLookback, rankingChange, rankingAsOf: boundary - fiveMinutes })
+    for (const [id, rankingChange] of [[btc, 2], [eth, 1]] as const) setHour(service, id, rankingChange)
     service.replaceCatalog([service.catalog.get(eth)])
     assert.equal(service.catalog.has(btc), false)
     const first = await service.snapshot()
@@ -173,28 +175,6 @@ test('buffered rows receive prices immediately and never carry a ranking across 
     const nextBoundary = await service.snapshot()
     assert.equal(nextBoundary.rows.length, 2)
     assert.ok(nextBoundary.rows.every(row => row.rankingChange === null && row.rankingAsOf === null))
-    assert.equal(f.requests(), 0)
-  } finally { context.mock.timers.reset(); await f.close() }
-})
-
-test('lookback changes recompute buffered rankings from shared candle inputs without new source work', async context => {
-  const f = await fixture(), service = f.service
-  const now = Math.floor(Date.now() / fiveMinutes) * fiveMinutes + 10_000, asOf = now - 10_000
-  try {
-    context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
-    f.admit([btc, eth])
-    for (const id of [btc, eth]) service.cacheRankingCandles(id, Array.from({ length: 7 }, (_, index) => ({
-      instrument: id, timeframe: '5m', timestamp: asOf - (7 - index) * fiveMinutes,
-      open: 100, high: 110, low: 90, close: id === btc ? 100 + index : 100, confirmed: true,
-    })))
-    service.replaceCatalog([service.catalog.get(eth)])
-    const previous = structuredClone(f.preferences)
-    f.preferences.rankingLookback = 30
-    service.updateRanking = MarketService.prototype.updateRanking.bind(service)
-    await service.reconfigure(previous)
-    const rows = service.listRowsFor()
-    assert.deepEqual(rows.map(row => [row.instId, row.rankingChange, row.rankingAsOf]), [[btc, 6, asOf], [eth, 0, asOf]])
-    assert.equal(service.catalog.has(btc), false)
     assert.equal(f.requests(), 0)
   } finally { context.mock.timers.reset(); await f.close() }
 })

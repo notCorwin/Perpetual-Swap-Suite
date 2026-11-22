@@ -28,8 +28,7 @@ test('a market push arriving before the closing deadline callback reports queued
   try {
     await service.ready
     service.preparedCharts.setUniverse = () => ({ frames: [] })
-    service.updateRanking = async () => undefined
-    const asOf = Math.floor(now / step) * step
+      const asOf = Math.floor(now / step) * step
     await store.appendCandles(Array.from({ length: 288 }, (_, index) => ({ instrument: instId, timeframe: '5m',
       timestamp: asOf - (288 - index) * step, open: 99, high: 101, low: 98, close: 100,
       volume: 2_000, baseVolume: 20, quoteVolume: 200_000, confirmed: true })))

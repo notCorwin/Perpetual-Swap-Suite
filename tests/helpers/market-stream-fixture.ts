@@ -63,7 +63,6 @@ export const marketStreamFixture = async (config: ReturnType<typeof preferences>
   // Keep chart source membership visible without admitting historical work.
   await service.ready
   service.preparedCharts.setUniverse = () => ({ frames: [] })
-  service.updateRanking = async () => undefined
   for (const lane of service.requestLanes.values()) lane.interval = 0
   const start = () => { service.publicRealtime.start(); service.realtime.start() }
   if (autoStart) start()

@@ -41,17 +41,17 @@ function NotificationPanel({ issue, setToast }: { issue: ToastIssue; setToast: D
   return <p data-chart-shared-status-item={['1H', '15m', '5m'].includes(issue.id) ? issue.id : undefined} className={cn('break-words rounded-md border bg-popover px-4 py-3 text-sm text-popover-foreground shadow-lg', issue.severity === 'error' && 'text-destructive')}><span className="font-medium">{issue.label}: </span>{issue.detail}</p>
 }
 
-const MarketRowView = memo(function MarketRowView({ row, index, selected, lookback, onSelect }: { row: RankedMarketRow; index: number; selected: boolean; lookback: number; onSelect: (id: string) => void }) {
+const MarketRowView = memo(function MarketRowView({ row, index, selected, onSelect }: { row: RankedMarketRow; index: number; selected: boolean; onSelect: (id: string) => void }) {
   const change = Number.isFinite(row.rankingChange) ? row.rankingChange : null
   const changeDirection = change === null ? 'unavailable' : change > 0 ? 'up' : change < 0 ? 'down' : 'flat'
-  const changeText = formatPercent(change)
+  const changeText = change !== null && change !== 0 && Math.abs(change) < 0.005 ? `${change > 0 ? '+' : '-'}0.00%` : formatPercent(change)
   const price = formatCurrentPrice(row.lastPrice, row.tickSz)
   return <TableRow data-market-index={index} aria-rowindex={index + 2} aria-selected={selected} data-state={selected ? 'selected' : undefined} tabIndex={0} aria-label={`View ${row.instId} chart`} onClick={() => onSelect(row.instId)} onKeyDown={event => {
     if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelect(row.instId) }
   }} className="cursor-pointer focus-visible:outline-2 focus-visible:outline-ring focus-visible:-outline-offset-2">
     <TableCell className="font-medium" title={row.instId}><span className="block truncate">{row.instId.replace(/-USDT-SWAP$/, '')}</span></TableCell>
     <TableCell className="text-right"><span className="block truncate" title={price}>{price}</span></TableCell>
-    <TableCell data-market-change={changeDirection} aria-label={`${lookback}-minute change: ${changeText}, ${changeDirection === 'up' ? 'up' : changeDirection === 'down' ? 'down' : changeDirection === 'flat' ? 'unchanged' : 'unavailable'}`} className={cn('text-right', changeDirection === 'up' ? 'text-positive' : changeDirection === 'down' ? 'text-negative' : changeDirection === 'flat' ? 'text-foreground' : 'text-muted-foreground')} title={row.rankingAsOf ? `${lookback}-minute signed relative change · completed candle as of ${new Date(row.rankingAsOf).toLocaleString('en-US')}` : 'Completed candle ranking is not available'}>
+    <TableCell data-market-change={changeDirection} aria-label={`1-hour candle change: ${changeText}, ${changeDirection === 'up' ? 'up' : changeDirection === 'down' ? 'down' : changeDirection === 'flat' ? 'unchanged' : 'unavailable'}`} className={cn('text-right', changeDirection === 'up' ? 'text-positive' : changeDirection === 'down' ? 'text-negative' : changeDirection === 'flat' ? 'text-foreground' : 'text-muted-foreground')} title={row.rankingAsOf ? `1-hour candle change · observed ${new Date(row.rankingAsOf).toLocaleString('en-US')}` : 'Current 1-hour candle is unavailable'}>
       <span className="block truncate">{changeText}</span>
     </TableCell>
   </TableRow>
@@ -397,8 +397,8 @@ function App() {
       <section data-market-scroll className="min-h-0 flex-1 overflow-y-auto [&>[data-slot=table-container]]:overflow-visible" aria-label="Perpetual swap markets">
         <Table className="table-fixed [&_tr:not([data-virtual-spacer])>:first-child]:pl-4 [&_tr:not([data-virtual-spacer])>:last-child]:pr-4" data-market-count={visible.length} data-total-market-count={rows.length} aria-rowcount={visible.length + 1}>
           <colgroup><col className="w-[25%]" /><col className="w-[45%]" /><col className="w-[30%]" /></colgroup>
-          <TableHeader className="sticky top-0 bg-background [&_th]:text-xs [&_th]:text-muted-foreground"><TableRow className="hover:bg-transparent"><TableHead>Contract</TableHead><TableHead className="text-right">Price</TableHead><TableHead className="text-right" aria-sort="other" aria-label={`${preferences.rankingLookback}m change By magnitude`} title="Sorted by absolute signed relative change from completed candles, largest first"><span>{preferences.rankingLookback}m Δ%</span></TableHead></TableRow></TableHeader>
-          {visible.length ? <MarketRowsViewport ids={visibleIds}>{index => <MarketRowView row={visible[index]} index={index} selected={visible[index].instId === selectedID} lookback={preferences.rankingLookback} onSelect={setSelected} />}</MarketRowsViewport> : <TableBody><TableRow><TableCell colSpan={3}>
+          <TableHeader className="sticky top-0 bg-background [&_th]:text-xs [&_th]:text-muted-foreground"><TableRow className="hover:bg-transparent"><TableHead>Contract</TableHead><TableHead className="text-right">Price</TableHead><TableHead className="text-right" aria-sort="other" aria-label="1-hour candle change By magnitude" title="Sorted by absolute current 1-hour candle change, largest first"><span>1h Δ%</span></TableHead></TableRow></TableHeader>
+          {visible.length ? <MarketRowsViewport ids={visibleIds}>{index => <MarketRowView row={visible[index]} index={index} selected={visible[index].instId === selectedID} onSelect={setSelected} />}</MarketRowsViewport> : <TableBody><TableRow><TableCell colSpan={3}>
             <Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{emptyDescription}</EmptyDescription></EmptyHeader></Empty>
           </TableCell></TableRow></TableBody>}
         </Table>

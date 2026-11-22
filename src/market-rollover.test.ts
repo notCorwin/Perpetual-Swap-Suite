@@ -80,7 +80,6 @@ const fixture = async (context: TestContext, { hourly = false, connected = true,
   const isolateQualification = (value: MarketService) => {
     value.preparedCharts.setRealtimeSubscriptions = () => undefined
     value.preparedCharts.setUniverse = () => ({ frames: [] })
-    value.updateRanking = async () => undefined
     value.scheduleRefresh = () => undefined
     value.scheduleRenewal = () => undefined
   }

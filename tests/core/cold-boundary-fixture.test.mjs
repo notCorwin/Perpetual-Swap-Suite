@@ -33,7 +33,7 @@ function fakeService(get = async () => []) {
   const listeners = new Set(), retired = [], focusChanges = []
   const service = {
     get, persistCandles: async () => {}, instruments: new Map(), catalog: new Map(), listRemovals: new Map(),
-    listedUniverse: new Set(), catalogRevision: 0, rankingTasks: new Map(), rankingRepairs: new Map(),
+    listedUniverse: new Set(), catalogRevision: 0, livePrefixTasks: new Map(),
     preparedCharts: { focus: null, universe: new Set(), observeStatistics: async () => {},
       setFocus(target) { this.focus = target; focusChanges.push(target) } },
     history: { sync: { active: new Map() }, async removeTargets(ids) { retired.push(...ids) } },
@@ -217,10 +217,10 @@ test('disposal retires only its own focus, list entry and history after admitted
   service.replaceCatalog([other])
   assert.ok(service.listRemovals.has(instId), 'The normal 30-second list grace is present before disposal.')
   service.preparedCharts.focus = { instId, timeframe }
-  let finishRanking, finishWrite
-  const ranking = new Promise(resolve => { finishRanking = resolve })
+  let finishPrefix, finishWrite
+  const prefix = new Promise(resolve => { finishPrefix = resolve })
   const write = new Promise(resolve => { finishWrite = resolve })
-  service.rankingTasks.set(`${instId}:15:1`, ranking)
+  service.livePrefixTasks.set(`${instId}:1H`, prefix)
   service.history.sync.active.set('fixture', { group: { instrument: instId }, promise: write })
   service.history.sync.active.set('other', { group: { instrument: other.instrument.instId }, promise: new Promise(() => {}) })
   let finished = false
@@ -232,8 +232,8 @@ test('disposal retires only its own focus, list entry and history after admitted
   assert.equal(service.listRemovals.get(buffered.instrument.instId), otherRemoval)
   assert.equal(service.listRemovals.has(instId), false)
   assert.equal(service.preparedCharts.universe.has(instId), false)
-  assert.deepEqual(retired, [], 'An in-flight ranking read must not enqueue after target retirement.')
-  finishRanking()
+  assert.deepEqual(retired, [], 'An in-flight live prefix read must not enqueue after target retirement.')
+  finishPrefix()
   for (let index = 0; index < 5; index++) await Promise.resolve()
   assert.deepEqual(retired, [instId])
   assert.equal(finished, false, 'An admitted fixture write must complete before disposal resolves.')

@@ -38,7 +38,6 @@ export async function seedMarketResources(store, service, { count = 287, periods
     service.instruments.set(instId, instrument)
     for (const timeframe of timeframes) for (let bar = 0; bar < periods; bar += 1) rows.push(resourceCandle(index, timeframe, bar, periods, asOf))
     await store.appendCandles(rows, 'background')
-    service.cacheRankingCandles(instId, rows.filter(row => row.timeframe === '5m'))
     const lease = { observedAt: startedAt, expiresAt: startedAt + 10 * 60_000 }
     const price = resourceCandle(index, '15m', periods - 1, periods, asOf).close
     const ticker = { instId, last: String(price), bidPx: String(price - 0.01), askPx: String(price + 0.01), open24h: String(price - 1), low24h: String(price - 2), high24h: String(price + 2), volCcy24h: '500000', ts: String(startedAt) }
