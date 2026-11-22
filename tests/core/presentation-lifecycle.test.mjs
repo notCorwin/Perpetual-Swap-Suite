@@ -1,8 +1,33 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { readFile } from 'node:fs/promises'
+import { parse } from '@babel/parser'
 import { PresentationLifecycle } from '../../electron/services/presentation-lifecycle.js'
 
-test('app deactivation gates publication immediately and resumption publishes only its consistent snapshot', async () => {
+test('production startup keeps presentation active independently of application activation', async () => {
+  const source = await readFile(new URL('../../electron/main.js', import.meta.url), 'utf8')
+  const tree = parse(source, { sourceType: 'module' })
+  const calls = [], constructors = []
+  const visit = node => {
+    if (!node || typeof node !== 'object') return
+    if (node.type === 'CallExpression') calls.push(node)
+    if (node.type === 'NewExpression' && node.callee?.name === 'PresentationLifecycle') constructors.push(node)
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) value.forEach(visit)
+      else if (value && typeof value === 'object' && value.type) visit(value)
+    }
+  }
+  visit(tree.program)
+  assert.equal(constructors.length, 1)
+  const active = constructors[0].arguments[0].properties.find(property => property.key?.name === 'active')
+  assert.equal(active?.value.type, 'BooleanLiteral')
+  assert.equal(active.value.value, true)
+  assert.equal(calls.some(call => call.callee?.object?.name === 'app' && call.callee?.property?.name === 'isActive'), false)
+  assert.equal(calls.some(call => call.callee?.object?.name === 'app' && ['on', 'once', 'addListener'].includes(call.callee?.property?.name)
+    && ['did-resign-active', 'did-become-active'].includes(call.arguments[0]?.value)), false)
+})
+
+test('presentation barrier gates publication immediately and resumption publishes only its consistent snapshot', async () => {
   const events = [], calls = []
   const lifecycle = new PresentationLifecycle({ active: true, now: () => 123,
     pause: epoch => { calls.push(['pause', epoch]); return Promise.resolve() },
@@ -19,7 +44,7 @@ test('app deactivation gates publication immediately and resumption publishes on
   assert.equal(lifecycle.getState().snapshot, undefined, 'Large snapshots do not become a retained UI-event queue.')
   const count = events.length
   await lifecycle.setActive(true)
-  assert.equal(events.length, count, 'Duplicate application activation is not a new restoration.')
+  assert.equal(events.length, count, 'Duplicate activation is not a new restoration.')
 })
 
 test('late resume snapshots cannot undo idle or supersede a newer activation', async () => {
@@ -47,10 +72,12 @@ test('failed catch-up retains the last frame and never advertises an active stal
     publish: state => events.push(state), failed: (...args) => failures.push(args) })
   await lifecycle.setActive(true)
   assert.equal(lifecycle.getState().active, false)
+  assert.match(lifecycle.getState().error, /Reload the window to retry/)
   assert.equal(events.some(state => state.active), false)
   assert.equal(failures[0][1].message, 'Reader unavailable')
   assert.deepEqual(pauses, [1, 1], 'A failed catch-up stops restarted preparation as well as notifications.')
   lifecycle.resume = async () => ({ frames: [] })
+  // Window reload requests a fresh snapshot even when activation was already desired.
   await lifecycle.setActive(true, { refresh: true })
   assert.equal(lifecycle.getState().active, true)
   lifecycle.publish = update => { if (update.active) throw new Error('Encoding failed') }

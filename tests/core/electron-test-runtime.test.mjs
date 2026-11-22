@@ -187,7 +187,7 @@ test('background UI retains a real frameless offscreen renderer and cannot focus
   const { webPreferences, ...window } = testWindowOptions(true)
   assert.deepEqual(window, { show: false, focusable: false, frame: false })
   assert.deepEqual(webPreferences, { offscreen: true, backgroundThrottling: false })
-  assert.equal(testWindowOptions(false).webPreferences.offscreen, false)
+  assert.deepEqual(testWindowOptions(false).webPreferences, { offscreen: false, backgroundThrottling: false })
 })
 
 test('an ordinary Node sandbox command never prepares Electron or accepts a raw app launch', async t => {

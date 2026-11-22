@@ -184,7 +184,7 @@ function App() {
     let stopped = false
     let working = false
     let queued = false
-    const visible = () => document.visibilityState !== 'hidden' && getPresentation().active
+    const visible = () => getPresentation().active
     const load = async () => {
       if (stopped) return
       if (working) { queued = true; return }
@@ -206,14 +206,11 @@ function App() {
       }
     }
     const changed = () => { void load() }
-    const shown = () => { if (visible()) void load() }
     window.addEventListener('radar-market-changed', changed)
-    document.addEventListener('visibilitychange', shown)
     void load()
     return () => {
       stopped = true
       window.removeEventListener('radar-market-changed', changed)
-      document.removeEventListener('visibilitychange', shown)
     }
   }, [preferencesLoaded, applyMarket])
 
@@ -302,7 +299,7 @@ function App() {
   }
 
   const issues: { id: string; label: string; detail: string; severity: 'error' | 'warning' | 'info'; frame?: RadarTimeframe }[] = []
-  if (presentation.error) issues.push({ id: 'presentation', label: 'Application', detail: 'The data service could not restore the workspace. Check the data service and try again.', severity: 'error' })
+  if (presentation.error) issues.push({ id: 'presentation', label: 'Application', detail: 'The data service could not restore the workspace. Check the data service and reload the window to retry.', severity: 'error' })
   if (preferencesError) issues.push({ id: 'preferences', label: 'Settings', detail: 'Settings could not be loaded. Check the local data service.', severity: 'error' })
   if (error) issues.push({ id: 'market-error', label: 'Market', detail: 'Market data is unavailable. Check the connection and data service.', severity: 'error' })
   if (connectionProblem) issues.push({ id: 'connection', label: 'Market', detail: `${connectionFailure ? 'Market connection interrupted' : 'Waiting for a live market connection'}. Check the connection for current prices.`, severity: 'warning' })

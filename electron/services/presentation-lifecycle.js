@@ -29,7 +29,7 @@ export class PresentationLifecycle {
       if (state.epoch === this.state.epoch) {
         try { await this.pause(state.epoch) } catch (pauseError) { this.failed('Could not pause interface preparation:', pauseError) }
         if (state.epoch !== this.state.epoch) return this.state
-        this.state = { ...state, error: 'The latest view could not be synchronized. Switch away and return to retry.' }
+        this.state = { ...state, error: 'The latest view could not be synchronized. Reload the window to retry.' }
         this.publish(this.state)
         this.failed('Could not resume the application interface:', error)
       }

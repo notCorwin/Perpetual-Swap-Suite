@@ -716,7 +716,7 @@ test('a healthy idle market list makes no periodic snapshot requests', async () 
   const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length)
   await new Promise(resolve => setTimeout(resolve, 2_250))
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length), before,
-    'Successful market reads must wait for a notification, action, or visibility change.')
+    'Successful market reads must wait for a notification or action.')
 })
 
 test('snapshot failures wait for a new notification and resume immediately on recovery', async () => {
@@ -796,27 +796,19 @@ test('market notifications refresh immediately and coalesce changes arriving dur
   }
 })
 
-test('market notifications wait while hidden and refresh immediately when the workspace becomes visible', async () => {
+test('market notifications continue refreshing while the workspace is hidden', async () => {
   try {
     await page.evaluate(() => {
       Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' })
       document.dispatchEvent(new Event('visibilitychange'))
     })
-    const before = await electron.evaluate(({ BrowserWindow }) => {
+    await electron.evaluate(({ BrowserWindow }) => {
       const state = globalThis.__workspaceFixture
       state.rows = state.rows.map(row => row.instId === 'BETA-USDT-SWAP' ? { ...row, lastPrice: 203 } : row)
       state.revision += 1
       for (let index = 0; index < 20; index += 1) BrowserWindow.getAllWindows()[0].webContents.send('radar:market-changed')
-      return state.requests.filter(value => value.snapshot).length
-    })
-    await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 100)))
-    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length), before, 'Hidden notifications cannot start snapshot requests.')
-    await page.evaluate(() => {
-      delete document.visibilityState
-      document.dispatchEvent(new Event('visibilitychange'))
     })
     await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '203', null, { timeout: 1_000 })
-    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length), before + 1, 'Visibility resumes one coalesced refresh immediately.')
   } finally {
     await page.evaluate(() => { delete document.visibilityState; document.dispatchEvent(new Event('visibilitychange')) })
     await electron.evaluate(({ BrowserWindow }) => {

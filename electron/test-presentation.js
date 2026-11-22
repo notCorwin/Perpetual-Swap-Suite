@@ -49,6 +49,6 @@ export function testWindowOptions(background) {
     show: false,
     focusable: !background,
     frame: !background,
-    webPreferences: { offscreen: background, backgroundThrottling: !background },
+    webPreferences: { offscreen: background, backgroundThrottling: false },
   }
 }

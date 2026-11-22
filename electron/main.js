@@ -376,7 +376,7 @@ function subscribeWindowNotifications(target, settingsOnly = false) {
 async function startDesktop() {
   if (recordGraphics) stopGraphicsRecording = await startGraphicsRecording(app, contentTracing, operationRecording.directory)
   backend = new MarketBackend({ userData: app.getPath('userData'), testMode, e2eLiveRefresh })
-  presentation = new PresentationLifecycle({ active: backgroundTests || app.isActive(),
+  presentation = new PresentationLifecycle({ active: true,
     pause: epoch => { for (const entry of windowNotifications) entry.detach(); return backend.presentation(false, epoch) },
     resume: async epoch => {
       for (const entry of windowNotifications) entry.attach()
@@ -384,20 +384,6 @@ async function startDesktop() {
       if (!snapshot) throw new Error('The presentation snapshot was superseded by a newer activation.')
       return snapshot
     }, publish: publishPresentation })
-  // Background test bundles are never natively active. Their explicit test
-  // entry exercises this same lifecycle without letting launch-time native
-  // deactivation race the simulated active workload or take desktop focus.
-  if (!backgroundTests) {
-    app.on('did-become-active', () => { void presentation.setActive(true) })
-    app.on('did-resign-active', () => { void presentation.setActive(false) })
-  }
-  // Dispatch initial idle without holding window creation behind data restore.
-  // App listeners are already installed, so activation during restore gets a
-  // newer epoch; reconcile once ready in case native startup changed state.
-  if (!presentation.desiredActive) void backend.presentation(false, 0).catch(error => console.error('Could not initialize interface idle:', error))
-  void backend.ready.then(() => {
-    if (!backgroundTests && !shuttingDown) return presentation.setActive(app.isActive())
-  }).catch(error => console.error('Could not reconcile application activation:', error))
   if (testMode) globalThis.__presentationTest = {
     setActive: active => presentation.setActive(active), getState: () => presentation.getState(),
   }
