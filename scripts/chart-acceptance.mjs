@@ -729,7 +729,11 @@ export function validateStoppedPaintCapture({ readyTarget = null, includeRequest
         // independent body/domain intersections used by chartViewportHours.
         const padding = Number(svg.barWidth) / Number(chart.barSpacing) * snapshot.intervalMS
         const firstSlot = Math.floor((Number(svg.domainStart) - padding) / snapshot.intervalMS) + 1
-        const lastSlot = Math.ceil((Number(svg.domainEnd) + padding) / snapshot.intervalMS) - 1
+        // The live viewport may extend past the forming candle. Those future
+        // slots have no market data and must not be required as rendered bars.
+        const domainLastSlot = Math.ceil((Number(svg.domainEnd) + padding) / snapshot.intervalMS) - 1
+        const lastSlot = Number.isFinite(snapshot.liveBar?.hour)
+          ? Math.min(domainLastSlot, snapshot.liveBar.hour / snapshot.intervalMS) : domainLastSlot
         if (![firstSlot, lastSlot].every(Number.isFinite) || bars.length !== lastSlot - firstSlot + 1
           || bars.some((bar, index) => bar.hour !== (firstSlot + index) * snapshot.intervalMS)) fail('The rendered bars do not cover every native slot in the geometric viewport.')
         if (Number(chart.renderedBars) !== bars.length || Math.floor(Number(chart.visibleBars)) !== 96 || Number(chart.targetBars) < 96) fail(`Chart candle-count metadata disagrees with the actual snapshot: ${JSON.stringify({ renderedBars: chart.renderedBars, actualBars: bars.length, visibleBars: chart.visibleBars, targetBars: chart.targetBars })}`)

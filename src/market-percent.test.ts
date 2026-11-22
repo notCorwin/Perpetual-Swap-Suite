@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { finitePercentage, formatCandleChange, formatPercent, type PercentageValue } from "./market-percent.ts"
+import { candleChangeDirection, finitePercentage, formatCandleChange, formatPercent, type PercentageValue } from "./market-percent.ts"
 
 test("percentage readings keep their native percentage units and two decimal places", () => {
   for (const [value, expected] of [
@@ -21,11 +21,13 @@ test("non-finite percentages are unavailable for display and chart coordinates",
 })
 
 test("active candle changes use its open, preserving direction and guarding invalid inputs", () => {
-  assert.equal(formatCandleChange(100, 102), '+2.00% ↑')
-  assert.equal(formatCandleChange(200, 196), '-2.00% ↓')
-  assert.equal(formatCandleChange(100, 100), '0.00% ↑')
-  assert.equal(formatCandleChange(100, 99.999), '0.00% ↓')
+  assert.equal(formatCandleChange(100, 102), '+2.00%')
+  assert.equal(formatCandleChange(200, 196), '-2.00%')
+  assert.equal(formatCandleChange(100, 100), '0.00%')
+  assert.equal(formatCandleChange(100, 99.999), '-0.00%')
+  assert.equal(formatCandleChange(100, 100.001), '+0.00%')
   assert.equal(formatCandleChange(0, 100), '—')
   assert.equal(formatCandleChange(NaN, 100), '—')
   assert.equal(formatCandleChange(100, Infinity), '—')
+  assert.deepEqual([[100, 102], [200, 196], [100, 100], [100, 99.999], [0, 100]].map(([open, close]) => candleChangeDirection(open, close)), ['up', 'down', 'flat', 'down', 'unavailable'])
 })

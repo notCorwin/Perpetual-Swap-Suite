@@ -113,8 +113,9 @@
   --chart-row-gap: var(--space-micro);
   --chart-bottom-axis-height: 16px;
   color-scheme: light;
-  --positive: rgb(142 188 57);
-  --negative: rgb(232 85 168);
+  --positive: rgb(68 151 130);
+  --negative: rgb(223 72 76);
+  --chart-price-label-foreground: rgb(0 0 0);
   --chart-annotation: var(--muted);
   --chart-threshold: color-mix(in srgb, var(--foreground) 29%, transparent);
   --chart-midpoint: color-mix(in srgb, var(--foreground) 6.5%, transparent);
@@ -167,7 +168,6 @@
 @media (prefers-color-scheme: dark) {
   :root {
     color-scheme: dark;
-    --positive: rgb(202 253 92);
     --chart-roc-positive-area: color-mix(in srgb, var(--positive) 16%, transparent);
     --chart-roc-negative-area: color-mix(in srgb, var(--negative) 16%, transparent);
     --background: oklch(0.145 0 0);

@@ -13,6 +13,11 @@ export type ChartPanel = typeof CHART_PANELS[number]
 
 type Range = readonly [number, number]
 
+/** A live price outside its own panel must not draw into neighboring panels. */
+export function chartPriceInPanel(y: number, panel: Range) {
+  return Number.isFinite(y) && y >= panel[0] && y <= panel[1]
+}
+
 export function chartCandleWidth(plotWidth: number, windowBars = 96) {
   return Math.max(5, Math.min(13, plotWidth / windowBars * 0.68))
 }
@@ -24,16 +29,19 @@ export function chartHourX(hour: number, latestHour: number, start: number, end:
 
 export function chartPriceLabelLayout(priceY: number, panel: Range, fontSize: number, paddingY: number, showCountdown: boolean) {
   const halfLine = fontSize / 2
-  const below = priceY + fontSize
-  const above = priceY - fontSize
+  const inset = Math.min(halfLine + paddingY, (panel[1] - panel[0]) / 2)
+  const labelY = Math.max(panel[0] + inset, Math.min(panel[1] - inset, priceY))
+  const below = labelY + fontSize
+  const above = labelY - fontSize
   const countdownY = !showCountdown ? null
     : below + halfLine + paddingY <= panel[1] ? below
       : above - halfLine - paddingY >= panel[0] ? above : null
-  // Keep the price anchor fixed; only its background clips at panel edges.
+  // Keep the text and its background inside the panel, even at its edges.
   return {
+    labelY,
     countdownY,
-    top: Math.max(panel[0], Math.min(priceY, countdownY ?? priceY) - halfLine - paddingY),
-    bottom: Math.min(panel[1], Math.max(priceY, countdownY ?? priceY) + halfLine + paddingY),
+    top: Math.max(panel[0], Math.min(labelY, countdownY ?? labelY) - halfLine - paddingY),
+    bottom: Math.min(panel[1], Math.max(labelY, countdownY ?? labelY) + halfLine + paddingY),
   }
 }
 

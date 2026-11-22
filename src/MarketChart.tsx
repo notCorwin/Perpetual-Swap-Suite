@@ -7,7 +7,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Spinner } from "@/components/ui/spinner"
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
-import { CHART_PANELS, chartContentClip, chartPanelClip, chartPriceLabelLayout, type ChartPanel as Panel } from "@/chart-layout"
+import { CHART_PANELS, chartContentClip, chartPanelClip, chartPriceInPanel, chartPriceLabelLayout, type ChartPanel as Panel } from "@/chart-layout"
 import { chartCompact as compact, chartPercent, chartPricePresentation, type ChartGeometry } from "@/chart-geometry"
 import { formatCurrentPrice, formatHistoricalPrice, formatIndicatorPrice } from '@/price-format'
 import { CHART_WHEEL_PIXELS_PER_BAR, chartRsiNavigationTarget, chartWheelIntent, chartZoomDemand, chartZoomSpacing, chartWheelContentOffset, chartPresentedWheelFraction, createChartWheelBatch, createChartWheelScheduler } from '@/chart-navigation'
@@ -15,7 +15,7 @@ import { chartStatisticsSamples } from '@/chart-legend'
 import { RSI_FIELDS, type RsiField } from '@/rsi-crossings'
 import { cn } from "@/lib/utils"
 import { chartNavigationTarget } from "@/market-sort"
-import { formatCandleChange, formatPercent } from "@/market-percent"
+import { candleChangeDirection, formatCandleChange, formatPercent } from "@/market-percent"
 import { RADAR_TIMEFRAMES, timeframeLabel, timeframeMilliseconds, type RadarTimeframe } from '@/timeframe'
 
 import { chartController as defaultChartController, type ChartController } from '@/chart-controller'
@@ -123,13 +123,13 @@ const subscribeVisibility = (listener: () => void) => {
   return () => document.removeEventListener('visibilitychange', listener)
 }
 const documentVisible = () => document.visibilityState !== 'hidden'
-const PriceCountdown = memo(function PriceCountdown({ hour, intervalMS, x, y }: { hour: number; intervalMS: number; x: number; y: number }) {
+const PriceCountdown = memo(function PriceCountdown({ hour, intervalMS, x, y, fill }: { hour: number; intervalMS: number; x: number; y: number; fill: string }) {
   const [now, setNow] = useState(Date.now)
   const visible = useContext(PlotVisible)
   useEffect(() => watchPriceCountdown(visible, presentationActive, setNow), [visible])
   const seconds = Math.max(0, Math.floor((hour + intervalMS - now) / 1000))
   const value = `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`
-  return <text data-chart-countdown x={x} y={y} dominantBaseline="middle" fill="var(--muted-foreground)">{value}</text>
+  return <text data-chart-countdown x={x} y={y} dominantBaseline="middle" fill={fill}>{value}</text>
 })
 const sourceStatusText = (label: string, state: PreparedChartState, status?: ChartSourceStatus) => {
   if (state === 'error') return `${label} failed: ${status?.error || 'Source request failed'}${status?.retryAt ? ` · retry at ${new Date(status.retryAt).toLocaleTimeString('en-US', { hour12: false })}` : status?.retryOn === 'worker-recovery' ? ' · waiting for calculation service recovery' : status?.retryOn === 'input-change' ? ' · waiting for updated data' : ''}`
@@ -162,13 +162,10 @@ const PlotPaths = memo(function PlotPaths({ bars, geometry, areaClipId, oiState,
   const { panels } = geometry.layout
   const lineStroke = (key: keyof Bar, d: string, color: string, dash?: string) => <path data-chart-indicator={key} d={d} fill="none" stroke={color} strokeLinecap="round" strokeLinejoin="round" strokeDasharray={dash} />
   return measureOperation({ category: 'cpu', name: 'chart.svg.paths.construct', attributes: { candles: bars.length } }, () => <>
-    {/* Expose contrasting segments within the same 1px stroke for the mandated light green. */}
     <g clipPath={`url(#${areaClipId}-price)`} visibility={priceVisible ? "visible" : "hidden"}>
-    <path d={upWicks} fill="none" stroke="var(--foreground)" />
-    <path d={upWicks} fill="none" stroke="var(--positive)" strokeDasharray="2 3" />
+    <path d={upWicks} fill="none" stroke="var(--positive)" />
     <path d={downWicks} fill="none" stroke="var(--negative)" />
-    <path d={upBodies} fill="var(--background)" stroke="var(--foreground)" />
-    <path data-chart-candle-direction="up" data-chart-candle-fill="hollow" d={upBodies} fill="none" stroke="var(--positive)" strokeDasharray="2 3" />
+    <path data-chart-candle-direction="up" data-chart-candle-fill="solid" d={upBodies} fill="var(--positive)" />
     <path data-chart-candle-direction="down" data-chart-candle-fill="solid" d={downBodies} fill="var(--negative)" />
     </g>
     {!geometry.priceOnly && <g clipPath={`url(#${areaClipId}-taker)`} data-chart-taker={takerComplete ? "complete" : takerAvailable ? "partial" : "empty"} data-chart-taker-state={takerState}>
@@ -221,8 +218,12 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
   const rocClip = chartPanelClip(geometry.layout, 'roc', geometry.barPitch)
   const tag = { price: liveBar.close, rising: liveBar.close >= liveBar.open, inViewport: presentation.base !== null && geometry.priceAxis.base !== null && Number.isFinite(liveBar.close) && liveBar.hour <= endHour + (liveOverlay ? intervalMS : 0) }
   const latestY = tag.inViewport ? priceY(tag.price) : panels.price[0]
+  const priceInViewport = tag.inViewport && chartPriceInPanel(latestY, panels.price)
   const latestColor = tag.rising ? "var(--positive)" : "var(--negative)"
   const latestPrice = formatCandleChange(liveBar.open, tag.price)
+  const priceDirection = candleChangeDirection(liveBar.open, tag.price)
+  const priceLabelBackground = priceDirection === 'up' ? 'var(--positive)' : priceDirection === 'down' ? 'var(--negative)' : 'var(--chart-annotation)'
+  const priceLabelForeground = priceDirection === 'up' || priceDirection === 'down' ? 'var(--chart-price-label-foreground)' : 'var(--foreground)'
   const priceLabel = chartPriceLabelLayout(latestY, panels.price, chartTokens.textSize, chartTokens.priceLabelPaddingY, liveOverlay)
   const tickHalfHeight = chartTokens.textSize / 2
   const inspectionX = x[0] + (active.hour - bars[0].hour) / intervalMS * geometry.barPitch
@@ -325,11 +326,11 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
         {timeLabels.map(tick => <text data-chart-time-label key={tick.hour} x={tick.x} y={height - 4} textAnchor="middle" fill="var(--muted-foreground)">{hourLabel(tick.hour)}</text>)}
       </g>
     </g>
-    {tag.inViewport && <g data-chart-price-label>
-      <title>{`Change from candle open ${latestPrice} · ${liveOverlay ? 'Forming candle' : 'Candle'}`}</title>
-      <rect data-chart-price-label-background x={right} y={priceLabel.top} width={gutter} height={priceLabel.bottom - priceLabel.top} fill="var(--chart-annotation)" />
-      <text data-chart-price-label-value x={axisStarts.price} y={latestY} dominantBaseline="middle" fill="var(--foreground)" textLength={chartTextWidth(latestPrice) > gutter - chartTokens.annotationPadding ? Math.max(1, gutter - chartTokens.annotationPadding) : undefined} lengthAdjust="spacingAndGlyphs">{latestPrice}</text>
-      {priceLabel.countdownY !== null && <PriceCountdown hour={liveBar.hour} intervalMS={intervalMS} x={axisStarts.price} y={priceLabel.countdownY} />}
+    {priceInViewport && <g data-chart-price-label data-chart-price-direction={priceDirection}>
+      <title>{`Change from candle open ${latestPrice} · ${priceDirection === 'flat' ? 'unchanged' : priceDirection} · ${liveOverlay ? 'Forming candle' : 'Candle'}`}</title>
+      <rect data-chart-price-label-background x={right} y={priceLabel.top} width={gutter} height={priceLabel.bottom - priceLabel.top} fill={priceLabelBackground} />
+      <text data-chart-price-label-value x={axisStarts.price} y={priceLabel.labelY} dominantBaseline="middle" fill={priceLabelForeground} textLength={chartTextWidth(latestPrice) > gutter - chartTokens.annotationPadding ? Math.max(1, gutter - chartTokens.annotationPadding) : undefined} lengthAdjust="spacingAndGlyphs">{latestPrice}</text>
+      {priceLabel.countdownY !== null && <PriceCountdown hour={liveBar.hour} intervalMS={intervalMS} x={axisStarts.price} y={priceLabel.countdownY} fill={priceLabelForeground} />}
     </g>}
     {statistics && <>
     {legend("price", priceOverlays.map(({ label, value, color, dash }) => [label, value(active), color, dash]))}
@@ -345,10 +346,10 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     {oiAxis && panels.oi[1] - panels.oi[0] >= 35 && geometry.oiTicks.map(({ y, label }, index) => <g key={index} data-chart-oi-tick><line x1={columns.oi[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.25" />{lineLabel(axisStarts.oi, y, label)}</g>)}
     {panels.taker[1] - panels.taker[0] >= 35 && geometry.takerTicks.map(({ y, label }, index) => <g key={index} data-chart-taker-tick>{lineLabel(axisStarts.taker, y, label)}</g>)}
     {inspectedTime && <g data-chart-inspected-time><rect x={inspectedTimeX} y={height - 16} width={inspectedTimeWidth} height={15} rx={3} fill="var(--chart-annotation)" /><text x={inspectedTimeX + inspectedTimeWidth / 2} y={height - 4} textAnchor="middle" fill="var(--foreground)">{inspectedTime}</text></g>}
-    {presentation.ticks.map(({ y, label }, index) => <g key={index} data-chart-price-tick><line x1={columns.price[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.35" />{y >= chartTokens.textSize && y <= height - chartTokens.textSize && (!tag.inViewport || y + tickHalfHeight < priceLabel.top || y - tickHalfHeight > priceLabel.bottom) && <text x={axisStarts.price} y={y} dominantBaseline="middle" fill="var(--muted-foreground)" textLength={chartTextWidth(label) > gutter - chartTokens.annotationPadding ? Math.max(1, gutter - chartTokens.annotationPadding) : undefined} lengthAdjust="spacingAndGlyphs">{label}</text>}</g>)}
+    {presentation.ticks.map(({ y, label }, index) => <g key={index} data-chart-price-tick><line x1={columns.price[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.35" />{y >= chartTokens.textSize && y <= height - chartTokens.textSize && (!priceInViewport || y + tickHalfHeight < priceLabel.top || y - tickHalfHeight > priceLabel.bottom) && <text x={axisStarts.price} y={y} dominantBaseline="middle" fill="var(--muted-foreground)" textLength={chartTextWidth(label) > gutter - chartTokens.annotationPadding ? Math.max(1, gutter - chartTokens.annotationPadding) : undefined} lengthAdjust="spacingAndGlyphs">{label}</text>}</g>)}
     <line x1={right} x2={right} y1={panels.price[0]} y2={geometry.priceOnly ? panels.price[1] : panels.taker[1]} stroke="var(--border)" opacity="0.8" />
-    {tag.inViewport && tag.rising && <line data-chart-live-price-outline x1={columns.price[0]} x2={right} y1={latestY} y2={latestY} stroke="var(--foreground)" />}
-    {tag.inViewport && <line data-chart-live-price x1={columns.price[0]} x2={right} y1={latestY} y2={latestY} stroke={latestColor} strokeDasharray="4 5" />}
+    {priceInViewport && tag.rising && <line data-chart-live-price-outline x1={columns.price[0]} x2={right} y1={latestY} y2={latestY} stroke="var(--foreground)" />}
+    {priceInViewport && <line data-chart-live-price x1={columns.price[0]} x2={right} y1={latestY} y2={latestY} stroke={latestColor} strokeDasharray="4 5" />}
   </>
   })
 })

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { chartCandleWidth, chartContentClip, chartHourX, chartLayout, chartPanelClip, chartPriceLabelLayout, type ChartPanel } from "./chart-layout.ts"
+import { chartCandleWidth, chartContentClip, chartHourX, chartLayout, chartPanelClip, chartPriceInPanel, chartPriceLabelLayout, type ChartPanel } from "./chart-layout.ts"
 
 test("stacked chart layout stays aligned and bounded", () => {
   const order: ChartPanel[] = ["price", "roc", "rsi", "atr", "oi", "taker"]
@@ -61,46 +61,51 @@ test("fractional content clipping stops before axis labels and legends", () => {
 
 test("axis price and countdown share one-line spacing and outer padding", () => {
   assert.deepEqual(chartPriceLabelLayout(60, [10, 110], 10, 2, true), {
-    countdownY: 70, top: 53, bottom: 77,
+    labelY: 60, countdownY: 70, top: 53, bottom: 77,
   })
+})
+
+test("live price overlays stay within their price panel", () => {
+  const panel = [10, 110] as const
+  assert.deepEqual([9.99, 10, 60, 110, 110.01, NaN, Infinity].map(y => chartPriceInPanel(y, panel)), [false, true, true, true, false, false, false])
 })
 
 test("countdown flips above with the same spacing near the lower boundary", () => {
   assert.deepEqual(chartPriceLabelLayout(100, [10, 110], 10, 2, true), {
-    countdownY: 90, top: 83, bottom: 107,
+    labelY: 100, countdownY: 90, top: 83, bottom: 107,
   })
   assert.deepEqual(chartPriceLabelLayout(110, [10, 110], 10, 2, true), {
-    countdownY: 100, top: 93, bottom: 110,
+    labelY: 103, countdownY: 93, top: 86, bottom: 110,
   })
 })
 
-test("price background clips at the upper boundary and leaves countdown below", () => {
+test("price label and background fit at the upper boundary with countdown below", () => {
   assert.deepEqual(chartPriceLabelLayout(10, [10, 110], 10, 2, true), {
-    countdownY: 20, top: 10, bottom: 27,
+    labelY: 17, countdownY: 27, top: 10, bottom: 34,
   })
 })
 
 test("historical axis labels occupy one padded line", () => {
   assert.deepEqual(chartPriceLabelLayout(60, [10, 110], 10, 2, false), {
-    countdownY: null, top: 53, bottom: 67,
+    labelY: 60, countdownY: null, top: 53, bottom: 67,
   })
 })
 
 test("countdown is omitted when neither side fits inside a small panel", () => {
   assert.deepEqual(chartPriceLabelLayout(20, [10, 30], 10, 2, true), {
-    countdownY: null, top: 13, bottom: 27,
+    labelY: 20, countdownY: null, top: 13, bottom: 27,
   })
   assert.deepEqual(chartPriceLabelLayout(12, [10, 14], 10, 2, true), {
-    countdownY: null, top: 10, bottom: 14,
+    labelY: 12, countdownY: null, top: 10, bottom: 14,
   })
 })
 
 test("a countdown including its padding remains visible at an exact fit", () => {
   assert.deepEqual(chartPriceLabelLayout(93, [10, 110], 10, 2, true), {
-    countdownY: 103, top: 86, bottom: 110,
+    labelY: 93, countdownY: 103, top: 86, bottom: 110,
   })
   assert.deepEqual(chartPriceLabelLayout(27, [10, 40], 10, 2, true), {
-    countdownY: 17, top: 10, bottom: 34,
+    labelY: 27, countdownY: 17, top: 10, bottom: 34,
   })
 })
 

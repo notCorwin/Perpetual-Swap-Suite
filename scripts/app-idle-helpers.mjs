@@ -167,8 +167,9 @@ export function assertReadyFrame(frame, { instId, timeframe, expected, historica
     const { open, close } = frame.liveBar
     assert.ok(Number.isFinite(open) && open !== 0, 'A live ready frame must contain a valid open price.')
     const change = (close - open) / Math.abs(open) * 100
-    const rounded = Math.abs(change) < .005 ? 0 : change
-    const label = `${rounded > 0 ? '+' : ''}${rounded.toFixed(2)}% ${close >= open ? '↑' : '↓'}`
+    const label = change !== 0 && Math.abs(change) < .005
+      ? `${change > 0 ? '+' : '-'}0.00%`
+      : `${change > 0 ? '+' : ''}${change.toFixed(2)}%`
     assert.equal(frame.priceLabel, label, 'SVG candle change does not match the live candle.')
   }
 }

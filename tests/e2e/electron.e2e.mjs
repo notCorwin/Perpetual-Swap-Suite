@@ -929,8 +929,16 @@ test('the live price overlay follows its actual price without changing the compl
     // This case measures the live overlay over a prepared adjacent window.
     // First acquisition may legitimately present its known prices while the
     // missing leading candle loads; cold acquisition is tested separately.
-    const historicalEnd = fixture.end - fixture.intervalMS
-    await wheelBurst(page, { deltaY: 12 })
+    // Shared time navigation uses the actual pixel pitch and can include a
+    // forming candle beyond the completed end. Scroll far enough to leave the
+    // live window rather than assuming 12 pixels is exactly one candle.
+    const scrollPixels = 4 * Number(await page.locator('[data-acceptance-target] [data-chart-inst]').getAttribute('data-chart-bar-spacing'))
+    await wheelBurst(page, { deltaY: scrollPixels })
+    const historicalEnd = await (await page.waitForFunction(end => {
+      const chart = document.querySelector('[data-acceptance-target] [data-chart-inst]')
+      const requested = Number(chart?.getAttribute('data-chart-requested-end'))
+      return requested && requested < end ? requested : false
+    }, fixture.end)).jsonValue()
     await waitForRendered(page, fixture, fixture.timeframe, historicalEnd)
     await page.waitForFunction(({ end, intervalMS }) => {
       const chart = document.querySelector('[data-acceptance-target] [data-chart-inst]'), bars = chart?.__chartRenderedBars ?? chart?.__chartSnapshot?.bars
@@ -938,10 +946,10 @@ test('the live price overlay follows its actual price without changing the compl
         bar.confirmed && bar.hour === end - (bars.length - 1 - index) * intervalMS)
     }, { end: historicalEnd, intervalMS: fixture.intervalMS })
     await assertCompleteChartViewport(page, fixture.instId, { endHour: historicalEnd })
-    await wheelBurst(page, { deltaY: -12 })
+    await wheelBurst(page, { deltaY: -2 * scrollPixels })
     await waitForRendered(page, fixture)
     await page.waitForFunction(() => Boolean(document.querySelector('[data-acceptance-target] [data-chart-inst]')?.__chartSnapshot?.liveBar))
-    await assertCompleteChartViewport(page, fixture.instId, { endHour: fixture.end })
+    await assertCompleteChartViewport(page, fixture.instId, { endHour: fixture.end, availableThrough: fixture.end + fixture.intervalMS })
     await startPaintProbe(page, fixture)
     const overlay = await page.evaluate(() => {
       const chart = document.querySelector('[data-acceptance-target] [data-chart-inst]')
@@ -984,10 +992,9 @@ test('the live price overlay follows its actual price without changing the compl
     assert.equal(overlay.labelFont, overlay.tickFont)
     assert.equal(overlay.countdownFont, overlay.labelFont, 'Price and countdown must use the same font size.')
     assert.ok(Math.abs(Math.abs(overlay.countdownY - overlay.labelY) - parseFloat(overlay.labelFont)) < 1e-6, 'The two lines must use single line spacing.')
-    assert.equal(overlay.countdownFill, overlay.tickFill, 'The countdown must use the muted axis text color.')
-    assert.notEqual(overlay.countdownFill, overlay.labelFill)
-    await wheelBurst(page, { deltaY: 12 })
-    await waitForRendered(page, fixture, fixture.timeframe, fixture.end - fixture.intervalMS)
+    assert.equal(overlay.countdownFill, overlay.labelFill, 'The countdown and price must use the same high-contrast foreground on the colored background.')
+    await wheelBurst(page, { deltaY: scrollPixels })
+    await waitForRendered(page, fixture, fixture.timeframe, historicalEnd)
     assert.equal(await page.locator('[data-acceptance-target] svg[data-rendered-inst] [data-chart-countdown]').count(), 0, 'Historical charts must not display a live countdown.')
     assert.equal(await page.evaluate(() => document.querySelector('[data-acceptance-target] [data-chart-inst]').__chartSnapshot.liveBar), undefined)
     const report = await finishPaintProbe(page)
@@ -1031,15 +1038,12 @@ test('live prices outside the saved domain keep their axis labels inside the pri
       await openChart(page, fixture)
       const geometry = await page.evaluate(() => {
         const svg = document.querySelector('[data-acceptance-target] svg[data-rendered-inst]')
-        const borders = [...svg.querySelectorAll(':scope > line')].filter(line =>
-          line.getAttribute('stroke') === 'var(--border)' && line.y1.baseVal.value === line.y2.baseVal.value
-          && line.x1.baseVal.value !== line.x2.baseVal.value)
         const bounds = selector => {
           const box = svg.querySelector(selector).getBBox()
           return [box.y, box.y + box.height]
         }
         return {
-          panel: borders.slice(0, 2).map(line => Number(line.getAttribute('y1'))),
+          panel: [0, Number(svg.querySelector('[data-chart-panel-divider="price"]').getAttribute('y1'))],
           livePrice: document.querySelector('[data-acceptance-target] [data-chart-inst]').__chartSnapshot.liveBar?.close,
           lineY: Number(svg.querySelector('[data-chart-live-price]').getAttribute('y1')),
           labelY: Number(svg.querySelector('[data-chart-price-label-value]').getAttribute('y')),
@@ -1050,7 +1054,7 @@ test('live prices outside the saved domain keep their axis labels inside the pri
         }
       })
       assert.equal(geometry.livePrice, livePrice)
-      assert.equal(geometry.labelY, geometry.lineY)
+      assert.ok(Math.abs(geometry.labelY - geometry.lineY) <= geometry.fontSize / 2 + 3, 'Only shift the price label as far as needed to keep it inside the panel.')
       assert.ok(geometry.lineY >= geometry.panel[0] && geometry.lineY <= geometry.panel[1])
       for (const bounds of [geometry.label, geometry.background, geometry.countdown]) {
         assert.ok(bounds[0] >= geometry.panel[0] && bounds[1] <= geometry.panel[1], `Axis text must stay in the price panel: ${JSON.stringify(geometry)}`)

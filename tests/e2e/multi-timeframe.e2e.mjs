@@ -83,7 +83,7 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
           const svg = chart.querySelector('svg[data-rendered-inst]')
           const referenceOpen = snapshot?.liveBar?.open
           const label = svg?.querySelector('[data-chart-price-label-value]')?.textContent ?? ''
-          const percent = /^([+-]?[\d,]+(?:\.\d+)?)% [↑↓]$/.exec(label)?.[1]
+          const percent = /^([+-]?[\d,]+(?:\.\d+)?)%$/.exec(label)?.[1]
           return snapshot?.instId === instId && snapshot.liveBar?.close === close && snapshot.priceObservedAt >= sentAt
             && percent !== undefined && Math.abs(Number(percent.replaceAll(',', '')) - (close / referenceOpen - 1) * 100) < 0.005001
             && svg.querySelector('[data-chart-countdown]')
@@ -136,7 +136,7 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
         && charts.every(chart => {
           const svg = chart.querySelector('svg[data-rendered-inst]'), snapshot = chart.__chartSnapshot
           const referenceOpen = snapshot?.liveBar?.open
-          const percent = /^([+-]?[\d,]+(?:\.\d+)?)% [↑↓]$/.exec(svg?.querySelector('[data-chart-price-label-value]')?.textContent ?? '')?.[1]
+          const percent = /^([+-]?[\d,]+(?:\.\d+)?)%$/.exec(svg?.querySelector('[data-chart-price-label-value]')?.textContent ?? '')?.[1]
           return percent !== undefined && Math.abs(Number(percent.replaceAll(',', '')) - (139.25 / referenceOpen - 1) * 100) < 0.005001
             && chart.querySelector('[data-chart-countdown]')
         })
@@ -172,10 +172,11 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
         const offset = Number(svg.querySelector('[data-chart-wheel-content]')?.dataset.chartWheelOffset ?? 0)
         const center = right - width / 2 + (bar.hour - Number(svg.dataset.chartDomainEnd)) / intervals[svg.dataset.renderedTimeframe] * Number(chart.dataset.chartBarSpacing) + offset
         const group = svg.querySelector('[data-chart-candle-direction]')?.parentElement
-        const paths = [...group.querySelectorAll('path')].map(path => path.getAttribute('d') ?? '')
+        const bodiesPaths = [...group.querySelectorAll('path[data-chart-candle-direction]')].map(path => path.getAttribute('d') ?? '')
+        const wickPaths = [...group.querySelectorAll('path:not([data-chart-candle-direction])')].map(path => path.getAttribute('d') ?? '')
         const number = '[-+]?(?:\\d*\\.)?\\d+(?:e[-+]?\\d+)?'
-        const bodies = paths.slice(3).flatMap(d => [...d.matchAll(new RegExp(`M(${number}) (${number})h(${number})v(${number})h(${number})Z`, 'gi'))].map(match => ({ x: Number(match[1]) + offset, width: Number(match[3]) })))
-        const wicks = paths.slice(0, 3).flatMap(d => [...d.matchAll(new RegExp(`M(${number}) (${number})V(${number})`, 'gi'))].map(match => Number(match[1]) + offset))
+        const bodies = bodiesPaths.flatMap(d => [...d.matchAll(new RegExp(`M(${number}) (${number})h(${number})v(${number})h(${number})Z`, 'gi'))].map(match => ({ x: Number(match[1]) + offset, width: Number(match[3]) })))
+        const wicks = wickPaths.flatMap(d => [...d.matchAll(new RegExp(`M(${number}) (${number})V(${number})`, 'gi'))].map(match => Number(match[1]) + offset))
         return { frame: svg.dataset.renderedTimeframe, right, width, center, bodies, wicks }
       }))
       for (const candle of candles) {

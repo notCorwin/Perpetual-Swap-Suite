@@ -37,7 +37,7 @@ try {
         const close = 100 + index * .01
         const averageTrueRange = .4 + .06 * Math.sin(index / 8) + .025 * Math.cos(index / 17)
         const bandHalfWidth = .5 + .18 * Math.cos(index / 13) + .04 * Math.sin(index / 5)
-        return { hour: endHour - (95 - index) * intervalMS, open: close + (index % 2 ? -.05 : .05), high: close + .2, low: close - .2, close,
+        return { hour: endHour - (95 - index) * intervalMS, open: close + (index === 95 && timeframe === '5m' ? .05 : index % 2 ? -.05 : .05), high: close + .2, low: close - .2, close,
           confirmed: true, statisticsSources: 3, statisticsObserved: true, indicatorsObserved: true,
           ema: close, vwap: close - .02, bollUpper: close + bandHalfWidth, bollMiddle: close, bollLower: close - bandHalfWidth,
           roc: .5, maroc: .25, rsi6: 50, rsi12: 55, rsi24: 60,
@@ -119,7 +119,11 @@ try {
           : element.getAttribute('aria-label') || element.id || element.dataset.slot || element.tagName.toLowerCase()
     const scope = document.querySelector('[role="dialog"]') ?? document.body
     const texts = [...scope.querySelectorAll('*')].filter(element => visible(element) && !element.closest('[aria-hidden="true"]') && ([...element.childNodes].some(node => node.nodeType === Node.TEXT_NODE && node.textContent.trim()) || element.matches('input,textarea'))).map(element => {
-      const style = getComputedStyle(element), bg = background(element), svg = element instanceof SVGElement
+      const style = getComputedStyle(element), svg = element instanceof SVGElement
+      const surface = background(element)
+      // SVG annotation backgrounds are painted as sibling rectangles, not CSS backgrounds.
+      const labelBackground = element.closest('[data-chart-price-label]')?.querySelector('[data-chart-price-label-background]')
+      const bg = labelBackground ? over(rgba(getComputedStyle(labelBackground).fill), surface) : surface
       const color = rgba(svg ? style.fill : style.color)
       color[3] *= Number(style.opacity) * (svg ? Number(style.fillOpacity) : 1)
       const actual = over(color, bg)
@@ -201,10 +205,15 @@ try {
       if (width === 1600 && dpr === 1) {
         await assertIndicatorLegends(page)
         const measured = await measure()
-        assert.deepEqual(measured.semantics.positive, theme === 'light' ? [142, 188, 57] : [202, 253, 92])
-        assert.deepEqual(measured.semantics.negative, [232, 85, 168])
-        assert.equal(measured.semantics.upFill, 'hollow')
+        assert.deepEqual(measured.semantics.positive, [68, 151, 130])
+        assert.deepEqual(measured.semantics.negative, [223, 72, 76])
+        assert.equal(measured.semantics.upFill, 'solid')
         assert.equal(measured.semantics.downFill, 'solid')
+        for (const expectedBackground of [measured.semantics.positive, measured.semantics.negative]) {
+          const label = measured.texts.find(item => item.text.endsWith('%') && item.background.every((value, index) => value === expectedBackground[index]))
+          assert.ok(label, `Missing price label on ${expectedBackground.join(',')} background in ${theme} theme`)
+          assert.ok(label.ratio >= 4.5, `Price label contrast is too low in ${theme} theme`)
+        }
         report.measurements.push({ theme, surface: 'workspace', ...measured })
         const settingsOpened = electron.waitForEvent('window')
         await electron.evaluate(({ Menu }) => Menu.getApplicationMenu().getMenuItemById('open-settings').click())

@@ -427,6 +427,9 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
     globalThis.__workspaceFixture.sendChart(frame)
   })
   await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.liveBar?.close === 133)
+  const priceLabel = chart.locator('[data-chart-price-label]')
+  await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-price-label]')?.getAttribute('data-chart-price-direction') === 'flat')
+  assert.equal(await priceLabel.locator('[data-chart-price-label-background]').getAttribute('fill'), 'var(--chart-annotation)')
   await assertCompleteChartViewport(page, 'BETA-USDT-SWAP', { fullSlots: null })
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), before + 1, 'Only the fixture read may be added; the pushed candle must not trigger another renderer read.')
   const liveUpdate = await page.evaluate(() => {
@@ -440,9 +443,17 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
   await electron.evaluate(({ BrowserWindow }, update) => globalThis.__workspaceFixture.sendChart(update), liveUpdate)
   await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.liveBar?.close === 135)
   assert.match(await chart.locator('[aria-live="off"]').textContent(), /Close\s+135/)
-  assert.match(await chart.locator('svg[data-rendered-inst] [data-chart-price-label-value]').textContent(), /^\+1\.50% ↑$/)
+  assert.match(await chart.locator('svg[data-rendered-inst] [data-chart-price-label-value]').textContent(), /^\+1\.50%$/)
+  assert.equal(await priceLabel.getAttribute('data-chart-price-direction'), 'up')
+  assert.equal(await priceLabel.locator('[data-chart-price-label-background]').getAttribute('fill'), 'var(--positive)')
+  assert.equal(await priceLabel.locator('[data-chart-price-label-value]').getAttribute('fill'), 'var(--chart-price-label-foreground)')
+  assert.equal(await priceLabel.locator('[data-chart-countdown]').getAttribute('fill'), 'var(--chart-price-label-foreground)')
   assert.equal(await page.evaluate(() => document.querySelector('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]').__chartSnapshot.bars === globalThis.__completedSubscriptionBars), true)
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), reads, 'Live-only subscriptions must reuse the completed frame without a follow-up read.')
+  await electron.evaluate(({ BrowserWindow }, update) => globalThis.__workspaceFixture.sendChart({ ...update, revision: update.revision + 1, liveBar: { ...update.liveBar, close: 132 } }), liveUpdate)
+  await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-price-label]')?.getAttribute('data-chart-price-direction') === 'down')
+  assert.equal(await priceLabel.locator('[data-chart-price-label-background]').getAttribute('fill'), 'var(--negative)')
+  assert.match(await priceLabel.locator('title').textContent(), /down/)
 })
 
 test('contract precision updates pad current quotes while preserving historical and indicator digits', async () => {
@@ -466,7 +477,7 @@ test('contract precision updates pad current quotes while preserving historical 
       return frame
     })
     await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '100.1200')
-    await waitForLabel('+0.02% ↑')
+    await waitForLabel('+0.02%')
     assert.equal(await close.textContent(), '100.1200')
     const baseline = await page.evaluate(() => {
       const chart = document.querySelector('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]')
@@ -481,7 +492,7 @@ test('contract precision updates pad current quotes while preserving historical 
       state.revision += 1; state.notify()
     })
     await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '100.12000000')
-    await waitForLabel('+0.02% ↑')
+    await waitForLabel('+0.02%')
     assert.equal(await close.textContent(), '100.12000000')
     const layout = await chart.evaluate(chart => {
       const label = chart.querySelector('[data-chart-price-label-value]').getBoundingClientRect()
@@ -500,7 +511,7 @@ test('contract precision updates pad current quotes while preserving historical 
     await page.mouse.down()
     await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-ohlc="close"] span[title]')?.textContent === '100.123456789')
     await page.mouse.up()
-    await waitForLabel('+0.02% ↑')
+    await waitForLabel('+0.02%')
   } finally {
     await page.mouse.up()
     const generation = await electron.evaluate(async () => {
@@ -1615,7 +1626,7 @@ test('missing recent candles remain visible with repair status until the complet
       assert.deepEqual(viewport.bars.map(bar => bar.hour), chartViewportHours(viewport).filter(hour => available.has(hour)),
         'While history is incomplete, draw exactly the source candles intersecting the viewport without inventing missing prices.')
       assert.equal((await chart.evaluate(node => node.__chartSnapshot.liveBar?.hour)), frame.liveHour, 'The live candle stays available even when the synchronized viewport is historical.')
-      assert.match(await chart.locator('svg[data-rendered-inst] [data-chart-price-label-value]').textContent(), /^[+-]?\d+\.\d+% [↑↓→]$/, 'The visible price label remains well formed across the historical gap.')
+      assert.match(await chart.locator('svg[data-rendered-inst] [data-chart-price-label-value]').textContent(), /^[+-]?\d+\.\d+%$/, 'The visible price label remains well formed across the historical gap.')
     }
     await waitForFrame(await publish('repaired'))
     await page.waitForFunction(() => !document.querySelector('[data-chart-shared-status-item="15m"]')?.textContent.includes('repairing'))

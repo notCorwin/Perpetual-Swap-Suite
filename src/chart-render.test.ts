@@ -152,7 +152,7 @@ test('active candle change reserves label width and reuses unchanged chart input
   const size = { width: 1280, height: 700 }, frame = window()
   const live = { ...frame, liveBar: { ...frame.bars.at(-1)!, confirmed: false, hour: 96 * step } }
   const plot = cache(live, size)!
-  const quote = '+2.00% ↑'
+  const quote = '+2.00%'
   assert.ok(labels.includes(quote), 'The gutter must measure the same candle change as the visible tag.')
   assert.ok(plot.geometry.gutter >= quote.length * 6 + 16)
   labels.length = 0

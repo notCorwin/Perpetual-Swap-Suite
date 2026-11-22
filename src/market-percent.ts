@@ -17,6 +17,13 @@ export function formatPercent(value: PercentageValue, decimals = 2): string {
 export function formatCandleChange(open: number, close: number): string {
   const change = signedRelativeChange(close, open)
   if (change === null) return '—'
-  const rounded = Math.abs(change) < 0.005 ? 0 : change
-  return `${formatPercent(rounded)} ${close >= open ? '↑' : '↓'}`
+  // Keep the direction visible even when a small change rounds to zero.
+  if (change !== 0 && Math.abs(change) < 0.005) return `${change > 0 ? '+' : '-'}0.00%`
+  return formatPercent(change)
+}
+
+/** Direction uses the unrounded change, so small moves remain distinguishable. */
+export function candleChangeDirection(open: number, close: number): 'up' | 'down' | 'flat' | 'unavailable' {
+  const change = signedRelativeChange(close, open)
+  return change === null ? 'unavailable' : change > 0 ? 'up' : change < 0 ? 'down' : 'flat'
 }
