@@ -6,7 +6,7 @@
   font-family: "Ubuntu Mono";
   src: url("./../public/fonts/ubuntu-mono-regular.ttf") format("truetype");
   font-style: normal;
-  font-weight: 400;
+  font-weight: 400 500;
   font-display: swap;
 }
 
@@ -14,7 +14,7 @@
   font-family: "Ubuntu Mono";
   src: url("./../public/fonts/ubuntu-mono-bold.ttf") format("truetype");
   font-style: normal;
-  font-weight: 500 900;
+  font-weight: 600 900;
   font-display: swap;
 }
 
@@ -94,9 +94,9 @@
   --space-annotation-label: calc(var(--space-annotation-symbol) + var(--space-annotation-small));
   --settings-control-width: calc(var(--space-unit) * 52);
   --settings-switch-width: 32px;
-  --ui-font-size: 11px;
-  --ui-font-meta: 10px;
-  --ui-font-heading: 12px;
+  --ui-font-size: 12px;
+  --ui-font-meta: 11px;
+  --ui-font-heading: 13px;
   --ui-line-height: 16px;
   --ui-line-meta: 14px;
   --ui-row-height: 28px;
@@ -124,7 +124,7 @@
   --chart-roc-negative-area: color-mix(in srgb, var(--negative) 12%, transparent);
   --chart-positive-label: color-mix(in srgb, var(--positive) 50%, var(--foreground));
   --chart-negative-label: color-mix(in srgb, var(--negative) 50%, var(--foreground));
-  --chart-text-size: 10px;
+  --chart-text-size: 11px;
   --ui-weight-normal: 400;
   --ui-weight-emphasis: 500;
   --market-row-border: color-mix(in srgb, var(--border) 40%, transparent);
@@ -144,7 +144,7 @@
   --secondary: oklch(0.97 0 0);
   --secondary-foreground: oklch(0.205 0 0);
   --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.54 0 0);
+  --muted-foreground: oklch(0.48 0 0);
   --accent: oklch(0.97 0 0);
   --accent-foreground: oklch(0.205 0 0);
   --destructive: oklch(0.577 0.245 27.325);
@@ -172,7 +172,7 @@
     --chart-roc-positive-area: color-mix(in srgb, var(--positive) 16%, transparent);
     --chart-roc-negative-area: color-mix(in srgb, var(--negative) 16%, transparent);
     --background: oklch(0.145 0 0);
-    --foreground: oklch(0.985 0 0);
+    --foreground: oklch(0.93 0 0);
     --card: oklch(0.205 0 0);
     --card-foreground: oklch(0.985 0 0);
     --popover: oklch(0.205 0 0);
@@ -182,7 +182,7 @@
     --secondary: oklch(0.269 0 0);
     --secondary-foreground: oklch(0.985 0 0);
     --muted: oklch(0.269 0 0);
-    --muted-foreground: oklch(0.708 0 0);
+    --muted-foreground: oklch(0.76 0 0);
     --accent: oklch(0.269 0 0);
     --accent-foreground: oklch(0.985 0 0);
     --destructive: oklch(0.704 0.191 22.216);
