@@ -101,6 +101,8 @@
   --ui-line-meta: 14px;
   --ui-row-height: 28px;
   --ui-inline-gap: var(--space-4);
+  --market-list-min-width: 280px;
+  --market-list-share: 20%;
   --market-list-max-width: 300px;
   --market-list-width: min(var(--market-list-max-width), 35vw);
   --chart-summary-height: 22px;

@@ -17,22 +17,22 @@ test('trackpad pinch zooms the cached chart around the pointer and keeps wheel h
     const errors = []
     page.on('pageerror', error => errors.push(error.message))
     await page.evaluate(() => window.radarDesktop.request({ e2e: { action: 'seedInstrumentNavigationBenchmark' } }))
-    await page.waitForFunction(() => document.querySelector('[data-multi-timeframe-charts] > :nth-child(2) [data-chart-inst][data-chart-loading="false"] svg[data-rendered-inst]'))
-    const initial = await page.locator('[data-multi-timeframe-charts] > :nth-child(2) [data-chart-inst]').evaluate(chart => ({
+    await page.waitForFunction(() => document.querySelector('[data-timeframe-panel="15m"] [data-chart-inst][data-chart-loading="false"] svg[data-rendered-inst]'))
+    const initial = await page.locator('[data-timeframe-panel="15m"] [data-chart-inst]').evaluate(chart => ({
       visible: Number(chart.dataset.chartVisibleBars), prepared: Number(chart.dataset.chartTargetBars),
       rendered: Number(chart.dataset.chartRenderedBars),
     }))
-    assert.ok(initial.visible >= 50 && initial.visible <= 250, 'Default candles use a readable density.')
+    assert.ok(initial.visible >= 20 && initial.visible <= 250, 'Default candles use a readable density.')
     assert.ok(initial.visible < initial.prepared, 'Display density is independent from coarse history demand.')
-    const input = async (deltaY, ctrlKey = true, deltaX = 0) => page.locator('[data-multi-timeframe-charts] > :nth-child(2) [data-chart-plot]').evaluate((plot, options) => {
+    const input = async (deltaY, ctrlKey = true, deltaX = 0) => page.locator('[data-timeframe-panel="15m"] [data-chart-plot]').evaluate((plot, options) => {
       const rect = plot.getBoundingClientRect()
       const event = new WheelEvent('wheel', { ...options, bubbles: true, cancelable: true, clientX: rect.left + rect.width * 0.4 })
       plot.dispatchEvent(event)
       return event.defaultPrevented
     }, { deltaY, ctrlKey, deltaX })
-    const state = () => page.locator('[data-multi-timeframe-charts] > :nth-child(2) [data-chart-inst]').evaluate(chart => {
+    const state = () => page.locator('[data-timeframe-panel="15m"] [data-chart-inst]').evaluate(chart => {
       const svg = chart.querySelector('svg[data-rendered-inst]')
-      const rect = chart.querySelector('[data-multi-timeframe-charts] > :nth-child(2) [data-chart-plot]').getBoundingClientRect()
+      const rect = chart.querySelector('[data-timeframe-panel="15m"] [data-chart-plot]').getBoundingClientRect()
       const width = svg.viewBox.baseVal.width
       const anchor = rect.width * 0.4 * width / rect.width / Number(svg.dataset.chartPlotRight)
       const start = Number(svg.dataset.chartDomainStart), end = Number(svg.dataset.chartDomainEnd)
@@ -42,7 +42,7 @@ test('trackpad pinch zooms the cached chart around the pointer and keeps wheel h
     const resize = async width => {
       await page.setViewportSize({ width, height: 1000 })
       await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
-      await page.waitForFunction(() => document.querySelector('[data-multi-timeframe-charts] > :nth-child(2) [data-chart-inst]')?.dataset.chartLoading === 'false')
+      await page.waitForFunction(() => document.querySelector('[data-timeframe-panel="15m"] [data-chart-inst]')?.dataset.chartLoading === 'false')
       return state()
     }
     const narrow = await resize(1200)
@@ -57,10 +57,10 @@ test('trackpad pinch zooms the cached chart around the pointer and keeps wheel h
     assert.ok(wider.count > wide.count && wider.count - wide.count < 1, 'Single-pixel resize has no density bucket jump.')
     // Start away from the live boundary, where both zoom directions have room.
     await input(720, false)
-    await page.waitForFunction(() => document.querySelector('[data-multi-timeframe-charts] > :nth-child(2) [data-chart-inst]')?.dataset.chartLoading === 'false')
+    await page.waitForFunction(() => document.querySelector('[data-timeframe-panel="15m"] [data-chart-inst]')?.dataset.chartLoading === 'false')
     const before = await state()
     assert.equal(await input(-20), true, 'Native nonpassive handler prevents Chromium page zoom.')
-    await page.waitForFunction(count => Number(document.querySelector('[data-multi-timeframe-charts] > :nth-child(2) [data-chart-visible-bars]').dataset.chartVisibleBars) < count, before.count)
+    await page.waitForFunction(count => Number(document.querySelector('[data-timeframe-panel="15m"] [data-chart-visible-bars]').dataset.chartVisibleBars) < count, before.count)
     const zoomed = await state()
     assert.ok(zoomed.count < before.count)
     assert.ok(Math.abs(zoomed.timeAtPointer - before.timeAtPointer) < 900_000, `Pointer anchor: ${JSON.stringify({ before, zoomed })}`)
@@ -71,38 +71,38 @@ test('trackpad pinch zooms the cached chart around the pointer and keeps wheel h
     await resize(1601)
     assert.equal(await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.getZoomFactor()), 1)
     await input(24, false, 48)
-    await page.waitForFunction(end => Number(document.querySelector('[data-multi-timeframe-charts] > :nth-child(2) [data-chart-inst]').dataset.chartCompletedEnd) > end, zoomed.end)
+    await page.waitForFunction(end => Number(document.querySelector('[data-timeframe-panel="15m"] [data-chart-inst]').dataset.chartCompletedEnd) > end, zoomed.end)
     const panned = await state()
     assert.equal(panned.spacing, zoomed.spacing, 'Two-finger scrolling preserves zoom.')
     await input(10)
-    await page.waitForFunction(count => Number(document.querySelector('[data-multi-timeframe-charts] > :nth-child(2) [data-chart-visible-bars]').dataset.chartVisibleBars) > count, zoomed.count)
+    await page.waitForFunction(count => Number(document.querySelector('[data-timeframe-panel="15m"] [data-chart-visible-bars]').dataset.chartVisibleBars) > count, zoomed.count)
     assert.ok((await state()).count > zoomed.count)
     // All events in one renderer task must combine before the first paint.
     const burstBefore = await state()
-    await page.locator('[data-multi-timeframe-charts] > :nth-child(2) [data-chart-plot]').evaluate(plot => {
+    await page.locator('[data-timeframe-panel="15m"] [data-chart-plot]').evaluate(plot => {
       const rect = plot.getBoundingClientRect()
       for (let index = 0; index < 32; index++) plot.dispatchEvent(new WheelEvent('wheel', {
         deltaY: -1, ctrlKey: true, clientX: rect.left + rect.width * 0.4, bubbles: true, cancelable: true,
       }))
     })
-    await page.waitForFunction(spacing => Math.abs(Number(document.querySelector('[data-multi-timeframe-charts] > :nth-child(2) [data-chart-bar-spacing]').dataset.chartBarSpacing) - spacing) < 1e-8, burstBefore.spacing * Math.exp(0.32))
+    await page.waitForFunction(spacing => Math.abs(Number(document.querySelector('[data-timeframe-panel="15m"] [data-chart-bar-spacing]').dataset.chartBarSpacing) - spacing) < 1e-8, burstBefore.spacing * Math.exp(0.32))
     await input(-10000)
-    await page.waitForFunction(() => Number(document.querySelector('[data-multi-timeframe-charts] > :nth-child(2) [data-chart-bar-spacing]').dataset.chartBarSpacing) === 100)
+    await page.waitForFunction(() => Number(document.querySelector('[data-timeframe-panel="15m"] [data-chart-bar-spacing]').dataset.chartBarSpacing) === 100)
     const minimum = await state()
     await input(-10000)
     assert.equal((await state()).domainEnd, minimum.domainEnd, 'Saturating zoom cannot accumulate hidden navigation.')
     await input(1)
-    await page.waitForFunction(() => Number(document.querySelector('[data-multi-timeframe-charts] > :nth-child(2) [data-chart-bar-spacing]').dataset.chartBarSpacing) < 100)
+    await page.waitForFunction(() => Number(document.querySelector('[data-timeframe-panel="15m"] [data-chart-bar-spacing]').dataset.chartBarSpacing) < 100)
     await input(10000)
-    await page.waitForFunction(() => Number(document.querySelector('[data-multi-timeframe-charts] > :nth-child(2) [data-chart-bar-spacing]').dataset.chartBarSpacing) === 4)
+    await page.waitForFunction(() => Number(document.querySelector('[data-timeframe-panel="15m"] [data-chart-bar-spacing]').dataset.chartBarSpacing) === 4)
     const maximum = await state()
     const ultraWide = await resize(2400)
     assert.equal(ultraWide.spacing, maximum.spacing)
     assert.equal(ultraWide.body, maximum.body)
-    assert.ok(ultraWide.count > 288, 'A widened zoomed-out chart can use more than the former cache maximum.')
+    assert.ok(ultraWide.count > 250, 'A widened zoomed-out chart can use a broad historical window.')
     assert.equal(ultraWide.domainEnd, maximum.domainEnd)
     await input(-1)
-    await page.waitForFunction(() => Number(document.querySelector('[data-multi-timeframe-charts] > :nth-child(2) [data-chart-bar-spacing]').dataset.chartBarSpacing) > 4)
+    await page.waitForFunction(() => Number(document.querySelector('[data-timeframe-panel="15m"] [data-chart-bar-spacing]').dataset.chartBarSpacing) > 4)
 
     // Every timeframe remains present after zooming and navigation.
     assert.deepEqual(await page.locator('[data-multi-timeframe-charts] svg[data-rendered-timeframe]').evaluateAll(nodes => nodes.map(node => node.dataset.renderedTimeframe)), ['1H', '15m', '5m'])

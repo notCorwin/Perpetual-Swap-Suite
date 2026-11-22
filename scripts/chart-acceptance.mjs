@@ -84,9 +84,9 @@ export async function foregroundPaintWindow(electron, page) {
 export async function selectTimeframe(page, timeframe) {
   const index = ['1H', '15m', '5m'].indexOf(timeframe)
   assert.notEqual(index, -1, `Unsupported chart timeframe: ${timeframe}`)
-  await page.locator('[data-multi-timeframe-charts] > [data-chart-workspace]').nth(index).waitFor({ state: 'visible' })
+  await page.locator('[data-multi-timeframe-charts] [data-timeframe-panel]').nth(index).waitFor({ state: 'visible' })
   await page.evaluate(({ index, timeframe }) => {
-    const charts = [...document.querySelectorAll('[data-multi-timeframe-charts] > [data-chart-workspace]')]
+    const charts = [...document.querySelectorAll('[data-multi-timeframe-charts] [data-timeframe-panel]')]
     charts.forEach((chart, position) => chart.toggleAttribute('data-acceptance-target', position === index))
     document.documentElement.dataset.acceptanceTimeframe = timeframe
   }, { index, timeframe })
@@ -141,13 +141,14 @@ export async function assertWorkspaceLayout(page) {
   })
   const layout = await page.locator('[data-layout="market-workspace"]').evaluate(root => {
     const rectangle = node => { if (!node) return null; const { x, y, width, height } = node.getBoundingClientRect(); return { x, y, width, height } }
-    const overlay = root.querySelector('[data-market-overlay]')
+    const overlay = root.querySelector('[data-market-panel]')
+    const panels = [...root.querySelectorAll('[data-timeframe-panel]')]
     const chart = root.querySelector('[data-chart-panel]')
     const toolbar = root.querySelector('[data-chart-toolbar]')
     return {
       designWidth: Number(root.dataset.designWidth), scale: Number(root.dataset.uiScale),
       viewport: { width: innerWidth, height: innerHeight }, root: rectangle(root),
-      expanded: overlay?.dataset.expanded === 'true', overlay: rectangle(overlay),
+      overlay: rectangle(overlay), panels: panels.map(panel => ({ ...rectangle(panel), radius: Number.parseFloat(getComputedStyle(panel).borderTopLeftRadius) })), radius: Number.parseFloat(getComputedStyle(overlay).borderTopLeftRadius),
       list: rectangle(root.querySelector('[data-market-list]')), chart: rectangle(chart),
       toolbar: rectangle(toolbar), title: rectangle(toolbar?.querySelector('[data-chart-title]')),
       toolbarControls: toolbar ? [...toolbar.querySelectorAll('button')].map(rectangle) : [],
@@ -157,14 +158,17 @@ export async function assertWorkspaceLayout(page) {
   })
   assert.equal(layout.designWidth, 1_600)
   assert.equal(layout.scale, 1, `Every window retains normal density: ${JSON.stringify(layout)}`)
-  assert.ok(layout.overlay && layout.chart, 'The contract overlay and chart must remain mounted together.')
-  assert.ok(layout.overlay.x > 0 && layout.overlay.y > 0, 'The floating contract panel must have an inset from the window edges.')
-  assert.ok(layout.overlay.x + layout.overlay.width <= layout.viewport.width && layout.overlay.y + layout.overlay.height <= layout.viewport.height, 'The floating panel must remain inside the window.')
-  assert.ok(layout.chart.x === 0 && layout.chart.y === 0 && Math.abs(layout.chart.width - layout.viewport.width) < 1 && Math.abs(layout.chart.height - layout.viewport.height) < 1, 'The chart workspace must fill the window.')
-  if (layout.expanded) assert.ok(Math.abs(layout.overlay.width - Math.min(300, layout.viewport.width * .35)) < 2, 'The contract overlay must follow its responsive width token.')
+  assert.ok(layout.overlay && layout.chart && layout.panels.length === 3, 'The contract list and three chart panels must remain mounted together.')
+  assert.ok(layout.overlay.x > 0 && layout.overlay.y > 0, 'The list panel must be inset from the window edges.')
+  assert.ok(layout.chart.x === 0 && layout.chart.y === 0 && Math.abs(layout.chart.width - layout.viewport.width) < 1 && Math.abs(layout.chart.height - layout.viewport.height) < 1, 'The workspace must fill the window.')
+  const [hour, quarter, five] = layout.panels
+  assert.ok(layout.radius > 0 && layout.panels.every(panel => panel.radius === layout.radius), 'All four panels must use the same rounded corners.')
+  assert.ok(Math.abs(layout.overlay.y - hour.y) < 1 && layout.overlay.x + layout.overlay.width <= hour.x, 'The list and 1H chart must share the top row.')
+  assert.ok(Math.abs(quarter.y - five.y) < 1 && quarter.y >= layout.overlay.y + layout.overlay.height && quarter.x + quarter.width <= five.x, 'The 15m and 5m charts must share the bottom row.')
+  assert.ok(Math.abs(quarter.width - five.width) < 2, 'Bottom charts must have equal widths.')
   if (layout.toolbar) {
     assert.ok(layout.toolbar.y === 0 && Math.abs(layout.toolbar.height - 36) < 1, 'The chart toolbar must remain at the top of the window.')
-    assert.ok(layout.overlay.y >= layout.toolbar.y + layout.toolbar.height, 'The overlay must not cover the chart toolbar.')
+    assert.ok(layout.overlay.y >= layout.toolbar.y + layout.toolbar.height, 'The list must not cover the chart toolbar.')
     const center = layout.toolbar.y + layout.toolbar.height / 2
     assert.ok(layout.toolbarControls.every(control => Math.abs(control.y + control.height / 2 - center) < 1), 'Chart toolbar controls must share the vertical center.')
     if (layout.nativeControls && layout.title) assert.ok(layout.title.x >= 84 - 1, 'The chart title must clear the native window controls.')

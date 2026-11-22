@@ -64,7 +64,7 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
       for (const field of ['vwap', 'bollUpper', 'bollMiddle', 'bollLower']) assert.equal(await page.locator(`[data-chart-indicator="${field}"]`).count(), 3)
       const positions = await page.locator('svg[data-rendered-inst]').evaluateAll(svgs => svgs.map(svg => ({ top: svg.getBoundingClientRect().top, height: svg.getBoundingClientRect().height })))
       assert.ok(positions.every(position => position.height > 60))
-      assert.ok(positions[0].top < positions[1].top && positions[1].top < positions[2].top)
+      assert.ok(positions[0].top < positions[1].top && Math.abs(positions[1].top - positions[2].top) < 1)
       const geometry = await page.locator('[data-chart-inst]').evaluateAll(charts => charts.map(chart => ({
         top: chart.getBoundingClientRect().top,
         plotTop: chart.querySelector('[data-chart-plot]').getBoundingClientRect().top,
@@ -189,8 +189,8 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
       await page.waitForFunction(() => {
         const svgs = [...document.querySelectorAll('svg[data-rendered-inst]')]
         if (svgs.length !== 3) return false
-        const edges = svgs.map(svg => Number(svg.dataset.chartPlotRight))
-        return edges.every(edge => Number.isFinite(edge) && Math.abs(edge - edges[0]) < .01)
+        const gutters = svgs.map(svg => svg.viewBox.baseVal.width - Number(svg.dataset.chartPlotRight))
+        return gutters.every(gutter => Number.isFinite(gutter) && Math.abs(gutter - gutters[0]) < .01)
       }, null, { timeout: 10_000 })
       const axes = await page.locator('svg[data-rendered-inst]').evaluateAll(svgs => svgs.map(svg => {
         const width = svg.viewBox.baseVal.width
@@ -215,6 +215,7 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
           start: Number(chart.dataset.chartTimeStart), end: Number(chart.dataset.chartTimeEnd),
           spacing: Number(chart.dataset.chartBarSpacing),
           width: Number(chart.querySelector('svg[data-chart-bar-width]')?.dataset.chartBarWidth),
+          plotWidth: Number(chart.querySelector('svg[data-chart-plot-right]')?.dataset.chartPlotRight),
         }))
         if (!ranges.every(range => Number.isFinite(range.start) && Number.isFinite(range.end)
           && range.end > range.start && Number.isFinite(range.spacing) && range.spacing > 0
@@ -223,8 +224,8 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
           || Math.abs(range.spacing - ranges[0].spacing) > 0.001
           || Math.abs(range.width - ranges[0].width) > 0.001)) return false
         const duration = range => range.end - range.start
-        if (Math.abs(duration(ranges[0]) / duration(ranges[2]) - 12) > .01
-          || Math.abs(duration(ranges[1]) / duration(ranges[2]) - 3) > .01) return false
+        if (Math.abs(duration(ranges[0]) / ranges[0].plotWidth / (duration(ranges[2]) / ranges[2].plotWidth) - 12) > .01
+          || Math.abs(duration(ranges[1]) / ranges[1].plotWidth / (duration(ranges[2]) / ranges[2].plotWidth) - 3) > .01) return false
         if (!previous) return true
         if (mode === 'pan') {
           const moves = ranges.map((range, index) => range.end - previous[index].end)
@@ -322,45 +323,42 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
       }, captured)
       assert.ok(masked.blank, 'The entire button, including its border, must match the toolbar background in the copied image.')
       assert.equal(captured.title, 'ETH-USDT', 'The copied image must identify its contract.')
-      // Compare the restored pixels against a reference capture of the same
-      // chart with the panel hidden in the test only. The live copy path keeps
-      // the panel visible and usable throughout the asynchronous request.
-      const reference = await page.evaluate(async bounds => {
-        const overlay = document.querySelector('[data-market-overlay]')
-        const rect = overlay.getBoundingClientRect()
-        overlay.style.visibility = 'hidden'
-        try {
-          await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
-          const image = await window.radarDesktop.request({ captureChart: { ...bounds, output: 'png' } })
-          return { image: image.imageDataURL, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }, chartTop: document.querySelector('svg[data-rendered-inst]').getBoundingClientRect().top }
-        } finally { overlay.style.removeProperty('visibility') }
-      }, captured.bounds)
-      const comparison = await page.evaluate(async ({ captured, reference }) => {
-        const load = async src => { const image = new Image(); image.src = src; await image.decode(); return image }
-        const [actual, expected] = await Promise.all([load(captured.image), load(reference.image)])
-        const canvas = document.createElement('canvas'); canvas.width = actual.naturalWidth; canvas.height = actual.naturalHeight
-        const ctx = canvas.getContext('2d'); ctx.drawImage(actual, 0, 0); const a = ctx.getImageData(0, 0, canvas.width, canvas.height).data
-        ctx.clearRect(0, 0, canvas.width, canvas.height); ctx.drawImage(expected, 0, 0); const b = ctx.getImageData(0, 0, canvas.width, canvas.height).data
-        const sx = canvas.width / (Math.ceil(captured.bounds.x + captured.bounds.width) - Math.floor(captured.bounds.x))
-        const sy = canvas.height / (Math.ceil(captured.bounds.y + captured.bounds.height) - Math.floor(captured.bounds.y))
-        const x0 = Math.max(0, Math.ceil((reference.rect.x - 16 - captured.bounds.x) * sx)), x1 = Math.min(canvas.width, Math.floor((reference.rect.x + reference.rect.width + 16 - captured.bounds.x) * sx))
-        const y0 = Math.max(0, Math.ceil((Math.max(reference.chartTop, reference.rect.y - 16) - captured.bounds.y) * sy)), y1 = Math.min(canvas.height, Math.floor((reference.rect.y + reference.rect.height + 16 - captured.bounds.y) * sy))
-        let different = 0, total = 0
-        for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
-          const i = (y * canvas.width + x) * 4
-          if (Math.max(...[0, 1, 2].map(channel => Math.abs(a[i + channel] - b[i + channel]))) > 30) different++
-          total++
-        }
-        return { different, total }
-      }, { captured, reference })
-      assert.ok(comparison.total > 0 && comparison.different / comparison.total < .03, `Restored chart pixels must match the unobstructed chart: ${JSON.stringify(comparison)}`)
+      const listBlank = await page.evaluate(async ({ bounds, image }) => {
+        const rect = document.querySelector('[data-market-panel]').getBoundingClientRect()
+        const bitmap = new Image(); bitmap.src = image; await bitmap.decode()
+        const canvas = document.createElement('canvas'); canvas.width = bitmap.naturalWidth; canvas.height = bitmap.naturalHeight
+        const context = canvas.getContext('2d'); context.drawImage(bitmap, 0, 0)
+        const sx = canvas.width / (Math.ceil(bounds.x + bounds.width) - Math.floor(bounds.x))
+        const sy = canvas.height / (Math.ceil(bounds.y + bounds.height) - Math.floor(bounds.y))
+        const x = Math.ceil((rect.left - Math.floor(bounds.x) + 2) * sx), y = Math.ceil((rect.top - Math.floor(bounds.y) + 2) * sy)
+        const width = Math.floor((rect.width - 4) * sx), height = Math.floor((rect.height - 4) * sy)
+        const pixels = context.getImageData(x, y, width, height).data
+        return pixels.every((value, index) => value === pixels[index % 4])
+      }, captured)
+      assert.ok(listBlank, 'The copied image must not include the contract list.')
+      const output = await page.evaluate(async ({ bounds, image }) => {
+        const bitmap = new Image(); bitmap.src = image; await bitmap.decode()
+        const canvas = document.createElement('canvas'); canvas.width = bitmap.naturalWidth; canvas.height = bitmap.naturalHeight
+        const context = canvas.getContext('2d'); context.drawImage(bitmap, 0, 0)
+        const left = Math.floor(bounds.x), top = Math.floor(bounds.y)
+        const sx = canvas.width / (Math.ceil(bounds.x + bounds.width) - left), sy = canvas.height / (Math.ceil(bounds.y + bounds.height) - top)
+        const pixelsIn = (rect, inset = 0) => context.getImageData(Math.ceil((rect.left - left + inset) * sx), Math.ceil((rect.top - top + inset) * sy), Math.floor((rect.width - inset * 2) * sx), Math.floor((rect.height - inset * 2) * sy)).data
+        const settings = pixelsIn(document.querySelector('[aria-label="Settings"]').getBoundingClientRect())
+        const settingsBlank = settings.every((value, index) => value === settings[index % 4])
+        const chartsHaveContent = [...document.querySelectorAll('[data-timeframe-panel]')].map(panel => {
+          const pixels = pixelsIn(panel.getBoundingClientRect(), 3)
+          let different = 0
+          for (let i = 4; i < pixels.length; i += 4) if (pixels[i] !== pixels[0] || pixels[i + 1] !== pixels[1] || pixels[i + 2] !== pixels[2]) different++
+          return different > 10
+        })
+        return { settingsBlank, chartsHaveContent }
+      }, captured)
+      assert.ok(output.settingsBlank, 'The settings button must be absent from the copied image.')
+      assert.deepEqual(output.chartsHaveContent, [true, true, true], 'The copied image must retain all three charts.')
       return masked.background
     }
     await page.emulateMedia({ colorScheme: 'dark' })
     const darkBackground = await assertCapture()
-    await page.getByRole('button', { name: 'Hide contract list' }).click()
-    await assertCapture()
-    await page.getByRole('button', { name: /^Show contract list/ }).click()
     await page.emulateMedia({ colorScheme: 'light' })
     await page.setViewportSize({ width: 1373, height: 917 })
     await page.waitForFunction(() => [...document.querySelectorAll('[data-chart-inst]')].every(chart => chart.dataset.chartLoading === 'false'))

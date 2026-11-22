@@ -117,7 +117,7 @@ before(async () => {
         : prepared(value.chartWindow)
       if (value.captureChart) {
         if (state.holdCapture) { state.holdCapture = false; await new Promise(resolve => { state.releaseCapture = resolve }); state.releaseCapture = null }
-        return { imageDataURL: 'data:image/png;base64,AA==', width: 10, height: 10 }
+        return { imageDataURL: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=', width: 10, height: 10 }
       }
       if (value.copyImage) return { ok: true }
       if (value.historyDownload) {
@@ -328,18 +328,17 @@ test('default selection uses absolute completed-candle change with nulls last an
 test('market arrow shortcuts survive contract clicks, toolbar focus and repeated chart switches', async () => {
   const expectMarket = async (key, symbol) => {
     await page.keyboard.press(key)
-    await page.locator(`svg[data-rendered-inst="${symbol}-USDT-SWAP"]`).waitFor({ state: 'visible', timeout: 2_000 })
+    await page.locator(`[data-timeframe-panel="1H"] svg[data-rendered-inst="${symbol}-USDT-SWAP"]`).waitFor({ state: 'visible', timeout: 2_000 })
     assert.equal(await selected().getAttribute('aria-label'), `View ${symbol}-USDT-SWAP chart`)
-    assert.equal(await page.locator('[data-chart-plot]').evaluate(plot => document.activeElement === plot), true,
+    assert.equal(await page.locator('[data-timeframe-panel="1H"] [data-chart-plot]').evaluate(plot => document.activeElement === plot), true,
       'Chart navigation must retain focus on the current chart surface.')
   }
   try {
     await page.getByRole('row', { name: 'View ZETA-USDT-SWAP chart', exact: true }).click()
     await expectMarket('ArrowDown', 'ALPHA')
     await expectMarket('ArrowUp', 'ZETA')
-    await page.getByRole('button', { name: '15m', exact: true }).click()
+    await page.locator('[data-timeframe-panel="15m"] [data-chart-plot]').focus()
     await expectMarket('ArrowRight', 'ALPHA')
-    assert.equal(await page.locator('[aria-label="Chart timeframe"] [aria-pressed="true"]').textContent(), '15m')
     await page.getByRole('button', { name: 'Copy chart', exact: true }).focus()
     await expectMarket('ArrowLeft', 'BETA')
     await expectMarket('ArrowUp', 'NULL')
@@ -358,25 +357,25 @@ test('market arrow shortcuts survive contract clicks, toolbar focus and repeated
 test('chart and settings retain their keyboard behavior', async () => {
   try {
     await page.getByRole('row', { name: 'View BETA-USDT-SWAP chart', exact: true }).click()
-    await page.locator('svg[data-rendered-inst]').click({ position: { x: 50, y: 50 } })
-    assert.equal(await page.locator('[data-chart-plot]').evaluate(plot => document.activeElement === plot), true,
+    await page.locator('[data-timeframe-panel="1H"] svg[data-rendered-inst]').click({ position: { x: 50, y: 50 } })
+    assert.equal(await page.locator('[data-timeframe-panel="1H"] [data-chart-plot]').evaluate(plot => document.activeElement === plot), true,
       'A chart click must explicitly transfer DOM focus after preventing pointer defaults for inspection.')
     await page.keyboard.press('ArrowDown')
-    await page.locator('svg[data-rendered-inst="ZETA-USDT-SWAP"]').waitFor({ state: 'visible', timeout: 2_000 })
+    await page.locator('[data-timeframe-panel="1H"] svg[data-rendered-inst="ZETA-USDT-SWAP"]').waitFor({ state: 'visible', timeout: 2_000 })
     for (const key of ['Shift+ArrowDown', 'Control+ArrowDown', 'Meta+ArrowDown', 'Alt+ArrowDown']) await page.keyboard.press(key)
     assert.equal(await selected().getAttribute('aria-label'), 'View ZETA-USDT-SWAP chart')
-    await page.locator('[data-chart-plot]').dispatchEvent('keydown', { key: 'ArrowDown', isComposing: true })
+    await page.locator('[data-timeframe-panel="1H"] [data-chart-plot]').dispatchEvent('keydown', { key: 'ArrowDown', isComposing: true })
     assert.equal(await selected().getAttribute('aria-label'), 'View ZETA-USDT-SWAP chart')
     const settings = await openSettings()
     const lookback = settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)', exact: true })
     await lookback.focus()
     await page.keyboard.press('ArrowUp')
     assert.equal(await lookback.inputValue(), '16')
-    assert.equal(await page.locator('[data-chart-inst]').getAttribute('data-chart-inst'), 'ZETA-USDT-SWAP')
+    assert.equal(await page.locator('[data-timeframe-panel="1H"] [data-chart-inst]').getAttribute('data-chart-inst'), 'ZETA-USDT-SWAP')
     await settings.getByRole('button', { name: 'Discard changes', exact: true }).click()
     await backToMarkets()
     await page.keyboard.press('ArrowDown')
-    await page.locator('svg[data-rendered-inst="ALPHA-USDT-SWAP"]').waitFor({ state: 'visible', timeout: 2_000 })
+    await page.locator('[data-timeframe-panel="1H"] svg[data-rendered-inst="ALPHA-USDT-SWAP"]').waitFor({ state: 'visible', timeout: 2_000 })
   } finally {
     if (await settingsPage().isVisible()) {
       const discard = settingsPage().getByRole('button', { name: 'Discard changes', exact: true })
@@ -394,12 +393,10 @@ test('the existing chart toolbar provides window dragging while its controls rem
   for (const name of ['Copy chart']) {
     assert.equal(await toolbar.getByRole('button', { name, exact: true }).evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'no-drag')
   }
-  assert.equal(await toolbar.getByRole('heading').count(), 0, 'The toolbar must retain the original chart actions and status without an application title.')
+  assert.equal(await toolbar.getByRole('heading', { name: 'Perpetual Swap Suite', exact: true }).count(), 1)
   const sidebar = page.getByRole('complementary', { name: 'Contract list' })
-  assert.equal(await sidebar.getByRole('heading', { name: 'Perpetual Swap Suite', exact: true }).isVisible(), true)
-  await toolbar.getByRole('button', { name: 'Copy chart', exact: true }).click()
-  await page.getByRole('status').filter({ hasText: 'Chart copied to clipboard' }).waitFor()
-  const settingsLink = sidebar.getByRole('link', { name: 'Settings', exact: true })
+  assert.equal(await sidebar.isVisible(), true)
+  const settingsLink = toolbar.getByRole('link', { name: 'Settings', exact: true })
   assert.equal(await settingsLink.evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'no-drag')
   await settingsLink.click()
   const settings = settingsPage()
@@ -759,6 +756,7 @@ test('a delayed chart capture cannot copy pixels after the selected contract cha
   const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.copyImage).length)
   const replies = await page.evaluate(() => window.__captureReplies)
   try {
+    await page.waitForFunction(() => [...document.querySelectorAll('[data-chart-inst]')].length === 3 && [...document.querySelectorAll('[data-chart-inst]')].every(chart => chart.dataset.chartLoading === 'false' && Number(chart.dataset.chartRenderedBars) > 0))
     await page.getByRole('button', { name: 'Copy chart', exact: true }).click()
     // Copying precedes the two animation frames that dispatch capture.
     await waitForAuditFixture(() => typeof globalThis.__workspaceFixture.releaseCapture === 'function')
@@ -770,8 +768,9 @@ test('a delayed chart capture cannot copy pixels after the selected contract cha
     assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.copyImage).length), before)
     assert.equal(await page.getByRole('alert').filter({ hasText: 'Chart changed during capture' }).count(), 0,
       'An obsolete capture cannot publish an error into the new chart session.')
+    await page.waitForFunction(() => [...document.querySelectorAll('[data-chart-inst]')].length === 3 && [...document.querySelectorAll('[data-chart-inst]')].every(chart => chart.dataset.chartLoading === 'false' && Number(chart.dataset.chartRenderedBars) > 0))
     await page.getByRole('button', { name: 'Copy chart', exact: true }).click()
-    await page.getByRole('status').filter({ hasText: 'Chart copied to clipboard' }).waitFor()
+    await page.waitForFunction(() => [...document.querySelectorAll('[role=status]')].some(node => node.textContent.includes('Chart copied to clipboard')))
     assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.copyImage).length), before + 1)
   } finally {
     await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.holdCapture = false; state.releaseCapture?.() })
@@ -1239,23 +1238,19 @@ test('constant Bollinger bands stay finite and negative lower bands retain the r
   } finally { await publishMode('standard') }
 })
 
-test('contract overlay can be collapsed while chart remains full width', async () => {
-  const overlay = page.locator('[data-market-overlay]')
-  const chart = page.locator('[data-chart-capture]')
-  const before = await chart.boundingBox()
-  const hide = page.getByRole('button', { name: 'Hide contract list' })
-  await hide.focus()
-  await page.keyboard.press('Enter')
-  const show = page.getByRole('button', { name: /^Show contract list/ })
-  await show.waitFor({ state: 'visible' })
-  assert.equal(await show.evaluate(node => document.activeElement === node), true)
-  assert.equal(await page.locator('[data-market-list]').isVisible(), false)
-  const after = await chart.boundingBox()
-  const panel = await overlay.boundingBox()
-  assert.ok(Math.abs(after.width - before.width) < 1 && before.x === 0 && after.x === 0 && panel.x > after.x)
-  await page.keyboard.press('Enter')
-  assert.equal(await hide.evaluate(node => document.activeElement === node), true)
+test('list and three rounded chart panels occupy their requested positions', async () => {
+  await assertWorkspaceLayout(page)
+  const panels = page.locator('[data-timeframe-panel]')
+  assert.deepEqual(await panels.evaluateAll(nodes => nodes.map(node => node.dataset.timeframePanel)), ['1H', '15m', '5m'])
   assert.equal(await page.locator('[data-market-list]').isVisible(), true)
+  const previous = page.viewportSize()
+  try {
+    await page.setViewportSize({ width: 1200, height: 640 })
+    await assertWorkspaceLayout(page)
+    const list = page.locator('[data-market-list]')
+    assert.ok((await page.locator('[data-market-panel]').boundingBox()).width >= 280, 'The list keeps a readable minimum width.')
+    assert.equal(await list.locator('th').evaluateAll(cells => cells.every(cell => cell.scrollWidth <= cell.clientWidth)), true, 'All list headers fit at minimum window width.')
+  } finally { if (previous) await page.setViewportSize(previous) }
 })
 
 test('status footer keeps failures visible and preserves the contract list', async () => {
@@ -1266,20 +1261,20 @@ test('status footer keeps failures visible and preserves the contract list', asy
   const footer = page.locator('[data-market-status-row]')
   const list = page.locator('[data-market-list]')
   const positions = () => list.evaluate(element => {
-    const toolbar = element.querySelector('[data-sidebar-toolbar]').getBoundingClientRect()
+    const panel = element.getBoundingClientRect()
     const header = element.querySelector('thead').getBoundingClientRect()
     const row = element.querySelector('[data-market-index]').getBoundingClientRect()
-    return { toolbarBottom: toolbar.bottom, header: header.top, row: row.top }
+    return { panelTop: panel.top, header: header.top, row: row.top }
   })
   try {
     await publish({ rows: await electron.evaluate(() => globalThis.__workspaceFixture.initialRows), loading: false, error: '', realtimeState: 'live', catalogSource: 'live', catalogProgress: undefined })
     const baseline = await positions()
-    assert.ok(Math.abs(baseline.header - baseline.toolbarBottom) < 1)
+    assert.ok(Math.abs(baseline.header - baseline.panelTop) < 1)
     assert.equal(await footer.evaluate(node => getComputedStyle(node).borderTopWidth), '1px')
     assert.equal(await footer.getByText(/^\d+ contracts$/).count(), 0)
     await publish({ error: 'Internal failure: do not expose this raw exception', realtimeState: 'disconnected' })
     await page.waitForFunction(() => document.querySelector('[data-market-status]')?.textContent.includes('Market data is unavailable'))
-    assert.match(await footer.getByRole('status').first().textContent(), /Market:.*Market data is unavailable/)
+    assert.match(await footer.textContent(), /Market:.*Market data is unavailable/)
     assert.doesNotMatch(await footer.textContent(), /Internal failure/)
     assert.deepEqual(await positions(), baseline, 'A status change must not move the table.')
     const details = footer.locator('[data-status-details]')
