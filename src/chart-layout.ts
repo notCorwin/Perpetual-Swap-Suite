@@ -45,6 +45,45 @@ export function chartPriceLabelLayout(priceY: number, panel: Range, fontSize: nu
   }
 }
 
+/** Fit the most indicator labels, then minimize displacement from their values.
+ * At most three Bollinger labels are searched, so exhaustive bounded packing
+ * avoids fragmentation around the reserved current-quote rectangle.
+ */
+export function chartIndicatorLabelLayout<T extends { y: number }>(candidates: readonly T[], panel: Range, height: number, reserved?: Range) {
+  const free: [number, number][] = []
+  const start = panel[0], end = panel[1]
+  if (!(Number.isFinite(height) && height > 0 && end > start)) return []
+  if (reserved) {
+    if (reserved[0] > start) free.push([start, Math.min(end, reserved[0])])
+    if (reserved[1] < end) free.push([Math.max(start, reserved[1]), end])
+  } else free.push([start, end])
+  type Placed = T & { labelY: number; top: number; bottom: number }
+  let best: { placed: Placed[]; distance: number } = { placed: [], distance: Infinity }
+  const search = (index: number, gaps: [number, number][], placed: Placed[], distance: number) => {
+    if (index === candidates.length) {
+      if (placed.length > best.placed.length || placed.length === best.placed.length && distance < best.distance) best = { placed, distance }
+      return
+    }
+    const candidate = candidates[index]
+    if (Number.isFinite(candidate.y) && candidate.y >= start && candidate.y <= end) {
+      for (const [gapIndex, [lo, hi]] of gaps.entries()) {
+        if (hi - lo < height) continue
+        const ideal = Math.max(lo, Math.min(hi - height, candidate.y - height / 2))
+        for (const top of new Set([lo, hi - height, ideal])) {
+          const bottom = top + height
+          const remainder: [number, number][] = [[lo, top], [bottom, hi]]
+          const next = [...gaps]
+          next.splice(gapIndex, 1, ...remainder.filter(([a, b]) => b > a))
+          search(index + 1, next, [...placed, { ...candidate, labelY: top + height / 2, top, bottom }], distance + Math.abs(top + height / 2 - candidate.y))
+        }
+      }
+    }
+    search(index + 1, gaps, placed, distance)
+  }
+  search(0, free, [], 0)
+  return best.placed
+}
+
 export function chartContentClip(layout: ReturnType<typeof chartLayout>, height: number) {
   const top = layout.panels.price[0]
   return { x: layout.columns.price[0], y: top, width: Math.max(0, layout.right - layout.columns.price[0]), height: Math.max(0, height - top) }

@@ -569,6 +569,8 @@ test('contract precision updates pad current quotes while preserving historical 
     await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '100.1200')
     await waitForLabel('+0.02%')
     assert.equal(await close.textContent(), '100.1200')
+    await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-boll-label="bollUpper"]')?.getAttribute('data-chart-boll-price') === '100.123456789')
+    assert.equal(await chart.locator('[data-chart-boll-label="bollUpper"] text').textContent(), '+0.02%', 'Indicator change uses the forming candle open and its plotted value.')
     const baseline = await page.evaluate(() => {
       const chart = document.querySelector('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]')
       globalThis.__precisionBars = chart.__chartSnapshot.bars
@@ -1260,6 +1262,22 @@ test('constant Bollinger bands stay finite and negative lower bands retain the r
     await publishMode('constant')
     await page.waitForFunction(() => document.querySelector('[data-chart-inst]').__chartSnapshot?.bars.every(bar => bar.bollUpper === 100 && bar.bollLower === 100))
     assert.ok(await page.locator('svg[data-rendered-inst]').first().locator('[data-chart-price-tick]').count() > 0)
+    const svg = page.locator('svg[data-rendered-inst]').first()
+    await page.waitForFunction(() => document.querySelector('svg[data-rendered-inst]')?.querySelectorAll('[data-chart-boll-label]').length === 3)
+    const labels = await svg.evaluate(node => {
+      const groups = [...node.querySelectorAll('[data-chart-boll-label], [data-chart-price-label]')]
+      return groups.map(group => ({
+        kind: group.getAttribute('data-chart-boll-label') ?? 'price',
+        text: group.querySelector('text')?.textContent,
+        countdown: group.querySelectorAll('[data-chart-countdown]').length,
+        ...(() => { const { top, bottom } = group.querySelector('rect').getBoundingClientRect(); return { top, bottom } })(),
+      }))
+    })
+    assert.deepEqual(labels.filter(label => label.kind !== 'price').map(label => label.text), ['+0.05%', '+0.05%', '+0.05%'])
+    assert.ok(labels.filter(label => label.kind !== 'price').every(label => label.countdown === 0))
+    for (let i = 0; i < labels.length; i++) for (let j = i + 1; j < labels.length; j++) {
+      assert.ok(labels[i].bottom <= labels[j].top || labels[j].bottom <= labels[i].top, `${labels[i].kind} overlaps ${labels[j].kind}`)
+    }
     await publishMode('negative')
     await page.waitForFunction(() => document.querySelector('[data-chart-inst]').__chartSnapshot?.bars.every(bar => bar.bollLower === -1))
     const paths = await page.locator('svg[data-rendered-inst] path[d]').evaluateAll(paths => paths.map(path => path.getAttribute('d')))
@@ -1952,16 +1970,19 @@ test('compact density reserves at least eighty-five percent of each stacked char
           const height = chart.getBoundingClientRect().height
           const svgBounds = svg.getBoundingClientRect()
           const priceHeight = Number(clip.getAttribute('height')) * svgBounds.height / svg.viewBox.baseVal.height
+          const priceAxis = svg.querySelector('[data-chart-price-axis]')
+          const axisClip = svg.querySelector(priceAxis.getAttribute('clip-path').slice(4, -1))?.querySelector('rect')
+          const axisTop = Number(axisClip?.getAttribute('y')), axisHeight = Number(axisClip?.getAttribute('height'))
+          const axisBottom = axisTop + axisHeight
+          const panelTop = Number(clip.getAttribute('y')), panelBottom = panelTop + Number(clip.getAttribute('height'))
           const ticks = [...svg.querySelectorAll('[data-chart-price-tick] > text')]
-          const clippedTicks = ticks.map(tick => {
+          const tickBounds = ticks.map(tick => {
             const bounds = tick.getBoundingClientRect()
-            return { text: tick.textContent, overflow: {
-              top: Math.max(0, svgBounds.top - bounds.top), bottom: Math.max(0, bounds.bottom - svgBounds.bottom),
-              left: Math.max(0, svgBounds.left - bounds.left), right: Math.max(0, bounds.right - svgBounds.right),
-            } }
-          }).filter(tick => Object.values(tick.overflow).some(pixels => pixels > 0.5))
+            return { text: tick.textContent, y: Number(tick.getAttribute('y')),
+              left: Math.max(0, svgBounds.left - bounds.left), right: Math.max(0, bounds.right - svgBounds.right) }
+          })
           return { height, priceHeight, ratio: priceHeight / height, bars: Number(chart.querySelector('[data-chart-inst]').dataset.chartRenderedBars),
-            fontSize: getComputedStyle(svg).fontSize, ticks: ticks.length, clippedTicks }
+            fontSize: getComputedStyle(svg).fontSize, tickBounds, axisTop, axisBottom, panelTop, panelBottom }
         }) }))
       readings.push(reading)
       if (!baseline) {
@@ -1969,7 +1990,10 @@ test('compact density reserves at least eighty-five percent of each stacked char
         assert.ok(reading.rowHeight >= 28 && reading.rowHeight <= 30)
         assert.equal(reading.fontSize, '12px')
         assert.ok(reading.charts.every(chart => chart.ratio >= .85), JSON.stringify(reading))
-        assert.ok(reading.charts.every(chart => chart.ticks > 0 && chart.clippedTicks.length === 0), JSON.stringify(reading))
+        assert.ok(reading.charts.every(chart => chart.tickBounds.length > 0 && chart.tickBounds.every(tick => tick.left <= .5 && tick.right <= .5)), JSON.stringify(reading))
+        assert.ok(reading.charts.every(chart => Math.abs(chart.axisTop - chart.panelTop) < .01 && Math.abs(chart.axisBottom - chart.panelBottom) < .01
+          && chart.tickBounds.some(tick => tick.y < chart.axisTop) && chart.tickBounds.some(tick => tick.y > chart.axisBottom)),
+        `Price ticks must extend past and be clipped to both panel edges: ${JSON.stringify(reading)}`)
       }
       if (!baseline) {
         assert.equal(await page.locator('[data-shared-chart-title]').count(), 1)

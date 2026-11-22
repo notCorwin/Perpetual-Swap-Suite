@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { chartCandleWidth, chartContentClip, chartHourX, chartLayout, chartPanelClip, chartPriceInPanel, chartPriceLabelLayout, type ChartPanel } from "./chart-layout.ts"
+import { chartCandleWidth, chartContentClip, chartHourX, chartIndicatorLabelLayout, chartLayout, chartPanelClip, chartPriceInPanel, chartPriceLabelLayout, type ChartPanel } from "./chart-layout.ts"
 
 test("stacked chart layout stays aligned and bounded", () => {
   const order: ChartPanel[] = ["price", "roc", "rsi", "atr", "oi", "taker"]
@@ -107,6 +107,34 @@ test("a countdown including its padding remains visible at an exact fit", () => 
   assert.deepEqual(chartPriceLabelLayout(27, [10, 40], 10, 2, true), {
     labelY: 27, countdownY: 17, top: 10, bottom: 34,
   })
+})
+
+test('indicator labels avoid each other and a two-line current price at coincident values', () => {
+  const candidates = [{ id: 'upper', y: 50 }, { id: 'middle', y: 50 }, { id: 'lower', y: 50 }]
+  const reserved = [40, 65] as const
+  const labels = chartIndicatorLabelLayout(candidates, [0, 100], 15, reserved)
+  assert.equal(labels.length, 3)
+  for (const label of labels) {
+    assert.ok(label.top >= 0 && label.bottom <= 100)
+    assert.ok(label.bottom <= reserved[0] || label.top >= reserved[1])
+  }
+  for (let i = 0; i < labels.length; i++) for (let j = i + 1; j < labels.length; j++) {
+    assert.ok(labels[i].bottom <= labels[j].top || labels[j].bottom <= labels[i].top)
+  }
+})
+
+test('indicator labels remain bounded at panel edges and omit invalid or infeasible placements', () => {
+  const candidates = [{ id: 'above', y: -1 }, { id: 'top', y: 0 }, { id: 'bottom', y: 30 }, { id: 'invalid', y: NaN }]
+  const labels = chartIndicatorLabelLayout(candidates, [0, 30], 15)
+  assert.deepEqual(labels.map(label => [label.id, label.top, label.bottom]), [['top', 0, 15], ['bottom', 15, 30]])
+  assert.deepEqual(chartIndicatorLabelLayout(candidates, [0, 10], 15), [])
+  assert.deepEqual(chartIndicatorLabelLayout(candidates, [0, 30], 15, [0, 30]), [])
+})
+
+test('packing keeps every indicator when moving the first label makes room', () => {
+  const labels = chartIndicatorLabelLayout([{ y: 15 }, { y: 16 }, { y: 17 }], [0, 60], 15, [30, 45])
+  assert.equal(labels.length, 3)
+  assert.deepEqual(labels.map(label => label.top).sort((a, b) => a - b), [0, 15, 45])
 })
 
 test('continuous spans retain exact candle pitch and body width across every resize pixel', async () => {

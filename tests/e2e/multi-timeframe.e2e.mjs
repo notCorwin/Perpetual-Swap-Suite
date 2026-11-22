@@ -71,6 +71,14 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
       const positions = await page.locator('svg[data-rendered-inst]').evaluateAll(svgs => svgs.map(svg => ({ top: svg.getBoundingClientRect().top, height: svg.getBoundingClientRect().height })))
       assert.ok(positions.every(position => position.height > 60))
       assert.ok(positions[0].top < positions[1].top && Math.abs(positions[1].top - positions[2].top) < 1)
+      const edgeTicks = await page.locator('svg[data-rendered-inst]').evaluateAll(svgs => svgs.map(svg => {
+        const axis = svg.querySelector('[data-chart-price-axis]')
+        const clip = svg.querySelector(axis.getAttribute('clip-path').slice(4, -1))?.querySelector('rect')
+        const top = Number(clip?.getAttribute('y')), bottom = top + Number(clip?.getAttribute('height'))
+        const ticks = [...axis.querySelectorAll('[data-chart-price-tick-label]')].map(label => Number(label.getAttribute('y'))).sort((a, b) => a - b)
+        return { top, bottom, first: ticks[0], second: ticks[1], penultimate: ticks.at(-2), last: ticks.at(-1) }
+      }))
+      assert.ok(edgeTicks.every(axis => axis.first < axis.top && axis.second >= axis.top && axis.penultimate <= axis.bottom && axis.last > axis.bottom), 'Price ticks continue past both panel edges and are clipped there.')
       const geometry = await page.locator('[data-chart-inst]').evaluateAll(charts => charts.map(chart => ({
         top: chart.getBoundingClientRect().top,
         plotTop: chart.querySelector('[data-chart-plot]').getBoundingClientRect().top,

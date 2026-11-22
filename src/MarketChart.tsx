@@ -7,8 +7,8 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Spinner } from "@/components/ui/spinner"
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
-import { CHART_PANELS, chartContentClip, chartPanelClip, chartPriceInPanel, chartPriceLabelLayout, type ChartPanel as Panel } from "@/chart-layout"
-import { chartCompact as compact, chartPercent, chartPricePresentation, type ChartGeometry } from "@/chart-geometry"
+import { CHART_PANELS, chartContentClip, chartIndicatorLabelLayout, chartPanelClip, chartPriceInPanel, chartPriceLabelLayout, type ChartPanel as Panel } from "@/chart-layout"
+import { chartCompact as compact, chartPercent, chartPricePresentation, chartVisibleLastBar, type ChartGeometry } from "@/chart-geometry"
 import { formatCurrentPrice, formatHistoricalPrice, formatIndicatorPrice } from '@/price-format'
 import { CHART_WHEEL_PIXELS_PER_BAR, chartRsiNavigationTarget, chartWheelIntent, chartZoomDemand, chartZoomSpacing, chartWheelContentOffset, chartPresentedWheelFraction, createChartWheelBatch, createChartWheelScheduler } from '@/chart-navigation'
 import { chartStatisticsSamples } from '@/chart-legend'
@@ -219,6 +219,24 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
   const priceLabelBackground = priceDirection === 'up' ? 'var(--positive)' : priceDirection === 'down' ? 'var(--negative)' : 'var(--chart-annotation)'
   const priceLabelForeground = 'white'
   const priceLabel = chartPriceLabelLayout(latestY, panels.price, chartTokens.textSize, chartTokens.priceLabelPaddingY, liveOverlay)
+  // Match the actual plotted series snapshot, including historical navigation;
+  // never fill a missing value with a previous candle's indicator.
+  const indicatorBar = chartVisibleLastBar(geometry, contentOffset)
+  const bollLabelSpecs = [
+    { field: 'bollUpper', name: 'Upper', color: 'var(--chart-boll-upper)' },
+    { field: 'bollMiddle', name: 'Middle', color: 'var(--chart-boll-middle)' },
+    { field: 'bollLower', name: 'Lower', color: 'var(--chart-boll-lower)' },
+  ] as const
+  const bollCandidates = presentation.base === null || !indicatorBar || !(indicatorBar.open > 0) ? [] : bollLabelSpecs.flatMap(spec => {
+    const value = indicatorBar[spec.field]
+    if (value === null || !Number.isFinite(value)) return []
+    const y = priceY(value)
+    if (!chartPriceInPanel(y, panels.price)) return []
+    return [{ ...spec, value, y, label: formatCandleChange(indicatorBar.open, value) }]
+  })
+  const bollLabels = chartIndicatorLabelLayout(bollCandidates, panels.price,
+    chartTokens.textSize + chartTokens.priceLabelPaddingY * 2,
+    priceInViewport ? [priceLabel.top, priceLabel.bottom] : undefined)
   const inspectionX = x[0] + (active.hour - bars[0].hour) / intervalMS * geometry.barPitch
   const inspectedTime = inspecting ? time(active.hour) : null
   const inspectedTimeWidth = inspectedTime ? chartTextWidth(inspectedTime) + chartTokens.annotationPadding : 0
@@ -279,6 +297,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
       <clipPath id={`${areaClipId}-positive`}><rect x={rocClip.x} y={panels.roc[0]} width={rocClip.width} height={rocZeroY - panels.roc[0]} /></clipPath>
       <clipPath id={`${areaClipId}-negative`}><rect x={rocClip.x} y={rocZeroY} width={rocClip.width} height={panels.roc[1] - rocZeroY} /></clipPath>
       <clipPath id={`${areaClipId}-content`}><rect {...contentClip} /></clipPath>
+      <clipPath id={`${areaClipId}-price-axis`}><rect x={0} y={panels.price[0]} width={width} height={Math.max(0, panels.price[1] - panels.price[0])} /></clipPath>
       <clipPath id={`${areaClipId}-time-axis`}><rect x={0} y={panels[panelKeys.at(-1)!][1]} width={width} height={height - panels[panelKeys.at(-1)!][1]} /></clipPath>
       {panelKeys.map(key => <clipPath key={key} id={`${areaClipId}-${key}`}><rect {...chartPanelClip(geometry.layout, key, geometry.barPitch)} /></clipPath>)}
     </defs>
@@ -331,13 +350,21 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     {panels.taker[1] - panels.taker[0] >= 35 && geometry.takerTicks.map(({ y, label }, index) => <g key={index} data-chart-taker-tick>{lineLabel(axisStarts.taker, y, label)}</g>)}
     {inspectedTime && <g data-chart-inspected-time><rect x={inspectedTimeX} y={height - chartTokenNumber('--chart-bottom-axis-height')} width={inspectedTimeWidth} height={chartTokenNumber('--chart-bottom-axis-height') - 1} rx={3} fill="var(--chart-annotation)" /><text x={inspectedTimeX + inspectedTimeWidth / 2} y={height - 6} textAnchor="middle" fill="var(--foreground)">{inspectedTime}</text></g>}
     {priceInViewport && <line data-chart-live-price x1={columns.price[0]} x2={right} y1={latestY} y2={latestY} stroke={latestColor} strokeDasharray="4 5" />}
+    <g clipPath={`url(#${areaClipId}-price-axis)`} data-chart-price-axis>
     {presentation.ticks.map(({ y, label }, index) => {
       const value = Number.parseFloat(label.replaceAll(',', ''))
       const major = Number.isFinite(value) && Math.abs(value / 10 - Math.round(value / 10)) < 1e-8
-      return <g key={index} data-chart-price-tick><line x1={columns.price[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.35" />{y >= chartTokens.textSize && y <= height - chartTokens.textSize &&
+      return <g key={index} data-chart-price-tick><line x1={columns.price[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.35" />
         <text data-chart-price-tick-label x={axisStarts.price} y={y} textAnchor="start" dominantBaseline="middle" fill={major ? 'var(--foreground)' : 'var(--muted-foreground)'} fontWeight={major ? 700 : 400}>{label}</text>
-      }</g>
+      </g>
     })}
+    </g>
+    {bollLabels.map(({ field, name, color, y, labelY, top, bottom, value, label }) => <g key={field} data-chart-boll-label={field} data-chart-boll-price={value} data-chart-boll-hour={indicatorBar?.hour}>
+      <title>{`Bollinger ${name}: ${label} from candle open`}</title>
+      {Math.abs(y - labelY) > 0.5 && <path d={`M ${right - 8} ${y} L ${right} ${labelY}`} fill="none" stroke={color} />}
+      <rect x={right} y={top} width={gutter} height={bottom - top} fill={color} />
+      <text x={axisStarts.price} y={labelY} dominantBaseline="middle" fill="white">{label}</text>
+    </g>)}
     {priceInViewport && <g data-chart-price-label data-chart-price-direction={priceDirection}>
       <title>{`Change from candle open ${latestPrice} · ${priceDirection === 'flat' ? 'unchanged' : priceDirection} · ${liveOverlay ? 'Forming candle' : 'Candle'}`}</title>
       <rect data-chart-price-label-background x={right} y={priceLabel.top} width={gutter} height={priceLabel.bottom - priceLabel.top} fill={priceLabelBackground} />
@@ -516,11 +543,16 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     const ticks = chartPricePresentation(plotGeometry, wheelContentOffset).ticks.map(tick => tick.label)
     const quote = surface?.liveBar && surface.liveBar.hour <= plotGeometry.endHour + intervalMS * 0.34 ? surface.liveBar : bars.at(-1)!
     const change = formatCandleChange(quote.open, quote.close)
+    const indicatorBar = chartVisibleLastBar(plotGeometry, wheelContentOffset)
+    const boll = indicatorBar ? (['bollUpper', 'bollMiddle', 'bollLower'] as const).map(field => {
+      const value = indicatorBar[field]
+      return value !== null && Number.isFinite(value) ? formatCandleChange(indicatorBar.open, value) : ''
+    }) : []
     // PriceCountdown can exceed two minute digits for future-dated candles.
     const seconds = Math.max(0, Math.floor((quote.hour + intervalMS - Date.now()) / 1000))
     const minutes = Math.max(Math.ceil(intervalMS / 60_000), Math.floor(seconds / 60))
     const countdown = `${String(minutes).padStart(2, '0')}:00`
-    reportGutter(timeframe, gutterEpoch, Math.ceil(Math.max(...[...ticks, change, countdown].map(legendWidth)) + 16))
+    reportGutter(timeframe, gutterEpoch, Math.ceil(Math.max(...[...ticks, change, countdown, ...boll].map(legendWidth)) + 16))
   }, [reportGutter, timeframe, gutterEpoch, plotGeometry, wheelContentOffset, matchesSelection, bars, surface?.liveBar, intervalMS])
   useEffect(() => () => reportGutter?.(timeframe, null, null), [reportGutter, timeframe])
   const navigationId = useRef(instId)

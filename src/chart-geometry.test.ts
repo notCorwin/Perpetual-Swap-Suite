@@ -42,7 +42,7 @@ test('price uses fixed scale while indicators retain data-driven domains', () =>
   close(geometry.takerAxis.min, 0)
   close(geometry.takerAxis.max, 10.5)
   close(geometry.rocAxis.max, 92 * 1.05)
-  assert.ok(geometry.priceAxis.ticks.every(tick => tick >= geometry.priceAxis.min && tick <= geometry.priceAxis.max))
+  assert.ok(geometry.priceAxis.ticks.every(tick => tick >= geometry.priceAxis.min - 1 && tick <= geometry.priceAxis.max + 1))
   assert.ok(geometry.rocAxis.ticks.every(tick => tick >= geometry.rocAxis.min && tick <= geometry.rocAxis.max))
 })
 
@@ -376,4 +376,14 @@ test('price axis uses one-percent ticks and 25px spacing at every panel height',
   }
   const tall = get(bars, { ...viewport, height: 560, priceOnly: true, priceScaleBase: 100 })
   assert.ok(tall.priceTicks.length > 9, 'A tall price-only panel is not limited to nine labels.')
+})
+
+test('price axis includes a tick beyond each panel edge for naturally clipped labels', () => {
+  const bars = rows(), get = createChartGeometryCache(text => text.length * 6)
+  const geometry = get(bars, { ...viewport, height: 240, priceOnly: true, priceScaleBase: 100 })
+  const [top, bottom] = geometry.layout.panels.price
+  const positions = geometry.priceTicks.map(tick => tick.y).sort((a, b) => a - b)
+  assert.ok(positions[0] < top && positions[1] >= top)
+  assert.ok(positions.at(-1)! > bottom && positions.at(-2)! <= bottom)
+  for (let i = 1; i < positions.length; i++) close(positions[i] - positions[i - 1], 25)
 })

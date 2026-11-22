@@ -62,7 +62,9 @@ function chartAxes(bars: readonly Bar[], options: ChartGeometryOptions, measureT
   const center = centerPrice === null ? 0 : relative(centerPrice)
   const halfSpan = (panels.price[1] - panels.price[0]) / CHART_PRICE_PIXELS_PER_PERCENT / 2
   const min = center - halfSpan, max = center + halfSpan
-  const first = Math.ceil(min - 1e-10), last = Math.floor(max + 1e-10)
+  // Include one tick beyond either edge so its label can naturally be clipped
+  // by the panel rather than disappearing before it reaches the boundary.
+  const first = Math.ceil(min - 1e-10) - 1, last = Math.floor(max + 1e-10) + 1
   const ticks = Array.from({ length: Math.max(0, last - first + 1) }, (_, index) => first + index)
   const priceAxis = { min, max, ticks, step: 1, decimals: 0, kind: 'relative' as const, base, centerPrice }
   const axisPrice = axisFormatter(priceAxis.decimals)
@@ -78,6 +80,10 @@ function chartAxes(bars: readonly Bar[], options: ChartGeometryOptions, measureT
     ...priceLabelsText,
     ...(!options.priceOnly ? [...rocAxis.ticks.map(tick => formatPercent(tick, rocAxis.decimals)), '100', '0', ...oiLabelsText, ...takerLabelsText] : []),
     formatCandleChange(bars.at(-1)!.open, liveClose ?? bars.at(-1)!.close), '00:00',
+    ...(['bollUpper', 'bollMiddle', 'bollLower'] as const).map(field => {
+      const last = bars.at(-1)!, value = last[field]
+      return finite(value) ? formatCandleChange(last.open, value) : ''
+    }),
   ]
   const gutter = Math.ceil(Math.max(...labels.map(measureText)) + 16)
   return { panels, priceAxis, priceLabelsText, rocAxis, atrRange, bbwRange, oiAxis, oiLabelsText, takerAxis, takerLabelsText, gutter, candleHigh, candleLow, highIndex, lowIndex, oiSamples }
@@ -240,6 +246,18 @@ function buildGeometry(sourceBars: readonly Bar[], options: ChartGeometryOptions
 
 export type ChartGeometry = ReturnType<typeof buildGeometry>
 
+/** Most recent candle with any body visible, including wheel overscan. */
+export function chartVisibleLastBar(geometry: ChartGeometry, contentOffset: number) {
+  const { left, right } = geometry.layout
+  const visible = (bar: Bar) => {
+    const center = geometry.x[0] + (bar.hour - geometry.bars[0].hour) / geometry.intervalMS * geometry.barPitch + contentOffset
+    return center + geometry.barWidth / 2 > left && center - geometry.barWidth / 2 < right
+  }
+  return (geometry.after && visible(geometry.after) ? geometry.after : undefined)
+    ?? geometry.bars.findLast(visible)
+    ?? (geometry.before && visible(geometry.before) ? geometry.before : undefined)
+}
+
 /** Rebase labels without changing the cached raw-price geometry. */
 export function chartPricePresentation(geometry: ChartGeometry, contentOffset: number, includeTicks = true) {
   const { left, right } = geometry.layout
@@ -248,7 +266,7 @@ export function chartPricePresentation(geometry: ChartGeometry, contentOffset: n
     return center + geometry.barWidth / 2 > left && center - geometry.barWidth / 2 < right
   }
   const first = (geometry.before && visible(geometry.before) ? geometry.before : undefined) ?? geometry.bars.find(visible) ?? (geometry.after && visible(geometry.after) ? geometry.after : undefined)
-  const last = (geometry.after && visible(geometry.after) ? geometry.after : undefined) ?? geometry.bars.findLast(visible) ?? (geometry.before && visible(geometry.before) ? geometry.before : undefined)
+  const last = chartVisibleLastBar(geometry, contentOffset)
   const base = first && finite(first.open) && first.open > 0 ? first.open : null
   const centerPrice = base === null ? null : last && finite(last.close) && last.close > 0 ? last.close : base
   const geometryBase = geometry.priceAxis.base
