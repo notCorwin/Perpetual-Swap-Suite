@@ -52,6 +52,17 @@ test('Settings menu opens one independent background window and changes update t
   const lookback = settings.locator('#rankingLookback')
   await lookback.waitFor({ state: 'visible' })
   await settings.waitForFunction(() => !document.querySelector('#rankingLookback')?.disabled)
+  assert.equal(await settings.locator('#settings-section-title').evaluate(element => element === document.activeElement), false,
+    'Opening settings must not move focus to the section heading.')
+  for (const name of ['Liquidity filters', 'Market data', 'Workspace']) {
+    const link = settings.getByRole('link', { name, exact: true })
+    await link.focus()
+    await settings.keyboard.press('Enter')
+    await settings.getByRole('heading', { name, exact: true, level: 2 }).waitFor()
+    assert.equal(await link.evaluate(element => element === document.activeElement), true,
+      'Keyboard navigation must keep focus on the category link.')
+    assert.equal(await link.getAttribute('aria-current'), 'page')
+  }
   assert.equal(await nativeWindowCount(), 2)
   const native = await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().map(window => ({ visible: window.isVisible(), focused: window.isFocused(), focusable: window.isFocusable() })))
   assert.ok(native.every(window => !window.visible && !window.focused && !window.focusable), 'Test windows must stay hidden and not steal focus.')

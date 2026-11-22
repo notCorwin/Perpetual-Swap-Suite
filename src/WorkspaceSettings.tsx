@@ -163,7 +163,6 @@ export function WorkspaceSettings({ section, active, preferences, loaded, loadEr
   const [savedMessage, setSavedMessage] = useState('')
   const [downloadStatus, setDownloadStatus] = useState<SettingsStatusValue | null>(null)
   const [visited, setVisited] = useState(() => new Set<SettingsSection>([section]))
-  const heading = useRef<HTMLHeadingElement>(null)
   const scroll = useRef<HTMLDivElement>(null)
   const scrollPositions = useRef(new Map<SettingsSection, number>())
   const focusAfterValidation = useRef<string | null>(null)
@@ -188,7 +187,7 @@ export function WorkspaceSettings({ section, active, preferences, loaded, loadEr
     if (focusAfterValidation.current) {
       document.getElementById(focusAfterValidation.current)?.focus()
       focusAfterValidation.current = null
-    } else heading.current?.focus({ preventScroll: true })
+    }
   }, [active, section])
   useLayoutEffect(() => { onNavigationStateChange({ dirty: active && dirty, busy: saving }) }, [active, dirty, saving, onNavigationStateChange])
   useEffect(() => () => onNavigationStateChange({ dirty: false, busy: false }), [onNavigationStateChange])
@@ -299,7 +298,7 @@ export function WorkspaceSettings({ section, active, preferences, loaded, loadEr
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <div ref={scroll} onScroll={event => scrollPositions.current.set(section, event.currentTarget.scrollTop)} className="min-h-0 flex-1 overflow-y-auto px-12 py-8 [scrollbar-gutter:stable]">
           <div className="mx-auto flex w-full max-w-3xl flex-col gap-8">
-            <h2 ref={heading} id="settings-section-title" tabIndex={-1} className="font-medium">{currentSection.label}</h2>
+            <h2 id="settings-section-title" className="font-medium">{currentSection.label}</h2>
             <form id="workspace-settings-form" noValidate onSubmit={event => { event.preventDefault(); void save() }}>
               <div hidden={section !== 'workspace'} className="flex flex-col gap-8">
         <FieldSet disabled={preferenceDisabled} aria-labelledby="settings-section-title">
