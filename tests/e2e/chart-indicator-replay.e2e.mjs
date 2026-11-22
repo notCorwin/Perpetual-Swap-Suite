@@ -9,7 +9,7 @@ test('indicator replay preserves visible paths while current prices update and t
   const userData = await mkdtemp(join(tmpdir(), 'perp-indicator-replay-'))
   let electron
   try {
-    await writeFile(join(userData, 'settings.json'), JSON.stringify({ chartDisplayMode: 'multi', chartTimeframe: '15m' }))
+    await writeFile(join(userData, 'settings.json'), JSON.stringify({ chartDisplayMode: 'multi' }))
     electron = await _electron.launch({ args: ['.', '--headless', '--disable-gpu'], cwd: new URL('../..', import.meta.url).pathname,
       env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_USER_DATA: userData } })
     const page = await electron.firstWindow()
@@ -35,7 +35,7 @@ test('indicator replay preserves visible paths while current prices update and t
         await new Promise(resolve => requestAnimationFrame(resolve))
         await new Promise(resolve => requestAnimationFrame(resolve))
         const source = chart.__chartSnapshot, rendered = chart.__chartRenderedBars
-        const status = document.querySelector('[data-market-status-row] [data-chart-shared-status-item="15m"]')
+        const status = document.querySelector('[data-market-status] [data-chart-shared-status-item="15m"]')
         observations.push({ state: source.indicatorState, stale: chart.dataset.chartIndicatorStale,
           continuous: !!svg.querySelector('[data-chart-boll-band]')?.getAttribute('d'),
           sourceNull: source.bars.every(bar => bar.bollUpper === null), renderedBand: rendered.find(bar => bar.hour === source.bars.at(-1).hour)?.bollUpper,
@@ -61,7 +61,7 @@ test('indicator replay preserves visible paths while current prices update and t
       assert.equal(state.renderedBand, replay.oldBand)
       assert.equal(state.sourceClose, replay.price)
       assert.equal(state.renderedClose, replay.price, 'New candle prices must be displayed during indicator replay.')
-      assert.equal(state.previousNotice, true)
+      assert.equal(state.previousNotice, true, 'A stale indicator warning remains visible during replay.')
       assert.equal(state.sameSurface, true)
     }
     assert.equal(replay.observations[0].sourceNull, true, 'Retained visual indicators must not enter the authoritative source.')

@@ -1,5 +1,12 @@
 import { openRecordedDatabase } from './recorded-database.js'
 import { DEFAULT_PREFERENCES, validatePreferenceFields, validatePreferences } from './preferences.js'
+// Discard retired chart settings while preserving validation of every other field.
+function withoutRetiredChartSettings(value) {
+  object(value, 'Preferences')
+  const { chartTimeframe, priceScaleMode, priceScalePixelsPerPercent, ...current } = value
+  return current
+}
+
 export { DEFAULT_PREFERENCES, validatePreferences } from './preferences.js'
 
 const AUDIT_STATUSES = new Set(['queued', 'running', 'paused', 'completed', 'cancelled', 'failed'])
@@ -166,7 +173,7 @@ export class MetadataStore {
       if (legacy !== undefined) {
         object(legacy, 'Legacy settings')
         const patch = Object.fromEntries(Object.keys(DEFAULT_PREFERENCES).filter(key => Object.hasOwn(legacy, key)).map(key => [key, legacy[key]]))
-        if (Object.hasOwn(legacy, 'preferences')) { validatePreferenceFields(legacy.preferences, true); Object.assign(patch, legacy.preferences) }
+        if (Object.hasOwn(legacy, 'preferences')) { const preferences = withoutRetiredChartSettings(legacy.preferences); validatePreferenceFields(preferences, true); Object.assign(patch, preferences) }
         if (Object.hasOwn(legacy, 'hourlyVolumeStabilityEnabled') && !patch.liquidity?.volumeStability) {
           patch.liquidity = merge(patch.liquidity ?? {}, { volumeStability: { enabled: legacy.hourlyVolumeStabilityEnabled } })
         }
@@ -184,7 +191,7 @@ export class MetadataStore {
     this.#assertOpen()
     const row = this.#database.prepare('SELECT revision, preferences FROM settings WHERE id = 1').get()
     integer(row.revision, 'Settings revision')
-    return { schemaVersion: 1, revision: row.revision, preferences: validatePreferences(merge(DEFAULT_PREFERENCES, JSON.parse(row.preferences))) }
+    return { schemaVersion: 1, revision: row.revision, preferences: validatePreferences(merge(DEFAULT_PREFERENCES, withoutRetiredChartSettings(JSON.parse(row.preferences)))) }
   }
 
   updateSettings(patch, options = {}) {

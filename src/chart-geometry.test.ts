@@ -31,15 +31,14 @@ test('shared viewport coordinates preserve time gaps and relative price and zero
   close(geometry.rsiY(0), layout.panels.rsi[1])
   close(geometry.rsiY(100), layout.panels.rsi[0])
   close(geometry.takerY(7) - geometry.takerY(10), (layout.panels.taker[1] - layout.panels.taker[0]) * 3 / (geometry.takerAxis.max - geometry.takerAxis.min))
-  assert.ok(priceAxis.min <= -2 && priceAxis.max >= 4)
+  close(geometry.priceY(100) - geometry.priceY(101), 25)
   assert.equal(geometry.buySamples, 96)
   assert.equal(geometry.sellSamples, 96)
 })
 
-test('visible data determines padded linear viewports independently from their ticks', () => {
+test('price uses fixed scale while indicators retain data-driven domains', () => {
   const geometry = createChartGeometryCache(text => text.length * 6)(rows(), viewport)
-  close(geometry.priceAxis.min, -2.3)
-  close(geometry.priceAxis.max, 4.3)
+  close(geometry.priceAxis.max - geometry.priceAxis.min, (geometry.layout.panels.price[1] - geometry.layout.panels.price[0]) / 25)
   close(geometry.takerAxis.min, 0)
   close(geometry.takerAxis.max, 10.5)
   close(geometry.rocAxis.max, 92 * 1.05)
@@ -197,7 +196,7 @@ test('Bollinger values crossing zero retain a relative domain and genuine warmup
   const bars = rows().map((bar, index) => ({ ...bar, bollLower: index < 19 ? null : -2, ema: null }))
   const geometry = createChartGeometryCache(text => text.length * 6)(bars, viewport)
   assert.equal(geometry.priceAxis.kind, 'relative')
-  assert.ok(geometry.priceAxis.min <= -102 && geometry.priceAxis.max >= 4)
+  close(geometry.priceY(100) - geometry.priceY(101), 25)
   close(geometry.priceY(0) - geometry.priceY(1), geometry.priceY(1) - geometry.priceY(2))
   assert.equal('ema' in geometry.lines, false)
   assert.equal(geometry.bollBands.length, 1)
@@ -217,7 +216,7 @@ test('immutable window revisits reuse geometry while corrections, resize, native
   const correction = get(corrected, viewport)
   assert.notEqual(correction, initial)
   assert.notEqual(correction.upWicks, initial.upWicks)
-  assert.ok(correction.priceAxis.max >= 50)
+  assert.deepEqual(correction.priceAxis, initial.priceAxis, 'An earlier extreme does not change the fixed scale.')
 
   const resized = get(bars, { ...viewport, width: 1200, height: 900 })
   assert.notEqual(resized.x.at(-1), initial.x.at(-1))
@@ -339,29 +338,30 @@ test('nonfinite OHLC never produces invalid cached price paths', () => {
   assert.deepEqual(unavailable.priceTicks, [])
 })
 
-test('fixed price scale maps one percent of its reference to the requested CSS pixels', () => {
+test('price scale maps one percent of its reference to 25 CSS pixels', () => {
   const bars = rows(), get = createChartGeometryCache(text => text.length * 6)
-  for (const height of [240, 700]) for (const pixels of [5, 20, 120]) for (const base of [100, 150]) {
-    const geometry = get(bars, { ...viewport, height, priceOnly: true, priceScaleMode: 'fixed', priceScalePixelsPerPercent: pixels, priceScaleBase: base })
-    close(geometry.priceY(base) - geometry.priceY(base * 1.01), pixels)
+  for (const height of [240, 700]) for (const base of [100, 150]) {
+    const geometry = get(bars, { ...viewport, height, priceOnly: true, priceScaleBase: base })
+    close(geometry.priceY(base) - geometry.priceY(base * 1.01), 25)
     close(geometry.priceY(bars.at(-1)!.close), (geometry.layout.panels.price[0] + geometry.layout.panels.price[1]) / 2)
-    assert.equal(get(bars, { ...viewport, height, priceOnly: true, priceScaleMode: 'fixed', priceScalePixelsPerPercent: pixels, priceScaleBase: base }), geometry)
+    assert.equal(get(bars, { ...viewport, height, priceOnly: true, priceScaleBase: base }), geometry)
   }
-  const fixed = get(bars, { ...viewport, priceScaleMode: 'fixed', priceScalePixelsPerPercent: 20 })
-  const automatic = get(bars, { ...viewport, priceScaleMode: 'auto', priceScalePixelsPerPercent: 20 })
-  assert.notEqual(fixed, automatic)
-  assert.notEqual(fixed.priceAxis.max - fixed.priceAxis.min, automatic.priceAxis.max - automatic.priceAxis.min)
 })
 
-test('price axis density follows panel height while preserving readable spacing and scale', () => {
+test('price axis uses one-percent ticks and 25px spacing at every panel height', () => {
   const bars = rows(), get = createChartGeometryCache(text => text.length * 6)
-  for (const mode of ['fixed', 'auto'] as const) for (const height of [240, 560, 1000]) {
-    const geometry = get(bars, { ...viewport, height, priceOnly: true, priceScaleMode: mode, priceScalePixelsPerPercent: 20, priceScaleBase: 100 })
+  for (const height of [240, 560, 1000]) {
+    const geometry = get(bars, { ...viewport, height, priceOnly: true, priceScaleBase: 100 })
+    assert.equal(geometry.priceAxis.step, 1)
+    assert.ok(geometry.priceAxis.ticks.every(Number.isInteger))
+    const displayed = chartPricePresentation(geometry, 0).ticks
+    assert.ok(displayed.some(tick => tick.label.startsWith('+')) && displayed.some(tick => tick.label.startsWith('-')))
+    assert.ok(displayed.every((tick, index) => Number.parseFloat(tick.label) === geometry.priceAxis.ticks[index]))
     for (let i = 1; i < geometry.priceTicks.length; i++) {
-      assert.ok(Math.abs(geometry.priceTicks[i].y - geometry.priceTicks[i - 1].y) >= 32 - 1e-8, 'Price labels have at least 32 CSS pixels of vertical separation.')
+      close(Math.abs(geometry.priceTicks[i].y - geometry.priceTicks[i - 1].y), 25)
     }
-    if (mode === 'fixed') close(geometry.priceY(100) - geometry.priceY(101), 20)
+    close(geometry.priceY(100) - geometry.priceY(101), 25)
   }
-  const tall = get(bars, { ...viewport, height: 560, priceOnly: true, priceScaleMode: 'fixed', priceScalePixelsPerPercent: 20, priceScaleBase: 100 })
+  const tall = get(bars, { ...viewport, height: 560, priceOnly: true, priceScaleBase: 100 })
   assert.ok(tall.priceTicks.length > 9, 'A tall price-only panel is not limited to nine labels.')
 })

@@ -63,7 +63,7 @@ test('complete observed trades replace closed Taker REST while OI keeps its inde
     const candle = row(0)
     await f.store.appendCandles([candle])
     f.service.listedUniverse.add(instId)
-    f.preferences.chartTimeframe = '5m'
+    f.service.preparedCharts.focuses.set('primary', { instId, timeframe: '5m', key: `${instId}:5m`, slot: 'primary' })
     f.service.liveStatistics.start(instId, base)
     f.service.liveStatistics.trades(instId, [
       { instId, tradeId: '1', ts: String(base + 1), side: 'buy', sz: '2' },
@@ -86,7 +86,6 @@ test('unselected closes save local Taker facts without acquiring remote statisti
     const candle = row(0)
     await f.store.appendCandles([candle])
     f.service.listedUniverse.add(instId)
-    f.preferences.chartTimeframe = '15m'
     f.service.liveStatistics.start(instId, base)
     f.service.liveStatistics.trades(instId, [
       { instId, tradeId: '1', ts: String(base + 1), side: 'buy', sz: '5' },
@@ -97,7 +96,7 @@ test('unselected closes save local Taker facts without acquiring remote statisti
     assert.equal(f.requests.length, 0)
     f.service.preparedCharts.focuses.set('primary', { instId, timeframe: '5m', key: `${instId}:5m`, slot: 'primary' })
     assert.equal(f.service.statisticsAcquisitionDemand(instId, '5m'), true)
-    assert.equal(f.service.statisticsAcquisitionDemand(instId, '1H'), false)
+    assert.equal(f.service.statisticsAcquisitionDemand(instId, '1H'), true)
   } finally { await f.close() }
 })
 
@@ -111,7 +110,6 @@ test('a corrected close arriving during the local Taker write is recalculated an
     const candle = row(0), corrected = { ...candle, volume: 6 }
     await f.store.appendCandles([candle])
     f.service.listedUniverse.add(instId)
-    f.preferences.chartTimeframe = '15m'
     f.service.liveStatistics.start(instId, base)
     f.service.liveStatistics.trades(instId, [{ instId, tradeId: '1', ts: String(base + 1), side: 'buy', sz: '5' }], base + 2)
     const append = f.store.appendStatistics.bind(f.store)
@@ -142,7 +140,6 @@ test('a late trade updates a local Taker proof even when the candle volume is un
     const candle = row(0)
     await f.store.appendCandles([candle])
     f.service.listedUniverse.add(instId)
-    f.preferences.chartTimeframe = '15m'
     f.service.liveStatistics.start(instId, base)
     f.service.liveStatistics.trades(instId, [{ instId, tradeId: '1', ts: String(base + 1), side: 'buy', sz: '4.999999995' }], base + 2)
     const append = f.store.appendStatistics.bind(f.store)

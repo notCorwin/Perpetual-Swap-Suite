@@ -414,7 +414,7 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
     let lastSurface = null
     const captureSurface = () => {
       const previous = lastSurface
-      const status = document.querySelector(`[data-market-status-row] [data-chart-shared-status-item="${expectedTimeframe}"]`)
+      const status = document.querySelector(`[data-market-status] [data-chart-shared-status-item="${expectedTimeframe}"]`)
       const chartState = shareRecord(previous?.chart, {
         instId: chart.dataset.chartInst, label: chart.getAttribute('aria-label'), start: chart.dataset.chartStart, end: chart.dataset.chartEnd,
         completedEnd: chart.dataset.chartCompletedEnd, requestedEnd: chart.dataset.chartRequestedEnd, renderedBars: chart.dataset.chartRenderedBars,
@@ -541,8 +541,8 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
       sample(false, sampledAt, sampledAt, true)
     })
     probe.observer.observe(chart, { subtree: true, childList: true, attributes: true, characterData: true })
-    const sharedStatus = document.querySelector('[data-market-status-row]')
-    if (sharedStatus) probe.observer.observe(sharedStatus, { subtree: true, childList: true, attributes: true, characterData: true })
+    const notification = document.querySelector('[data-market-status]')
+    if (notification) probe.observer.observe(notification, { subtree: true, childList: true, attributes: true, characterData: true })
     const frame = timestamp => {
       const sampledAt = performance.now()
       if (!probe.active) return

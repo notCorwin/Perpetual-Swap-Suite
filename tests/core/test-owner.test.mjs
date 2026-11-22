@@ -16,6 +16,17 @@ async function ownerProcess(t) {
   return { child, exited }
 }
 
+async function waitForLoss(lost) {
+  let timer
+  try {
+    return await Promise.race([lost, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('The watchdog did not detect the lost owner.')), 1000)
+    })])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 test('SIGKILL of either real Node owner ends monitoring once while the other owner remains alive', { timeout: 5_000 }, async t => {
   for (const source of ['runner', 'parent']) {
     await t.test(source, async t => {
@@ -34,7 +45,7 @@ test('SIGKILL of either real Node owner ends monitoring once while the other own
       assert.deepEqual(losses, [], 'A live owner must not terminate the app.')
       child.kill('SIGKILL')
       assert.equal((await exited)[1], 'SIGKILL')
-      assert.deepEqual(await lost, { pid: child.pid, source })
+      assert.deepEqual(await waitForLoss(lost), { pid: child.pid, source })
       await delay(35)
       assert.equal(losses.length, 1, 'Later checks cannot request another shutdown.')
       assert.doesNotThrow(() => process.kill(process.pid, 0))

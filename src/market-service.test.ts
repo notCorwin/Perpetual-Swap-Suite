@@ -149,7 +149,7 @@ test('no-op and audit-only configuration changes preserve the market revision an
   } finally { await f.close() }
 })
 
-test('chart timeframe preferences cause no market revision, publication, reads or calculations', async () => {
+test('history retention preferences cause no market revision, publication, reads or calculations', async () => {
   const f = await fixture()
   try {
     localCatalog(f.service)
@@ -162,12 +162,12 @@ test('chart timeframe preferences cause no market revision, publication, reads o
     const original = new Map<string, (...args: any[]) => unknown>()
     for (const method of ['touchList', 'listRowsFor', 'updateSubscriptions', 'updateRanking', 'scheduleMarketDeadline', 'replaceCatalog']) {
       original.set(method, f.service[method])
-      f.service[method] = () => { throw new Error(`A chart timeframe preference called ${method}.`) }
+      f.service[method] = () => { throw new Error(`A history retention preference called ${method}.`) }
     }
     try {
-      for (const chartTimeframe of ['5m', '1H', '15m'] as const) {
+      for (const historyDays of [15, 45, 30]) {
         const previous = structuredClone(f.preferences)
-        f.preferences.chartTimeframe = chartTimeframe
+        f.preferences.historyDays = historyDays
         await f.service.reconfigure(previous)
       }
       await new Promise(resolve => setTimeout(resolve, 25))
@@ -452,13 +452,10 @@ test('backend listed membership owns chart preparation and prepared reads never 
     assert.equal(f.service.publicRealtime.subscriptions, publicSubscriptions)
     f.service.publishStreamRecords([{ ...f.service.catalog.get(instId), ticker: { ...ticker, last: '120' } }])
     assert.deepEqual(universes, [[instId]], 'Renewals and price changes preserve the backend preparation universe.')
-    for (const timeframe of ['5m', '15m', '1H'] as const) {
-      const previous = structuredClone(f.preferences)
-      f.preferences.chartTimeframe = timeframe
-      await f.service.reconfigure(previous)
+    for (let index = 0; index < 3; index++) {
       assert.deepEqual(await f.service.getPreparedCharts(), { frames: [] })
     }
-    assert.deepEqual(universes, [[instId]], 'Renderer reads and timeframe preferences cannot modify preparation.')
+    assert.deepEqual(universes, [[instId]], 'Renderer reads cannot modify preparation.')
     localCatalog(f.service, [instId, 'ETH-USDT-SWAP'])
     localCatalog(f.service, [])
     assert.equal(f.service.catalog.size, 0)
@@ -503,7 +500,7 @@ test('missing Taker observations are fetched through bounded HTTP while genuine 
 test('constructor requires full Preferences and opens durable owned metadata', async () => {
   const f = await fixture()
   try {
-    assert.equal(f.service.metadata.getSettings().preferences.chartTimeframe, '15m')
+    assert.deepEqual(f.service.metadata.getSettings().preferences, DEFAULT_PREFERENCES)
     assert.equal(f.service.history.sync.closed, false)
     assert.throws(() => new MarketService(f.store, (() => ({ hourlyVolumeStabilityEnabled: true })) as any), /Preferences/)
     await f.service.persistCatalog([{ instrument, ticker, result: { eligible: true, status: 'verified' } }])
@@ -946,7 +943,7 @@ test('SQLite catalogue restore enforces config key and expiry while historical c
   } finally { await restored?.dispose(); await f.close() }
 })
 
-test('ranking uses one completed 5m boundary independently of chart timeframe', async () => {
+test('ranking uses one completed 5m boundary independently of history retention', async () => {
   const f = await fixture()
   const asOf = Math.floor(Date.now() / fiveMinutes) * fiveMinutes
   try {
@@ -960,7 +957,7 @@ test('ranking uses one completed 5m boundary independently of chart timeframe', 
     assert.deepEqual(before.rows.map(row => row.instId), ['ETH-USDT-SWAP', instId, 'SOL-USDT-SWAP'])
     assert.equal(before.rows[0].rankingAsOf, asOf)
     const previous = structuredClone(f.preferences)
-    f.preferences.chartTimeframe = '1H'
+    f.preferences.historyDays += 1
     await f.service.reconfigure(previous)
     assert.deepEqual((await f.service.snapshot()).rows.map(row => [row.instId, row.rankingChange]), before.rows.map(row => [row.instId, row.rankingChange]))
     const old = structuredClone(f.preferences); f.preferences.rankingLookback = 30

@@ -11,7 +11,7 @@ test('a missing settings chunk leaves the market workspace usable', async () => 
   try {
     electron = await _electron.launch({ args: ['.', '--disable-gpu'], env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_USER_DATA: userData } })
     const page = await electron.firstWindow()
-    await page.locator('[data-market-status-row]').waitFor()
+    await page.locator('[data-market-list]').waitFor()
     await electron.evaluate(({ BrowserWindow }, chunk) => {
       BrowserWindow.getAllWindows()[0].webContents.session.webRequest.onBeforeRequest((details, callback) => callback({ cancel: details.url.includes(chunk) }))
     }, '/SettingsWindow-')
@@ -24,7 +24,7 @@ test('a missing settings chunk leaves the market workspace usable', async () => 
     const closed = settingsPage.waitForEvent('close')
     await region.getByRole('button', { name: 'Close settings', exact: true }).click()
     await closed
-    await page.locator('[data-market-status-row]').waitFor()
+    await page.locator('[data-market-list]').waitFor()
     assert.equal(await page.locator('[data-chart-panel]').count(), 1)
   } finally {
     try { await electron?.close() } finally { await rm(userData, { recursive: true, force: true }) }

@@ -37,7 +37,7 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
   }
 
   before(async () => {
-    await writeFile(join(await userData, 'settings.json'), JSON.stringify({ chartDisplayMode: 'indicators', chartTimeframe: '15m' }))
+    await writeFile(join(await userData, 'settings.json'), JSON.stringify({ chartDisplayMode: 'indicators' }))
     await launch()
     await installNavigationProbe(electron, { omitUniverseInstId: 'BTC-USDT-SWAP' })
     fixture = await page.evaluate(() => window.radarDesktop.request({ e2e: { action: 'seedInstrumentNavigationBenchmark' } }))

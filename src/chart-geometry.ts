@@ -10,7 +10,6 @@ const axisFormatters = new Map<number, Intl.NumberFormat>()
 export const chartCompact = (value: number | null) => value === null ? '—' : compactFormatter.format(value)
 export const chartPercent = (value: number | null, decimals = 2) => value === null ? '—' : `${value.toFixed(decimals)}%`
 const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value)
-const priceFields = ['low', 'high', 'bollUpper', 'bollLower'] as const
 const lineFields = ['rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'roc', 'maroc', 'oi'] as const
 const axisLabelLimit = (panel: readonly [number, number], maximum: number) =>
   Math.min(maximum, Math.max(2, Math.floor((panel[1] - panel[0]) / 32) + 1))
@@ -24,7 +23,8 @@ const axisFormatter = (decimals: number) => {
 }
 
 type Range = readonly [number, number]
-export type ChartGeometryOptions = Readonly<{ width: number; height: number; endHour: number; intervalMS: number; liveClose?: number; currentPriceTickSz?: string | null; priceOnly?: boolean; windowBars?: number; layoutDensity?: ChartLayoutDensity; barSpacing?: number; fixedGutter?: number; priceScaleMode?: 'fixed' | 'auto'; priceScalePixelsPerPercent?: number; priceScaleBase?: number | null }>
+export type ChartGeometryOptions = Readonly<{ width: number; height: number; endHour: number; intervalMS: number; liveClose?: number; currentPriceTickSz?: string | null; priceOnly?: boolean; windowBars?: number; layoutDensity?: ChartLayoutDensity; barSpacing?: number; fixedGutter?: number; priceScaleBase?: number | null; priceScaleCenter?: number | null }>
+export const CHART_PRICE_PIXELS_PER_PERCENT = 25
 export type ChartGeometryOverscan = Readonly<{ before?: Bar; after?: Bar }>
 const linearScale = (min: number, max: number, panel: Range) => {
   const span = max - min || 1, height = panel[1] - panel[0]
@@ -38,14 +38,10 @@ const paddedIndicatorRange = (min: number, max: number) => {
 
 function chartAxes(bars: readonly Bar[], options: ChartGeometryOptions, measureText: (text: string) => number) {
   const { height, liveClose } = options
-  let priceMin = Infinity, priceMax = -Infinity, rocExtent = 0, minATR = Infinity, maxATR = 0, minBBW = Infinity, maxBBW = 0, maxTaker = 1
+  let rocExtent = 0, minATR = Infinity, maxATR = 0, minBBW = Infinity, maxBBW = 0, maxTaker = 1
   let candleHigh = -Infinity, candleLow = Infinity, highIndex = 0, lowIndex = 0
   const oiSamples: { index: number; value: number }[] = []
   for (const [index, bar] of bars.entries()) {
-    for (const field of priceFields) {
-      const value = bar[field]
-      if (finite(value)) { priceMin = Math.min(priceMin, value); priceMax = Math.max(priceMax, value) }
-    }
     for (const value of [finitePercentage(bar.roc), finitePercentage(bar.maroc)]) if (value !== null) rocExtent = Math.max(rocExtent, Math.abs(value))
     if (finite(bar.atrPercent)) { minATR = Math.min(minATR, bar.atrPercent); maxATR = Math.max(maxATR, bar.atrPercent) }
     if (finite(bar.bbw)) { minBBW = Math.min(minBBW, bar.bbw); maxBBW = Math.max(maxBBW, bar.bbw) }
@@ -54,25 +50,20 @@ function chartAxes(bars: readonly Bar[], options: ChartGeometryOptions, measureT
     if (bar.high > candleHigh) { candleHigh = bar.high; highIndex = index }
     if (bar.low < candleLow) { candleLow = bar.low; lowIndex = index }
   }
-  if (finite(liveClose)) { priceMin = Math.min(priceMin, liveClose); priceMax = Math.max(priceMax, liveClose) }
   // Panel heights do not depend on the label gutter, so each axis is computed
   // once and shared by both the gutter measurement and the final plot.
   const { panels } = chartLayout(0, height, 64, options.priceOnly, options.layoutDensity)
-  // Price-only charts can be much taller than the original indicator panels.
-  // Keep labels spaced by their available pixel height instead of imposing a
-  // fixed label count that leaves tall price axes mostly empty.
-  const priceLabels = axisLabelLimit(panels.price, Infinity)
   const base = options.priceScaleBase === undefined ? bars.flatMap(bar => [bar.open, bar.high, bar.low, bar.close]).find(value => finite(value) && value > 0) ?? null : options.priceScaleBase
-  if (!Number.isFinite(priceMin) || !Number.isFinite(priceMax)) { priceMin = base ?? 0; priceMax = base ?? 1 }
   const relative = (value: number) => (value / base! - 1) * 100
-  const priceLow = base === null ? -1 : relative(priceMin), priceHigh = base === null ? 1 : relative(priceMax)
-  // Reserve breathing room based on the visible data, not on a rounded tick.
-  const pricePadding = (priceHigh - priceLow || Math.max(Math.abs(priceHigh) * 0.01, 0.01)) * 0.05
-  const fixed = options.priceScaleMode === 'fixed' && finite(options.priceScalePixelsPerPercent) && options.priceScalePixelsPerPercent > 0 && base !== null
   const lastClose = bars.at(-1)!.close
-  const center = fixed ? relative(finite(liveClose) && liveClose > 0 ? liveClose : finite(lastClose) && lastClose > 0 ? lastClose : base!) : 0
-  const halfSpan = fixed ? (panels.price[1] - panels.price[0]) / options.priceScalePixelsPerPercent! / 2 : 0
-  const priceAxis = { ...chartAxisForLabels(fixed ? center - halfSpan : priceLow - pricePadding, fixed ? center + halfSpan : priceHigh + pricePadding, priceLabels), kind: 'relative' as const, base }
+  const preferredCenter = options.priceScaleCenter === undefined ? liveClose : options.priceScaleCenter
+  const centerPrice = base === null ? null : finite(preferredCenter) && preferredCenter > 0 ? preferredCenter : finite(lastClose) && lastClose > 0 ? lastClose : base
+  const center = centerPrice === null ? 0 : relative(centerPrice)
+  const halfSpan = (panels.price[1] - panels.price[0]) / CHART_PRICE_PIXELS_PER_PERCENT / 2
+  const min = center - halfSpan, max = center + halfSpan
+  const first = Math.ceil(min - 1e-10), last = Math.floor(max + 1e-10)
+  const ticks = Array.from({ length: Math.max(0, last - first + 1) }, (_, index) => first + index)
+  const priceAxis = { min, max, ticks, step: 1, decimals: 0, kind: 'relative' as const, base, centerPrice }
   const axisPrice = axisFormatter(priceAxis.decimals)
   const rocRange = (rocExtent || 1) * 1.05
   const rocAxis = chartAxisForLabels(-rocRange, rocRange, axisLabelLimit(panels.roc, 7))
@@ -255,7 +246,9 @@ export function chartPricePresentation(geometry: ChartGeometry, contentOffset: n
     return center + geometry.barWidth / 2 > left && center - geometry.barWidth / 2 < right
   }
   const first = (geometry.before && visible(geometry.before) ? geometry.before : undefined) ?? geometry.bars.find(visible) ?? (geometry.after && visible(geometry.after) ? geometry.after : undefined)
+  const last = (geometry.after && visible(geometry.after) ? geometry.after : undefined) ?? geometry.bars.findLast(visible) ?? (geometry.before && visible(geometry.before) ? geometry.before : undefined)
   const base = first && finite(first.open) && first.open > 0 ? first.open : null
+  const centerPrice = base === null ? null : last && finite(last.close) && last.close > 0 ? last.close : base
   const geometryBase = geometry.priceAxis.base
   const step = base !== null && geometryBase !== null ? geometry.priceAxis.step * geometryBase / base : 1
   const decimals = Math.max(2, Math.min(20, -Math.floor(Math.log10(step)) + 1))
@@ -271,7 +264,7 @@ export function chartPricePresentation(geometry: ChartGeometry, contentOffset: n
     const raw = geometryBase * (1 + value / 100)
     return { y: geometry.priceTicks[index].y, label: formatChange(raw) ?? '—' }
   })
-  return { base, geometryBase, ticks, formatChange }
+  return { base, centerPrice, geometryBase, ticks, formatChange }
 }
 
 /** Weak ownership follows immutable chart windows. A separate LRU also caps
@@ -283,7 +276,7 @@ export function createChartGeometryCache(measureText: (text: string) => number) 
     const variants = axisCache.get(bars) ?? []
     const cached = variants.find(({ options: prior }) => prior.height === options.height && prior.liveClose === options.liveClose
       && prior.priceOnly === options.priceOnly && prior.currentPriceTickSz === options.currentPriceTickSz && prior.layoutDensity === options.layoutDensity
-      && prior.priceScaleMode === options.priceScaleMode && prior.priceScalePixelsPerPercent === options.priceScalePixelsPerPercent && prior.priceScaleBase === options.priceScaleBase)
+      && prior.priceScaleBase === options.priceScaleBase && prior.priceScaleCenter === options.priceScaleCenter)
     if (cached) return cached.axes
     const axes = chartAxes(bars, options, measureText)
     variants.push({ options, axes })
@@ -300,7 +293,7 @@ export function createChartGeometryCache(measureText: (text: string) => number) 
     const index = variants.findIndex(({ value, before, after }) => value.width === options.width && value.height === options.height
       && value.endHour === options.endHour && value.intervalMS === options.intervalMS && value.liveClose === liveClose
       && value.barSpacing === options.barSpacing && value.fixedGutter === options.fixedGutter && value.layoutDensity === options.layoutDensity && (options.barSpacing !== undefined || (value.windowBars ?? 96) === (options.windowBars ?? 96)) && value.currentPriceTickSz === options.currentPriceTickSz && value.priceOnly === options.priceOnly
-      && value.priceScaleMode === options.priceScaleMode && value.priceScalePixelsPerPercent === options.priceScalePixelsPerPercent && value.priceScaleBase === options.priceScaleBase
+      && value.priceScaleBase === options.priceScaleBase && value.priceScaleCenter === options.priceScaleCenter
       && before === overscan.before && after === overscan.after)
     if (index >= 0) {
       const [variant] = variants.splice(index, 1)

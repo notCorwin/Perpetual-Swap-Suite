@@ -178,7 +178,7 @@ test('native traffic lights align with the renderer toolbar after window resizin
 
 test('preferences persist through the single desktop entry point and survive a process restart', async () => {
   const initial = await request({ preferences: { action: 'read' } })
-  assert.equal(initial.chartTimeframe, '15m')
+  assert.equal('chartTimeframe' in initial, false)
   assert.equal(initial.rankingLookback, 15)
   assert.equal(initial.historyDays, 30)
   assert.equal(initial.liquidity.volumeStability.enabled, false)
@@ -302,7 +302,6 @@ test('canonical catalog rows show contract, live price, and ranking independentl
 
   // Reload so React obtains the row through the same initial snapshot read as
   // an app user, then inspect the rendered table instead of the IPC object.
-  await request({ preferences: { action: 'update', values: { chartTimeframe: fixture.timeframe } } })
   await page.reload({ waitUntil: 'domcontentloaded' })
   const market = page.locator(`[aria-label="View ${fixture.instId} chart"]`)
   await market.waitFor({ state: 'visible', timeout: 10_000 })
@@ -323,7 +322,6 @@ test('a restarted desktop restores cached catalog readings before a live scan co
   // recreate the entire Electron process to cover the production startup path,
   // rather than a renderer reload against an already-warm main process.
   const fixture = await request({ e2e: { action: 'seedCachedListProjection' } })
-  await request({ preferences: { action: 'update', values: { chartTimeframe: fixture.timeframe } } })
   await electron.close()
   await launchElectron(true)
 

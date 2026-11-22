@@ -108,14 +108,8 @@ test('ranking ties use fixed instrument IDs for both known and unavailable chang
   assert.equal(compareRanking({ instId: 'A', rankingChange: null }, { instId: 'A', rankingChange: null }), 0)
 })
 
-test('changing chart timeframe does not change the ranking lookback or native 5m inputs', () => {
-  const state = { chartTimeframe: '5m', rankingLookback: 15, nativeCandles: path() }
-  const before = rankingFromCandles(state.nativeCandles, state.rankingLookback, closeBoundary)
-  for (const chartTimeframe of ['15m', '1h', '5m']) {
-    state.chartTimeframe = chartTimeframe
-    assert.deepEqual(rankingFromCandles(state.nativeCandles, state.rankingLookback, closeBoundary), before)
-  }
-  assert.equal(before.rankingChange, 2)
+test('ranking requires native 5m inputs rather than an aggregated chart series', () => {
+  assert.equal(rankingFromCandles(path(), 15, closeBoundary).rankingChange, 2)
   // An aggregated chart series cannot substitute for the native ranking series.
   assert.deepEqual(rankingFromCandles(path().map(entry => ({ ...entry, timeframe: '15m' })), 15, closeBoundary), unavailable)
 })

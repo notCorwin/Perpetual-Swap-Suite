@@ -53,7 +53,7 @@ try {
       const page = await electron.firstWindow()
       const errors = []
       page.on('pageerror', error => errors.push(error.message))
-      await page.waitForFunction(() => Boolean(document.querySelector('[data-market-status-row]') && document.querySelector('[data-chart-panel]') && document.querySelector('a[aria-label="Settings"]')), undefined, { timeout: 10_000 })
+      await page.waitForFunction(() => Boolean(document.querySelector('[data-market-list]') && document.querySelector('[data-chart-panel]') && document.querySelector('a[aria-label="Settings"]')), undefined, { timeout: 10_000 })
       await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
       const firstScreenMS = performance.now() - started
       const readyMS = performance.now() - started

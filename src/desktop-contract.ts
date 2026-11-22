@@ -54,6 +54,7 @@ export type PresentationSnapshot = {
 }
 export type PresentationUpdate = { epoch: number; active: boolean; startedAt: number; snapshot?: PresentationSnapshot; error?: string }
 export type DesktopCommands = {
+  statusLog: { input: { status: string; realtime: string; updatedAt: number | null; issues: string[]; cause: string; catalog: CatalogProgress | null }; output: { ok: boolean } }
   preferences: { input: { action: 'read' } | { action: 'update'; values: PreferencesPatch }; output: Preferences }
   snapshot: { input: { sinceRevision?: number; serviceSession?: string }; output: MarketSnapshot | UnchangedSnapshot }
   dataAudit: { input: { action: 'start' | 'cancel' | 'status' | 'repair' }; output: DataAudit }
@@ -80,6 +81,7 @@ export interface RadarDesktop {
   initializeOperations(hooks: OperationBridgeHooks): Promise<OperationSourceIdentity>
   recordOperations(batch: OperationBatch): Promise<OperationAcknowledgment>
   operationSourceFailure(value: { executionId: string; reason: string; omitted: number }): Promise<void>
+  request(value: { statusLog: DesktopCommands['statusLog']['input'] }): Promise<DesktopCommands['statusLog']['output']>
   request(value: { preferences: DesktopCommands['preferences']['input'] }): Promise<DesktopCommands['preferences']['output']>
   request(value: { snapshot: DesktopCommands['snapshot']['input'] }): Promise<DesktopCommands['snapshot']['output']>
   request(value: { dataAudit: DesktopCommands['dataAudit']['input'] }): Promise<DesktopCommands['dataAudit']['output']>

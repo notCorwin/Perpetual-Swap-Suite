@@ -160,7 +160,7 @@ test('resource capture ends before numerical validation and reuses unchanged imm
   const result = paint.finish()
   assert.equal(result.complete, true)
   assert.deepEqual(result.violations, [])
-  assert.equal(result.indicatorValuesChecked, 96 * 12)
+  assert.equal(result.indicatorValuesChecked, 96 * 11)
   assert.equal(oracleCalls, 96, 'The identical retained bar set is checked once across commit and RAF captures.')
   assert.ok(result.deferredValidation.reusedBarChecks > 0)
   assert.ok(result.captureTimings.samples > 0)

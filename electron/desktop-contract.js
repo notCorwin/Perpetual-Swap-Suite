@@ -112,13 +112,10 @@ function preferences(value) {
   if (action === 'read') { record(value, path, ['action']); return { action } }
   record(value, path, ['action', 'values'], ['action', 'values'])
   const valuesPath = `${path}.values`
-  const values = record(value.values, valuesPath, ['chartTimeframe', 'chartDisplayMode', 'priceScaleMode', 'priceScalePixelsPerPercent', 'rankingLookback', 'historyDays', 'liquidity'])
+  const values = record(value.values, valuesPath, ['chartDisplayMode', 'rankingLookback', 'historyDays', 'liquidity'])
   if (Object.keys(values).length === 0) invalid(valuesPath, 'must contain an update')
   const result = {}
   optional(result, values, 'chartDisplayMode', input => choice(input, `${valuesPath}.chartDisplayMode`, ['multi', 'indicators']))
-  optional(result, values, 'priceScaleMode', input => choice(input, `${valuesPath}.priceScaleMode`, ['auto', 'fixed']))
-  optional(result, values, 'priceScalePixelsPerPercent', input => number(input, `${valuesPath}.priceScalePixelsPerPercent`, 1, 500))
-  optional(result, values, 'chartTimeframe', input => choice(input, `${valuesPath}.chartTimeframe`, TIMEFRAMES))
   optional(result, values, 'rankingLookback', input => {
     number(input, `${valuesPath}.rankingLookback`, 5, Number.MAX_SAFE_INTEGER, true)
     if (input % 5 !== 0) invalid(`${valuesPath}.rankingLookback`, 'must be a multiple of 5 minutes')
@@ -192,13 +189,26 @@ function candle(value, index) {
 
 /** Validate the complete request before dispatching any operation or side effect. */
 export function parseDesktopRequest(value, { allowE2E = false } = {}) {
-  const operations = ['snapshot', 'preferences', 'dataAudit', 'historyDownload', 'chartFocus', 'chartWindow', 'chartLocal', 'chartHistory', 'chartUniverse', 'captureChart', 'copyText', 'copyImage', 'e2e']
+  const operations = ['snapshot', 'preferences', 'dataAudit', 'historyDownload', 'chartFocus', 'chartWindow', 'chartLocal', 'chartHistory', 'chartUniverse', 'captureChart', 'copyText', 'copyImage', 'statusLog', 'e2e']
   record(value, 'request', operations)
   const keys = Object.keys(value)
   if (keys.length !== 1) invalid('request', 'must contain exactly one operation')
   const operation = keys[0]
   const input = value[operation]
   switch (operation) {
+    case 'statusLog': {
+      record(input, operation, ['status', 'realtime', 'updatedAt', 'issues', 'cause', 'catalog'], ['status', 'realtime', 'updatedAt', 'issues', 'cause', 'catalog'])
+      array(input.issues, 'statusLog.issues', 32)
+      if (input.catalog !== null) record(input.catalog, 'statusLog.catalog', ['total', 'completed', 'pending', 'verified', 'failed', 'unknown'], ['total', 'completed', 'pending', 'verified', 'failed', 'unknown'])
+      return { statusLog: {
+        status: text(input.status, 'statusLog.status', { maximum: 128 }),
+        realtime: text(input.realtime, 'statusLog.realtime', { maximum: 128 }),
+        updatedAt: input.updatedAt === null ? null : number(input.updatedAt, 'statusLog.updatedAt', 0, Number.MAX_SAFE_INTEGER, true),
+        issues: input.issues.map((issue, index) => text(issue, `statusLog.issues[${index}]`, { maximum: 512 })),
+        cause: text(input.cause, 'statusLog.cause', { empty: true, maximum: 1024 }),
+        catalog: input.catalog === null ? null : Object.fromEntries(['total', 'completed', 'pending', 'verified', 'failed', 'unknown'].map(key => [key, number(input.catalog[key], `statusLog.catalog.${key}`, 0, Number.MAX_SAFE_INTEGER, true)])),
+      } }
+    }
     case 'snapshot': return { snapshot: snapshot(input) }
     case 'preferences': return { preferences: preferences(input) }
     case 'dataAudit': {

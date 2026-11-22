@@ -14,7 +14,7 @@ test('metadata schema migration drops obsolete sync demand once and preserves du
   const root = await temporary()
   let store = await MetadataStore.open(root)
   try {
-    const settings = store.updateSettings({ historyDays: 45, chartTimeframe: '1H' })
+    const settings = store.updateSettings({ historyDays: 45 })
     const analysis = store.updateAnalysisSettings({ model: 'fixture-model', apiKey: 'fixture-private-value' })
     const audit = { id: 'audit-1', status: 'paused' as const, phase: 'verify' as const, checkedRows: 42 }
     const download = { ...emptyHistoryDownload(), phase: 'cancelled' as const, startedAt: 1, finishedAt: 2 }
@@ -67,7 +67,7 @@ test('preference schema owns immutable snapshots, reuses proven values and valid
   const input = structuredClone(DEFAULT_PREFERENCES)
   const preferences = validatePreferences(input)
   assert.deepEqual(preferences, {
-    chartTimeframe: '15m', chartDisplayMode: 'multi', priceScaleMode: 'fixed', priceScalePixelsPerPercent: 20, rankingLookback: 15, historyDays: 30,
+    chartDisplayMode: 'multi', rankingLookback: 15, historyDays: 30,
     liquidity: {
       spread: { enabled: true, maxPercent: 0.05 }, depth: { enabled: true, minUSDT: 100_000 },
       slippage: { enabled: true, maxPercent: 0.1, notionalUSDT: 100_000 }, volume24h: { enabled: true, minUSDT: 30_000_000 },
@@ -80,16 +80,15 @@ test('preference schema owns immutable snapshots, reuses proven values and valid
   assert.equal(preferences.liquidity.spread.maxPercent, 0.05)
   assert.equal(validatePreferences(input).liquidity.spread.maxPercent, 1)
   let reads = 0
-  const changing = { ...input, get chartTimeframe() { return ++reads === 1 ? '15m' : 'invalid' } }
-  assert.throws(() => validatePreferences(changing), /chartTimeframe/, 'A changing accessor cannot admit an unvalidated immutable snapshot.')
+  const changing = { ...input, get rankingLookback() { return ++reads === 1 ? 15 : -1 } }
+  assert.throws(() => validatePreferences(changing), /rankingLookback/, 'A changing accessor cannot admit an unvalidated immutable snapshot.')
   assert.equal(DEFAULT_PREFERENCES.liquidity.spread.maxPercent, 0.05)
   assert.equal(Object.isFrozen(DEFAULT_PREFERENCES.liquidity.slippage), true)
   assert.equal(validatePreferences({ ...DEFAULT_PREFERENCES, historyDays: 3650 }).historyDays, 3650)
   for (const invalid of [
-    { ...DEFAULT_PREFERENCES, priceScaleMode: 'bad' }, { ...DEFAULT_PREFERENCES, priceScalePixelsPerPercent: 0 }, { ...DEFAULT_PREFERENCES, priceScalePixelsPerPercent: 501 },
     { ...DEFAULT_PREFERENCES, rankingLookback: 7 }, { ...DEFAULT_PREFERENCES, rankingLookback: 0 }, { ...DEFAULT_PREFERENCES, rankingLookback: 9_007_199_254_740_990 },
     { ...DEFAULT_PREFERENCES, historyDays: 0 }, { ...DEFAULT_PREFERENCES, historyDays: 1.5 }, { ...DEFAULT_PREFERENCES, historyDays: 3651 },
-    { ...DEFAULT_PREFERENCES, chartTimeframe: '1m' }, { ...DEFAULT_PREFERENCES, frostedBackgroundEnabled: true },
+    { ...DEFAULT_PREFERENCES, frostedBackgroundEnabled: true },
     { ...DEFAULT_PREFERENCES, liquidity: { ...DEFAULT_PREFERENCES.liquidity, spread: { enabled: true, maxPercent: Infinity } } },
     { ...DEFAULT_PREFERENCES, liquidity: { ...DEFAULT_PREFERENCES.liquidity, depth: { enabled: 1, minUSDT: 100 } } },
     { ...DEFAULT_PREFERENCES, liquidity: { ...DEFAULT_PREFERENCES.liquidity, slippage: { enabled: true, maxPercent: 0.1 } } },
@@ -101,7 +100,6 @@ test('unchanged preference saves keep their durable revision', async () => {
   try {
     const before = store.getSettings()
     assert.deepEqual(store.updateSettings({}), before)
-    assert.deepEqual(store.updateSettings({ chartTimeframe: before.preferences.chartTimeframe }), before)
     assert.deepEqual(store.getSettings(), before)
   } finally { store.close(); await rm(root, { recursive: true, force: true }) }
 })
@@ -138,11 +136,10 @@ test('independent connections merge settings at the latest revision and reject s
   const second = await MetadataStore.open(root)
   try {
     assert.equal(first.getSettings().revision, 0)
-    first.updateSettings({ chartTimeframe: '1H', liquidity: { spread: { maxPercent: 0.02 } } })
+    first.updateSettings({ liquidity: { spread: { maxPercent: 0.02 } } })
     second.updateSettings({ rankingLookback: 60, liquidity: { spread: { enabled: false }, slippage: { notionalUSDT: 50_000 } } })
     const merged = first.getSettings()
     assert.equal(merged.revision, 2)
-    assert.equal(merged.preferences.chartTimeframe, '1H')
     assert.equal(merged.preferences.rankingLookback, 60)
     assert.deepEqual(merged.preferences.liquidity.spread, { enabled: false, maxPercent: 0.02 })
     assert.deepEqual(merged.preferences.liquidity.slippage, { enabled: true, maxPercent: 0.1, notionalUSDT: 50_000 })
@@ -227,7 +224,7 @@ test('malformed legacy input is preserved without error snippets and can be retr
     assert.equal(await readFile(path, 'utf8'), malformed)
     await writeFile(path, JSON.stringify({ chartTimeframe: '5m', analysis: { model: 'fixture' } }))
     const store = await MetadataStore.open(root, { legacySettingsPath: path })
-    try { assert.equal(store.getSettings().preferences.chartTimeframe, '5m'); assert.equal(store.getSettings().revision, 1) }
+    try { assert.equal('chartTimeframe' in store.getSettings().preferences, false); assert.equal(store.getSettings().revision, 1) }
     finally { store.close() }
   } finally { await rm(root, { recursive: true, force: true }) }
 })
@@ -308,18 +305,21 @@ test('existing SQLite preferences gain the multi default and preserve a saved in
   const root = await temporary()
   let store = await MetadataStore.open(root)
   try {
-    store.updateSettings({ chartTimeframe: '1H', historyDays: 45 })
+    store.updateSettings({ historyDays: 45 })
     store.close()
     const database = new DatabaseSync(join(root, 'metadata.sqlite'))
     try {
       const row = database.prepare('SELECT preferences FROM settings WHERE id=1').get()!
       const old = JSON.parse(row.preferences as string)
       delete old.chartDisplayMode
+      Object.assign(old, { chartTimeframe: '5m', priceScaleMode: 'auto', priceScalePixelsPerPercent: 99 })
       database.prepare('UPDATE settings SET preferences=? WHERE id=1').run(JSON.stringify(old))
     } finally { database.close() }
     store = await MetadataStore.open(root)
     assert.equal(store.getSettings().preferences.chartDisplayMode, 'multi')
-    assert.equal(store.getSettings().preferences.chartTimeframe, '1H')
+    assert.equal('chartTimeframe' in store.getSettings().preferences, false)
+    assert.equal('priceScaleMode' in store.getSettings().preferences, false)
+    assert.equal('priceScalePixelsPerPercent' in store.getSettings().preferences, false)
     assert.equal(store.getSettings().preferences.historyDays, 45)
     store.updateSettings({ chartDisplayMode: 'indicators' })
     store.close(); store = await MetadataStore.open(root)

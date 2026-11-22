@@ -1,9 +1,5 @@
-export type ChartTimeframe = '5m' | '15m' | '1H'
 export type Preferences = {
   chartDisplayMode: 'multi' | 'indicators'
-  priceScaleMode: 'auto' | 'fixed'
-  priceScalePixelsPerPercent: number
-  chartTimeframe: ChartTimeframe
   rankingLookback: number
   /** Whole days, from 1 through 3650 inclusive. */
   historyDays: number
@@ -18,13 +14,11 @@ export type Preferences = {
 }
 export type PreferencesPatch = {
   chartDisplayMode?: 'multi' | 'indicators'
-  priceScaleMode?: 'auto' | 'fixed'
-  priceScalePixelsPerPercent?: number
-  chartTimeframe?: ChartTimeframe
   rankingLookback?: number
   historyDays?: number
   liquidity?: { [Rule in keyof Preferences['liquidity']]?: Partial<Preferences['liquidity'][Rule]> }
 }
+export const CHART_PRIMARY_TIMEFRAME: '1H'
 export const DEFAULT_PREFERENCES: Readonly<Preferences>
 type Immutable<T> = T extends object ? { readonly [K in keyof T]: Immutable<T[K]> } : T
 export type PreferenceSnapshot = Immutable<Preferences>

@@ -6,10 +6,48 @@ import { MarketStore } from './market-store.js'
 import { MarketService } from './market-service.js'
 import { drainCallbackProbeObserverCostMonotonicUS, monotonicMicroseconds, validateMarketTrafficDrainWindow, wrapAcceptedCallback } from './market-traffic-callback-probe.js'
 import { ChartNotificationEncoder } from './chart-notifications.js'
+import { createStatusLog } from './status-log.js'
 import { createChartAcquisitionFixture, createChartColdBoundaryFixture, seedCachedListProjection, seedChartScrollBenchmark, seedHistoricalStatisticsBoundary, seedInstrumentNavigationBenchmark } from '../e2e-fixtures.js'
 import { backgroundArchiveRows, seedMarketResources, startBackgroundArchive } from '../market-resource-fixtures.js'
 
 let metadata, store, service, preferences, sourceProbe
+const backendStatusLog = createStatusLog(join(workerData.userData, 'Logs', 'market-backend.jsonl'))
+let backendStatusTimer, backendStatusTask = Promise.resolve(), lastBackendStatus = '', backendStatusWriting = false, backendStatusDirty = false, backendStatusRetryAt = 0, backendStatusRetryAttempts = 0, backendStatusAttempted = '', backendStatusClosing = false
+function captureBackendStatus(force = false) {
+  if (!service) return Promise.resolve()
+  backendStatusDirty = false
+  let unknown = 0
+  for (const record of service.catalogChecks.values()) if (record.status === 'unknown' || record.status === 'verified' && !service.validCatalogEntry(record)) unknown++
+  const state = { source: service.catalogSource, realtime: service.realtimeState(), error: service.error, incomplete: unknown > 0 }
+  const signature = JSON.stringify(state)
+  if (signature === lastBackendStatus) return Promise.resolve()
+  if (signature !== backendStatusAttempted) { backendStatusAttempted = signature; backendStatusRetryAttempts = 0; backendStatusRetryAt = 0 }
+  if (!force && backendStatusRetryAttempts >= 3) return Promise.resolve()
+  backendStatusWriting = true
+  backendStatusRetryAttempts++
+  backendStatusTask = backendStatusLog.write({ ...state, unknown, updatedAt: service.listUpdatedAt ?? service.catalogUpdatedAt }).then(() => {
+    lastBackendStatus = signature
+    backendStatusRetryAt = 0
+  }).catch(error => {
+    backendStatusRetryAt = Date.now() + 5000
+    backendStatusDirty ||= backendStatusRetryAttempts < 3
+    console.error('Could not write backend status log:', error.message)
+  }).finally(() => {
+    backendStatusWriting = false
+    if (backendStatusDirty) scheduleBackendStatus()
+  })
+  return backendStatusTask
+}
+function scheduleBackendStatus() {
+  if (backendStatusClosing) return
+  backendStatusDirty = true
+  if (backendStatusTimer || backendStatusWriting) return
+  backendStatusTimer = setTimeout(() => {
+    backendStatusTimer = undefined
+    void captureBackendStatus()
+  }, Math.max(1000, backendStatusRetryAt - Date.now()))
+  backendStatusTimer.unref?.()
+}
 let resourceFixture, acquisitionFixture, coldBoundaryFixture
 const notificationSubscriptions = new Map()
 let presentationActive = true, presentationEpoch = 0, requestedSubscriptions = []
@@ -115,8 +153,9 @@ const initialize = runWorkerInitialization('market-backend', async () => {
   store = await MarketStore.open(join(workerData.userData, 'MarketData'))
   const exchange = nativeExchangeFixture()
   service = new MarketService(store, () => preferences, exchange?.fetcher ?? (workerData.testMode ? offline : fetch),
-    !workerData.testMode || Boolean(exchange), { metadata, ...(exchange ? { webSocketFactory: exchange.webSocketFactory } : {}) })
+    !workerData.testMode || Boolean(exchange), { metadata, onStatusChange: scheduleBackendStatus, ...(exchange ? { webSocketFactory: exchange.webSocketFactory } : {}) })
   await service.ready
+  scheduleBackendStatus()
   if (workerData.e2eLiveRefresh) void service.refresh().catch(error => console.error(error))
   parentPort.postMessage({ type: 'ready' })
 })
@@ -437,10 +476,12 @@ onOperationMessage(parentPort, 'market-backend', async ({ id, method, value }) =
     else if (method === 'probe') result = await probe(value)
     else if (method === 'dispose') {
       subscribeNotifications([])
+      backendStatusClosing = true
+      clearTimeout(backendStatusTimer)
       sourceProbe?.release()
       const failures = []
       for (const close of [() => coldBoundaryLifecycle(async () => { await coldBoundaryFixture?.remove(); coldBoundaryFixture = null }),
-        () => service.dispose(), () => store.close(), () => metadata.close()]) {
+        () => service.dispose(), async () => { await backendStatusTask; await captureBackendStatus(true) }, () => backendStatusLog.flush(), () => store.close(), () => metadata.close()]) {
         try { await close() } catch (error) { failures.push(error) }
       }
       if (failures.length) throw new AggregateError(failures, `Market backend shutdown failed: ${failures.map(error => error?.message ?? String(error)).join('; ')}`)

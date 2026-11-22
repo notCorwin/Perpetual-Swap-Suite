@@ -21,7 +21,7 @@ let electron, page, stopDiagnostics, stopWitness
 
 before(async () => {
   await writeFile(join(userData, 'settings.json'), JSON.stringify({
-    chartTimeframe: '15m', rankingLookback: 15, historyDays: 30,
+    rankingLookback: 15, historyDays: 30,
     notificationsEnabled: true, backgroundMonitoringEnabled: true, monitoringPaused: true,
   }))
   electron = await _electron.launch({ args: ['.'], cwd: root,

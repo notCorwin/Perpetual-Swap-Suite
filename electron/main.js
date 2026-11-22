@@ -20,6 +20,7 @@ import { MarketBackend } from './services/market-backend.js'
 import { backgroundWindowLaunch, windowToolbarLayout } from './window-layout.js'
 import { restoreWindowBounds, saveWindowBounds } from './window-state.js'
 import { PresentationLifecycle } from './services/presentation-lifecycle.js'
+import { createStatusLog } from './services/status-log.js'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const rendererURL = process.env.ELECTRON_RENDERER_URL || undefined
@@ -52,6 +53,7 @@ const maintainOperationRetention = () => {
 }
 await maintainOperationRetention()
 const operationRecording = initializeOperationRecording({ label: 'electron-main' })
+const statusLog = createStatusLog(join(app.getPath('userData'), 'Logs', 'market-status.jsonl'))
 const retentionTimer = operationSession ? setInterval(maintainOperationRetention, 60_000) : undefined
 retentionTimer?.unref()
 const rendererOperations = operationRecording ? createRendererOperationReceiver() : undefined
@@ -138,6 +140,7 @@ async function handleRequest(event, payload, context) {
   }
   assertPresentation()
   const execute = async () => {
+  if ('statusLog' in request) { await statusLog.write(request.statusLog); return { ok: true } }
   if ('copyText' in request) { await clipboard.writeText(request.copyText); return { ok: true } }
   if ('copyImage' in request) {
     const image = nativeImage.createFromDataURL(request.copyImage)
@@ -454,6 +457,7 @@ function startShutdown() {
       try { await backend?.dispose() }
       catch (error) { console.error('Market backend shutdown failed:', error) }
       await Promise.allSettled([...desktopRequests])
+      await statusLog.flush()
       await Promise.all([window, settingsWindow].filter(target => target && !target.isDestroyed() && !target.webContents.isDestroyed()).map(target => drainRendererOperations(target).catch(error => console.error('Renderer operation shutdown failed:', error))))
       await stopGraphicsRecording?.()
       await closeOperationRecording()

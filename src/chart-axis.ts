@@ -49,6 +49,36 @@ export function chartTimeTicks(start: number, end: number, intervalMS: number, s
   return ticks
 }
 
+const axisDateFormatter = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' })
+const axisTimeFormatter = new Intl.DateTimeFormat('en-US', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
+
+/** Lay out labels within the plot. Dates are shown at the first label and on day changes. */
+export function chartTimeLabels(ticks: readonly { hour: number; x: number }[], left: number, right: number, gap: number, measure: (label: string, major: boolean) => number) {
+  const labels: { hour: number; x: number; label: string; major: boolean; anchor: 'start' | 'middle' | 'end'; left: number; right: number }[] = []
+  let previousDay = '', previousRight = left - gap
+  for (const tick of ticks) {
+    const date = new Date(tick.hour)
+    const day = `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`
+    const dateChanged = day !== previousDay
+    const major = dateChanged || date.getMinutes() === 0
+    const clock = axisTimeFormatter.format(date)
+    const label = dateChanged ? `${axisDateFormatter.format(date)}, ${clock}` : clock
+    const width = measure(label, major)
+    if (!Number.isFinite(width) || width > right - left) continue
+    if (tick.x < left || tick.x > right) continue
+    const anchor = tick.x - width / 2 >= left && tick.x + width / 2 <= right ? 'middle'
+      : tick.x + width <= right ? 'start' : tick.x - width >= left ? 'end' : null
+    if (!anchor) continue
+    const labelLeft = anchor === 'start' ? tick.x : anchor === 'end' ? tick.x - width : tick.x - width / 2
+    const labelRight = labelLeft + width
+    if (labelLeft < previousRight + gap) continue
+    labels.push({ hour: tick.hour, x: tick.x, label, major, anchor, left: labelLeft, right: labelRight })
+    previousDay = day
+    previousRight = labelRight
+  }
+  return labels
+}
+
 export type LogChartAxis = { min: number; max: number; ticks: number[]; decimals: number; zeroInclusive: boolean }
 
 const logCoordinate = (value: number, zeroInclusive: boolean) => zeroInclusive ? Math.log1p(value) / Math.LN10 : Math.log10(value)

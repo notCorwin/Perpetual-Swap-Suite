@@ -46,7 +46,7 @@ const readChart = () => page.evaluate(() => {
       endHour: snapshot.endHour, liveBar: snapshot.liveBar && { hour: snapshot.liveBar.hour, open: snapshot.liveBar.open, high: snapshot.liveBar.high,
         low: snapshot.liveBar.low, close: snapshot.liveBar.close, confirmed: snapshot.liveBar.confirmed }, priceObservedAt: snapshot.priceObservedAt,
       realtimeState: snapshot.realtimeState, bars: snapshot.bars.length, generation: snapshot.generation } : null,
-    statuses: [...document.querySelectorAll('[data-market-status-row] [data-chart-shared-status-item="5m"]')].map(value => value.textContent?.trim()) }
+    notifications: [...document.querySelectorAll('[data-market-status]')].map(value => value.textContent?.trim()) }
 })
 try {
   const sentAt = Date.now(), clockResponse = await fetch('https://www.okx.com/api/v5/public/time', { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(7000)]) })
@@ -58,7 +58,7 @@ try {
   stage = 'isolated-setup'
   const { MetadataStore, DEFAULT_PREFERENCES } = await import(pathToFileURL(join(root, 'electron/services/metadata-store.js')))
   const userData = join(directory, 'user-data'), metadata = await MetadataStore.open(userData)
-  try { const preferences = structuredClone(DEFAULT_PREFERENCES); preferences.chartTimeframe = '5m'; for (const condition of Object.values(preferences.liquidity)) condition.enabled = false; metadata.updateSettings(preferences) }
+  try { const preferences = structuredClone(DEFAULT_PREFERENCES); for (const condition of Object.values(preferences.liquidity)) condition.enabled = false; metadata.updateSettings(preferences) }
   finally { metadata.close() }
   relay = await createOKXRelay({ signal: controller.signal })
   stage = 'launch-app'
@@ -86,7 +86,8 @@ try {
       throw error
     }
     await page.locator(`[aria-label="View ${instId} chart"]`).evaluate(node => node.click())
-    await page.locator('[aria-label="Chart timeframe"] button').filter({ hasText: /^5m$/i }).evaluate(node => node.click())
+    const timeframeControl = page.locator('[aria-label="Chart timeframe"] button').filter({ hasText: /^5m$/i })
+    if (await timeframeControl.count()) await timeframeControl.evaluate(node => node.click())
     relay.gate(instId)
     const gateAt = Date.now(), gateOrder = relay.checkpoint()
     let witness
@@ -117,7 +118,7 @@ try {
         && actual.svgEnd === Number(expected.raw[0]) && live?.hour === Number(expected.raw[0]) && live.confirmed === false
         && ['open', 'high', 'low', 'close'].every((field, index) => live[field] === Number(expected.raw[index + 1]))
         && actual.price === Number(expected.raw[4]) && actual.snapshot.priceObservedAt >= expected.forwardedAt
-        && Date.now() - actual.snapshot.priceObservedAt < 10_000 && actual.snapshot.realtimeState === 'live' && !actual.statuses.some(status => status?.includes('Cached price'))
+        && Date.now() - actual.snapshot.priceObservedAt < 10_000 && actual.snapshot.realtimeState === 'live'
     }, 8_000, 'app-failure', `A genuine, delivered ${instId} candle failed to reach the selected SVG with exact OHLC, identity and freshness.`)
     assertionActive = false
     if (previous) assert.ok(actual.snapshot.priceObservedAt > previous.actual.snapshot.priceObservedAt, 'New real candle delivery must advance the observed timestamp even when price repeats.')

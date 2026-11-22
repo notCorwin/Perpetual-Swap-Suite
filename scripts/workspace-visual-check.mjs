@@ -22,7 +22,7 @@ try {
   await page.waitForLoadState('domcontentloaded')
   await electron.evaluate(async ({ ipcMain }) => {
     const { encodeChartWire } = process.getBuiltinModule('module').createRequire(`${process.cwd()}/package.json`)('./electron/chart-wire.js')
-    const preferences = { chartTimeframe: '15m', rankingLookback: 15, historyDays: 30, liquidity: {
+    const preferences = { chartDisplayMode: 'multi', rankingLookback: 15, historyDays: 30, liquidity: {
       spread: { enabled: true, maxPercent: .05 }, depth: { enabled: true, minUSDT: 100_000 },
       slippage: { enabled: true, maxPercent: .1, notionalUSDT: 100_000 }, volume24h: { enabled: true, minUSDT: 30_000_000 },
       openInterest: { enabled: true, minUSDT: 5_000_000 }, volumeStability: { enabled: false, maxRatio: 2 },

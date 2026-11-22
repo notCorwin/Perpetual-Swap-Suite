@@ -60,7 +60,6 @@ async function fixture(hourStart: number, options: { holdPrefix?: ReturnType<typ
   const root = await mkdtemp(join(tmpdir(), 'perp-market-live-prefix-'))
   const store = await MarketStore.open(root)
   const preferences: Preferences = structuredClone(DEFAULT_PREFERENCES)
-  preferences.chartTimeframe = '1H'
   preferences.rankingLookback = 15
   for (const rule of Object.values(preferences.liquidity)) rule.enabled = false
   preferences.liquidity.volume24h.enabled = false

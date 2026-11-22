@@ -1,6 +1,6 @@
 import { readDesignLengths } from '@/design-lengths'
 import { CHART_DEFAULT_SPACING, chartPitchSpan } from './chart-layout.ts'
-import { chartTimeTicks, chartTimeTickStep } from './chart-axis.ts'
+import { chartTimeLabels, chartTimeTicks, chartTimeTickStep } from './chart-axis.ts'
 import { createContext, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { flushSync } from "react-dom"
 import { Badge } from "@/components/ui/badge"
@@ -74,7 +74,6 @@ const SharedChartStatus = memo(function SharedChartStatus({ timeframe, summary, 
 
 const chartTimeFormatter = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })
 const time = (hour: number) => chartTimeFormatter.format(hour)
-const hourLabel = time
 const chartStyle = getComputedStyle(document.documentElement)
 // Tokens are fixed for the page lifetime; geometry and rendered annotations share these resolved pixels.
 const chartLengths = readDesignLengths({
@@ -103,18 +102,18 @@ const priceOverlays = [bollOverlay]
 
 const legendContext = document.createElement("canvas").getContext("2d")
 const chartTextWidths = new Map<string, number>()
-const chartTextWidth = (text: string, fontSize: number = chartTokens.textSize) => {
+const chartTextWidth = (text: string, fontSize: number = chartTokens.textSize, weight = 400) => {
   const normalized = text.replace(/\d/g, "0")
-  const key = `${fontSize}:${normalized}`
+  const key = `${fontSize}:${weight}:${normalized}`
   const cached = chartTextWidths.get(key)
   if (cached !== undefined) return cached
   if (!legendContext) return normalized.length * fontSize * .7
-  legendContext.font = `${fontSize}px ${chartStyle.getPropertyValue('--font-mono').trim() || 'ui-monospace, monospace'}`
+  legendContext.font = `${weight} ${fontSize}px ${chartStyle.getPropertyValue('--font-mono').trim() || 'ui-monospace, monospace'}`
   const width = legendContext.measureText(normalized).width
   chartTextWidths.set(key, width)
   return width
 }
-const legendWidth = (text: string) => chartTextWidth(text)
+const legendWidth = (text: string) => Math.max(chartTextWidth(text), chartTextWidth(text, chartTokens.textSize, 700))
 const PlotVisible = createContext(true)
 const subscribeVisibility = (listener: () => void) => {
   document.addEventListener('visibilitychange', listener)
@@ -262,15 +261,13 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
       </g>
     </g>
   }
-  // A viewport can straddle a month boundary where the day gains a digit.
-  const timeTickStep = chartTimeTickStep(geometry.barPitch, chartTextWidth(hourLabel(bars[n - 1].hour)) + chartTokens.textSize, chartTokens.annotationSmall)
+  const timeTickStep = chartTimeTickStep(geometry.barPitch, chartTextWidth('00:00', chartTokens.textSize, 700), chartTokens.annotationSmall)
   const timeAtX = (position: number) => bars[0].hour + (position - x[0] - contentOffset) / geometry.barPitch * intervalMS
   const timeTicks = chartTimeTicks(timeAtX(0), timeAtX(right), intervalMS, timeTickStep)
     .map(hour => ({ hour, x: x[0] + (hour - bars[0].hour) / intervalMS * geometry.barPitch }))
-  const timeLabels = timeTicks.filter(tick => {
-    const halfWidth = chartTextWidth(hourLabel(tick.hour)) / 2
-    const center = tick.x + contentOffset
-    return !inspectedTime || center + halfWidth < inspectedTimeX - chartTokens.annotationXs || center - halfWidth > inspectedTimeX + inspectedTimeWidth + chartTokens.annotationXs
+  const timeLabels = chartTimeLabels(timeTicks.map(tick => ({ ...tick, x: tick.x + contentOffset })), 0, right, chartTokens.annotationSmall,
+    (label, major) => chartTextWidth(label, chartTokens.textSize, major ? 700 : 400)).filter(tick => {
+    return !inspectedTime || tick.right < inspectedTimeX - chartTokens.annotationXs || tick.left > inspectedTimeX + inspectedTimeWidth + chartTokens.annotationXs
   })
   return <>
     <defs>
@@ -304,7 +301,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     {presentation.base !== null && geometry.priceAxis.base !== null && ([[highIndex, candleHigh, "high"], [lowIndex, candleLow, "low"]] as const).map(([index, value, kind]) => {
       if (!Number.isFinite(value)) return null
       const markerX = x[index], label = formatHistoricalPrice(value)
-      const labelWidth = label.length * 6.5 + 8
+      const labelWidth = chartTextWidth(label) + 8
       const start = index < n / 2 ? markerX + 10 : markerX - labelWidth - 10
       return <g key={kind}>
         <line x1={markerX} x2={index < n / 2 ? markerX + 10 : markerX - 10} y1={priceY(value)} y2={priceY(value)} stroke="var(--foreground)" />
@@ -315,14 +312,12 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
       </g>
     </g>
     <g clipPath={`url(#${areaClipId}-time-axis)`}>
-      <g transform={`translate(${contentOffset},0)`}>
-        {timeLabels.map(tick => <text data-chart-time-label key={tick.hour} x={tick.x} y={height - 4} textAnchor="middle" fill="var(--muted-foreground)">{hourLabel(tick.hour)}</text>)}
-      </g>
+      {timeLabels.map(tick => <text data-chart-time-label key={tick.hour} x={tick.x} y={height - 6} textAnchor={tick.anchor} fill={tick.major ? 'var(--foreground)' : 'var(--muted-foreground)'} fontWeight={tick.major ? 700 : 400}>{tick.label}</text>)}
     </g>
     {priceInViewport && <g data-chart-price-label data-chart-price-direction={priceDirection}>
       <title>{`Change from candle open ${latestPrice} · ${priceDirection === 'flat' ? 'unchanged' : priceDirection} · ${liveOverlay ? 'Forming candle' : 'Candle'}`}</title>
       <rect data-chart-price-label-background x={right} y={priceLabel.top} width={gutter} height={priceLabel.bottom - priceLabel.top} fill={priceLabelBackground} />
-      <text data-chart-price-label-value x={axisStarts.price} y={priceLabel.labelY} dominantBaseline="middle" fill={priceLabelForeground} textLength={chartTextWidth(latestPrice) > gutter - chartTokens.annotationPadding ? Math.max(1, gutter - chartTokens.annotationPadding) : undefined} lengthAdjust="spacingAndGlyphs">{latestPrice}</text>
+      <text data-chart-price-label-value x={axisStarts.price} y={priceLabel.labelY} dominantBaseline="middle" fill={priceLabelForeground}>{latestPrice}</text>
       {priceLabel.countdownY !== null && <PriceCountdown hour={liveBar.hour} intervalMS={intervalMS} x={axisStarts.price} y={priceLabel.countdownY} fill={priceLabelForeground} />}
     </g>}
     {statistics && <>
@@ -338,8 +333,12 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     {panels.roc[1] - panels.roc[0] >= 35 && rocAxis.ticks.map(tick => <g key={tick} data-chart-roc-tick>{lineLabel(axisStarts.roc, rocY(tick), formatPercent(tick, rocAxis.decimals))}</g>)}
     {oiAxis && panels.oi[1] - panels.oi[0] >= 35 && geometry.oiTicks.map(({ y, label }, index) => <g key={index} data-chart-oi-tick><line x1={columns.oi[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.25" />{lineLabel(axisStarts.oi, y, label)}</g>)}
     {panels.taker[1] - panels.taker[0] >= 35 && geometry.takerTicks.map(({ y, label }, index) => <g key={index} data-chart-taker-tick>{lineLabel(axisStarts.taker, y, label)}</g>)}
-    {inspectedTime && <g data-chart-inspected-time><rect x={inspectedTimeX} y={height - 16} width={inspectedTimeWidth} height={15} rx={3} fill="var(--chart-annotation)" /><text x={inspectedTimeX + inspectedTimeWidth / 2} y={height - 4} textAnchor="middle" fill="var(--foreground)">{inspectedTime}</text></g>}
-    {presentation.ticks.map(({ y, label }, index) => <g key={index} data-chart-price-tick><line x1={columns.price[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.35" />{y >= chartTokens.textSize && y <= height - chartTokens.textSize && (!priceInViewport || y + tickHalfHeight < priceLabel.top || y - tickHalfHeight > priceLabel.bottom) && <text x={axisStarts.price} y={y} dominantBaseline="middle" fill="var(--muted-foreground)" textLength={chartTextWidth(label) > gutter - chartTokens.annotationPadding ? Math.max(1, gutter - chartTokens.annotationPadding) : undefined} lengthAdjust="spacingAndGlyphs">{label}</text>}</g>)}
+    {inspectedTime && <g data-chart-inspected-time><rect x={inspectedTimeX} y={height - chartTokenNumber('--chart-bottom-axis-height')} width={inspectedTimeWidth} height={chartTokenNumber('--chart-bottom-axis-height') - 1} rx={3} fill="var(--chart-annotation)" /><text x={inspectedTimeX + inspectedTimeWidth / 2} y={height - 6} textAnchor="middle" fill="var(--foreground)">{inspectedTime}</text></g>}
+    {presentation.ticks.map(({ y, label }, index) => {
+      const value = Number.parseFloat(label.replaceAll(',', ''))
+      const major = Number.isFinite(value) && Math.abs(value / 10 - Math.round(value / 10)) < 1e-8
+      return <g key={index} data-chart-price-tick><line x1={columns.price[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.35" />{y >= chartTokens.textSize && y <= height - chartTokens.textSize && (!priceInViewport || y + tickHalfHeight < priceLabel.top || y - tickHalfHeight > priceLabel.bottom) && <text x={axisStarts.price} y={y} dominantBaseline="middle" fill={major ? 'var(--foreground)' : 'var(--muted-foreground)'} fontWeight={major ? 700 : 400}>{label}</text>}</g>
+    })}
     <line x1={right} x2={right} y1={panels.price[0]} y2={geometry.priceOnly ? panels.price[1] : panels.taker[1]} stroke="var(--border)" opacity="0.8" />
     {priceInViewport && <line data-chart-live-price x1={columns.price[0]} x2={right} y1={latestY} y2={latestY} stroke={latestColor} strokeDasharray="4 5" />}
   </>
@@ -377,7 +376,7 @@ const ChartSurface = memo(function ChartSurface({ instId, timeframe, hasComplete
   </PlotVisible>
 })
 
-export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, turnoverOrder, onSelect, controller: chartController = defaultChartController, priceOnly = false, navigation = true, onStatus, priceScaleMode = 'fixed', priceScalePixelsPerPercent = 20 }: { priceScaleMode?: 'fixed' | 'auto'; priceScalePixelsPerPercent?: number; controller?: ChartController; priceOnly?: boolean; navigation?: boolean; onStatus?: (timeframe: RadarTimeframe, value: SharedChartStatusValue | null) => void; instId: string; tickSz?: string | null; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; candidateIds?: string[]; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
+export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe = '15m', active: isActive = true, onTimeframeChange, listOrder, turnoverOrder, onSelect, controller: chartController = defaultChartController, priceOnly = false, navigation = true, onStatus }: { controller?: ChartController; priceOnly?: boolean; navigation?: boolean; onStatus?: (timeframe: RadarTimeframe, value: SharedChartStatusValue | null) => void; instId: string; tickSz?: string | null; timeframe?: RadarTimeframe; active?: boolean; onTimeframeChange?: (value: RadarTimeframe) => void; candidateIds?: string[]; listOrder: string[]; turnoverOrder: string[]; onSelect: (id: string) => void }) {
   const sync = useContext(ChartTimeSync)
   const presentation = usePresentation()
   const readoutId = useId()
@@ -427,7 +426,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
   const activeWheelFraction = matchesSelection && wheelOwnerMatches
     ? chartPresentedWheelFraction(wheelFraction, view.pending && !requestedEndMatches ? requestedEnd : surface?.endHour, surface?.endHour, intervalMS) : 0
   const overscan = chartOverscan(surface, chartController)
-  const preparedPlot = chartPlot(displayedIndicators.window, plotSize, overscan, currentPriceTickSz, priceOnly, viewport, { mode: priceScaleMode, pixelsPerPercent: priceScalePixelsPerPercent, wheelFraction: activeWheelFraction })
+  const preparedPlot = chartPlot(displayedIndicators.window, plotSize, overscan, currentPriceTickSz, priceOnly, viewport, activeWheelFraction)
   const bars = preparedPlot?.bars ?? surface?.bars ?? EMPTY_BARS
   const plotGeometry = preparedPlot?.geometry ?? null
   const visibleBars = plotGeometry?.windowBars ?? chartPitchSpan(plotSize.width, viewport.spacing)
@@ -505,7 +504,7 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
   // Do not include the measured geometry or shared gutter in this epoch:
   // both change as the shared width converges. New market data, navigation,
   // fractional scrolling, and size changes invalidate the measurement.
-  const gutterEpoch = useMemo(() => ({ window: displayedIndicators.window, sync: sync?.value, fraction: activeWheelFraction, width: plotSize.width, height: plotSize.height, instId, timeframe, priceScaleMode, priceScalePixelsPerPercent }), [displayedIndicators.window, sync?.value, activeWheelFraction, plotSize.width, plotSize.height, instId, timeframe, priceScaleMode, priceScalePixelsPerPercent])
+  const gutterEpoch = useMemo(() => ({ window: displayedIndicators.window, sync: sync?.value, fraction: activeWheelFraction, width: plotSize.width, height: plotSize.height, instId, timeframe }), [displayedIndicators.window, sync?.value, activeWheelFraction, plotSize.width, plotSize.height, instId, timeframe])
   const reportGutter = sync?.reportGutter
   useLayoutEffect(() => {
     if (!reportGutter) return

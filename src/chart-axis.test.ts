@@ -1,6 +1,21 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { chartAxis, chartAxisForLabels, chartTimeTicks, chartTimeTickStep, logarithmicChartAxis, logarithmicScale } from "./chart-axis.ts"
+import { chartAxis, chartAxisForLabels, chartTimeLabels, chartTimeTicks, chartTimeTickStep, logarithmicChartAxis, logarithmicScale } from "./chart-axis.ts"
+
+test('time labels preserve date context across days and stay inside the axis without overlaps', () => {
+  const start = new Date(2026, 10, 20, 22, 0).getTime()
+  const ticks = Array.from({ length: 5 }, (_, i) => ({ hour: start + i * 3_600_000, x: i * 150 }))
+  const measure = (label: string) => label.length * 7
+  const labels = chartTimeLabels(ticks, 0, 600, 8, measure)
+  assert.match(labels[0].label, /Nov 20, 22:00/)
+  assert.equal(labels[1].label, '23:00')
+  assert.match(labels[2].label, /Nov 21, 00:00/)
+  assert.equal(labels[3].label, '01:00')
+  assert.equal(labels[0].anchor, 'start')
+  assert.equal(labels.at(-1)?.anchor, 'end')
+  assert.ok(labels.every((label, i) => label.x === ticks.find(tick => tick.hour === label.hour)?.x && label.left >= 0 && label.right <= 600 && (!i || label.left >= labels[i - 1].right + 8)))
+  assert.deepEqual(chartTimeLabels(ticks, 0, 20, 8, measure), [])
+})
 
 test('viewport time ticks remain regular at the right edge and across missing candles', () => {
   const interval = 900_000

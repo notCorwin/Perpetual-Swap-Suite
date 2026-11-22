@@ -10,7 +10,7 @@ import { WorkspaceViewport } from '@/WorkspaceViewport'
 import { chartCoordinator, multiChartControllers, ingestPreparedChart } from '@/chart-controller'
 import { reconcileMarketOrder, reconcileMarketRows } from '@/market-snapshot'
 import { SnapshotOrder } from '@/snapshot-order'
-import { DEFAULT_PREFERENCES, type Preferences } from '@/renderer-preferences'
+import { CHART_PRIMARY_TIMEFRAME, DEFAULT_PREFERENCES, type Preferences } from '@/renderer-preferences'
 import type { DataAudit, HistoryDownload, MarketSnapshot, RankedMarketRow, UnchangedSnapshot } from '@/desktop-contract'
 import type { PreparedChartNotification } from '@/chart-data'
 import { cn } from '@/lib/utils'
@@ -42,14 +42,13 @@ const MarketRowView = memo(function MarketRowView({ row, index, selected, lookba
   }} className="cursor-pointer focus-visible:outline-2 focus-visible:outline-ring focus-visible:-outline-offset-2">
     <TableCell className="font-medium" title={row.instId}><span className="block truncate">{row.instId.replace(/-USDT-SWAP$/, '')}</span></TableCell>
     <TableCell className="text-right"><span className="block truncate" title={price}>{price}</span></TableCell>
-    <TableCell data-market-change={changeDirection} aria-label={`${lookback}-minute change: ${changeText}, ${changeDirection === 'up' ? 'up' : changeDirection === 'down' ? 'down' : changeDirection === 'flat' ? 'unchanged' : 'unavailable'}`} className={cn('text-right', changeDirection === 'up' ? 'bg-positive text-[color:var(--change-label-foreground)]' : changeDirection === 'down' ? 'bg-negative text-[color:var(--change-label-foreground)]' : changeDirection === 'flat' ? 'bg-muted text-foreground' : 'bg-muted text-muted-foreground')} title={row.rankingAsOf ? `${lookback}-minute signed relative change · completed candle as of ${new Date(row.rankingAsOf).toLocaleString('en-US')}` : 'Completed candle ranking is not available'}>
+    <TableCell data-market-change={changeDirection} aria-label={`${lookback}-minute change: ${changeText}, ${changeDirection === 'up' ? 'up' : changeDirection === 'down' ? 'down' : changeDirection === 'flat' ? 'unchanged' : 'unavailable'}`} className={cn('text-right', changeDirection === 'up' ? 'text-positive' : changeDirection === 'down' ? 'text-negative' : changeDirection === 'flat' ? 'text-foreground' : 'text-muted-foreground')} title={row.rankingAsOf ? `${lookback}-minute signed relative change · completed candle as of ${new Date(row.rankingAsOf).toLocaleString('en-US')}` : 'Completed candle ranking is not available'}>
       <span className="block truncate">{changeText}</span>
     </TableCell>
   </TableRow>
 })
 
 function App() {
-  const statusRow = useRef<HTMLElement>(null)
   const [preferences, setPreferences] = useState<Preferences>(DEFAULT_PREFERENCES)
   const [preferencesLoaded, setPreferencesLoaded] = useState(false)
   const [preferencesError, setPreferencesError] = useState('')
@@ -62,7 +61,8 @@ function App() {
   const [status, setStatus] = useState('Connecting')
   const [realtime, setRealtime] = useState('Connecting')
   const [error, setError] = useState('')
-  const [updatedAt, setUpdatedAt] = useState<number | null>(null)
+  const updatedAt = useRef<number | null>(null)
+  const lastCatalogProgress = useRef<MarketSnapshot['catalogProgress']>(undefined)
   const [globalAudit, setGlobalAudit] = useState<DataAudit | null>(null)
   const [globalDownload, setGlobalDownload] = useState<HistoryDownload | null>(null)
   const [auditStatusUnavailable, setAuditStatusUnavailable] = useState(false)
@@ -74,7 +74,7 @@ function App() {
   const order = useRef(new SnapshotOrder())
   const retainSelection = useRef(false)
   const preferenceWrite = useRef(0)
-  const timeframe = preferences.chartTimeframe
+  const timeframe = CHART_PRIMARY_TIMEFRAME
   const presentation = usePresentation()
 
   const applyMarket = useCallback((snapshot: MarketSnapshot | UnchangedSnapshot, preserveSelection = false) => {
@@ -94,7 +94,8 @@ function App() {
       catalogProgress: snapshot.catalogProgress ?? ('unchanged' in snapshot ? current.catalogProgress : undefined),
     }))
     if (!('unchanged' in snapshot) || snapshot.catalogSource !== undefined || snapshot.catalogProgress !== undefined || snapshot.loading !== undefined) setStatus(collectorStatus(snapshot))
-    if (snapshot.updatedAt !== undefined) setUpdatedAt(snapshot.updatedAt)
+    if (snapshot.updatedAt !== undefined) updatedAt.current = snapshot.updatedAt
+    if (snapshot.catalogProgress !== undefined) lastCatalogProgress.current = snapshot.catalogProgress
     if (snapshot.realtimeState) setRealtime(snapshot.realtimeState)
     else if (!('unchanged' in snapshot)) setRealtime('Unavailable')
   }, [])
@@ -245,7 +246,7 @@ function App() {
     document.querySelector<SVGElement>('[data-timeframe-panel="1H"] [data-chart-plot]')?.focus({ preventScroll: true })
   }, [selectedID])
   const connectionProblem = !['live', 'connected'].includes(realtime.toLowerCase())
-  const connectionFailure = ['reconnecting', 'disconnected'].includes(realtime.toLowerCase())
+  const connectionFailure = ['reconnecting', 'disconnected', 'unavailable'].includes(realtime.toLowerCase())
   const listOrder = candidateIds
   useEffect(() => { if (ready) void chartCoordinator.setUniverse(retainedChart && selectedID ? [...candidateIds, selectedID] : candidateIds, timeframe) }, [ready, candidateIds, timeframe, retainedChart, selectedID])
   const marketOverlayRef = useRef<HTMLDivElement>(null)
@@ -317,7 +318,7 @@ function App() {
   if (preferencesError) issues.push({ id: 'preferences', label: 'Settings', detail: 'Settings could not be loaded. Check the local data service.', severity: 'error' })
   if (error) issues.push({ id: 'market-error', label: 'Market', detail: 'Market data is unavailable. Check the connection and data service.', severity: 'error' })
   if (connectionProblem) issues.push({ id: 'connection', label: 'Market', detail: `${connectionFailure ? 'Market connection interrupted' : 'Waiting for a live market connection'}. Check the connection for current prices.`, severity: 'warning' })
-  if (status !== 'Live' && status !== 'Connecting') issues.push({ id: 'catalog', label: 'Contracts', detail: status === 'Cached' ? 'Cached market data' : status, severity: status === 'Incomplete' || status === 'Unavailable' || status === 'Cached' ? 'warning' : 'info' })
+  if (status !== 'Live' && status !== 'Connecting') issues.push({ id: 'catalog', label: 'Contracts', detail: status === 'Cached' ? 'Cached contract data. Check the connection for current contracts.' : status === 'Unavailable' ? 'Contract verification is unavailable. Check the connection and data service.' : status, severity: status === 'Incomplete' || status === 'Unavailable' || status === 'Cached' ? 'warning' : 'info' })
   if (copyState.error) issues.push({ id: 'copy', label: 'Copy chart', detail: copyState.error, severity: 'error' })
   if (auditStatusUnavailable) issues.push({ id: 'data-audit-status', label: 'Data audit', detail: 'Audit status unavailable. Check the data service in Data settings.', severity: 'warning' })
   if (downloadStatusUnavailable) issues.push({ id: 'history-download-status', label: 'History download', detail: 'Download status unavailable. Check the data service in Data settings.', severity: 'warning' })
@@ -338,47 +339,63 @@ function App() {
     if (value) issues.push({ id: frame, label: timeframeLabel(frame), ...value, frame })
   }
   const rankedIssues = [...issues].sort((a, b) => ({ error: 0, warning: 1, info: 2 }[a.severity] - { error: 0, warning: 1, info: 2 }[b.severity]))
-  const errorKey = JSON.stringify(rankedIssues.filter(issue => issue.severity === 'error').map(({ id, label, detail }) => ({ id, label, detail })))
-  const previousErrors = useRef(new Map<string, string>())
-  const [errorAnnouncement, setErrorAnnouncement] = useState('')
-  useLayoutEffect(() => {
-    const errors = JSON.parse(errorKey) as { id: string; label: string; detail: string }[]
-    const added = errors.filter(error => !previousErrors.current.has(error.id))
-    const changed = errors.filter(error => previousErrors.current.get(error.id) !== error.detail)
-    if (added.length && statusRow.current) statusRow.current.scrollTop = 0
-    setErrorAnnouncement(changed.map(error => `${error.label}: ${error.detail}`).join('. '))
-    previousErrors.current = new Map(errors.map(error => [error.id, error.detail]))
-  }, [errorKey])
-  const statusText = updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString('en-US')}` : 'Waiting for market data'
-
-  const renderStatus = (ref: React.Ref<HTMLElement> | undefined) => <footer ref={ref} data-market-status-row tabIndex={0} aria-label="Application status" onKeyDown={event => {
-      const row = event.currentTarget
-      if (row.scrollHeight <= row.clientHeight) return
-      const offset = event.key === 'ArrowDown' ? row.clientHeight / 4 : event.key === 'ArrowUp' ? -row.clientHeight / 4
-        : event.key === 'PageDown' ? row.clientHeight : event.key === 'PageUp' ? -row.clientHeight : null
-      if (offset !== null) { event.preventDefault(); row.scrollTop += offset }
-      else if (event.key === 'Home' || event.key === 'End') { event.preventDefault(); row.scrollTop = event.key === 'Home' ? 0 : row.scrollHeight }
-    }} className="min-h-0 max-h-[40%] shrink-0 overflow-y-auto border-t bg-background px-4 py-1 text-xs text-muted-foreground focus-visible:outline-2 focus-visible:outline-ring">
-      <div data-status-details data-market-status>
-        {rankedIssues.map(issue => <p key={issue.id} role={issue.severity === 'error' ? undefined : 'status'} aria-atomic="true" data-chart-shared-status-item={issue.frame} data-timeframe={issue.frame} data-chart-status={issue.frame !== undefined ? '' : undefined} className={cn('break-words py-1', issue.severity === 'error' && 'text-destructive')}><span className="font-medium">{issue.label}: </span>{issue.detail}</p>)}
-        <p aria-live="off">{statusText}</p>
-      </div>
-    </footer>
+  const toastIssues = rankedIssues.filter(issue => (issue.id !== 'catalog' || status === 'Unavailable' || status === 'Cached') && issue.severity !== 'info' && (issue.id !== 'connection' || connectionFailure))
+  const toastKey = JSON.stringify(toastIssues.map(({ id, label, detail, severity }) => ({ id, label, detail, severity })))
+  const previousToastIssues = useRef(new Map<string, string>())
+  const [toast, setToast] = useState<{ id: string; label: string; detail: string; severity: string }[]>([])
+  useEffect(() => {
+    const current = JSON.parse(toastKey) as { id: string; label: string; detail: string; severity: string }[]
+    const added = current.filter(issue => previousToastIssues.current.get(issue.id) !== issue.detail)
+    previousToastIssues.current = new Map(current.map(issue => [issue.id, issue.detail]))
+    if (added.length) setToast(shown => [...shown.filter(issue => current.some(active => active.id === issue.id) && !added.some(next => next.id === issue.id)), ...added]
+      .sort((a, b) => Number(b.severity === 'error') - Number(a.severity === 'error')).slice(0, 3))
+  }, [toastKey])
+  useEffect(() => {
+    if (!toast.length) return
+    const timer = window.setTimeout(() => setToast([]), 7000)
+    return () => window.clearTimeout(timer)
+  }, [toast])
+  const logStatus = status.startsWith('Verifying ') ? 'Verifying' : status.startsWith('Updating ') ? 'Updating' : status
+  const logIssues = rankedIssues.filter(issue => issue.id !== 'catalog' && issue.severity !== 'info').map(issue => `${issue.label}: ${issue.detail}`)
+  if (globalAudit && globalAudit.phase !== 'idle') logIssues.push(`Data audit phase: ${globalAudit.phase}`)
+  if (globalDownload && globalDownload.phase !== 'idle') logIssues.push(`History download phase: ${globalDownload.phase}`)
+  const logCause = [error, presentation.error, preferencesError, globalAudit?.error, globalDownload?.error].filter(Boolean).join('; ').slice(0, 1024)
+  const statusKey = JSON.stringify({ status: logStatus, realtime, issues: logIssues, cause: logCause })
+  const lastLoggedStatus = useRef('')
+  useEffect(() => {
+    if (statusKey === lastLoggedStatus.current) return
+    const detail = JSON.parse(statusKey) as { status: string; realtime: string; issues: string[]; cause: string }
+    let cancelled = false
+    let retryTimer: number | undefined
+    const write = (attempt: number) => {
+      void window.radarDesktop.request({ statusLog: { ...detail, updatedAt: updatedAt.current, catalog: lastCatalogProgress.current ?? null } }).then(() => {
+        if (!cancelled) lastLoggedStatus.current = statusKey
+      }).catch(cause => {
+        if (cancelled) return
+        if (attempt < 3) retryTimer = window.setTimeout(() => write(attempt + 1), 5000)
+        else console.error('Could not write market status log.', cause)
+      })
+    }
+    write(1)
+    return () => { cancelled = true; window.clearTimeout(retryTimer) }
+  }, [statusKey])
 
   const renderChart = (frame: '1H' | '15m' | '5m', navigation = false) => <div key={frame} data-timeframe-panel={frame} className="min-h-0 min-w-0 flex-1 overflow-hidden rounded-lg border bg-background">
-    {selectedID ? <MarketChart priceScaleMode={preferences.priceScaleMode} priceScalePixelsPerPercent={preferences.priceScalePixelsPerPercent} controller={multiChartControllers[frame]} priceOnly onStatus={updateChartStatus} navigation={navigation} instId={selectedID} tickSz={selectedRow?.tickSz} timeframe={frame} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={selectFromChart} /> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}
+    {selectedID ? <MarketChart controller={multiChartControllers[frame]} priceOnly onStatus={updateChartStatus} navigation={navigation} instId={selectedID} tickSz={selectedRow?.tickSz} timeframe={frame} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={selectFromChart} /> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}
   </div>
 
   return <WorkspaceViewport>
     <div className="relative flex h-full min-w-0 flex-1">
-      <span role="status" aria-atomic="true" className="sr-only">{errorAnnouncement}</span>
+      {toast.length > 0 && <div data-market-status role="status" aria-atomic="true" className="pointer-events-none absolute bottom-4 left-4 z-50 max-w-[min(28rem,90%)] rounded-md border bg-popover px-4 py-3 text-sm text-popover-foreground shadow-lg" aria-label="Application notifications">
+        {toast.map(issue => <p key={issue.id} data-chart-shared-status-item={['1H', '15m', '5m'].includes(issue.id) ? issue.id : undefined} className={cn('break-words py-1', issue.severity === 'error' && 'text-destructive')}><span className="font-medium">{issue.label}: </span>{issue.detail}</p>)}
+      </div>}
       <div className="flex h-full min-w-0 flex-1">
         <section data-chart-panel className="h-full min-w-0 flex-1" aria-label="Market chart workspace">
           <div data-chart-display-mode="multi" className="flex h-full min-h-0 flex-col">
             <span role="status" className="sr-only">{copyState.status === 'copying' ? 'Copying chart' : copyState.status === 'copied' ? 'Chart copied to clipboard' : ''}</span>
             <div ref={chartsRef} data-chart-capture className="flex min-h-0 flex-1 flex-col">
               <header data-chart-toolbar data-window-toolbar data-window-drag-region className="flex shrink-0 items-center gap-3 px-4">
-                <div className="flex min-w-0 flex-1 items-center gap-2">
+                <div className="flex min-w-0 flex-1 items-center gap-4">
                   <h1 className="sr-only">Perpetual Swap Suite</h1>
                   {selectedID && <h2 data-chart-title data-shared-chart-title className="max-w-32 truncate" title={selectedID}>{selectedID.replace(/-SWAP$/, '')}</h2>}
                   {sharedPriceText !== undefined && <><span className="sr-only">Market price</span><span data-shared-chart-price className="max-w-32 truncate" title={sharedPriceText}>{sharedPriceText}</span></>}
@@ -391,7 +408,7 @@ function App() {
                   <aside data-market-list className="flex min-h-0 flex-1 flex-col" aria-label="Contract list">
       <section data-market-scroll className="min-h-0 flex-1 overflow-y-auto [&>[data-slot=table-container]]:overflow-visible" aria-label="Perpetual swap markets">
         <Table className="table-fixed [&_tr:not([data-virtual-spacer])>:first-child]:pl-4 [&_tr:not([data-virtual-spacer])>:last-child]:pr-4" data-market-count={visible.length} data-total-market-count={rows.length} aria-rowcount={visible.length + 1}>
-          <colgroup><col className="w-[35%]" /><col className="w-[33%]" /><col className="w-[32%]" /></colgroup>
+          <colgroup><col className="w-[25%]" /><col className="w-[45%]" /><col className="w-[30%]" /></colgroup>
           <TableHeader className="sticky top-0 bg-background [&_th]:text-xs [&_th]:text-muted-foreground"><TableRow className="hover:bg-transparent"><TableHead>Contract</TableHead><TableHead className="text-right">Price</TableHead><TableHead className="text-right" aria-sort="other" aria-label={`${preferences.rankingLookback}m change By magnitude`} title="Sorted by absolute signed relative change from completed candles, largest first"><span>{preferences.rankingLookback}m change</span></TableHead></TableRow></TableHeader>
           {visible.length ? <MarketRowsViewport ids={visibleIds}>{index => <MarketRowView row={visible[index]} index={index} selected={visible[index].instId === selectedID} lookback={preferences.rankingLookback} onSelect={setSelected} />}</MarketRowsViewport> : <TableBody><TableRow><TableCell colSpan={3}>
             <Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{emptyDescription}</EmptyDescription></EmptyHeader></Empty>
@@ -399,7 +416,6 @@ function App() {
         </Table>
       </section>
                   </aside>
-                  {renderStatus(statusRow)}
                 </div>
                 {renderChart('1H', true)}
                 </div>

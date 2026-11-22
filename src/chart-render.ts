@@ -43,7 +43,7 @@ export function createChartPlotCache(measureText: (text: string) => number, layo
   const geometry = createChartGeometryCache(measureText)
   type Plot = { sourceBefore?: Bar; sourceAfter?: Bar; fixedGutter?: number; bars: readonly Bar[]; geometry: ReturnType<typeof geometry>; before?: Bar; after?: Bar }
   const cache = new WeakMap<readonly Bar[], WeakMap<object, { bars: readonly Bar[]; variants: Plot[]; windowBars?: number }>>()
-  return (window: ReadyChartWindow | null, size: { width: number; height: number }, overscan: ChartGeometryOverscan = {}, currentPriceTickSz?: string | null, priceOnly = false, viewport?: { count?: number; spacing?: number; offset: number; fixedGutter?: number }, priceScale?: { mode: 'fixed' | 'auto'; pixelsPerPercent: number; wheelFraction: number }): Plot | null => {
+  return (window: ReadyChartWindow | null, size: { width: number; height: number }, overscan: ChartGeometryOverscan = {}, currentPriceTickSz?: string | null, priceOnly = false, viewport?: { count?: number; spacing?: number; offset: number; fixedGutter?: number }, wheelFraction = 0): Plot | null => {
     if (!window || !(size.width > 0 && size.height > 0)) return null
     let liveVariants = cache.get(window.bars)
     if (!liveVariants) { liveVariants = new WeakMap(); cache.set(window.bars, liveVariants) }
@@ -66,8 +66,10 @@ export function createChartPlotCache(measureText: (text: string) => number, layo
       && plot.fixedGutter === viewport?.fixedGutter
       && (spacing !== undefined || (plot.geometry.windowBars ?? 96) === (count ?? 96))
       && plot.geometry.currentPriceTickSz === currentPriceTickSz && plot.geometry.priceOnly === priceOnly
-      && plot.geometry.priceScaleMode === priceScale?.mode && plot.geometry.priceScalePixelsPerPercent === priceScale?.pixelsPerPercent
-      && (priceScale?.mode !== 'fixed' || plot.geometry.priceScaleBase === chartPricePresentation(plot.geometry, chartWheelContentOffset(priceScale.wheelFraction, plot.geometry.barPitch, Boolean(plot.before), Boolean(plot.after)), false).base)
+      && (() => {
+        const current = chartPricePresentation(plot.geometry, chartWheelContentOffset(wheelFraction, plot.geometry.barPitch, Boolean(plot.before), Boolean(plot.after)), false)
+        return plot.geometry.priceAxis.base === current.base && plot.geometry.priceAxis.centerPrice === current.centerPrice
+      })()
       && plot.sourceBefore === overscan.before && plot.sourceAfter === overscan.after)
     if (cached) return cached
     const bars = viewport && spacing === undefined ? sourceBars.filter(bar => bar.hour >= firstHour - 0.001 && bar.hour <= endHour + 0.001) : sourceBars
@@ -75,18 +77,18 @@ export function createChartPlotCache(measureText: (text: string) => number, layo
     const before = viewport ? sourceBars.find(bar => bar.hour === bars[0].hour - window.intervalMS) ?? overscan.before : overscan.before
     const after = viewport ? sourceBars.find(bar => bar.hour === bars.at(-1)!.hour + window.intervalMS) ?? overscan.after : overscan.after
     const options = { ...size, endHour, intervalMS: window.intervalMS, windowBars: count, barSpacing: spacing, fixedGutter: viewport?.fixedGutter, layoutDensity,
-      liveClose: (window.liveBar && window.liveBar.hour <= endHour && window.liveBar.hour >= firstHour ? window.liveBar : bars.at(-1)!).close, currentPriceTickSz, priceOnly, priceScaleMode: priceScale?.mode, priceScalePixelsPerPercent: priceScale?.pixelsPerPercent }
+      liveClose: (window.liveBar && window.liveBar.hour <= endHour && window.liveBar.hour >= firstHour ? window.liveBar : bars.at(-1)!).close, currentPriceTickSz, priceOnly }
     let projected = geometry(bars, options, { before, after })
-    if (priceScale?.mode === 'fixed') {
+    {
       // A changed reference can widen labels and reveal a different edge candle.
       // Keep the gutter monotonic until geometry and displayed reference agree.
       let gutter = viewport?.fixedGutter ?? projected.gutter
       for (;;) {
-        const offset = chartWheelContentOffset(priceScale.wheelFraction, projected.barPitch, Boolean(projected.before), Boolean(projected.after))
-        const base = chartPricePresentation(projected, offset, false).base
+        const offset = chartWheelContentOffset(wheelFraction, projected.barPitch, Boolean(projected.before), Boolean(projected.after))
+        const { base, centerPrice } = chartPricePresentation(projected, offset, false)
         if (viewport?.fixedGutter === undefined) gutter = Math.max(gutter, projected.measuredGutter)
-        if (projected.priceScaleBase === base && projected.gutter === gutter) break
-        projected = geometry(bars, { ...options, fixedGutter: gutter, priceScaleBase: base }, { before, after })
+        if (projected.priceAxis.base === base && projected.priceAxis.centerPrice === centerPrice && projected.gutter === gutter) break
+        projected = geometry(bars, { ...options, fixedGutter: gutter, priceScaleBase: base, priceScaleCenter: centerPrice }, { before, after })
       }
     }
     const plot = { bars: projected.bars, before: projected.before, after: projected.after, sourceBefore: overscan.before, sourceAfter: overscan.after, fixedGutter: viewport?.fixedGutter, geometry: projected }

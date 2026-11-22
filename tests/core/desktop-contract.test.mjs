@@ -12,7 +12,7 @@ test('desktop requests accept each supported operation and preserve the public p
     { snapshot: { sinceRevision: -1, serviceSession: 'collector-1' } },
     { snapshot: { sinceRevision: 0, serviceSession: 'collector-1' } },
     { preferences: { action: 'read' } },
-    { preferences: { action: 'update', values: { chartTimeframe: '5m', rankingLookback: 15, historyDays: 30, liquidity: { spread: { enabled: true, maxPercent: .05 }, depth: { enabled: false, minUSDT: 100_000 }, slippage: { enabled: true, maxPercent: .1, notionalUSDT: 100_000 }, volume24h: { minUSDT: 30_000_000 }, openInterest: { minUSDT: 5_000_000 }, volumeStability: { maxRatio: 2, enabled: false } } } } },
+    { preferences: { action: 'update', values: { rankingLookback: 15, historyDays: 30, liquidity: { spread: { enabled: true, maxPercent: .05 }, depth: { enabled: false, minUSDT: 100_000 }, slippage: { enabled: true, maxPercent: .1, notionalUSDT: 100_000 }, volume24h: { minUSDT: 30_000_000 }, openInterest: { minUSDT: 5_000_000 }, volumeStability: { maxRatio: 2, enabled: false } } } } },
     { preferences: { action: 'update', values: { liquidity: { slippage: { notionalUSDT: 200_000 } } } } },
     ...['start', 'cancel', 'status', 'repair'].map(action => ({ dataAudit: { action } })),
     ...['start', 'cancel', 'status'].map(action => ({ historyDownload: { action } })),
@@ -88,6 +88,9 @@ test('retired protocol operations and appearance preferences have no accepted co
     { hourlyVolumeStabilityEnabled: true },
     { preferences: { action: 'update', values: { windowBlurRadius: 10 } } },
     { preferences: { action: 'update', values: { frostedBackgroundEnabled: true } } },
+    { preferences: { action: 'update', values: { chartTimeframe: '1H' } } },
+    { preferences: { action: 'update', values: { priceScaleMode: 'fixed' } } },
+    { preferences: { action: 'update', values: { priceScalePixelsPerPercent: 25 } } },
   ]) reject(request)
 })
 

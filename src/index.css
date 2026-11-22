@@ -97,6 +97,9 @@
   --ui-font-size: 12px;
   --ui-font-meta: 11px;
   --ui-font-heading: 13px;
+  --market-font-size: 14px;
+  --market-heading-size: 13px;
+  --workspace-title-size: 15px;
   --ui-line-height: 16px;
   --ui-line-meta: 14px;
   --ui-row-height: 28px;
@@ -111,7 +114,7 @@
   --chart-top-inset: var(--space-micro);
   --chart-price-top-inset: 0px;
   --chart-row-gap: var(--space-micro);
-  --chart-bottom-axis-height: 16px;
+  --chart-bottom-axis-height: 25px;
   color-scheme: light;
   --positive: rgb(68 151 130);
   --negative: rgb(223 72 76);
@@ -124,10 +127,11 @@
   --chart-roc-negative-area: color-mix(in srgb, var(--negative) 12%, transparent);
   --chart-positive-label: color-mix(in srgb, var(--positive) 50%, var(--foreground));
   --chart-negative-label: color-mix(in srgb, var(--negative) 50%, var(--foreground));
-  --chart-text-size: 11px;
+  --chart-text-size: 13px;
   --ui-weight-normal: 400;
   --ui-weight-emphasis: 500;
   --market-row-border: color-mix(in srgb, var(--border) 40%, transparent);
+  --market-change-light-background: oklch(0.145 0 0);
   --chart-line-width: 1px;
   --chart-legend-gap: calc(var(--space-annotation-small) * 2);
   --chart-price-label-padding-y: var(--space-1);
@@ -326,9 +330,22 @@ html[data-presentation-idle] *, html[data-presentation-idle] *::before, html[dat
 }
 
 [data-market-list] [data-slot="table-row"][data-market-index] { border-color: var(--market-row-border); }
-[data-market-list] [data-slot="table-cell"], [data-market-list] h1 { font-weight: var(--ui-weight-normal); }
-[data-market-list] [data-slot="table-head"] { font-weight: var(--ui-weight-normal); }
-[data-chart-title] { font-size: var(--ui-font-size); font-weight: var(--ui-weight-emphasis); }
+[data-market-list] [data-slot="table-cell"], [data-market-list] h1 { font-size: var(--market-font-size); font-weight: var(--ui-weight-normal); }
+[data-market-list] [data-slot="table-head"] { font-size: var(--market-heading-size); font-weight: var(--ui-weight-normal); }
+[data-chart-title] { font-size: var(--workspace-title-size); font-weight: 700; }
+[data-shared-chart-price] { font-size: var(--workspace-title-size); font-weight: var(--ui-weight-normal); }
+
+/* Preserve the prescribed market colors with readable contrast in light mode. */
+@media (prefers-color-scheme: light) {
+  [data-market-change="up"] > span, [data-market-change="down"] > span {
+    width: fit-content;
+    max-width: 100%;
+    margin-inline-start: auto;
+    padding-inline: var(--space-1);
+    border-radius: var(--radius-sm);
+    background: var(--market-change-light-background);
+  }
+}
 [data-chart-inspection-readout][hidden] { display: none; }
 
 /* Fieldset owns legend separation: the native legend is outside its flex flow. */

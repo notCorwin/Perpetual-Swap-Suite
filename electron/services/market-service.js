@@ -4,6 +4,7 @@ import { beginOperation, measureOperation } from './operations.js'
 import { networkResource } from './network-operations.js'
 import { PreparedChartPipeline } from './prepared-chart-service.js'
 import { MetadataStore, DEFAULT_PREFERENCES, validatePreferences } from './metadata-store.js'
+import { CHART_PRIMARY_TIMEFRAME } from './preferences.js'
 import { MarketHistory } from './market-history.js'
 import { HistoryDownload } from './history-download.js'
 import { eligibleInstrument, evaluateLiquidity, createLiquidityEvaluator, quoteTurnover24h } from './liquidity.js'
@@ -262,7 +263,8 @@ const priceRecord = row => Object.fromEntries(candleFields.map(field => [field, 
 
 /** Owns market observations and projections; HistorySync owns every historical source task. */
 export class MarketService {
-  constructor(store, preferences = () => DEFAULT_PREFERENCES, fetcher = fetch, autoRefresh = true, { metadata, requestTimeout = REQUEST_TIMEOUT, webSocketFactory } = {}) {
+  constructor(store, preferences = () => DEFAULT_PREFERENCES, fetcher = fetch, autoRefresh = true, { metadata, requestTimeout = REQUEST_TIMEOUT, webSocketFactory, onStatusChange } = {}) {
+    this.onStatusChange = onStatusChange
     if (typeof preferences !== 'function') throw new TypeError('A full Preferences callback is required.')
     this.store = store
     this.preferences = preferences
@@ -419,7 +421,7 @@ export class MarketService {
     }]))
     this.preparedCharts = new PreparedChartPipeline({ store, history, normalize: normalizedStatistics, revision: instId => this.dataRevision(instId), instrument: instId => this.instruments.get(instId),
       streaming: (instId, timeframe) => this.priceStreaming(instId, timeframe),
-      acquire: (_instId, timeframe) => timeframe === this.preferences().chartTimeframe,
+      acquire: (_instId, timeframe) => timeframe === CHART_PRIMARY_TIMEFRAME,
       onFocus: () => this.scheduleSubscriptions() })
     this.candleDerivations = new CandleDerivations({ store,
       onLive: (instId, timeframe, row, context) => {
@@ -440,6 +442,7 @@ export class MarketService {
   touchList() {
     this.canonicalList = null
     this.revision += 1
+    this.onStatusChange?.()
     if (!this.presentationActive || !this.marketListeners.size || this.marketPublicationTimer || this.closing) return
     // Coalesce a batch of market changes into one renderer wakeup.
     this.marketPublicationTimer = setTimeout(() => {
@@ -1939,7 +1942,7 @@ export class MarketService {
   }
 
   statisticsAcquisitionDemand(instId, timeframe) {
-    return this.listedUniverse.has(instId) && timeframe === this.preferences().chartTimeframe
+    return this.listedUniverse.has(instId) && timeframe === CHART_PRIMARY_TIMEFRAME
       || Boolean(this.preparedCharts.focusFor(`${instId}:${timeframe}`))
   }
 
@@ -3198,7 +3201,6 @@ export class MarketService {
     await this.ready
     const current = this.prefs(), previous = validatePreferences(previousPreferences)
     const liquidityChanged = liquidityConfigKey(previous.liquidity) !== liquidityConfigKey(current.liquidity)
-    if (previous.chartTimeframe !== current.chartTimeframe) this.preparedCharts.sourceStateChanged()
     if (!liquidityChanged && previous.rankingLookback === current.rankingLookback) return
     if (liquidityChanged) {
       this.historicalAssessments = new WeakMap()

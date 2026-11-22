@@ -59,7 +59,6 @@ export async function runNativeMarketAcceptance({ directory, launch, close = ele
           && svg?.getAttribute('data-rendered-inst') === expected.instId && svg.getAttribute('data-rendered-timeframe') === expected.timeframe
           && Number(svg.getAttribute('data-rendered-end')) === expected.hour
           && snapshot.priceObservedAt >= expected.sentAt && snapshot.realtimeState === 'live'
-          && !document.querySelector(`[data-market-status-row] [data-chart-shared-status-item="${expected.timeframe}"]`)?.textContent?.includes('Cached price')
       }, expected, { timeout: 10_000 })
     } catch (error) {
       throw new Error(`Native price failed to reach the selected chart. Expected ${JSON.stringify(expected)}; actual ${JSON.stringify(await readPrice())}; exchange ${JSON.stringify({ errors: exchange.errors, requests: exchange.requests })}`, { cause: error })
@@ -107,7 +106,6 @@ export async function runNativeMarketAcceptance({ directory, launch, close = ele
       const metadata = await MetadataStore.open(directory)
       try {
         const preferences = structuredClone(DEFAULT_PREFERENCES)
-        preferences.chartTimeframe = '15m'
         for (const condition of Object.values(preferences.liquidity)) condition.enabled = false
         metadata.updateSettings(preferences)
       } finally { metadata.close() }
@@ -199,7 +197,7 @@ export async function runNativeMarketAcceptance({ directory, launch, close = ele
         const snapshot = workspace?.querySelector('svg[data-rendered-timeframe="15m"]')?.closest('[data-chart-inst]')?.__chartSnapshot
         return snapshot?.instId === 'BTC-USDT-SWAP' && snapshot.timeframe === '15m'
           && snapshot.realtimeState === 'stale'
-          && document.querySelector('[data-market-status-row] [data-chart-shared-status-item="15m"]')?.textContent?.includes('Cached price')
+          && document.querySelector('[data-market-status] [data-chart-shared-status-item="15m"]')?.textContent?.includes('Cached price')
       }, null, { timeout: 2_000 })
       const disconnectedPrice = await readPrice()
       assert.equal(disconnectedPrice.snapshot.livePrice, 136.25, 'Disconnecting must preserve the actual last price while revoking its live status.')

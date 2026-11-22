@@ -5,9 +5,10 @@ import test from 'node:test'
 import { lazy } from 'react'
 import { parse } from '@babel/parser'
 import { reconcileMarketOrder, reconcileMarketRows } from './market-snapshot.ts'
-import { DEFAULT_PREFERENCES, type Preferences } from './renderer-preferences.ts'
+import { CHART_PRIMARY_TIMEFRAME, DEFAULT_PREFERENCES, type Preferences } from './renderer-preferences.ts'
 import { SnapshotOrder } from './snapshot-order.ts'
 import { formatCurrentPrice } from './price-format.ts'
+import { timeframeLabel } from './timeframe.ts'
 import type { DataAudit, HistoryDownload, MarketSnapshot, PresentationUpdate, RankedMarketRow } from './desktop-contract.ts'
 
 type View = {
@@ -16,9 +17,7 @@ type View = {
   globalAudit: DataAudit | null; globalDownload: HistoryDownload | null
   auditStatusUnavailable: boolean; downloadStatusUnavailable: boolean
   issues: { id: string; detail: string }[]
-  receiveSettingsJob(kind: 'audit' | 'download', value: DataAudit | HistoryDownload): void
-  updateSettingsStatuses(values: { id: string; label: string; detail: string; severity: 'error' | 'warning' | 'info'; transient?: boolean }[]): void
-  savePreferences(values: Partial<Preferences>): Promise<void>
+  receiveAudit(value: DataAudit): void
 }
 type Slot = { value?: unknown; dependencies?: unknown[]; cleanup?: void | (() => void) }
 
@@ -28,14 +27,14 @@ const source = readFileSync(new URL('./App.tsx', import.meta.url), 'utf8')
 const ast = parse(source, { sourceType: 'module', plugins: ['typescript', 'jsx'] })
 const component = ast.program.body.find(node => node.type === 'FunctionDeclaration' && node.id?.name === 'App')
 assert.ok(component?.type === 'FunctionDeclaration')
-const renderReturn = component.body.body.at(-1)
-assert.ok(renderReturn?.type === 'ReturnStatement')
+const renderChart = component.body.body.find(node => node.type === 'VariableDeclaration' && node.declarations.some(item => item.id.type === 'Identifier' && item.id.name === 'renderChart'))
+assert.ok(renderChart)
 const declarations = ast.program.body.filter(node => node.type === 'VariableDeclaration'
   && node.declarations.every(declaration => declaration.id.type === 'Identifier' && declaration.id.name !== 'MarketRowView'))
 const logic = stripTypeScriptTypes([
   ...declarations.map(node => source.slice(node.start!, node.end!)),
-  source.slice(component.start!, renderReturn.start!),
-  'return { preferences, rows, turnoverOrder, ready, status, error, selectedID, savePreferences, globalAudit, globalDownload, auditStatusUnavailable, downloadStatusUnavailable, issues, updateSettingsStatuses, receiveSettingsJob } }',
+  source.slice(component.start!, renderChart.start!),
+  'return { preferences, rows, turnoverOrder, ready, status, error, selectedID, globalAudit, globalDownload, auditStatusUnavailable, downloadStatusUnavailable, issues, receiveAudit } }',
 ].join('\n'))
 
 function fixture(snapshotFailure = false) {
@@ -46,7 +45,7 @@ function fixture(snapshotFailure = false) {
   const universeRequests: unknown[][] = []
   const state = {
     preferences: structuredClone(DEFAULT_PREFERENCES), revision: 1, snapshotFailure, serviceSession: 'fixture',
-    metadata: { loading: false, catalogSource: 'live', error: '' } as Pick<MarketSnapshot, 'loading' | 'catalogSource' | 'error' | 'catalogProgress'>,
+    metadata: { loading: false, catalogSource: 'live', error: '', realtimeState: 'live' } as Pick<MarketSnapshot, 'loading' | 'catalogSource' | 'error' | 'catalogProgress' | 'realtimeState'>,
     rows: [{ instId: 'BTC-USDT-SWAP', tickSz: '0.1', lastPrice: 100, rankingChange: 2, rankingAsOf: 900_000, turnover24hUSDT: 100 }] as RankedMarketRow[],
     afterUpdate: undefined as undefined | (() => Promise<void>),
     beforeUpdate: undefined as undefined | (() => Promise<void>),
@@ -63,7 +62,9 @@ function fixture(snapshotFailure = false) {
       preferences?: { action: string; values?: Partial<Preferences> }
       snapshot?: { sinceRevision: number; serviceSession?: string }
       dataAudit?: { action: string }; historyDownload?: { action: string }
+      statusLog?: unknown
     }) {
+      if (command.statusLog) return { ok: true }
       if (command.preferences) {
         if (command.preferences.action === 'update') {
           await state.beforeUpdate?.()
@@ -97,7 +98,7 @@ function fixture(snapshotFailure = false) {
   const changed = (previous: unknown[] | undefined, next: unknown[]) => !previous || previous.length !== next.length || next.some((value, index) => !Object.is(value, previous[index]))
   const environment = {
     lazy,
-    window, document, DEFAULT_PREFERENCES, SnapshotOrder, reconcileMarketRows, reconcileMarketOrder, formatCurrentPrice,
+    window, document, CHART_PRIMARY_TIMEFRAME, DEFAULT_PREFERENCES, SnapshotOrder, reconcileMarketRows, reconcileMarketOrder, formatCurrentPrice, timeframeLabel,
     chartController: { ingestPrepared() {}, setPresentationActive() {}, getSnapshot: () => ({}), setUniverse: (...args: unknown[]) => { universeRequests.push(args) } },
     usePresentation: () => presentation,
     getPresentation: () => presentation,
@@ -137,6 +138,7 @@ function fixture(snapshotFailure = false) {
     get view() { return rendered },
     get timers() { return timers },
     notify() { window.dispatchEvent(new Event('radar-market-changed')) },
+    notifyPreferences() { window.dispatchEvent(new CustomEvent('radar-preferences-changed', { detail: structuredClone(state.preferences) })) },
     notifyJob(name: 'audit' | 'download') { window.dispatchEvent(new CustomEvent(name === 'audit' ? 'radar-audit-changed' : 'radar-history-download-changed', { detail: structuredClone(state[name]) })) },
     present(update: PresentationUpdate) { presentation = update; for (const listener of transitions) listener(update); dirty = true },
     async flush() {
@@ -177,36 +179,24 @@ test('job status failures remain visible until a later authoritative update', as
   await app.flush()
   assert.equal(app.view.auditStatusUnavailable, true)
   assert.equal(app.view.downloadStatusUnavailable, true)
-  app.view.receiveSettingsJob('audit', app.state.audit)
+  app.view.receiveAudit(app.state.audit)
   await app.flush()
   assert.equal(app.view.auditStatusUnavailable, false)
   assert.equal(app.view.downloadStatusUnavailable, true)
-  const obsolete = { ...app.state.audit, serviceSession: 'old', revision: 100 }
-  app.view.receiveSettingsJob('audit', obsolete)
+  const obsolete = { ...app.state.audit, revision: 0 }
+  app.view.receiveAudit(obsolete)
   await app.flush()
   assert.equal(app.view.globalAudit?.serviceSession, 'fixture')
 })
 
-test('background job snapshots cannot be hidden by older settings state', async context => {
-  const app = fixture(); context.after(() => app.close())
-  await app.flush()
-  app.view.updateSettingsStatuses([{ id: 'data-audit', label: 'Data audit', detail: 'Audit complete.', severity: 'info' }])
-  await app.flush()
-  assert.ok(app.view.issues.some(issue => issue.id === 'data-audit' && issue.detail.includes('Audit running')))
-  assert.ok(!app.view.issues.some(issue => issue.id === 'settings-data-audit'))
-  app.view.updateSettingsStatuses([{ id: 'data-audit', label: 'Data audit', detail: 'Could not cancel audit.', severity: 'error', transient: true }])
-  await app.flush()
-  assert.ok(app.view.issues.some(issue => issue.id === 'settings-data-audit' && issue.detail.includes('Could not cancel')))
-})
-
-test('no-op and audit-only preference saves retain the active market loading state', async context => {
+test('a settings preference notification preserves active market state', async context => {
   const app = fixture(); context.after(() => app.close())
   await app.flush()
   const rows = app.view.rows, requests = app.snapshotRequests.length, universes = app.universeRequests.length
-  await app.view.savePreferences({})
+  app.state.preferences = { ...app.state.preferences, historyDays: 90 }
+  app.notifyPreferences()
   await app.flush()
-  await app.view.savePreferences({ historyDays: 90 })
-  await app.flush()
+  assert.equal(app.view.preferences.historyDays, 90)
   assert.equal(app.view.rows, rows)
   assert.equal(app.view.ready, true)
   assert.equal(app.view.status, 'Live')
@@ -215,22 +205,17 @@ test('no-op and audit-only preference saves retain the active market loading sta
   assert.equal(app.timers, 0)
 })
 
-test('a market notification arriving before the preference response stays authoritative', async context => {
+test('a market notification alongside a preference notification stays authoritative', async context => {
   const app = fixture(); context.after(() => app.close())
   await app.flush()
-  let release = () => {}
-  app.state.afterUpdate = async () => {
-    app.state.rows = [{ ...app.state.rows[0], instId: 'ETH-USDT-SWAP' }]
-    app.state.revision++
-    app.notify()
-    await new Promise<void>(resolve => { release = resolve })
-  }
-  const saving = app.view.savePreferences({ liquidity: { ...app.view.preferences.liquidity, spread: { enabled: false, maxPercent: 0.05 } } })
+  app.state.rows = [{ ...app.state.rows[0], instId: 'ETH-USDT-SWAP' }]
+  app.state.revision++
+  app.notify()
+  app.state.preferences = { ...app.state.preferences, historyDays: 90 }
+  app.notifyPreferences()
   await app.flush()
   assert.equal(app.view.rows[0]?.instId, 'ETH-USDT-SWAP')
-  const rows = app.view.rows
-  release(); await saving; await app.flush()
-  assert.equal(app.view.rows, rows)
+  assert.equal(app.view.preferences.historyDays, 90)
   assert.equal(app.view.ready, true)
   assert.equal(app.snapshotRequests.length, 2)
   assert.equal(app.snapshotRequests[1].sinceRevision, 1)
@@ -345,7 +330,9 @@ test('local snapshot failures wait for a backend notification without polling', 
   await app.flush()
   assert.equal(app.view.status, 'Unavailable')
   assert.equal(app.snapshotRequests.length, 1)
-  assert.equal(app.timers, 0)
+  assert.equal(app.timers, 1, 'The error notification schedules its dismissal.')
+  await app.flush()
+  assert.equal(app.snapshotRequests.length, 1, 'Dismissal does not poll market snapshots.')
   app.state.snapshotFailure = false
   app.notify(); await app.flush()
   assert.equal(app.snapshotRequests.length, 2)

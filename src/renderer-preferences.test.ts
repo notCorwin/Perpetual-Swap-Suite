@@ -2,10 +2,9 @@ import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
 import { DEFAULT_PREFERENCES, preferencesDraft, validatePreferencesDraft } from './renderer-preferences.ts'
 
-test('default screening settings round trip independently from chart timeframe', () => {
+test('default screening settings round trip and can be changed independently', () => {
   const draft = preferencesDraft(DEFAULT_PREFERENCES)
   assert.deepEqual(validatePreferencesDraft(draft), { values: DEFAULT_PREFERENCES, errors: {} })
-  draft.chartTimeframe = '1H'
   draft.liquidity.spread.enabled = false
   const result = validatePreferencesDraft(draft).values!
   assert.equal(result.rankingLookback, 15)
