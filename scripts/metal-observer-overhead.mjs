@@ -31,9 +31,11 @@ export function assessMetalObserverPairs(pairs, budget = defaultBudgets.renderer
   return { metrics, passed: Object.values(metrics).every(metric => metric.passed) }
 }
 
-export async function measureMetalObserver({ output = '.build/metal-observer-overhead', repeats = 5 } = {}) {
+export async function measureMetalObserver({ output, repeats = 5 } = {}) {
   assert.equal(process.platform, 'darwin', 'Native Metal observer measurement requires macOS.')
-  const directory = resolve(output), executableRoot = resolve('.build/gpu-provider'), pairs = []
+  assert.ok(output, 'Specify --output or use npm run benchmark:metal for a temporary report.')
+  assert.ok(process.env.PERPETUAL_SWAP_METAL_PROVIDER_DIR, 'Run npm run benchmark:metal to prepare the Metal provider.')
+  const directory = resolve(output), executableRoot = resolve(process.env.PERPETUAL_SWAP_METAL_PROVIDER_DIR), pairs = []
   assert.ok(Number.isInteger(repeats) && repeats >= 3 && repeats <= 15)
   await mkdir(directory, { recursive: true })
   const report = { schemaVersion: 1, observedAt: new Date().toISOString(), outcome: 'running', repeats, commandBuffers: 128,

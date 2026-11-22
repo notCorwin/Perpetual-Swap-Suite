@@ -1,17 +1,22 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mkdir,writeFile,rm,symlink,readFile,lstat } from 'node:fs/promises'
+import { mkdir,mkdtemp,writeFile,symlink,readFile,lstat } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { createMetalDiagnostic,collectMetalDiagnostic,stopMetalDiagnostic } from '../../scripts/gpu/metal-provider.mjs'
-const root=fileURLToPath(new URL('../../.build/gpu-provider-tests/',import.meta.url)),executableRoot=fileURLToPath(new URL('../../.build/gpu-provider/',import.meta.url))
+import { trashPath } from '../../scripts/electron-delivery.mjs'
 const native = process.env.PERPETUAL_SWAP_METAL_NATIVE_TESTS === '1'
+const root=await mkdtemp(join(tmpdir(),'perp-metal-tests-'))
+const executableRoot=native ? process.env.PERPETUAL_SWAP_METAL_PROVIDER_DIR : join(root,'executables')
+if(!executableRoot)throw new Error('PERPETUAL_SWAP_METAL_PROVIDER_DIR is required for native tests')
+test.after(()=>trashPath(root))
 await mkdir(executableRoot,{recursive:true,mode:0o700})
 const pid=12001
 async function fixture(t,options={}) {
   const scope=await createMetalDiagnostic({root,executableRoot,...(!native?{libraryPath:fileURLToPath(import.meta.url)}:{}),maxBytes:4096,maxRecords:64,maxProcesses:2,...options})
-  t.after(()=>rm(scope.directory,{recursive:true,force:true}));return scope
+  t.after(()=>trashPath(scope.directory));return scope
 }
 function rows(scope) {
   return [{kind:'loader',schemaVersion:1,provider:'metal-command-buffer',source:'native',measurement:'device-clock',clock:'metal-host-monotonic-seconds',pid,uid:process.getuid(),token:scope.token,hostTime:1,maxBytes:4096,maxRecords:64},
@@ -55,7 +60,7 @@ test('native GPU errors remain recorded with raw status and count, without fabri
   const report=await collect(scope);assert.equal(report.capability.complete,true);assert.equal(report.samples[0].status,'error');assert.equal(report.processes[0].nativeErrors,1)
 })
 test('symlinks, unknown files and byte-budget violations are rejected without reading outside artifacts',async t=>{
-  const scope=await fixture(t);const external=join(scope.directory,'..','outside-'+scope.token);await writeFile(external,'outside',{mode:0o600});t.after(()=>rm(external,{force:true}))
+  const scope=await fixture(t);const external=join(scope.directory,'..','outside-'+scope.token);await writeFile(external,'outside',{mode:0o600});t.after(()=>trashPath(external))
   await symlink(external,join(scope.directory,'metal-slot-0.jsonl'));const report=await collect(scope);assert.equal(report.capability.supported,false);assert.ok(report.issues.includes('unsafe-or-oversized-file'));assert.equal(await readFile(external,'utf8'),'outside')
   const oversized=await fixture(t);await writeFile(join(oversized.directory,'metal-slot-0.jsonl'),'x'.repeat(4097),{mode:0o600});assert.ok((await collect(oversized)).issues.includes('unsafe-or-oversized-file'))
   const unknown=await fixture(t);await mkdir(join(unknown.directory,'unknown'));assert.ok((await collect(unknown)).issues.includes('unknown-diagnostic-artifact'))

@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { _electron } from 'playwright'
-import { startSampling } from '../experiments/runtime-comparison/measurement/index.mjs'
+import { startSampling } from './measurement/index.mjs'
 import { waitForAsyncCondition } from './async-readiness.mjs'
 
 export const root = fileURLToPath(new URL('../', import.meta.url))

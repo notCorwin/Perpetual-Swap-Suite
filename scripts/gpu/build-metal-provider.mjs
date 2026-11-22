@@ -1,10 +1,12 @@
 import { execFile } from 'node:child_process'
 import { mkdir } from 'node:fs/promises'
 import { promisify } from 'node:util'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 const execute = promisify(execFile), source = name => fileURLToPath(new URL(name, import.meta.url))
-const directory = fileURLToPath(new URL('../../.build/gpu-provider/', import.meta.url)), output = name => join(directory, name)
+const directory = process.env.PERPETUAL_SWAP_METAL_PROVIDER_DIR && resolve(process.env.PERPETUAL_SWAP_METAL_PROVIDER_DIR)
+if (!directory) throw new Error('PERPETUAL_SWAP_METAL_PROVIDER_DIR is required; use npm run test:gpu:metal or npm run benchmark:metal.')
+const output = name => join(directory, name)
 if (process.platform !== 'darwin') throw new Error('Optional Metal diagnostics require macOS.')
 if (process.argv.slice(2).some(value => value !== '--tests')) throw new Error('Usage: node scripts/gpu/build-metal-provider.mjs [--tests]')
 await mkdir(directory, { recursive: true, mode: 0o700 })

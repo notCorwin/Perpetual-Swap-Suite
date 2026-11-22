@@ -2,7 +2,6 @@ import { constants } from 'node:fs'
 import { mkdir, mkdtemp, lstat, realpath, open, readdir, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { randomBytes } from 'node:crypto'
-import { fileURLToPath } from 'node:url'
 const kind='perp-metal-diagnostic', integer=value=>Number.isSafeInteger(value)&&value>=0
 const time=value=>typeof value==='number'&&Number.isFinite(value)&&value>=0
 const uid=()=>process.getuid?.()
@@ -21,8 +20,9 @@ async function safeRead(path,maxBytes) {
     return buffer.subarray(0,used).toString('utf8')
   } finally {await file.close()}
 }
-export async function createMetalDiagnostic({root,executableRoot,libraryPath=fileURLToPath(new URL('../../.build/gpu-provider/metal-provider.dylib',import.meta.url)),maxBytes=1024*1024,maxRecords=4096,maxProcesses=8}={}) {
+export async function createMetalDiagnostic({root,executableRoot,libraryPath=process.env.PERPETUAL_SWAP_METAL_PROVIDER_DIR && join(process.env.PERPETUAL_SWAP_METAL_PROVIDER_DIR,'metal-provider.dylib'),maxBytes=1024*1024,maxRecords=4096,maxProcesses=8}={}) {
   if(process.platform!=='darwin')throw new Error('metal-diagnostics-require-macos')
+  if(!libraryPath)throw new Error('metal-provider-directory-required')
   if(!bounded(maxBytes,4096,16*1024*1024)||!bounded(maxRecords,8,65536)||!bounded(maxProcesses,1,32))throw new Error('invalid-budget')
   executableRoot=await realpath(executableRoot)
   if(!(await lstat(executableRoot)).isDirectory())throw new Error('invalid-executable-root')

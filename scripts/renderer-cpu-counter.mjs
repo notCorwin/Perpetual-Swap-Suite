@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
+import { testArtifactDirectory } from './test-artifact-directory.mjs'
 
 const units = Object.freeze({
   Timestamp: 'Chromium monotonic wall-clock seconds',
@@ -24,7 +25,7 @@ const units = Object.freeze({
 export async function startRendererCPUCounter(page, { label = 'chart', capacity = 8_192, directory } = {}) {
   if (typeof label !== 'string' || !Number.isSafeInteger(capacity) || capacity < 1) throw new TypeError('Invalid renderer CPU counter options.')
   const id = randomUUID(), markerPrefix = `renderer-cpu:${id}:`, samples = [], captureErrors = []
-  const artifact = join(resolve(directory ?? process.env.PERPETUAL_SWAP_PROCESS_WITNESS_DIRECTORY ?? '.build/process-witness'),
+  const artifact = join(resolve(directory ?? process.env.PERPETUAL_SWAP_PROCESS_WITNESS_DIRECTORY ?? testArtifactDirectory()),
     `renderer-cpu-${label.replace(/[^a-z0-9]+/gi, '-').slice(0, 120)}-${id}.json`)
   let session, stopped, previous, origin, active = true, totalSamples = 0, droppedSamples = 0, droppedCaptureErrors = 0, totalRAFSamples = 0, invalidRAFSamples = 0
   const failed = (stage, error) => {

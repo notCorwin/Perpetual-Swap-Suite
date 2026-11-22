@@ -17,9 +17,9 @@ export async function replayHarnessFingerprint() {
       else if (entry.isFile() && code.test(entry.name)) await add(path)
     }
   }
-  for (const directory of ['scripts', 'tests/helpers', 'experiments/runtime-comparison']) await visit(directory)
+  for (const directory of ['scripts', 'tests/helpers']) await visit(directory)
   for (const path of ['package.json', 'package-lock.json']) await add(path)
   const ordered = Object.fromEntries(Object.entries(files).sort(([left], [right]) => left.localeCompare(right)))
-  return { scope: 'Code-file superset of scripts, tests/helpers and experiments/runtime-comparison, plus package manifests; build artifacts and dependencies excluded.',
+  return { scope: 'Code-file superset of scripts and tests/helpers, plus package manifests; build artifacts and dependencies excluded.',
     sha256: createHash('sha256').update(JSON.stringify(ordered)).digest('hex'), files: ordered }
 }

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { reportOutput } from './report-output.mjs'
 import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -183,7 +184,7 @@ async function measureCachedScenario(electron, page, cdp, fixture, timeframe, {
 }
 
 const app = await appEntryFor(values['app-root'] ?? projectRoot)
-const reportPath = resolve(values.output ?? join(projectRoot, '.build/chart-scroll-performance.json'))
+const reportPath = await reportOutput(values.output, 'chart-scroll-performance.json', '--output')
 const partialPath = `${reportPath}.partial`
 await mkdir(dirname(reportPath), { recursive: true })
 const userData = await mkdtemp(join(tmpdir(), 'perp-radar-chart-scroll-performance-'))

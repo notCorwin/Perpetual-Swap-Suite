@@ -1,3 +1,4 @@
+import { reportOutput } from './report-output.mjs'
 import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -31,7 +32,7 @@ const loopCapacity = Math.ceil((loopCapacityBasis.inputDurationMS + loopCapacity
 if (!offscreen) requireForegroundTests()
 
 const root = fileURLToPath(new URL('..', import.meta.url))
-const reportPath = resolve(root, process.env.PERPETUAL_SWAP_RESOURCE_REPORT ?? '.build/resource-benchmark.json')
+const reportPath = await reportOutput(process.env.PERPETUAL_SWAP_RESOURCE_REPORT, 'resource-benchmark.json', 'PERPETUAL_SWAP_RESOURCE_REPORT')
 const userData = await mkdtemp(join(tmpdir(), 'perp-market-resources-'))
 const report = { generatedAt: new Date().toISOString(), mode: 'real Electron renderer, worker backend and SQLite; synthetic native intake',
   diagnosticOnly: values.diagnostic === true,

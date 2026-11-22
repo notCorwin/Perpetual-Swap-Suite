@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { reportOutput } from './report-output.mjs'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
@@ -6,7 +7,7 @@ import { execFileSync } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
-import { percentile, summarizeResources } from '../experiments/runtime-comparison/analyze.mjs'
+import { percentile, summarizeResources } from './resource-summary.mjs'
 import { assertReadyFrame, awaitReady, delay, expectedClose, hash, installReadyRecorder, launchIdleApp, phaseWindow,
   presentationState, probe, removeReadyRecorder, root, seedAndPrepare, selectChart, setActive, waitLoad } from './app-idle-helpers.mjs'
 
@@ -28,12 +29,12 @@ async function fingerprint() {
 async function main() {
   const { values } = parseArgs({ options: { help: { type: 'boolean' }, ticks: { type: 'string' }, report: { type: 'string' } } })
   if (values.help) {
-    console.log('Usage: node scripts/test-sandbox.mjs command --desktop -- node scripts/app-idle-benchmark.mjs [--ticks 40] [--report .build/app-idle/summary.json]')
+    console.log('Usage: node scripts/test-sandbox.mjs command --desktop -- node scripts/app-idle-benchmark.mjs [--ticks 40] --report PATH')
     return
   }
   const ticksPerPhase = Number(values.ticks ?? 40), cadenceMS = 500
   if (!Number.isSafeInteger(ticksPerPhase) || ticksPerPhase < 10 || ticksPerPhase > 120) throw new Error('--ticks must be an integer from 10 to 120 per phase.')
-  const reportPath = resolve(root, values.report ?? '.build/app-idle/summary.json')
+  const reportPath = await reportOutput(values.report, 'app-idle/summary.json', '--report')
   const rawPath = resolve(dirname(reportPath), `${reportPath.split('/').at(-1).replace(/\.json$/i, '')}.raw.json`)
   if (reportPath === rawPath) throw new Error('Summary and raw output paths must differ.')
   const report = { schemaVersion: 1, outcome: 'running', startedAt: new Date().toISOString(),

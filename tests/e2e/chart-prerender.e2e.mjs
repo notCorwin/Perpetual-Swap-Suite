@@ -78,6 +78,10 @@ test('qualified rows stay stable while three timeframe surfaces load and resize'
         if (rows.length !== nodes.length || rows.some((row, index) => row !== nodes[index] || id(row) !== probe.ids[index])) fail('Chart readiness changed row identity, count or order.')
         if (table.dataset.marketCount !== probe.count || table.dataset.totalMarketCount !== probe.total) fail('Chart readiness changed the qualified list count.')
         const selected = rows.filter(row => row.getAttribute('aria-selected') === 'true').map(id)
+        if (selected.length === 1 && selected[0] === probe.pendingSelection) {
+          probe.selected = probe.pendingSelection
+          probe.pendingSelection = null
+        }
         if (selected.length !== 1 || selected[0] !== probe.selected) fail('Chart readiness changed the selected contract.')
         if (records.some(record => [...record.removedNodes].some(removed => nodes.some(row => removed === row || removed.contains(row))))) fail('A stable qualified row was detached and reinserted.')
       }
@@ -93,7 +97,7 @@ test('qualified rows stay stable while three timeframe surfaces load and resize'
     assert.equal(await page.evaluate(() => document.querySelectorAll('svg[data-prepared-chart-inst]').length), 0,
       'Qualified rows must be present while the current SVG surface is still missing.')
     await page.locator(`[aria-label="View ${coldTarget} chart"]`).evaluate(row => {
-      window.__prerenderProbe.selected = row.getAttribute('aria-label').slice(5, -6)
+      window.__prerenderProbe.pendingSelection = row.getAttribute('aria-label').slice(5, -6)
       row.click()
     })
     await page.waitForFunction(id => document.querySelector('[data-market-index][aria-selected="true"]')?.getAttribute('aria-label') === `View ${id} chart`, coldTarget)
@@ -111,7 +115,7 @@ test('qualified rows stay stable while three timeframe surfaces load and resize'
     assert.deepEqual(await page.locator('[data-multi-timeframe-charts] svg[data-rendered-timeframe]').evaluateAll(nodes => nodes.map(node => node.dataset.renderedTimeframe)), ['1H', '15m', '5m'])
     const target = initial.ids.find(id => id !== coldTarget)
     await page.locator(`[aria-label="View ${target} chart"]`).evaluate(row => {
-      window.__prerenderProbe.selected = row.getAttribute('aria-label').slice(5, -6)
+      window.__prerenderProbe.pendingSelection = row.getAttribute('aria-label').slice(5, -6)
       row.click()
     })
     await ready(target)

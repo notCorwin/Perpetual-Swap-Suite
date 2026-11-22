@@ -168,7 +168,7 @@ test('native traffic lights align with the renderer toolbar after window resizin
       }
       measurements.push({ width: actualWidth, row, title, native })
     }
-    await writeFile(join(root, '.build', 'native-topbar-geometry.json'), `${JSON.stringify(measurements, null, 2)}\n`)
+    if (process.env.PERPETUAL_SWAP_SANDBOX_REPORT_DIR) await writeFile(join(process.env.PERPETUAL_SWAP_SANDBOX_REPORT_DIR, 'native-topbar-geometry.json'), `${JSON.stringify(measurements, null, 2)}\n`)
   } finally {
     await electron.evaluate(({ BrowserWindow }, [width, height]) => BrowserWindow.getAllWindows()[0].setContentSize(width, height), previous)
     await page.waitForFunction(([width, height]) => innerWidth === width && innerHeight === height, previous)

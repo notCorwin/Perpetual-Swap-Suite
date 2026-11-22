@@ -1,13 +1,23 @@
-import { execFile } from 'node:child_process'
+import { execFile, spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { access, mkdir, mkdtemp, readFile, rename, rm } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, rename } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
+import { trashPath } from '../../scripts/electron-delivery.mjs'
 
 const execute = promisify(execFile)
 const source = fileURLToPath(new URL('./native-window-controls.m', import.meta.url))
-const directory = fileURLToPath(new URL('../../.build/native-window-controls/', import.meta.url))
+const ownedDirectory = process.env.PERPETUAL_SWAP_SANDBOX_WORK_DIR ? null : await mkdtemp(join(tmpdir(), 'perp-native-window-'))
+const directory = ownedDirectory ?? join(process.env.PERPETUAL_SWAP_SANDBOX_WORK_DIR, 'native-window-controls')
+if (ownedDirectory) process.once('exit', () => {
+  const result = spawnSync('trash', ['-s', ownedDirectory], { stdio: 'inherit' })
+  if (result.error || result.status !== 0) {
+    console.error(`Could not move temporary native window files to Trash: ${ownedDirectory}`)
+    process.exitCode = 1
+  }
+})
 const flags = ['-bundle', '-undefined', 'dynamic_lookup', '-framework', 'AppKit', '-fobjc-arc', '-Wall', '-Wextra', '-Werror']
 let measurements = Promise.resolve()
 
@@ -22,7 +32,7 @@ async function compile(architecture) {
   try {
     await execute('xcrun', ['clang', ...flags, '-arch', arch, source, '-o', intermediate])
     await rename(intermediate, addon)
-  } finally { await rm(intermediate, { force: true }) }
+  } finally { await trashPath(intermediate) }
   return addon
 }
 
@@ -65,7 +75,7 @@ async function measure(electron, windowId) {
     const report = JSON.parse(await readFile(reportPath, 'utf8'))
     if (report.error) throw new Error(`Native window controls probe: ${report.error}`)
     return { windowId: identity.windowId, ...report }
-  } finally { await rm(reportDirectory, { recursive: true, force: true }) }
+  } finally { await trashPath(reportDirectory) }
 }
 
 // Rectangles use AppKit points (DIP), relative to the outer window's top-left.

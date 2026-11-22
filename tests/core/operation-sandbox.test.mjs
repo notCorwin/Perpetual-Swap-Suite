@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { spawn, spawnSync } from 'node:child_process'
+import { access, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -10,6 +10,7 @@ import { encodeOperationJournal, operationJournalSuffix } from '../../electron/s
 import { writeBuildReuseManifest } from '../../scripts/build-artifact-reuse.mjs'
 import { operationReportHasFailures, operationReportMarkdown, summarizeOperations } from '../../scripts/operation-report.mjs'
 import { sandboxCommands, sandboxCoverage } from '../../scripts/test-sandbox.mjs'
+import { trashPath } from '../../scripts/electron-delivery.mjs'
 
 const event = (overrides = {}) => ({ schemaVersion: 2, phase: 'end', id: 'execution:1', traceId: 'trace:1', sessionId: 'session', executionId: 'execution',
   category: 'cpu', name: 'indicators.replay', resource: 'BTC-USDT-SWAP', startedAt: 1_700_000_000_000, durationMS: 4, status: 'ok', attributes: {}, ...overrides })
@@ -351,6 +352,65 @@ test('sandbox runs isolate data, enforce declared coverage, record lifecycle pai
     assert.deepEqual(manifests.map(value => value.outcome.exitCode).sort((left, right) => left - right), [0, 0, 1, 1, 23])
     assert.notEqual(manifests[0].environment.userDataDirectory, manifests[1].environment.userDataDirectory)
   } finally { await rm(output, { recursive: true, force: true }) }
+})
+
+test('default sandbox work is recoverably removed, failure diagnostics remain visible, and explicit reports survive', async () => {
+  const output = await mkdtemp(join(tmpdir(), 'perp-sandbox-report-'))
+  const runner = fileURLToPath(new URL('../../scripts/test-sandbox.mjs', import.meta.url))
+  const run = (options, exitCode) => new Promise((resolve, reject) => {
+    const source = `console.log('WORKDIR=' + process.env.PERPETUAL_SWAP_SANDBOX_WORK_DIR); process.exitCode = ${exitCode}`
+    const child = spawn(process.execPath, [runner, 'command', '--allow-empty', ...options, '--', process.execPath, '-e', source], { env: process.env, stdio: ['ignore', 'pipe', 'pipe'] })
+    let diagnostics = ''
+    for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => { diagnostics += chunk })
+    child.on('error', reject); child.on('close', code => resolve({ code, diagnostics }))
+  })
+  try {
+    const failure = await run([], 7)
+    assert.equal(failure.code, 7, failure.diagnostics)
+    assert.match(failure.diagnostics, /Sandbox failure report:/)
+    const temporary = /^WORKDIR=(.+)$/m.exec(failure.diagnostics)?.[1]
+    assert.ok(temporary)
+    await assert.rejects(access(temporary), { code: 'ENOENT' })
+    const success = await run(['--output', output], 0)
+    assert.equal(success.code, 0, success.diagnostics)
+    const retained = await readdir(output)
+    assert.equal(retained.length, 1)
+    await access(join(output, retained[0], 'summary.json'))
+    const temporarySuccess = /^WORKDIR=(.+)$/m.exec(success.diagnostics)?.[1]
+    assert.ok(temporarySuccess)
+    await assert.rejects(access(temporarySuccess), { code: 'ENOENT' })
+  } finally { await trashPath(output) }
+})
+
+test('desktop sandbox protects renderer output against concurrent and nested builds', { skip: process.platform !== 'darwin', timeout: 60_000 }, async () => {
+  const runner = fileURLToPath(new URL('../../scripts/test-sandbox.mjs', import.meta.url))
+  const root = fileURLToPath(new URL('../../', import.meta.url))
+  const lockModule = new URL('../../scripts/build-lock.mjs', import.meta.url).href
+  const lockProgram = `import { withBuildLock } from ${JSON.stringify(lockModule)}; await withBuildLock(process.argv[1], async () => {})`
+  const lockAttempt = () => spawnSync(process.execPath, ['--input-type=module', '-e', lockProgram, root], { encoding: 'utf8' })
+  const command = `import { spawnSync } from 'node:child_process';
+    const nested = spawnSync(process.execPath, ['--input-type=module', '-e', ${JSON.stringify(lockProgram)}, ${JSON.stringify(root)}]);
+    console.log('nested-blocked=' + (nested.status !== 0));
+    console.log('renderer-locked'); await new Promise(resolve => process.stdin.once('data', resolve));`
+  const child = spawn(process.execPath, [runner, 'command', '--desktop', '--allow-empty', '--', 'node', '--input-type=module', '-e', command], { stdio: ['pipe', 'pipe', 'pipe'] })
+  let diagnostics = ''
+  const ready = new Promise((resolveReady, reject) => {
+    const add = chunk => { diagnostics += chunk; if (diagnostics.includes('renderer-locked')) resolveReady() }
+    child.stdout.on('data', add); child.stderr.on('data', add)
+    child.on('error', reject); child.on('close', code => { if (!diagnostics.includes('renderer-locked')) reject(new Error(`Sandbox exited ${code}: ${diagnostics}`)) })
+  })
+  const finished = new Promise((resolveFinished, reject) => { child.on('error', reject); child.on('close', code => resolveFinished(code)) })
+  try {
+    await ready
+    assert.match(diagnostics, /nested-blocked=true/, 'A build started inside a desktop command must fail fast rather than deadlock.')
+    const blocked = lockAttempt()
+    assert.notEqual(blocked.status, 0, 'A concurrent build must fail before touching dist.')
+    assert.match(blocked.stderr, /Another build or packaging operation is running/)
+    child.stdin.end('finish')
+    assert.equal(await finished, 0, diagnostics)
+    const released = lockAttempt()
+    assert.equal(released.status, 0, released.stderr)
+  } finally { if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM') }
 })
 
 test('reports expose killed executions, missing raw records and incomplete opt-in native GPU traces', async () => {

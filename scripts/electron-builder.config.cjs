@@ -9,6 +9,6 @@ module.exports = {
   mac: { ...build.mac, identity: null, notarize: false },
   extraResources: [
     ...(build.extraResources ?? []),
-    { from: '.build/build-revision.json', to: 'build-revision.json' },
+    { from: process.env.PERPETUAL_SWAP_BUILD_METADATA || '.build/build-revision.json', to: 'build-revision.json' },
   ],
 }

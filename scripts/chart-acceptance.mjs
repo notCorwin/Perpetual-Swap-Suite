@@ -270,13 +270,19 @@ export async function openChart(page, fixture, timeframe = fixture.timeframe, { 
     }))
     if (Math.abs(state.span - 96.5) <= .05) break
     const viewport = page.viewportSize()
-    await page.setViewportSize({ ...viewport, width: Math.round(viewport.width + (96.5 - state.span) * state.spacing * state.scale) })
+    // The 15m and 5m panels share a row, so each gains only half of an
+    // added viewport pixel. The 1H panel spans the full row.
+    const widthFactor = timeframe === '1H' ? 1 : 2
+    await page.setViewportSize({ ...viewport, width: Math.round(viewport.width + (96.5 - state.span) * state.spacing * state.scale * widthFactor) })
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
   }
   await waitForRendered(page, fixture, timeframe)
   const targetBars = Number(await page.locator(`[data-acceptance-target] [data-chart-inst="${fixture.instId}"]`).getAttribute('data-chart-target-bars'))
   assert.ok(validChartWindowBars(targetBars), 'The selected chart must publish a supported prepared demand bucket.')
-  fixture.currentWindowBars = Math.max(fixture.currentWindowBars ?? 96, targetBars)
+  // The full-width 1H panel can request a larger bucket than the selected
+  // half-width panel; use all three real demands when classifying maintenance.
+  const workspaceTargets = await page.locator('[data-multi-timeframe-charts] [data-chart-inst]').evaluateAll(charts => charts.map(chart => Number(chart.dataset.chartTargetBars)))
+  fixture.currentWindowBars = Math.max(fixture.currentWindowBars ?? 96, targetBars, ...workspaceTargets.filter(validChartWindowBars))
   if (!liveOverlay) {
     const count = Number(await page.locator(`[data-acceptance-target] [data-chart-inst="${fixture.instId}"]`).getAttribute('data-chart-rendered-bars'))
     assert.ok(count >= 96 && count <= 98, `Expected 96 full slots plus partially visible candles; got ${count}.`)

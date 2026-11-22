@@ -1,7 +1,8 @@
+import { reportOutput } from './report-output.mjs'
 // Renderer-only visual acceptance, using the same real Electron/IPC-boundary
 // approach as tests/e2e/workspace.e2e.mjs. Build the renderer before running:
 // npm exec --yes --package=node@24.22.0 -- node scripts/workspace-visual-check.mjs
-// PNGs and measured colors are written to .build/ui-review/visual by default.
+// Set PERPETUAL_SWAP_UI_VISUAL_OUTPUT or use a sandbox with explicit --output to retain the report.
 import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -10,7 +11,7 @@ import { _electron } from 'playwright'
 import { assertIndicatorLegends, assertWorkspaceLayout } from './chart-acceptance.mjs'
 
 const root = new URL('..', import.meta.url).pathname
-const output = resolve(process.env.PERPETUAL_SWAP_UI_VISUAL_OUTPUT ?? '.build/ui-review/visual')
+const output = await reportOutput(process.env.PERPETUAL_SWAP_UI_VISUAL_OUTPUT, 'workspace-visual', 'PERPETUAL_SWAP_UI_VISUAL_OUTPUT')
 const userData = await mkdtemp(join(tmpdir(), 'perp-visual-'))
 const report = { fixture: 'Offline desktop-boundary fixture; production renderer and preload', contrastMethod: 'WCAG relative luminance after browser sRGB conversion and compositing each element over its painted ancestor backgrounds. Plot intersections and antialiasing require screenshot review; outlined mandated colors are reported separately.', baselineWidth: 1600, screenshots: [], measurements: [], failures: [] }
 await mkdir(output, { recursive: true })

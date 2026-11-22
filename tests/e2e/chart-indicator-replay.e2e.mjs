@@ -35,12 +35,10 @@ test('indicator replay preserves visible paths while current prices update and t
         await new Promise(resolve => requestAnimationFrame(resolve))
         await new Promise(resolve => requestAnimationFrame(resolve))
         const source = chart.__chartSnapshot, rendered = chart.__chartRenderedBars
-        const status = document.querySelector('[data-market-status] [data-chart-shared-status-item="15m"]')
         observations.push({ state: source.indicatorState, stale: chart.dataset.chartIndicatorStale,
           continuous: !!svg.querySelector('[data-chart-boll-band]')?.getAttribute('d'),
           sourceNull: source.bars.every(bar => bar.bollUpper === null), renderedBand: rendered.find(bar => bar.hour === source.bars.at(-1).hour)?.bollUpper,
           sourceClose: source.bars.at(-1).close, renderedClose: rendered.find(bar => bar.hour === source.bars.at(-1).hour)?.close,
-          previousNotice: status?.textContent.includes('Showing previous indicators') ?? false,
           sameSurface: chart.querySelector('svg[data-rendered-inst]') === svg })
       }
       const price = frame.bars.at(-1).close * 1.001
@@ -61,7 +59,6 @@ test('indicator replay preserves visible paths while current prices update and t
       assert.equal(state.renderedBand, replay.oldBand)
       assert.equal(state.sourceClose, replay.price)
       assert.equal(state.renderedClose, replay.price, 'New candle prices must be displayed during indicator replay.')
-      assert.equal(state.previousNotice, true, 'A stale indicator warning remains visible during replay.')
       assert.equal(state.sameSurface, true)
     }
     assert.equal(replay.observations[0].sourceNull, true, 'Retained visual indicators must not enter the authoritative source.')

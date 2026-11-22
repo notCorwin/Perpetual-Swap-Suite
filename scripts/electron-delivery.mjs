@@ -2,27 +2,36 @@ import assert from 'node:assert/strict'
 import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { constants } from 'node:fs'
-import { access, lstat, mkdir, readFile, readdir, rename, rm } from 'node:fs/promises'
+import { access, lstat, mkdir, readFile, readdir, rename } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
+import { buildChildStdio } from './build-lock.mjs'
 
 const execute = promisify(execFile)
 export const productName = 'Perpetual Swap Suite'
 
-// Keep packaged artifacts in dist; discard build metadata, reports, and test replicas
-// only after the operation has finished using them, including on failure.
+// Never permanently delete build output: the user can restore it from Trash.
+export async function trashPath(path) {
+  try { await lstat(path) }
+  catch (error) { if (error.code === 'ENOENT') return; throw error }
+  await run('trash', ['-s', path])
+}
+
+// Only disposable, inactive files belong in the root build directory. Active
+// test and packaging data have their own lifetime outside this directory.
 export async function withBuildCleanup(root, operation) {
   let operationFailure
   try {
+    await trashPath(join(root, '.build'))
     return await operation()
   } catch (error) {
     operationFailure = { error }
     throw error
   } finally {
     try {
-      await rm(join(root, '.build'), { recursive: true, force: true })
+      await trashPath(join(root, '.build'))
     } catch (cause) {
-      const cleanupError = new Error('Could not remove .build after the app build. Close processes using it and remove the directory before rebuilding.', { cause })
+      const cleanupError = new Error('Could not move .build to Trash after the app build. Close processes using it and move the directory to Trash before rebuilding.', { cause })
       if (operationFailure) throw new AggregateError([operationFailure.error, cleanupError], 'The app build and .build cleanup both failed.')
       throw cleanupError
     }
@@ -65,7 +74,7 @@ export async function quitInstalledApp(destination) {
 
 export async function run(command, args, options = {}) {
   await new Promise((resolveRun, reject) => {
-    const child = spawn(command, args, { stdio: 'inherit', ...options })
+    const child = spawn(command, args, { stdio: buildChildStdio(), ...options })
     child.once('error', reject)
     child.once('exit', (code, signal) => code === 0 ? resolveRun() : reject(new Error(`${basename(command)} failed (${signal ?? code}).`)))
   })
@@ -127,15 +136,15 @@ export async function installApp({ candidate, destination, revision, validate = 
     const installedArtifact = await validate(destination, revision)
     const report = await verify(destination, revision, { stage: 'installed', artifact: installedArtifact, candidateArtifact, candidateVerification })
     verified = true
-    if (backedUp) await rm(backup, { recursive: true })
+    if (backedUp) await trashPath(backup)
     return report
   } catch (error) {
     if (!verified) {
-      if (replaced) await rm(destination, { recursive: true, force: true })
+      if (replaced) await trashPath(destination)
       if (backedUp) await rename(backup, destination)
     }
     throw error
   } finally {
-    await rm(staged, { recursive: true, force: true })
+    await trashPath(staged)
   }
 }

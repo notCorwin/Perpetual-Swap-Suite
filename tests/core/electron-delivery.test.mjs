@@ -3,7 +3,8 @@ import { mkdtemp, mkdir, readFile, readdir, writeFile, cp, rm } from 'node:fs/pr
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { fingerprintInputs, installApp, withBuildCleanup } from '../../scripts/electron-delivery.mjs'
+import { fingerprintInputs, installApp, trashPath, withBuildCleanup } from '../../scripts/electron-delivery.mjs'
+import { buildRenderer } from '../../scripts/build-renderer.mjs'
 
 test('packaging fingerprints ignore Finder metadata while detecting changed application inputs', async t => {
   const root = await mkdtemp(join(tmpdir(), 'perpetual-swap-fingerprint-test-'))
@@ -35,6 +36,41 @@ async function setup(t) {
     verify: async path => ({ executable: path }),
   }
 }
+
+test('renderer build clears old build files before running and temporary files after a failure', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'perpetual-swap-renderer-cleanup-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const build = join(root, '.build')
+  await mkdir(build)
+  await writeFile(join(build, 'old'), 'old')
+  const failure = new Error('Type check failed')
+  await assert.rejects(buildRenderer({ root, execute: async () => {
+    await assert.rejects(readdir(build), { code: 'ENOENT' })
+    await mkdir(build)
+    await writeFile(join(build, 'temporary'), 'temporary')
+    throw failure
+  } }), error => error === failure)
+  await assert.rejects(readdir(build), { code: 'ENOENT' })
+})
+
+test('renderer build does not publish a reuse manifest when source changes during compilation', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'perpetual-swap-renderer-snapshot-'))
+  const previous = process.env.PERPETUAL_SWAP_BUILD_RESULT_MANIFEST
+  t.after(async () => {
+    if (previous === undefined) delete process.env.PERPETUAL_SWAP_BUILD_RESULT_MANIFEST
+    else process.env.PERPETUAL_SWAP_BUILD_RESULT_MANIFEST = previous
+    await trashPath(root)
+  })
+  const manifest = join(root, 'result.json')
+  process.env.PERPETUAL_SWAP_BUILD_RESULT_MANIFEST = manifest
+  await writeFile(join(root, 'source.js'), 'before')
+  let calls = 0
+  await assert.rejects(buildRenderer({ root, execute: async () => {
+    calls++
+    if (calls === 1) await writeFile(join(root, 'source.js'), 'after')
+  } }), /Build inputs changed/)
+  await assert.rejects(readFile(manifest), { code: 'ENOENT' })
+})
 
 test('a rejected candidate never changes the installed app', async t => {
   const options = await setup(t)
@@ -110,7 +146,8 @@ for (const fails of [false, true]) {
     await writeFile(artifact, 'packaged app')
     const failure = new Error('Packaging failed')
     const operation = withBuildCleanup(root, async () => {
-      assert.equal(await readFile(join(build, 'old-test-replica', 'data'), 'utf8'), 'stale')
+      await assert.rejects(readdir(build), { code: 'ENOENT' })
+      await mkdir(build, { recursive: true })
       await writeFile(join(build, 'build-revision.json'), 'metadata')
       if (fails) throw failure
       return 'packaged'

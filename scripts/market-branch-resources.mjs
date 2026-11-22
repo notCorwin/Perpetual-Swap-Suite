@@ -1,14 +1,15 @@
 #!/usr/bin/env node
+import { reportOutput } from './report-output.mjs'
 import assert from 'node:assert/strict'
 import { fork } from 'node:child_process'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { startSampling } from '../experiments/runtime-comparison/measurement/index.mjs'
-import { summarizeResources } from '../experiments/runtime-comparison/analyze.mjs'
+import { startSampling } from './measurement/index.mjs'
+import { summarizeResources } from './resource-summary.mjs'
 
 if (process.env.PERPETUAL_SWAP_SANDBOX !== '1' || process.env.PERPETUAL_SWAP_ALLOW_NETWORK !== '0') throw new Error('Run in the network-disabled test sandbox.')
-const output = resolve(process.argv[2] ?? '.build/market-branch-resources.json')
+const output = await reportOutput(process.argv[2], 'market-branch-resources.json', 'an output path as the first argument')
 const cycles = process.argv[3] ?? '1000'
 const child = fork(fileURLToPath(new URL('./market-branch-replay.mjs', import.meta.url)), [output, cycles], {
   env: { ...process.env, PERPETUAL_SWAP_REPLAY_CONTROLLER: '1' }, stdio: ['ignore', 'inherit', 'inherit', 'ipc'],

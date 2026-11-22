@@ -154,10 +154,17 @@ async function publishManifest(resolvedRoot, path, inputs) {
   return manifest
 }
 
-export async function writeBuildReuseManifest({ root = projectRoot, manifestPath, toolchain, environment = process.env } = {}) {
+export async function captureBuildInputs({ root = projectRoot, manifestPath, toolchain, environment = process.env } = {}) {
+  const resolvedRoot = resolve(root)
+  const path = manifestPathFrom(resolvedRoot, manifestPath)
+  return snapshot(resolvedRoot, { manifestPath: path, toolchain, environment })
+}
+
+export async function writeBuildReuseManifest({ root = projectRoot, manifestPath, toolchain, environment = process.env, expectedBuildKey } = {}) {
   const resolvedRoot = resolve(root)
   const path = manifestPathFrom(resolvedRoot, manifestPath)
   const inputs = await snapshot(resolvedRoot, { manifestPath: path, toolchain, environment })
+  if (expectedBuildKey && inputs.key !== expectedBuildKey) throw new Error('Build inputs changed while the renderer was being built; refusing to write a reusable manifest.')
   return publishManifest(resolvedRoot, path, inputs)
 }
 

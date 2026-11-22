@@ -1,3 +1,4 @@
+import { reportOutput } from './report-output.mjs'
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, extname, join, resolve } from 'node:path'
@@ -78,11 +79,11 @@ async function assertHiddenOffscreen(electron) {
   return state
 }
 
-const userData = await mkdtemp(join(tmpdir(), 'perp-instrument-navigation-benchmark-'))
+const reportPath = await reportOutput(values.output, 'instrument-navigation.json', '--output')
 const app = await appEntryFor(values['app-root'] ?? root)
-const reportPath = resolve(values.output ?? join(root, '.build/traffic-optimization/instrument-navigation.json'))
 const checkout = checkoutMetadata()
 const target = await targetRevision(app, checkout)
+const userData = await mkdtemp(join(tmpdir(), 'perp-instrument-navigation-benchmark-'))
 let electron, report
 try {
   electron = await _electron.launch({ args: [app.entry], cwd: app.cwd,

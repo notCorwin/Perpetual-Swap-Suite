@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { reportOutput } from './report-output.mjs'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
@@ -13,7 +14,7 @@ import { replayHarnessFingerprint } from './replay-fingerprint.mjs'
 // The process is isolated: only service wall time is advanced; Node timers and
 // external IO remain real. No network response may be consumed by this replay.
 if (process.env.PERPETUAL_SWAP_SANDBOX !== '1' || process.env.PERPETUAL_SWAP_ALLOW_NETWORK !== '0') throw new Error('Run in the network-disabled test sandbox.')
-const output = resolve(process.argv[2] ?? '.build/market-branch-replay.json')
+const output = await reportOutput(process.argv[2], 'market-branch-replay.json', 'an output path as the first argument')
 const cycles = Number(process.argv[3] ?? 1)
 assert.ok(Number.isSafeInteger(cycles) && cycles >= 1 && cycles <= 1_000, 'Replay cycles must be between 1 and 1000.')
 const root = await mkdtemp(`${tmpdir()}/market-branch-replay-`)

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { setTimeout as delay } from 'node:timers/promises'
-import { intervalFor, snapshotProcessTree, startSampling } from './index.mjs'
+import { intervalFor, snapshotProcessTree, startSampling } from '../../scripts/measurement/index.mjs'
 
 test('samples a controlled process tree, separate backend, CPU time and energy', { timeout: 15000 }, async () => {
   const source = `

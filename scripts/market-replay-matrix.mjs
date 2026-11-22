@@ -1,11 +1,12 @@
 #!/usr/bin/env node
+import { reportOutput } from './report-output.mjs'
 import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { resolve, join } from 'node:path'
 
 // Each scenario gets a fresh network-disabled sandbox and runs serially.
-const directory = resolve(process.argv[2] ?? '.build/market-replay-matrix')
+const directory = await reportOutput(process.argv[2], 'market-replay-matrix', 'an output directory as the first argument')
 await mkdir(directory, { recursive: true })
 const scenarios = [
   { name: 'branches', desktop: false, command: ['scripts/market-branch-resources.mjs', join(directory, 'branches.json')] },

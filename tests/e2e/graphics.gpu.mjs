@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { createInterface } from 'node:readline'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url'
 import { _electron } from 'playwright'
 import { graphicsAccelerationSupport, graphicsCapabilities, graphicsRequirementFailures, readGraphicsTrace } from '../../electron/services/graphics-trace.js'
 import { isOperationJournal, readOperationJournal } from '../../electron/services/operation-journal.js'
+import { trashPath } from '../../scripts/electron-delivery.mjs'
 
 const root = fileURLToPath(new URL('../..', import.meta.url))
 const policy = process.env.PERPETUAL_SWAP_GPU_POLICY || 'auto'
@@ -31,8 +32,8 @@ test('hidden chart rendering validates available native GPU capability and durab
   assert.ok(['auto', 'require-accelerated', 'require-hardware-timing'].includes(policy))
   assert.ok(['chromium', 'metal'].includes(provider))
   const directory = await mkdtemp(join(tmpdir(), 'native-gpu-chart-'))
-  t.after(() => rm(directory, { recursive: true, force: true }))
-  const id = randomUUID(), base = process.env.PERPETUAL_SWAP_OPERATION_DIR ?? join(root, '.build/gpu', id, 'operations')
+  t.after(() => trashPath(directory))
+  const id = randomUUID(), base = process.env.PERPETUAL_SWAP_OPERATION_DIR ?? join(directory, 'operations')
   const operations = join(base, 'native-gpu-chart'), artifacts = join(dirname(base), 'gpu', id)
   await Promise.all([mkdir(operations, { recursive: true }), mkdir(artifacts, { recursive: true })])
   let metalAPI, metalScope, metalReport, metalStatus, metalStatusFile, electron, closed = false

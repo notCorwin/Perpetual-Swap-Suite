@@ -2,8 +2,8 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { createWriteStream } from 'node:fs'
-import { mkdir, readdir, writeFile } from 'node:fs/promises'
-import { arch, platform } from 'node:os'
+import { mkdir, mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises'
+import { arch, platform, tmpdir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { operationCategories, operationRequirementKey, operationReportHasFailures, writeOperationReport } from './operation-report.mjs'
@@ -11,6 +11,9 @@ import { verifyBuildReuseManifest } from './build-artifact-reuse.mjs'
 import { requireForegroundTests } from '../electron/test-presentation.js'
 import { backgroundTestEnvironment, prepareTestElectron } from './electron-test-runtime.mjs'
 import { assertTestSpawn } from './electron-test-launch-register.mjs'
+import { trashPath } from './electron-delivery.mjs'
+import { assertOutsideBuildSync } from './build-output-path.mjs'
+import { buildChildStdio, withBuildLock } from './build-lock.mjs'
 
 const projectRoot = fileURLToPath(new URL('../', import.meta.url))
 const registration = fileURLToPath(new URL('./sandbox-register.mjs', import.meta.url))
@@ -88,11 +91,13 @@ export async function sandboxCommands(mode, args = [], { reuseBuildManifest, roo
   return commands
 }
 
-function execute(command, { environment, logPath, onChild }) {
+function execute(command, { environment, logPath, onChild, locked = false }) {
   assertTestSpawn(command[0], { env: environment })
   return new Promise(resolveResult => {
     const log = createWriteStream(logPath)
-    const child = spawn(command[0], command.slice(1), { cwd: projectRoot, env: environment, detached: process.platform !== 'win32', stdio: ['inherit', 'pipe', 'pipe'] })
+    const inherited = locked ? buildChildStdio() : undefined
+    const stdio = ['inherit', 'pipe', 'pipe', ...(Array.isArray(inherited) ? inherited.slice(3) : [])]
+    const child = spawn(command[0], command.slice(1), { cwd: projectRoot, env: environment, detached: process.platform !== 'win32', stdio })
     onChild(child)
     let logError = null
     log.on('error', error => { logError = error.message })
@@ -114,19 +119,27 @@ export async function runSandbox({ mode = 'core', args = [], output, allowNetwor
   const coverage = sandboxCoverage(mode, { allowEmpty, requireCategories, requireRoles, graphicsPolicy, graphicsProvider })
   if (typeof scenario !== 'string' || !scenario || scenario.length > 160) throw new Error('Scenario must be a nonempty label of at most 160 characters.')
   const commands = await sandboxCommands(mode, args, { reuseBuildManifest })
+  // Builds clean .build. Reject reports or scratch space there, even through
+  // an alias, so an active run cannot lose its data during a nested build.
+  if (output) assertOutsideBuildSync(projectRoot, output, 'Sandbox --output')
+  assertOutsideBuildSync(projectRoot, tmpdir(), 'The temporary directory')
+  const workRoot = await mkdtemp(join(tmpdir(), 'perpetual-swap-sandbox-'))
+  try {
   // Prepare once before any command can import Playwright/Electron. Never ask
   // electron/index.js to download or resolve an unprotected runtime here.
   const guardedRuntime = presentation === 'background' && process.platform === 'darwin' && (['functional', 'e2e', 'gpu', 'soak', 'all'].includes(mode) || mode === 'command' && desktop)
     ? await prepareTestElectron() : undefined
   const id = `${new Date().toISOString().replaceAll(':', '').replaceAll('.', '')}-${randomUUID().slice(0, 8)}`
-  const directory = output ? resolve(output, id) : join(projectRoot, '.build/sandbox', id)
+  const directory = output ? resolve(output, id) : join(workRoot, 'report')
+  const buildManifest = !reuseBuildManifest && mode !== 'command' && mode !== 'core' ? join(workRoot, 'renderer-build.json') : undefined
   const operations = join(directory, 'operations'), temporary = join(directory, 'tmp'), userData = join(directory, 'user-data')
   await Promise.all([operations, temporary, userData].map(path => mkdir(path, { recursive: true })))
   let environment = { ...process.env, PERPETUAL_SWAP_SANDBOX: '1', PERPETUAL_SWAP_TEST_UI: presentation, PERPETUAL_SWAP_ALLOW_NETWORK: allowNetwork ? '1' : '0',
     PERPETUAL_SWAP_TEST_OWNER_PID: String(process.pid),
     PERPETUAL_SWAP_GPU_TRACE: gpuTrace ? '1' : '0', PERPETUAL_SWAP_OPERATION_DIR: operations, PERPETUAL_SWAP_OPERATION_SESSION: id, PERPETUAL_SWAP_OPERATION_SCENARIO: scenario,
     PERPETUAL_SWAP_GPU_POLICY: coverage.graphics?.policy ?? '', PERPETUAL_SWAP_GPU_PROVIDER: coverage.graphics?.provider ?? '',
-    PERPETUAL_SWAP_USER_DATA: userData, TMPDIR: temporary, TMP: temporary, TEMP: temporary }
+    PERPETUAL_SWAP_USER_DATA: userData, TMPDIR: temporary, TMP: temporary, TEMP: temporary,
+    PERPETUAL_SWAP_SANDBOX_WORK_DIR: workRoot, PERPETUAL_SWAP_SANDBOX_REPORT_DIR: output ? directory : '' }
   if (guardedRuntime) environment = backgroundTestEnvironment(guardedRuntime, environment)
   const manifest = { schemaVersion: 2, id, mode, scenario, coverage, startedAt: new Date().toISOString(), directory,
     revision: git(['rev-parse', 'HEAD']), dirty: Boolean(git(['status', '--porcelain'])),
@@ -157,7 +170,17 @@ export async function runSandbox({ mode = 'core', args = [], output, allowNetwor
       if (interrupted) { exitCode = signalExit[interrupted]; break }
       const record = manifest.commands[index]
       record.status = 'running'; record.startedAt = new Date().toISOString(); await save()
-      const result = await execute(commands[index], { environment, logPath: join(directory, `command-${index + 1}.log`), onChild: child => { activeChild = child } })
+      const command = commands[index]
+      const buildCommand = mode !== 'command' && basename(command[0]).replace(/\.cmd$/, '') === 'npm' && command[1] === 'run' && command[2] === 'build'
+      const commandEnvironment = { ...environment, PERPETUAL_SWAP_BUILD_RESULT_MANIFEST: buildCommand ? buildManifest ?? '' : '' }
+      const executeCommand = locked => execute(command, { environment: commandEnvironment, logPath: join(directory, `command-${index + 1}.log`), onChild: child => { activeChild = child }, locked })
+      const rendererSuite = mode === 'command' ? desktop : command.some(value => /^(?:tests\/e2e|tests\/soak)\//.test(value))
+      const result = rendererSuite ? await withBuildLock(projectRoot, async () => {
+        // Re-check an explicitly reused build while holding the lock; another
+        // build may have finished after the initial command planning.
+        if (reuseBuildManifest || buildManifest) await verifyBuildReuseManifest({ root: projectRoot, manifestPath: reuseBuildManifest ?? buildManifest })
+        return executeCommand(true)
+      }) : await executeCommand(false)
       Object.assign(record, result, { endedAt: new Date().toISOString(), status: result.code === 0 ? 'passed' : 'failed' })
       await save()
       if (result.code !== 0) { exitCode = result.code; break }
@@ -175,7 +198,7 @@ export async function runSandbox({ mode = 'core', args = [], output, allowNetwor
       manifest.recordedOperations = report.totals.count
       manifest.journalRecords = report.journalRecords
       if (report.graphics) manifest.graphics = report.graphics
-      console.log(`Operations: ${report.totals.count}; errors: ${report.totals.errors}; cancelled: ${report.totals.cancelled}. Report: ${join(directory, 'summary.md')}`)
+      console.log(`Operations: ${report.totals.count}; errors: ${report.totals.errors}; cancelled: ${report.totals.cancelled}.${output ? ` Report: ${join(directory, 'summary.md')}` : ' Use --output to retain the full report.'}`)
       if (operationReportHasFailures(report)) {
         console.error('The operation recording is incomplete or invalid; see summary.json.')
         if (!exitCode) { exitCode = 1; manifest.outcome.status = 'failed'; manifest.outcome.exitCode = exitCode }
@@ -188,7 +211,14 @@ export async function runSandbox({ mode = 'core', args = [], output, allowNetwor
     }
     await save()
   }
-  return { directory, exitCode, manifest }
+  if (!output && exitCode) {
+    // Commands stream their logs live. Print the operation diagnostics before
+    // deleting the temporary report so failed runs remain actionable.
+    const summary = await readFile(join(directory, 'summary.md'), 'utf8').catch(() => '')
+    if (summary) console.error(`Sandbox failure report:\n${summary.slice(0, 32_768)}`)
+  }
+  return { directory: output ? directory : null, exitCode, manifest }
+  } finally { await trashPath(workRoot) }
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

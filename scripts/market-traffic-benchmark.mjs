@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { reportOutput } from './report-output.mjs'
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
@@ -17,8 +18,8 @@ import { compareMarketTrafficReports, validateMarketTrafficReport } from './mark
 import { startRendererDiagnostics } from './renderer-diagnostics.mjs'
 import { installMainLoopWitness } from './main-loop-witness.mjs'
 import { installMarketTrafficRendererProbe } from './market-traffic-renderer-probe.mjs'
-import { startSampling } from '../experiments/runtime-comparison/measurement/index.mjs'
-import { summarizeResources } from '../experiments/runtime-comparison/analyze.mjs'
+import { startSampling } from './measurement/index.mjs'
+import { summarizeResources } from './resource-summary.mjs'
 import { replayHarnessFingerprint } from './replay-fingerprint.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
@@ -261,7 +262,7 @@ if (baselineReportPath) {
   }
 }
 const runId = randomUUID()
-const output = resolve(values.output ?? join(root, '.build/traffic-optimization/market-traffic.json'))
+const output = await reportOutput(values.output, 'market-traffic.json', '--output')
 await mkdir(dirname(output), { recursive: true })
 await writeFile(output, `${JSON.stringify({ schemaVersion: 1, runId, outcome: 'running', partial: true, startedAt: new Date().toISOString() }, null, 2)}\n`)
 let app, checkout, target, replayFingerprint, userData, fixture

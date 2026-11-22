@@ -1,3 +1,4 @@
+import { reportOutput } from './report-output.mjs'
 import assert from 'node:assert/strict'
 import { mkdir, writeFile, readFile, readdir } from 'node:fs/promises'
 import { writeFileSync } from 'node:fs'
@@ -7,7 +8,7 @@ import { _electron } from 'playwright'
 import { createOKXRelay } from './okx-relay.mjs'
 import { chartOutcomeWithRelayErrors, missingCandleEvidence, requiredMarketInputFailures } from './okx-live-evidence.mjs'
 
-const root = process.cwd(), directory = resolve(root, process.env.OKX_LIVE_CHART_OUTPUT ?? `.build/okx-live-chart/${new Date().toISOString().replaceAll(':', '').replaceAll('.', '')}`)
+const root = process.cwd(), directory = await reportOutput(process.env.OKX_LIVE_CHART_OUTPUT, 'okx-live-chart', 'OKX_LIVE_CHART_OUTPUT')
 await mkdir(directory, { recursive: true })
 const operations = process.env.PERPETUAL_SWAP_OPERATION_DIR ? join(process.env.PERPETUAL_SWAP_OPERATION_DIR, 'okx-live-chart') : join(directory, 'operations')
 const reportPath = join(directory, 'result.json'), controller = new AbortController()

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { installMainLoopWitness, startNodeDriverLoopWitness } from '../../scripts/main-loop-witness.mjs'
+import { testArtifactDirectory } from '../../scripts/test-artifact-directory.mjs'
 
 // Covers the test/process lifetime. Match raw epochs to a report's measured
 // phase; warmup and post-timing validation are deliberately not acceptance data.
@@ -39,7 +40,7 @@ export async function startProcessWitness(electron, name, { capacity = 6_002, di
       generatedAt: new Date().toISOString(), ...evidence,
       complete: !errors.length && evidence.nodeDriverLoop?.complete === true && evidence.mainLoop?.complete === true,
       collectionErrors: errors.map(({ stage, error }) => ({ stage, message: error.stack ?? error.message ?? String(error) })) }
-    const outputDirectory = resolve(directory ?? process.env.PERPETUAL_SWAP_PROCESS_WITNESS_DIRECTORY ?? '.build/process-witness')
+    const outputDirectory = resolve(directory ?? process.env.PERPETUAL_SWAP_PROCESS_WITNESS_DIRECTORY ?? testArtifactDirectory())
     report.artifact = join(outputDirectory, `${name.replace(/[^a-z0-9]+/gi, '-')}-${ownerId}.json`)
     try {
       await mkdir(outputDirectory, { recursive: true })

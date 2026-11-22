@@ -295,7 +295,7 @@ test('real resident reserve covers delayed history delivery before continuous in
     runwayAtRequest: report.runwayAtRequest, observedHistoryDeliveryMS: report.observedHistoryDeliveryMS,
     minimumBars: report.minimumBars, pendingFrames: report.pendingFrames, latestInputToRafSampleMS: report.latestInputToRafSampleMS,
     nativePaintMeasured: report.nativePaintMeasured }))
-  await writeFile(join(root, '.build/chart-prefetch-latency.json'), `${JSON.stringify(report, null, 2)}\n`)
+  if (process.env.PERPETUAL_SWAP_SANDBOX_REPORT_DIR) await writeFile(join(process.env.PERPETUAL_SWAP_SANDBOX_REPORT_DIR, 'chart-prefetch-latency.json'), `${JSON.stringify(report, null, 2)}\n`)
 })
 
 test('a prefetch validation failure retains complete timing and delivery evidence', { timeout: 90_000 }, async context => {
