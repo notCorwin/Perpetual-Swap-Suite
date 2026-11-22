@@ -11,6 +11,7 @@ test('time labels preserve date context across days and stay inside the axis wit
   assert.equal(labels[1].label, '23:00')
   assert.match(labels[2].label, /Nov 21, 00:00/)
   assert.equal(labels[3].label, '01:00')
+  assert.deepEqual(labels.map(label => label.major), [true, false, true, false, false])
   assert.equal(labels[0].anchor, 'start')
   assert.equal(labels.at(-1)?.anchor, 'end')
   assert.ok(labels.every((label, i) => label.x === ticks.find(tick => tick.hour === label.hour)?.x && label.left >= 0 && label.right <= 600 && (!i || label.left >= labels[i - 1].right + 8)))

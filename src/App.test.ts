@@ -330,7 +330,7 @@ test('local snapshot failures wait for a backend notification without polling', 
   await app.flush()
   assert.equal(app.view.status, 'Unavailable')
   assert.equal(app.snapshotRequests.length, 1)
-  assert.equal(app.timers, 1, 'The error notification schedules its dismissal.')
+  assert.equal(app.timers, 0, 'Market snapshot failures do not schedule polling.')
   await app.flush()
   assert.equal(app.snapshotRequests.length, 1, 'Dismissal does not poll market snapshots.')
   app.state.snapshotFailure = false

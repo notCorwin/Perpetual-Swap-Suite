@@ -60,7 +60,9 @@ export function chartTimeLabels(ticks: readonly { hour: number; x: number }[], l
     const date = new Date(tick.hour)
     const day = `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`
     const dateChanged = day !== previousDay
-    const major = dateChanged || date.getMinutes() === 0
+    // A date boundary is the meaningful anchor across all timeframes. Marking
+    // every whole hour as major makes every 1h label bold.
+    const major = dateChanged
     const clock = axisTimeFormatter.format(date)
     const label = dateChanged ? `${axisDateFormatter.format(date)}, ${clock}` : clock
     const width = measure(label, major)

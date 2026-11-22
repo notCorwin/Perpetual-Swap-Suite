@@ -478,7 +478,8 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
   await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.liveBar?.close === 133)
   const priceLabel = chart.locator('[data-chart-price-label]')
   await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-price-label]')?.getAttribute('data-chart-price-direction') === 'flat')
-  assert.equal(await priceLabel.locator('[data-chart-price-label-background]').getAttribute('fill'), 'var(--chart-annotation)')
+  assert.equal(await priceLabel.locator('[data-chart-price-label-background]').getAttribute('fill'), 'rgb(89 89 89)')
+  assert.equal(await priceLabel.locator('[data-chart-price-label-value]').getAttribute('fill'), 'white')
   await assertCompleteChartViewport(page, 'BETA-USDT-SWAP', { fullSlots: null })
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), before + 1, 'Only the fixture read may be added; the pushed candle must not trigger another renderer read.')
   const liveUpdate = await page.evaluate(() => {
@@ -494,15 +495,55 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
   assert.match(await chart.locator('[aria-live="off"]').textContent(), /Close\s+135/)
   assert.match(await chart.locator('svg[data-rendered-inst] [data-chart-price-label-value]').textContent(), /^\+1\.50%$/)
   assert.equal(await priceLabel.getAttribute('data-chart-price-direction'), 'up')
-  assert.equal(await priceLabel.locator('[data-chart-price-label-background]').getAttribute('fill'), 'var(--positive)')
-  assert.equal(await priceLabel.locator('[data-chart-price-label-value]').getAttribute('fill'), 'var(--chart-price-label-foreground)')
-  assert.equal(await priceLabel.locator('[data-chart-countdown]').getAttribute('fill'), 'var(--chart-price-label-foreground)')
+  assert.equal(await priceLabel.locator('[data-chart-price-label-background]').getAttribute('fill'), 'color-mix(in srgb, var(--positive) 75%, black)')
+  assert.equal(await priceLabel.locator('[data-chart-price-label-value]').getAttribute('fill'), 'white')
+  assert.equal(await priceLabel.locator('[data-chart-countdown]').getAttribute('fill'), 'white')
+  const ticks = await chart.evaluate(chart => {
+    const background = chart.querySelector('[data-chart-price-label-background]').getBoundingClientRect()
+    return [...chart.querySelectorAll('[data-chart-price-tick]')].map(tick => {
+      const line = tick.querySelector('line')
+      const text = tick.querySelector('text')
+      if (!text) return null
+      const rect = text.getBoundingClientRect()
+      return { y: Number(text.getAttribute('y')), lineY: Number(line.getAttribute('y1')),
+        overlaps: rect.left < background.right && rect.right > background.left && rect.top < background.bottom && rect.bottom > background.top }
+    }).filter(Boolean)
+  })
+  assert.ok(ticks.length > 0 && ticks.every(tick => tick.y === tick.lineY && !tick.overlaps), 'Every visible price tick stays on its grid line and clear of the price tag.')
+  assert.ok(await chart.locator('[data-chart-price-tick-inset]').count() > 0, 'Ticks near the price tag remain visible on the plot side.')
   assert.equal(await page.evaluate(() => document.querySelector('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]').__chartSnapshot.bars === globalThis.__completedSubscriptionBars), true)
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), reads, 'Live-only subscriptions must reuse the completed frame without a follow-up read.')
   await electron.evaluate(({ BrowserWindow }, update) => globalThis.__workspaceFixture.sendChart({ ...update, revision: update.revision + 1, liveBar: { ...update.liveBar, close: 132 } }), liveUpdate)
   await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-price-label]')?.getAttribute('data-chart-price-direction') === 'down')
-  assert.equal(await priceLabel.locator('[data-chart-price-label-background]').getAttribute('fill'), 'var(--negative)')
+  assert.equal(await priceLabel.locator('[data-chart-price-label-background]').getAttribute('fill'), 'color-mix(in srgb, var(--negative) 75%, black)')
   assert.match(await priceLabel.locator('title').textContent(), /down/)
+  // Put the live line exactly on a displayed tick, rather than relying on a
+  // coincidental overlap. The inset tick's background must paint after the
+  // line so the dash can never run through its text.
+  const alignedClose = await chart.evaluate(chart => {
+    const line = chart.querySelector('[data-chart-live-price]')
+    const lineY = Number(line.getAttribute('y1'))
+    const ticks = [...chart.querySelectorAll('[data-chart-price-tick] text')].map(text => ({
+      y: Number(text.getAttribute('y')), value: parseFloat(text.textContent.replaceAll(',', '')),
+    })).sort((a, b) => a.y - b.y)
+    const first = ticks[0], last = ticks.at(-1)
+    const lineValue = first.value + (lineY - first.y) * (last.value - first.value) / (last.y - first.y)
+    const closest = ticks.reduce((best, tick) => Math.abs(tick.y - lineY) < Math.abs(best.y - lineY) ? tick : best)
+    return chart.__chartSnapshot.liveBar.close * (1 + closest.value / 100) / (1 + lineValue / 100)
+  })
+  await electron.evaluate(({ BrowserWindow }, { update, close }) => globalThis.__workspaceFixture.sendChart({
+    ...update, revision: update.revision + 2,
+    liveBar: { ...update.liveBar, close, high: Math.max(update.liveBar.high, close), low: Math.min(update.liveBar.low, close) },
+  }), { update: liveUpdate, close: alignedClose })
+  await page.waitForFunction(close => Math.abs(document.querySelector('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.liveBar?.close - close) < 1e-7, alignedClose)
+  const aligned = await chart.evaluate(chart => {
+    const line = chart.querySelector('[data-chart-live-price]')
+    const tick = [...chart.querySelectorAll('[data-chart-price-tick-inset]')].find(text =>
+      Math.abs(Number(text.getAttribute('y')) - Number(line.getAttribute('y1'))) < .1)
+    const background = tick?.parentElement.querySelector('rect')
+    return { exists: Boolean(tick && background), lineBeforeBackground: Boolean(background && (line.compareDocumentPosition(background) & Node.DOCUMENT_POSITION_FOLLOWING)) }
+  })
+  assert.ok(aligned.exists && aligned.lineBeforeBackground, 'A coincident live price line must paint behind the visible tick background and text.')
 })
 
 test('contract precision updates pad current quotes while preserving historical and indicator digits', async () => {
@@ -1341,6 +1382,13 @@ test('simultaneous notification errors take priority over warnings', async () =>
     await toast.getByText(/Data audit:.*Audit failed/).waitFor({ state: 'visible' })
     await toast.getByText(/History download:.*Download failed/).waitFor({ state: 'visible' })
     assert.ok(await toast.locator('p').count() <= 3, 'The notification has a bounded number of lines.')
+    const panels = await toast.locator('p').evaluateAll(nodes => nodes.map(node => {
+      const rect = node.getBoundingClientRect()
+      return { top: rect.top, bottom: rect.bottom, border: getComputedStyle(node).borderTopWidth }
+    }))
+    assert.equal(panels.length, 3)
+    assert.ok(panels.every(panel => parseFloat(panel.border) > 0), 'Each notification has its own panel.')
+    assert.ok(panels.every((panel, index) => index === 0 || panel.top > panels[index - 1].bottom), 'Panels are separated vertically.')
     assert.doesNotMatch(await toast.textContent(), /diagnostic/)
   } finally {
     await electron.evaluate(() => {
@@ -1349,6 +1397,95 @@ test('simultaneous notification errors take priority over warnings', async () =>
       state.publishAudit({ phase: 'idle', error: '', progress: { completed: 0, total: 0 }, issues: [] })
       state.publishDownload({ phase: 'idle', error: '', progress: { checked: 0, total: 0, available: 0, empty: 0, unavailable: 0, failed: 0, reused: 0, pending: 0 } })
     })
+    await page.clock.fastForward(7_100)
+  }
+})
+
+test('notification panels expire independently when failures arrive at different times', async () => {
+  const toast = page.locator('[data-market-status]')
+  const audit = toast.getByText(/Data audit:.*Audit failed/)
+  const download = toast.getByText(/History download:.*Download failed/)
+  try {
+    await page.clock.fastForward(7_100)
+    await electron.evaluate(() => globalThis.__workspaceFixture.publishAudit({ phase: 'failed', error: 'audit diagnostic' }))
+    await audit.waitFor({ state: 'visible' })
+    await page.clock.fastForward(4_000)
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      state.publishAudit({ phase: 'idle', error: '', progress: { completed: 0, total: 0 }, issues: [] })
+      state.publishDownload({ phase: 'failed', error: 'download diagnostic' })
+    })
+    await download.waitFor({ state: 'visible' })
+    assert.equal(await audit.isVisible(), true, 'A recovered issue remains visible for its full lifetime.')
+    await page.clock.fastForward(3_100)
+    await audit.waitFor({ state: 'hidden' })
+    assert.equal(await download.isVisible(), true, 'A newer panel retains its own seven-second lifetime.')
+    await page.clock.fastForward(4_000)
+    await download.waitFor({ state: 'hidden' })
+  } finally {
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      state.publishAudit({ phase: 'idle', error: '', progress: { completed: 0, total: 0 }, issues: [] })
+      state.publishDownload({ phase: 'idle', error: '', progress: { checked: 0, total: 0, available: 0, empty: 0, unavailable: 0, failed: 0, reused: 0, pending: 0 } })
+    })
+    await page.clock.fastForward(7_100)
+  }
+})
+
+test('queued notification panels appear after the visible panels expire', async () => {
+  const toast = page.locator('[data-market-status]')
+  try {
+    await page.clock.fastForward(7_100)
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      Object.assign(state, { error: 'market diagnostic', realtimeState: 'live' })
+      state.revision += 1; state.notify()
+      state.publishAudit({ phase: 'failed', error: 'audit diagnostic' })
+      state.publishDownload({ phase: 'failed', error: 'download diagnostic' })
+    })
+    await toast.getByText(/Market:.*Market data is unavailable/).waitFor({ state: 'visible' })
+    await toast.getByText(/Data audit:.*Audit failed/).waitFor({ state: 'visible' })
+    await toast.getByText(/History download:.*Download failed/).waitFor({ state: 'visible' })
+    await page.clock.fastForward(4_000)
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      state.realtimeState = 'disconnected'; state.revision += 1; state.notify()
+    })
+    await waitForAuditFixture(() => globalThis.__workspaceFixture.requests.some(value => value.statusLog?.issues?.some(issue => issue.includes('Market connection interrupted'))))
+    assert.equal(await toast.getByText(/Market:.*Market connection interrupted/).count(), 0, 'The fourth issue waits for a free panel.')
+    await page.clock.fastForward(3_100)
+    await toast.getByText(/Market:.*Market connection interrupted/).waitFor({ state: 'visible' })
+    await page.clock.fastForward(7_100)
+    await toast.waitFor({ state: 'hidden' })
+  } finally {
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      Object.assign(state, { error: '', realtimeState: 'live' }); state.revision += 1; state.notify()
+      state.publishAudit({ phase: 'idle', error: '', progress: { completed: 0, total: 0 }, issues: [] })
+      state.publishDownload({ phase: 'idle', error: '', progress: { checked: 0, total: 0, available: 0, empty: 0, unavailable: 0, failed: 0, reused: 0, pending: 0 } })
+    })
+    await page.clock.fastForward(7_100)
+  }
+})
+
+test('a repeated failure after recovery receives a new full notification lifetime', async () => {
+  const toast = page.locator('[data-market-status]')
+  const audit = toast.getByText(/Data audit:.*Audit failed/)
+  try {
+    await page.clock.fastForward(7_100)
+    await electron.evaluate(() => globalThis.__workspaceFixture.publishAudit({ phase: 'failed', error: 'audit diagnostic' }))
+    await audit.waitFor({ state: 'visible' })
+    await page.clock.fastForward(4_000)
+    await electron.evaluate(() => globalThis.__workspaceFixture.publishAudit({ phase: 'idle', error: '', progress: { completed: 0, total: 0 }, issues: [] }))
+    await waitForAuditFixture(() => !globalThis.__workspaceFixture.requests.filter(value => value.statusLog).at(-1)?.statusLog.issues.some(issue => issue.includes('Audit failed')))
+    await electron.evaluate(() => globalThis.__workspaceFixture.publishAudit({ phase: 'failed', error: 'audit diagnostic' }))
+    await waitForAuditFixture(() => globalThis.__workspaceFixture.requests.filter(value => value.statusLog).at(-1)?.statusLog.issues.some(issue => issue.includes('Audit failed')))
+    await page.clock.fastForward(3_100)
+    assert.equal(await audit.isVisible(), true, 'A repeated failure is not dismissed by the previous instance timer.')
+    await page.clock.fastForward(4_000)
+    await audit.waitFor({ state: 'hidden' })
+  } finally {
+    await electron.evaluate(() => globalThis.__workspaceFixture.publishAudit({ phase: 'idle', error: '', progress: { completed: 0, total: 0 }, issues: [] }))
     await page.clock.fastForward(7_100)
   }
 })

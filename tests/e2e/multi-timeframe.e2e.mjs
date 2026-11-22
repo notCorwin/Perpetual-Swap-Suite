@@ -57,8 +57,17 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
       assert.deepEqual(await page.locator('svg[data-rendered-inst]').evaluateAll(svgs => svgs.map(svg => svg.getAttribute('aria-label')?.match(/(?:1h|15m|5m)/i)?.[0]?.toLowerCase())), ['1h', '15m', '5m'])
       assert.equal(await page.locator('[data-chart-indicator="rsi6"]').count(), 0)
       assert.equal(await page.locator('[data-chart-indicator="ema"], [data-chart-legend="EMA(200)"]').count(), 0)
-      for (const field of ['vwap', 'bollUpper', 'bollMiddle', 'bollLower']) assert.equal(await page.locator(`[data-chart-indicator="${field}"]`).count(), 0)
+      assert.equal(await page.locator('[data-chart-indicator="vwap"]').count(), 0)
+      for (const field of ['bollUpper', 'bollMiddle', 'bollLower']) assert.equal(await page.locator(`[data-chart-indicator="${field}"]`).count(), 3)
       await page.waitForFunction(() => document.querySelectorAll('[data-chart-boll-band]').length >= 3, null, { timeout: 15_000 })
+      for (const [field, color] of [['bollUpper', 'rgb(223, 72, 76)'], ['bollMiddle', 'rgb(56, 97, 246)'], ['bollLower', 'rgb(68, 151, 130)']]) {
+        const styles = await page.locator(`[data-chart-indicator="${field}"]`).evaluateAll(paths => paths.map(path => ({
+          stroke: getComputedStyle(path).stroke, width: getComputedStyle(path).strokeWidth, path: path.getAttribute('d'),
+        })))
+        assert.ok(styles.every(style => style.stroke === color && style.width === '1px' && style.path), `${field} should render on each chart with the specified 1px stroke`)
+      }
+      const opacity = await page.locator('[data-chart-boll-band]').evaluateAll(paths => paths.map(path => getComputedStyle(path).fillOpacity))
+      assert.ok(opacity.every(value => value === '0.05'), 'Bollinger fill should have 5% opacity')
       const positions = await page.locator('svg[data-rendered-inst]').evaluateAll(svgs => svgs.map(svg => ({ top: svg.getBoundingClientRect().top, height: svg.getBoundingClientRect().height })))
       assert.ok(positions.every(position => position.height > 60))
       assert.ok(positions[0].top < positions[1].top && Math.abs(positions[1].top - positions[2].top) < 1)

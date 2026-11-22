@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState, type Dispatch, type SetStateAction } from 'react'
 import { Camera } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { captureStableChart, chartCaptureBounds, eraseCapturedAction } from '@/chart-capture'
@@ -31,6 +31,16 @@ const collectorStatus = (snapshot: MarketSnapshot | UnchangedSnapshot) => {
   return snapshot.catalogSource === 'cache' ? 'Cached' : snapshot.catalogSource === 'live' ? 'Live' : 'Waiting'
 }
 const message = (cause: unknown) => cause instanceof Error ? cause.message : 'The desktop data service could not complete this request.'
+
+type ToastIssue = { id: string; label: string; detail: string; severity: string; instance: number }
+
+function NotificationPanel({ issue, setToast }: { issue: ToastIssue; setToast: Dispatch<SetStateAction<ToastIssue[]>> }) {
+  useEffect(() => {
+    const timer = window.setTimeout(() => setToast(shown => shown.filter(item => item.instance !== issue.instance)), 7000)
+    return () => window.clearTimeout(timer)
+  }, [issue.instance, setToast])
+  return <p data-chart-shared-status-item={['1H', '15m', '5m'].includes(issue.id) ? issue.id : undefined} className={cn('break-words rounded-md border bg-popover px-4 py-3 text-sm text-popover-foreground shadow-lg', issue.severity === 'error' && 'text-destructive')}><span className="font-medium">{issue.label}: </span>{issue.detail}</p>
+}
 
 const MarketRowView = memo(function MarketRowView({ row, index, selected, lookback, onSelect }: { row: RankedMarketRow; index: number; selected: boolean; lookback: number; onSelect: (id: string) => void }) {
   const change = Number.isFinite(row.rankingChange) ? row.rankingChange : null
@@ -342,19 +352,21 @@ function App() {
   const toastIssues = rankedIssues.filter(issue => (issue.id !== 'catalog' || status === 'Unavailable' || status === 'Cached') && issue.severity !== 'info' && (issue.id !== 'connection' || connectionFailure))
   const toastKey = JSON.stringify(toastIssues.map(({ id, label, detail, severity }) => ({ id, label, detail, severity })))
   const previousToastIssues = useRef(new Map<string, string>())
-  const [toast, setToast] = useState<{ id: string; label: string; detail: string; severity: string }[]>([])
+  const toastSequence = useRef(0)
+  const [toast, setToast] = useState<ToastIssue[]>([])
   useEffect(() => {
-    const current = JSON.parse(toastKey) as { id: string; label: string; detail: string; severity: string }[]
-    const added = current.filter(issue => previousToastIssues.current.get(issue.id) !== issue.detail)
-    previousToastIssues.current = new Map(current.map(issue => [issue.id, issue.detail]))
-    if (added.length) setToast(shown => [...shown.filter(issue => current.some(active => active.id === issue.id) && !added.some(next => next.id === issue.id)), ...added]
-      .sort((a, b) => Number(b.severity === 'error') - Number(a.severity === 'error')).slice(0, 3))
+    const current = JSON.parse(toastKey) as Omit<ToastIssue, 'instance'>[]
+    const signature = (issue: Omit<ToastIssue, 'instance'>) => JSON.stringify([issue.label, issue.detail, issue.severity])
+    const added = current.filter(issue => previousToastIssues.current.get(issue.id) !== signature(issue))
+    previousToastIssues.current = new Map(current.map(issue => [issue.id, signature(issue)]))
+    const instances = added.map(issue => ({ ...issue, instance: ++toastSequence.current }))
+    if (instances.length) setToast(shown => {
+      const remaining = shown.filter(issue => !instances.some(next => next.id === issue.id))
+      const visible = remaining.slice(0, 3)
+      const pending = [...remaining.slice(3), ...instances].sort((a, b) => Number(b.severity === 'error') - Number(a.severity === 'error'))
+      return [...visible, ...pending].slice(0, 32)
+    })
   }, [toastKey])
-  useEffect(() => {
-    if (!toast.length) return
-    const timer = window.setTimeout(() => setToast([]), 7000)
-    return () => window.clearTimeout(timer)
-  }, [toast])
   const logStatus = status.startsWith('Verifying ') ? 'Verifying' : status.startsWith('Updating ') ? 'Updating' : status
   const logIssues = rankedIssues.filter(issue => issue.id !== 'catalog' && issue.severity !== 'info').map(issue => `${issue.label}: ${issue.detail}`)
   if (globalAudit && globalAudit.phase !== 'idle') logIssues.push(`Data audit phase: ${globalAudit.phase}`)
@@ -386,8 +398,8 @@ function App() {
 
   return <WorkspaceViewport>
     <div className="relative flex h-full min-w-0 flex-1">
-      {toast.length > 0 && <div data-market-status role="status" aria-atomic="true" className="pointer-events-none absolute bottom-4 left-4 z-50 max-w-[min(28rem,90%)] rounded-md border bg-popover px-4 py-3 text-sm text-popover-foreground shadow-lg" aria-label="Application notifications">
-        {toast.map(issue => <p key={issue.id} data-chart-shared-status-item={['1H', '15m', '5m'].includes(issue.id) ? issue.id : undefined} className={cn('break-words py-1', issue.severity === 'error' && 'text-destructive')}><span className="font-medium">{issue.label}: </span>{issue.detail}</p>)}
+      {toast.length > 0 && <div data-market-status role="status" aria-atomic="false" className="pointer-events-none absolute bottom-4 left-4 z-50 flex max-w-[min(28rem,90%)] flex-col gap-2" aria-label="Application notifications">
+        {toast.slice(0, 3).map(issue => <NotificationPanel key={issue.instance} issue={issue} setToast={setToast} />)}
       </div>}
       <div className="flex h-full min-w-0 flex-1">
         <section data-chart-panel className="h-full min-w-0 flex-1" aria-label="Market chart workspace">
@@ -409,7 +421,7 @@ function App() {
       <section data-market-scroll className="min-h-0 flex-1 overflow-y-auto [&>[data-slot=table-container]]:overflow-visible" aria-label="Perpetual swap markets">
         <Table className="table-fixed [&_tr:not([data-virtual-spacer])>:first-child]:pl-4 [&_tr:not([data-virtual-spacer])>:last-child]:pr-4" data-market-count={visible.length} data-total-market-count={rows.length} aria-rowcount={visible.length + 1}>
           <colgroup><col className="w-[25%]" /><col className="w-[45%]" /><col className="w-[30%]" /></colgroup>
-          <TableHeader className="sticky top-0 bg-background [&_th]:text-xs [&_th]:text-muted-foreground"><TableRow className="hover:bg-transparent"><TableHead>Contract</TableHead><TableHead className="text-right">Price</TableHead><TableHead className="text-right" aria-sort="other" aria-label={`${preferences.rankingLookback}m change By magnitude`} title="Sorted by absolute signed relative change from completed candles, largest first"><span>{preferences.rankingLookback}m change</span></TableHead></TableRow></TableHeader>
+          <TableHeader className="sticky top-0 bg-background [&_th]:text-xs [&_th]:text-muted-foreground"><TableRow className="hover:bg-transparent"><TableHead>Contract</TableHead><TableHead className="text-right">Price</TableHead><TableHead className="text-right" aria-sort="other" aria-label={`${preferences.rankingLookback}m change By magnitude`} title="Sorted by absolute signed relative change from completed candles, largest first"><span>{preferences.rankingLookback}m Δ%</span></TableHead></TableRow></TableHeader>
           {visible.length ? <MarketRowsViewport ids={visibleIds}>{index => <MarketRowView row={visible[index]} index={index} selected={visible[index].instId === selectedID} lookback={preferences.rankingLookback} onSelect={setSelected} />}</MarketRowsViewport> : <TableBody><TableRow><TableCell colSpan={3}>
             <Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{emptyDescription}</EmptyDescription></EmptyHeader></Empty>
           </TableCell></TableRow></TableBody>}

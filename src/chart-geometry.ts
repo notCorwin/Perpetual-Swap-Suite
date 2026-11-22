@@ -11,6 +11,7 @@ export const chartCompact = (value: number | null) => value === null ? '—' : c
 export const chartPercent = (value: number | null, decimals = 2) => value === null ? '—' : `${value.toFixed(decimals)}%`
 const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value)
 const lineFields = ['rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'roc', 'maroc', 'oi'] as const
+const bollLineFields = ['bollUpper', 'bollMiddle', 'bollLower'] as const
 const axisLabelLimit = (panel: readonly [number, number], maximum: number) =>
   Math.min(maximum, Math.max(2, Math.floor((panel[1] - panel[0]) / 32) + 1))
 const axisFormatter = (decimals: number) => {
@@ -144,7 +145,7 @@ function buildGeometry(sourceBars: readonly Bar[], options: ChartGeometryOptions
   const bbwY = linearScale(bbwRange.min, bbwRange.max, panels.atr)
   const oiY = oiAxis ? logarithmicScale(oiAxis, panels.oi) : () => NaN
   const takerY = linearScale(takerAxis.min, takerAxis.max, panels.taker), rocZeroY = rocY(0)
-  const line = (key: typeof lineFields[number], y: (value: number) => number) => {
+  const line = (key: typeof lineFields[number] | typeof bollLineFields[number], y: (value: number) => number) => {
     const segments: string[] = []
     let segment = ''
     pathBars.forEach((bar, index) => {
@@ -162,6 +163,7 @@ function buildGeometry(sourceBars: readonly Bar[], options: ChartGeometryOptions
   }
   const lines = Object.fromEntries(lineFields.map(field => [field, options.priceOnly ? '' : line(field,
     field.startsWith('rsi') ? rsiY : field === 'atrPercent' ? atrY : field === 'bbw' ? bbwY : field === 'roc' || field === 'maroc' ? rocY : field === 'oi' ? oiY : priceY)])) as Record<typeof lineFields[number], string>
+  const bollLines = Object.fromEntries(bollLineFields.map(field => [field, line(field, priceY)])) as Record<typeof bollLineFields[number], string>
   const rocArea = (key: 'roc' | 'maroc') => {
     const segments: string[] = []
     let points: [number, number][] = []
@@ -228,7 +230,7 @@ function buildGeometry(sourceBars: readonly Bar[], options: ChartGeometryOptions
     takerTicks: takerAxis.ticks.map((value, index) => ({ y: takerY(value), label: takerLabelsText[index] })),
     firstHour, candleHigh, candleLow, highIndex, lowIndex, oiSamples, takerAvailable,
     oiComplete: bars.every(bar => finite(bar.oi)), takerComplete: bars.every(bar => finite(bar.buy) && finite(bar.sell)),
-    lines, rocAreas, bollBands,
+    lines, rocAreas, bollBands, bollLines,
     upWicks: upWicks.join(' '), downWicks: downWicks.join(' '), upBodies: upBodies.join(' '), downBodies: downBodies.join(' '),
     buys: buys.join(' '), sells: sells.join(' '),
     buySamples: bars.filter(bar => finite(bar.buy) && bar.buy > 0).length,

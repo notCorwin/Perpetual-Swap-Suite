@@ -119,10 +119,12 @@
   --positive: rgb(68 151 130);
   --negative: rgb(223 72 76);
   --change-label-foreground: rgb(0 0 0);
-  --chart-price-label-foreground: var(--change-label-foreground);
   --chart-annotation: var(--muted);
   --chart-threshold: color-mix(in srgb, var(--foreground) 29%, transparent);
   --chart-midpoint: color-mix(in srgb, var(--foreground) 6.5%, transparent);
+  --chart-boll-middle: rgb(56 97 246);
+  --chart-boll-upper: rgb(223 72 76);
+  --chart-boll-lower: rgb(68 151 130);
   --chart-roc-positive-area: color-mix(in srgb, var(--positive) 12%, transparent);
   --chart-roc-negative-area: color-mix(in srgb, var(--negative) 12%, transparent);
   --chart-positive-label: color-mix(in srgb, var(--positive) 50%, var(--foreground));

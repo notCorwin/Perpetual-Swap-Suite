@@ -96,7 +96,7 @@ const chartTokens = {
   legendValue: chartTokenNumber('--space-annotation-value'),
   priceLabelPaddingY: chartTokenNumber('--chart-price-label-padding-y'),
 } as const
-const bollOverlay = { label: 'BOLL(20,2)', color: 'var(--chart-1)', dash: undefined,
+const bollOverlay = { label: 'BOLL(20,2)', color: 'var(--chart-boll-middle)', dash: undefined,
   value: (bar: Bar, compact?: boolean) => `U ${formatIndicatorPrice(bar.bollUpper, compact)}\u00a0·\u00a0M ${formatIndicatorPrice(bar.bollMiddle, compact)}\u00a0·\u00a0L ${formatIndicatorPrice(bar.bollLower, compact)}` }
 const priceOverlays = [bollOverlay]
 
@@ -155,11 +155,14 @@ const chartOverscan = (surface: ReadyChartWindow | null, chartController: ChartC
 }
 
 const PlotPaths = memo(function PlotPaths({ bars, geometry, areaClipId, oiState, takerState, priceVisible }: { priceVisible: boolean; bars: readonly Bar[]; geometry: ChartGeometry; areaClipId: string; oiState: PreparedChartState; takerState: PreparedChartState }) {
-  const { upWicks, downWicks, upBodies, downBodies, buys, sells, lines, rsiMarkers, oiAxis, oiComplete, oiSamples, oiY, x, takerComplete, takerAvailable } = geometry
+  const { upWicks, downWicks, upBodies, downBodies, buys, sells, lines, bollLines, rsiMarkers, oiAxis, oiComplete, oiSamples, oiY, x, takerComplete, takerAvailable } = geometry
   const { panels } = geometry.layout
   const lineStroke = (key: keyof Bar, d: string, color: string, dash?: string) => <path data-chart-indicator={key} d={d} fill="none" stroke={color} strokeLinecap="round" strokeLinejoin="round" strokeDasharray={dash} />
   return measureOperation({ category: 'cpu', name: 'chart.svg.paths.construct', attributes: { candles: bars.length } }, () => <>
     <g clipPath={`url(#${areaClipId}-price)`} visibility={priceVisible ? "visible" : "hidden"}>
+    {lineStroke("bollUpper", bollLines.bollUpper, "var(--chart-boll-upper)")}
+    {lineStroke("bollMiddle", bollLines.bollMiddle, "var(--chart-boll-middle)")}
+    {lineStroke("bollLower", bollLines.bollLower, "var(--chart-boll-lower)")}
     <path d={upWicks} fill="none" stroke="var(--positive)" />
     <path d={downWicks} fill="none" stroke="var(--negative)" />
     <path data-chart-candle-direction="up" data-chart-candle-fill="solid" d={upBodies} fill="var(--positive)" />
@@ -213,8 +216,10 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
   const latestColor = tag.rising ? "var(--positive)" : "var(--negative)"
   const latestPrice = formatCandleChange(liveBar.open, tag.price)
   const priceDirection = candleChangeDirection(liveBar.open, tag.price)
-  const priceLabelBackground = priceDirection === 'up' ? 'var(--positive)' : priceDirection === 'down' ? 'var(--negative)' : 'var(--chart-annotation)'
-  const priceLabelForeground = priceDirection === 'up' || priceDirection === 'down' ? 'var(--chart-price-label-foreground)' : 'var(--foreground)'
+  // Darken just the label background so white text remains legible without
+  // changing the prescribed candle and price-line colors.
+  const priceLabelBackground = priceDirection === 'up' ? 'color-mix(in srgb, var(--positive) 75%, black)' : priceDirection === 'down' ? 'color-mix(in srgb, var(--negative) 75%, black)' : 'rgb(89 89 89)'
+  const priceLabelForeground = 'white'
   const priceLabel = chartPriceLabelLayout(latestY, panels.price, chartTokens.textSize, chartTokens.priceLabelPaddingY, liveOverlay)
   const tickHalfHeight = chartTokens.textSize / 2
   const inspectionX = x[0] + (active.hour - bars[0].hour) / intervalMS * geometry.barPitch
@@ -282,7 +287,7 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     </defs>
     <g clipPath={`url(#${areaClipId}-content)`}>
       <g transform={`translate(${contentOffset},0)`} data-chart-wheel-content data-chart-wheel-offset={contentOffset}>
-      <g clipPath={`url(#${areaClipId}-price)`} visibility={presentation.base !== null && presentation.geometryBase !== null ? "visible" : "hidden"}>{bollBands.map((d, index) => <path key={index} data-chart-boll-band d={d} fill="var(--chart-1)" fillOpacity="0.1" />)}</g>
+      <g clipPath={`url(#${areaClipId}-price)`} visibility={presentation.base !== null && presentation.geometryBase !== null ? "visible" : "hidden"}>{bollBands.map((d, index) => <path key={index} data-chart-boll-band d={d} fill="var(--chart-boll-middle)" fillOpacity="0.05" />)}</g>
       {!geometry.priceOnly && <g clipPath={`url(#${areaClipId}-roc)`}>{rocAreas.map((area, index) => <g key={index}>
         <path d={area} fill="var(--chart-roc-positive-area)" clipPath={`url(#${areaClipId}-positive)`} />
         <path d={area} fill="var(--chart-roc-negative-area)" clipPath={`url(#${areaClipId}-negative)`} />
@@ -334,13 +339,19 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     {oiAxis && panels.oi[1] - panels.oi[0] >= 35 && geometry.oiTicks.map(({ y, label }, index) => <g key={index} data-chart-oi-tick><line x1={columns.oi[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.25" />{lineLabel(axisStarts.oi, y, label)}</g>)}
     {panels.taker[1] - panels.taker[0] >= 35 && geometry.takerTicks.map(({ y, label }, index) => <g key={index} data-chart-taker-tick>{lineLabel(axisStarts.taker, y, label)}</g>)}
     {inspectedTime && <g data-chart-inspected-time><rect x={inspectedTimeX} y={height - chartTokenNumber('--chart-bottom-axis-height')} width={inspectedTimeWidth} height={chartTokenNumber('--chart-bottom-axis-height') - 1} rx={3} fill="var(--chart-annotation)" /><text x={inspectedTimeX + inspectedTimeWidth / 2} y={height - 6} textAnchor="middle" fill="var(--foreground)">{inspectedTime}</text></g>}
+    {priceInViewport && <line data-chart-live-price x1={columns.price[0]} x2={right} y1={latestY} y2={latestY} stroke={latestColor} strokeDasharray="4 5" />}
     {presentation.ticks.map(({ y, label }, index) => {
       const value = Number.parseFloat(label.replaceAll(',', ''))
       const major = Number.isFinite(value) && Math.abs(value / 10 - Math.round(value / 10)) < 1e-8
-      return <g key={index} data-chart-price-tick><line x1={columns.price[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.35" />{y >= chartTokens.textSize && y <= height - chartTokens.textSize && (!priceInViewport || y + tickHalfHeight < priceLabel.top || y - tickHalfHeight > priceLabel.bottom) && <text x={axisStarts.price} y={y} dominantBaseline="middle" fill={major ? 'var(--foreground)' : 'var(--muted-foreground)'} fontWeight={major ? 700 : 400}>{label}</text>}</g>
+      const overlapsPriceLabel = priceInViewport && y + tickHalfHeight >= priceLabel.top && y - tickHalfHeight <= priceLabel.bottom
+      const inset = chartTokens.annotationXs
+      const labelWidth = overlapsPriceLabel ? chartTextWidth(label, chartTokens.textSize, major ? 700 : 400) : 0
+      return <g key={index} data-chart-price-tick><line x1={columns.price[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.35" />{y >= chartTokens.textSize && y <= height - chartTokens.textSize && <>
+        {overlapsPriceLabel && <rect x={right - inset - labelWidth - inset} y={y - tickHalfHeight - 1} width={labelWidth + inset * 2} height={chartTokens.textSize + 2} fill="var(--background)" />}
+        <text data-chart-price-tick-label data-chart-price-tick-inset={overlapsPriceLabel || undefined} x={overlapsPriceLabel ? right - inset : axisStarts.price} y={y} textAnchor={overlapsPriceLabel ? 'end' : 'start'} dominantBaseline="middle" fill={major ? 'var(--foreground)' : 'var(--muted-foreground)'} fontWeight={major ? 700 : 400}>{label}</text>
+      </>}</g>
     })}
     <line x1={right} x2={right} y1={panels.price[0]} y2={geometry.priceOnly ? panels.price[1] : panels.taker[1]} stroke="var(--border)" opacity="0.8" />
-    {priceInViewport && <line data-chart-live-price x1={columns.price[0]} x2={right} y1={latestY} y2={latestY} stroke={latestColor} strokeDasharray="4 5" />}
   </>
   })
 })

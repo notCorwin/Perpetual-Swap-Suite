@@ -181,15 +181,21 @@ export async function assertIndicatorLegends(page) {
   const reading = await page.locator('[data-multi-timeframe-charts] svg[data-rendered-inst]').evaluateAll(charts => charts.map(svg => ({
     timeframe: svg.dataset.renderedTimeframe,
     panels: svg.querySelectorAll('[data-chart-panel-header]').length,
-    removed: svg.querySelectorAll('[data-chart-indicator="vwap"], [data-chart-indicator="bollUpper"], [data-chart-indicator="bollMiddle"], [data-chart-indicator="bollLower"]').length,
+    removed: svg.querySelectorAll('[data-chart-indicator="vwap"]').length,
+    bollLines: ['bollUpper', 'bollMiddle', 'bollLower'].map(field => {
+      const path = svg.querySelector(`[data-chart-indicator="${field}"]`)
+      return path && { path: path.getAttribute('d'), stroke: getComputedStyle(path).stroke, width: Number.parseFloat(getComputedStyle(path).strokeWidth) }
+    }),
     bands: [...svg.querySelectorAll('[data-chart-boll-band]')].map(path => ({ path: path.getAttribute('d'), fill: getComputedStyle(path).fill, opacity: Number(getComputedStyle(path).fillOpacity) })),
   })))
   assert.deepEqual(reading.map(chart => chart.timeframe), ['1H', '15m', '5m'])
   assert.equal(await page.locator('[data-shared-chart-legend]').count(), 0)
   for (const chart of reading) {
     assert.equal(chart.panels, 0, `${chart.timeframe} should contain only its price chart.`)
-    assert.equal(chart.removed, 0, `${chart.timeframe} must not draw VWAP or BOLL lines.`)
-    assert.ok(chart.bands.length && chart.bands.every(band => band.path && band.fill !== 'none' && band.opacity > 0 && !/NaN|Infinity|undefined/.test(band.path)), `${chart.timeframe} must retain a finite BOLL background.`)
+    assert.equal(chart.removed, 0, `${chart.timeframe} must not draw VWAP.`)
+    assert.deepEqual(chart.bollLines.map(line => line?.stroke), ['rgb(223, 72, 76)', 'rgb(56, 97, 246)', 'rgb(68, 151, 130)'])
+    assert.ok(chart.bollLines.every(line => line?.path && line.width === 1 && !/NaN|Infinity|undefined/.test(line.path)), `${chart.timeframe} must draw three finite 1px BOLL lines.`)
+    assert.ok(chart.bands.length && chart.bands.every(band => band.path && band.fill !== 'none' && band.opacity === 0.05 && !/NaN|Infinity|undefined/.test(band.path)), `${chart.timeframe} must retain a faint finite BOLL background.`)
   }
   return reading
 }

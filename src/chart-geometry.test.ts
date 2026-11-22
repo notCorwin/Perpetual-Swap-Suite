@@ -252,7 +252,19 @@ test('price-only geometry fills the plot and has a separate reusable cache varia
   assert.equal(multi.layout.panels.price[1], 224)
   assert.ok(multi.layout.panels.price[1] - multi.layout.panels.price[0] > 180)
   assert.ok(multi.bollBands.length > 0)
+  assert.ok(Object.values(multi.bollLines).every(path => path.length > 0), 'Price-only charts retain all three Bollinger lines.')
   assert.equal(Object.values(multi.lines).every(path => path === ''), true)
+})
+
+test('Bollinger lines independently break at missing values and time gaps', () => {
+  const bars = rows().map((bar, index) => ({ ...bar, bollMiddle: index === 30 ? null : bar.bollMiddle }))
+  bars.splice(60, 1)
+  const geometry = createChartGeometryCache(text => text.length * 6)(bars, viewport)
+  const moves = (path: string) => (path.match(/M/g) ?? []).length
+  assert.equal(moves(geometry.bollLines.bollUpper), 2)
+  assert.equal(moves(geometry.bollLines.bollMiddle), 3)
+  assert.equal(moves(geometry.bollLines.bollLower), 2)
+  for (const path of Object.values(geometry.bollLines)) assert.doesNotMatch(path, /NaN|Infinity/)
 })
 
 test('unplotted EMA values cannot widen the main price scale or generate a path', () => {
