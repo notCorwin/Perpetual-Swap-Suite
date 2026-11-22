@@ -305,6 +305,19 @@ html[data-presentation-idle] *, html[data-presentation-idle] *::before, html[dat
 }
 
 [data-slot="button"], [data-slot="toggle-group-item"] { font-size: var(--ui-font-size); }
+[data-slot="button"][data-screenshot-button] { font-size: var(--market-font-size); }
+
+@keyframes screenshot-shutter {
+  from { opacity: 0.16; }
+  to { opacity: 0; }
+}
+[data-screenshot-shutter] {
+  background: var(--foreground);
+  animation: screenshot-shutter 220ms ease-out both;
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-screenshot-shutter] { display: none; }
+}
 [data-market-index] { height: var(--ui-row-height); }
 [data-chart-summary] {
   height: var(--chart-summary-height);

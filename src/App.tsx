@@ -260,13 +260,20 @@ function App() {
   useEffect(() => { if (ready) void chartCoordinator.setUniverse(retainedChart && selectedID ? [...candidateIds, selectedID] : candidateIds, timeframe) }, [ready, candidateIds, timeframe, retainedChart, selectedID])
   const screenshotOwner = useRef<object | null>(null)
   const screenshotPending = useRef(false)
-  const [copyState, setCopyState] = useState<{ status: 'idle' | 'copied' | 'failed'; error: string; revision: number }>({ status: 'idle', error: '', revision: 0 })
+  const [copyState, setCopyState] = useState<{ error: string }>({ error: '' })
+  const [screenshotSuccess, setScreenshotSuccess] = useState(0)
+  const [shutter, setShutter] = useState(0)
   useEffect(() => () => { screenshotOwner.current = null; screenshotPending.current = false }, [])
   useEffect(() => {
-    if (copyState.status !== 'copied') return
-    const timer = window.setTimeout(() => setCopyState(current => ({ ...current, status: 'idle', error: '' })), 2000)
+    if (!screenshotSuccess) return
+    const timer = window.setTimeout(() => setScreenshotSuccess(0), 1000)
     return () => window.clearTimeout(timer)
-  }, [copyState.status, copyState.revision])
+  }, [screenshotSuccess])
+  useEffect(() => {
+    if (!shutter) return
+    const timer = window.setTimeout(() => setShutter(0), 240)
+    return () => window.clearTimeout(timer)
+  }, [shutter])
   const screenshot = async () => {
     if (screenshotOwner.current) { screenshotPending.current = true; return }
     const owner = {}
@@ -274,12 +281,16 @@ function App() {
     try {
       const result = await window.radarDesktop.request({ screenshot: {} })
       if (!result.ok) throw new Error('Screenshot failed.')
-      if (screenshotOwner.current === owner) setCopyState(current => ({ status: 'copied', error: '', revision: current.revision + 1 }))
+      if (screenshotOwner.current === owner) {
+        setCopyState({ error: '' })
+        setScreenshotSuccess(current => current + 1)
+        setShutter(current => current + 1)
+      }
     } catch {
       if (screenshotOwner.current === owner) {
         const detail = 'Could not copy the screenshot. Check the clipboard and try again.'
         const issue = { id: 'copy', label: 'Screenshot', detail, severity: 'error', instance: ++toastSequence.current }
-        setCopyState(current => ({ status: 'failed', error: detail, revision: current.revision + 1 }))
+        setCopyState({ error: detail })
         setToast(shown => [...shown.slice(0, 3), ...[...shown.slice(3), issue].sort((a, b) => Number(b.severity === 'error') - Number(a.severity === 'error'))].slice(0, 32))
       }
     } finally {
@@ -365,13 +376,14 @@ function App() {
 
   return <WorkspaceViewport>
     <div className="relative flex h-full min-w-0 flex-1">
-      {toast.length > 0 && <div data-market-status role="status" aria-atomic="false" className="pointer-events-none absolute bottom-4 left-4 z-50 flex max-w-[min(28rem,90%)] flex-col gap-2" aria-label="Application notifications">
+      {shutter > 0 && <div key={shutter} data-screenshot-shutter aria-hidden="true" className="pointer-events-none absolute inset-0 z-50" />}
+      {(toast.length > 0 || screenshotSuccess > 0) && <div data-market-status role="status" aria-atomic="false" className="pointer-events-none absolute bottom-4 left-4 z-50 flex max-w-[min(28rem,90%)] flex-col gap-2" aria-label="Application notifications">
         {toast.slice(0, 3).map(issue => <NotificationPanel key={issue.instance} issue={issue} setToast={setToast} />)}
+        {screenshotSuccess > 0 && <p data-screenshot-success className="rounded-md border bg-popover px-4 py-3 text-sm text-popover-foreground shadow-lg">Screenshot copied to clipboard</p>}
       </div>}
       <div className="flex h-full min-w-0 flex-1">
         <section data-chart-panel className="h-full min-w-0 flex-1" aria-label="Market chart workspace">
           <div data-chart-display-mode="multi" className="flex h-full min-h-0 flex-col">
-            <span role="status" className="sr-only">{copyState.status === 'copied' ? 'Screenshot copied to clipboard' : ''}</span>
             <div className="flex min-h-0 flex-1 flex-col">
               <header data-chart-toolbar data-window-toolbar data-window-drag-region className="flex shrink-0 items-center gap-3 px-4">
                 <div className="flex min-w-0 flex-1 items-center gap-4">
@@ -379,7 +391,7 @@ function App() {
                   {selectedID && <h2 data-chart-title data-shared-chart-title className="max-w-32 truncate" title={selectedID}>{selectedID.replace(/-SWAP$/, '')}</h2>}
                   {sharedPriceText !== undefined && <><span className="sr-only">Market price</span><span data-shared-chart-price className="max-w-32 truncate" title={sharedPriceText}>{sharedPriceText}</span></>}
                 </div>
-                <Button data-window-no-drag aria-label="Screenshot" variant="outline" size="sm" onClick={() => { void screenshot() }}><Camera data-icon="inline-start" aria-hidden="true" />{copyState.status === 'copied' ? 'Copied' : 'Screenshot'}</Button>
+                <Button data-window-no-drag data-screenshot-button aria-label="Screenshot" variant="ghost" size="sm" className="border-0 text-muted-foreground" onClick={() => { void screenshot() }}><Camera className="size-[var(--ui-line-height)]" data-icon="inline-start" aria-hidden="true" />Screenshot</Button>
               </header>
               <ChartTimeSyncProvider key={selectedID}><div className="grid min-h-0 flex-1 grid-rows-2 gap-2 p-2 pt-0" data-multi-timeframe-charts>
                 <div className="flex min-h-0 min-w-0 gap-2">
