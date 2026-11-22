@@ -96,7 +96,7 @@ test('indicator changes and observed nulls replace only changed projections and 
   try {
     const ready = pipeline.frame(state), hour = end - 10 * step, index = ready.bars.findIndex(value => value.hour === hour)
     const original = state.indicators.get(hour)
-    state.indicators.set(hour, Object.freeze({ ...original, vwap: null }))
+    state.indicators.set(hour, Object.freeze({ ...original, bollUpper: null }))
     const undefinedValue = pipeline.frame(state)
     assert.notEqual(undefinedValue.bars, ready.bars)
     assert.notEqual(undefinedValue.bars[index], ready.bars[index])
@@ -114,7 +114,7 @@ test('indicator changes and observed nulls replace only changed projections and 
     assert.equal(corrected.indicatorState, 'ready')
     assert.equal(corrected.bars[index].ema, original.ema + 1)
     assert.equal(ready.bars[index].ema, original.ema)
-    assert.equal(undefinedValue.bars[index].vwap, null)
+    assert.equal(undefinedValue.bars[index].bollUpper, null)
     assert.ok(Object.isFrozen(corrected.bars[index]))
 
     const history = pipeline.historyFrame(state, end)

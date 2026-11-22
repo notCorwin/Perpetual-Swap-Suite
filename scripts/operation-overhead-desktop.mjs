@@ -31,7 +31,7 @@ const close = window.overhead.enabled ? await initializeOperationTelemetry({ ini
  recordOperations: async batch => { const started=performance.now();const result=await window.overhead.recordOperations(batch);acknowledgmentLatencies.push({durationMS:performance.now()-started,size:batch.events.length});return result; }, reportFailure: value => window.overhead.reportFailure(value),
  timeOrigin: performance.timeOrigin, schedule: (fn, ms) => setTimeout(fn, ms), cancel: handle => clearTimeout(handle),
  onFlush: callback => {flushWarmup=callback;return () => {};} }) : async () => {};
-const bars = Array.from({length:96}, (_, index) => ({hour:1700000100000+index*300000,open:100,high:102,low:98,close:100+index/100,ema:100,vwap:100,
+const bars = Array.from({length:96}, (_, index) => ({hour:1700000100000+index*300000,open:100,high:102,low:98,close:100+index/100,ema:100,
  bollUpper:102,bollMiddle:100,bollLower:98,roc:1,maroc:1,rsi6:50,rsi12:50,rsi24:50,atrPercent:2,bbw:4,oi:1000,buy:70,sell:30,confirmed:true}));
 const geometry = createChartGeometryCache(text => text.length*7), path = document.querySelector('path');
 const yieldToBrowser = () => new Promise(resolve => setTimeout(resolve,0));

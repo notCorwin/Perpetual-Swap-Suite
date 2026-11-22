@@ -101,7 +101,7 @@ test('list admission immediately returns while all periods of every unselected c
       const oracle: any[] = buildIndicatorSeries(rowsFor(id, 400, timeframe), intervalFor(timeframe)).bars
       const frame = frames.findLast(frame => frame.instId === id && frame.timeframe === timeframe && frame.indicatorState === 'ready')
       assert.equal(frame.bars.length, 96); assert.equal(frame.priceState, 'ready')
-      for (const [index, bar] of frame.bars.entries()) for (const field of ['ema', 'vwap', 'bollUpper', 'rsi6', 'rsi12', 'rsi24', 'roc', 'maroc', 'atrPercent', 'bbw']) {
+      for (const [index, bar] of frame.bars.entries()) for (const field of ['ema', 'bollUpper', 'rsi6', 'rsi12', 'rsi24', 'roc', 'maroc', 'atrPercent', 'bbw']) {
         assert.equal(bar[field], oracle.at(-96 + index)?.[field], `${id} ${timeframe} ${field} at ${bar.hour}`)
       }
     }

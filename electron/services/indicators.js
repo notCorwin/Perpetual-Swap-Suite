@@ -5,7 +5,6 @@ const finite = value => typeof value === 'number' && Number.isFinite(value) ? va
 const EMA_PERIOD = 200
 const EMA_MULTIPLIER = 2 / (EMA_PERIOD + 1)
 const BOLL_PERIOD = 20
-const VWAP_PERIOD = 14
 const ROC_PERIOD = 9
 const MAROC_PERIOD = 9
 const RSI_PERIODS = [6, 12, 24]
@@ -17,7 +16,7 @@ export function createIndicatorState(intervalMS = 300_000) {
   if (!Number.isFinite(intervalMS) || intervalMS <= 0) throw new RangeError('Indicator interval must be positive.')
   return {
     intervalMS, lastTimestamp: null, count: 0, previousClose: null,
-    emaSeedSum: 0, ema: null, closes: [], volumes: [], rocs: [],
+    emaSeedSum: 0, ema: null, closes: [], rocs: [],
     previousROC: null, previousMAROC: null,
     rsi: RSI_PERIODS.map(period => ({ period, gains: 0, losses: 0 })),
     atrCount: 0, atrSeedSum: 0, atr: null,
@@ -89,16 +88,6 @@ export function appendIndicatorCandle(state, candle) {
     band = { upper: middle + 2 * deviation, middle, lower: middle - 2 * deviation }
   }
 
-  state.volumes.push({ typicalPrice: (candle.high + candle.low + price) / 3, volume: finite(candle.baseVolume) })
-  if (state.volumes.length > VWAP_PERIOD) state.volumes.shift()
-  let vwap = null
-  if (state.volumes.length === VWAP_PERIOD && state.volumes.every(value => value.volume !== null && value.volume >= 0 && Number.isFinite(value.typicalPrice))) {
-    // VWAP14 uses typical price and base quantity. Missing/negative quantity,
-    // invalid typical prices and an all-zero volume window are unavailable.
-    const volume = state.volumes.reduce((sum, value) => sum + value.volume, 0)
-    if (volume > 0) vwap = state.volumes.reduce((sum, value) => sum + value.typicalPrice * value.volume, 0) / volume
-  }
-
   state.rocs.push(currentROC)
   if (state.rocs.length > MAROC_PERIOD) state.rocs.shift()
   const maroc = state.rocs.length === MAROC_PERIOD && state.rocs.every(value => value !== null && Number.isFinite(value))
@@ -109,7 +98,7 @@ export function appendIndicatorCandle(state, candle) {
     hour: candle.timestamp, quoteVolume: candle.quoteVolume ?? null,
     open: candle.open, high: candle.high, low: candle.low, close: price, confirmed: Boolean(candle.confirmed),
     statisticsSources: candle.statisticsSources, statisticsObserved: candle.statisticsObserved,
-    vwap, ema: state.ema, bollUpper: band?.upper ?? null, bollMiddle: band?.middle ?? null, bollLower: band?.lower ?? null,
+    ema: state.ema, bollUpper: band?.upper ?? null, bollMiddle: band?.middle ?? null, bollLower: band?.lower ?? null,
     roc: currentROC, maroc, rsi6: rsis[0], rsi12: rsis[1], rsi24: rsis[2], atrPercent, bbw,
     oi: finite(candle.oi), buy: finite(candle.buy), sell: finite(candle.sell), bandPosition,
     rocChange: change(currentROC, state.previousROC), marocChange: change(maroc, state.previousMAROC),
@@ -127,7 +116,7 @@ export function appendIndicatorCandle(state, candle) {
 // keeps successive live revisions from changing EMA/RSI/ATR's confirmed state.
 export function projectIndicatorCandle(state, candle) {
   return measureOperation({ category: 'cpu', name: 'indicators.project', attributes: { candles: 1, intervalMS: state.intervalMS } }, () => appendIndicatorCandle({
-    ...state, closes: [...state.closes], volumes: [...state.volumes], rocs: [...state.rocs],
+    ...state, closes: [...state.closes], rocs: [...state.rocs],
     rsi: state.rsi.map(value => ({ ...value })),
   }, candle))
 }

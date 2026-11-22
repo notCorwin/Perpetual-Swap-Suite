@@ -39,7 +39,7 @@ try {
         const bandHalfWidth = .5 + .18 * Math.cos(index / 13) + .04 * Math.sin(index / 5)
         return { hour: endHour - (95 - index) * intervalMS, open: close + (index === 95 && timeframe === '5m' ? .05 : index % 2 ? -.05 : .05), high: close + .2, low: close - .2, close,
           confirmed: true, statisticsSources: 3, statisticsObserved: true, indicatorsObserved: true,
-          ema: close, vwap: close - .02, bollUpper: close + bandHalfWidth, bollMiddle: close, bollLower: close - bandHalfWidth,
+          ema: close, bollUpper: close + bandHalfWidth, bollMiddle: close, bollLower: close - bandHalfWidth,
           roc: .5, maroc: .25, rsi6: 50, rsi12: 55, rsi24: 60,
           atrPercent: averageTrueRange / close * 100, bbw: bandHalfWidth * 2 / close * 100, oi: 1_000_000 + index, buy: 12_000, sell: 10_000 }
       })
@@ -186,7 +186,7 @@ try {
         labelColor: rgba(getComputedStyle(swatch.parentElement.querySelector('text')).fill).slice(0, 3), swatchColor: rgba(getComputedStyle(swatch).stroke).slice(0, 3) })),
       upFill: renderedChart?.querySelector('[data-chart-candle-direction="up"]')?.dataset.chartCandleFill,
       downFill: renderedChart?.querySelector('[data-chart-candle-direction="down"]')?.dataset.chartCandleFill,
-      emaDash: chartLineDash('ema'), vwapDash: chartLineDash('vwap') }
+      emaDash: chartLineDash('ema') }
     return { texts, graphics, semantics }
   })
   for (const theme of ['light', 'dark']) {

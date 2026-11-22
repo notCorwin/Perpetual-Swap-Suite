@@ -18,10 +18,11 @@ const HISTORY_RUNWAY = 192 + 2 * 120 * 1.5 + 2 // Include the two-candle gesture
 const HISTORY_RESIDENT = 2304, HISTORY_BALANCE = 768
 const HISTORY_SHARE_DISTANCE = 512
 const INDICATOR_WARMUP = 199 // EMA200 is the longest initial seed.
-// Formula versions identify the complete recursive state and verified producer.
-// Older checkpoints do not contain ATR14's Wilder accumulator and SMA seed.
-const FORMULA_VERSION = 'native-exact-chunks-ema200-wilder-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-wilder-atr14-percent-bbw20-2-v5'
-const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
+// The v5 state is compatible for all retained indicators, but must remain
+// untouched for older producers that still require its rolling volume window.
+const LEGACY_FORMULA_VERSION = 'native-exact-chunks-ema200-wilder-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-wilder-atr14-percent-bbw20-2-v5'
+const FORMULA_VERSION = 'native-exact-chunks-ema200-wilder-rsi6-12-24-boll20-2-roc9-maroc9-wilder-atr14-percent-bbw20-2-v6'
+const indicatorFields = ['ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
 const priceFields = ['open', 'high', 'low', 'close', 'volume', 'baseVolume', 'quoteVolume', 'confirmed']
 const TIMEFRAMES = ['5m', '15m', '1H']
 const intervalFor = timeframe => ({ '5m': 300_000, '15m': 900_000, '1H': 3_600_000 })[timeframe]
@@ -44,7 +45,7 @@ const samePrice = (left, right) => left && priceFields.every(field => Object.is(
 const sameRecord = (left, right) => left === right || Boolean(left && right && JSON.stringify(left) === JSON.stringify(right))
 // Only these forming-candle fields affect the indicator math. Other output
 // fields, including quote volume and statistics, are taken from the new row.
-const liveIndicatorFields = ['timestamp', 'high', 'low', 'close', 'baseVolume']
+const liveIndicatorFields = ['timestamp', 'high', 'low', 'close']
 const sameLiveIndicatorInput = (left, right) => left === right || Boolean(left && right
   && liveIndicatorFields.every(field => Object.is(left[field], right[field])))
 // Cached projections use row/indicator identity. Own and freeze every resident
@@ -98,14 +99,13 @@ const bar = (row, calculated, oiFresh = sourceFresh(row, 1), takerFresh = source
 // promotions must never mutate the admitted prefix behind another owner.
 const sharedIndicatorState = state => {
   if (!state || Object.isFrozen(state)) return state
-  for (const value of state.volumes) Object.freeze(value)
   for (const value of state.rsi) Object.freeze(value)
-  for (const field of ['closes', 'volumes', 'rocs', 'rsi']) Object.freeze(state[field])
+  for (const field of ['closes', 'rocs', 'rsi']) Object.freeze(state[field])
   if (state.bollExpansion) Object.freeze(state.bollExpansion)
   return Object.freeze(state)
 }
 const appendConfirmed = (previous, candle) => {
-  const state = { ...previous, closes: [...previous.closes], volumes: [...previous.volumes], rocs: [...previous.rocs],
+  const state = { ...previous, closes: [...previous.closes], rocs: [...previous.rocs],
     rsi: previous.rsi.map(value => ({ ...value })) }
   const previousHour = state.lastTimestamp, previousWidth = state.previousBandWidth ?? null
   const value = appendIndicatorCandle(state, candle)
@@ -940,8 +940,22 @@ export class PreparedChartPipeline {
     const rows = await this.store.candles({ instrument: state.instId, timeframe: state.timeframe, from, through, limit, order: 'desc' }, priority)
     if (this.closed || options.wanted && !options.wanted()) return false
     if (admittedPrice !== state.priceVersion || residentRevision !== this.store.candleRevision?.(state.instId, state.timeframe)) return this.readRows(state, end, limit, priority, options)
-    for (const row of rows) if (row.confirmed) assertCandleGrid(row.timestamp, state.intervalMS)
     const residentFirst = Math.min(...state.rows.keys()), residentLast = Math.max(...state.rows.keys())
+    const inspected = state.historyReadRange
+    let fencedRevision = null
+    if (residentRevision != null && inspected?.revision === residentRevision && inspected.priceVersion === state.priceVersion
+      && rows.some(row => row.confirmed && !state.rows.has(row.timestamp) && row.timestamp > residentFirst && row.timestamp < residentLast
+        && (row.timestamp < inspected.from || row.timestamp > inspected.through))
+      && typeof this.store.withCandleCommitFence === 'function') {
+      // A reader can see a committed write before the writer's revision
+      // notification reaches this process. Wait for dispatched writes before
+      // trusting the in-memory revision as a proof of unchanged source data.
+      fencedRevision = await this.store.withCandleCommitFence(() => this.store.candleRevision(state.instId, state.timeframe))
+      if (this.closed || options.wanted && !options.wanted()) return false
+      if (admittedPrice !== state.priceVersion || state.historyReadRange !== inspected || fencedRevision !== residentRevision
+        || residentRevision !== this.store.candleRevision?.(state.instId, state.timeframe)) return this.readRows(state, end, limit, priority, options)
+    }
+    for (const row of rows) if (row.confirmed) assertCandleGrid(row.timestamp, state.intervalMS)
     let pricesChanged = false, observationsChanged = false, changedFrom = Infinity, oiChanged = false, takerChanged = false
     for (const row of rows) if (row.confirmed) {
       const previous = state.rows.get(row.timestamp), prior = admittedRows.get(row.timestamp)
@@ -952,7 +966,13 @@ export class PreparedChartPipeline {
       // A committed hole repair may precede its observer. It changes the
       // recursive input prefix just like a correction of an existing candle.
       // Ordinary reserve expansion lies outside the retained interval.
-      if (previous ? !samePrice(previous, value) : row.timestamp > residentFirst && row.timestamp < residentLast) {
+      // A retained historical reserve and the latest tail may be disjoint.
+      // Their min/max timestamps do not prove the interval between them was
+      // previously read. At an unchanged durable revision, rows outside the
+      // inspected range are ordinary admission, not a repaired source hole.
+      const uninspected = !previous && fencedRevision !== null && inspected?.revision === fencedRevision && inspected.priceVersion === state.priceVersion
+        && (row.timestamp < inspected.from || row.timestamp > inspected.through)
+      if (previous ? !samePrice(previous, value) : !uninspected && row.timestamp > residentFirst && row.timestamp < residentLast) {
         pricesChanged = true; changedFrom = Math.min(changedFrom, row.timestamp)
       }
       const unchanged = sameRecord(previous, value)
@@ -1622,14 +1642,6 @@ export class PreparedChartPipeline {
       if (!numeric(calculated.ema) && hour >= floor + INDICATOR_WARMUP * state.intervalMS) {
         from = Math.min(from, hour - INDICATOR_WARMUP * state.intervalMS); through = hour
       }
-      // VWAP can lack offscreen native volumes even when EMA is mature.
-      // An observed zero-volume window is mathematically undefined, not a gap.
-      if (!numeric(calculated.vwap) && hour >= floor + 13 * state.intervalMS) {
-        const start = hour - 13 * state.intervalMS
-        for (let stamp = start; stamp <= hour; stamp += state.intervalMS) if (!completePriceCandle(state.rows.get(stamp))) {
-          from = Math.min(from, start); through = hour; break
-        }
-      }
     }
     return from < Infinity ? { from, through } : null
   }
@@ -1988,9 +2000,14 @@ export class PreparedChartPipeline {
           if (version === state.priceVersion && generation === state.generation) await this.refreshChangedCanonical(state, version)
           return false
         }
-        const checkpoint = await this.store.readIndicatorCheckpoint?.({ instrument: state.instId, timeframe: state.timeframe, before: first - state.intervalMS, formulaVersion: FORMULA_VERSION }, priority)
+        let checkpoint = await this.store.readIndicatorCheckpoint?.({ instrument: state.instId, timeframe: state.timeframe, before: first - state.intervalMS, formulaVersion: FORMULA_VERSION }, priority)
         if (!await currentBasis()) return
-        let calculated = checkpoint?.state ?? null, cursor = checkpoint ? checkpoint.timestamp + state.intervalMS : 0, progressed = false
+        if (!checkpoint) {
+          checkpoint = await this.store.readIndicatorCheckpoint?.({ instrument: state.instId, timeframe: state.timeframe, before: first - state.intervalMS, formulaVersion: LEGACY_FORMULA_VERSION }, priority)
+          if (!await currentBasis()) return
+        }
+        let calculated = checkpoint?.state ? { ...checkpoint.state } : null, cursor = checkpoint ? checkpoint.timestamp + state.intervalMS : 0, progressed = false
+        if (calculated) delete calculated.volumes
         while (stillNeeded() && cursor <= end) {
           failedFrom = cursor
           const rows = await this.store.candles({ instrument: state.instId, timeframe: state.timeframe, from: cursor, through: end, limit: CHUNK, order: 'asc' }, priority)

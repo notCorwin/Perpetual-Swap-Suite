@@ -3,7 +3,7 @@ import type { Bar, ReadyChartWindow } from './chart-data.ts'
 import { chartPricePresentation, createChartGeometryCache, type ChartGeometryOverscan } from './chart-geometry.ts'
 import { chartWheelContentOffset } from './chart-navigation.ts'
 
-const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw'] as const
+const indicatorFields = ['ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw'] as const
 
 /** A loading-only visual snapshot. It never certifies or enters the source store. */
 export function createChartIndicatorPresentation() {

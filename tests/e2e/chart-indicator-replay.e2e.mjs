@@ -26,9 +26,9 @@ test('indicator replay preserves visible paths while current prices update and t
     })
     const replay = await page.evaluate(async () => {
       const chart = document.querySelector('svg[data-rendered-timeframe="15m"]')?.closest('[data-chart-inst]'), frame = chart.__chartSnapshot
-      const fields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
+      const fields = ['ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
       const svg = chart.querySelector('svg[data-rendered-inst]')
-      const paths = [...svg.querySelectorAll('[data-chart-indicator]')].filter(path => path.getAttribute('d')).map(path => path.dataset.chartIndicator)
+      const band = svg.querySelector('[data-chart-boll-band]')?.getAttribute('d')
       const observations = []
       const send = async detail => {
         window.dispatchEvent(new CustomEvent('radar-chart-prepared', { detail }))
@@ -37,8 +37,8 @@ test('indicator replay preserves visible paths while current prices update and t
         const source = chart.__chartSnapshot, rendered = chart.__chartRenderedBars
         const status = document.querySelector('[data-market-status-row] [data-chart-shared-status-item="15m"]')
         observations.push({ state: source.indicatorState, stale: chart.dataset.chartIndicatorStale,
-          continuous: paths.every(field => svg.querySelector(`[data-chart-indicator="${field}"]`).getAttribute('d')),
-          sourceNull: source.bars.every(bar => bar.vwap === null), renderedVWAP: rendered.find(bar => bar.hour === source.bars.at(-1).hour)?.vwap,
+          continuous: !!svg.querySelector('[data-chart-boll-band]')?.getAttribute('d'),
+          sourceNull: source.bars.every(bar => bar.bollUpper === null), renderedBand: rendered.find(bar => bar.hour === source.bars.at(-1).hour)?.bollUpper,
           sourceClose: source.bars.at(-1).close, renderedClose: rendered.find(bar => bar.hour === source.bars.at(-1).hour)?.close,
           previousNotice: status?.textContent.includes('Showing previous indicators') ?? false,
           sameSurface: chart.querySelector('svg[data-rendered-inst]') === svg })
@@ -51,14 +51,14 @@ test('indicator replay preserves visible paths while current prices update and t
       await send(raw)
       await send({ ...raw, revision: 2, bars: raw.bars.map((bar, index) => index < 20 ? { ...bar, ...Object.fromEntries(fields.map(field => [field, frame.bars[index][field]])), indicatorsObserved: true } : bar) })
       await send({ ...raw, revision: 3, indicatorState: 'unavailable', bars: raw.bars.map(bar => ({ ...bar, indicatorsObserved: true })) })
-      return { observations, paths, price, oldVWAP: frame.bars.at(-1).vwap }
+      return { observations, band, price, oldBand: frame.bars.at(-1).bollUpper }
     })
-    assert.ok(replay.paths.includes('vwap') && replay.paths.includes('bollUpper'))
+    assert.ok(replay.band, 'The BOLL background must exist before replay.')
     for (const state of replay.observations.slice(0, 2)) {
       assert.equal(state.state, 'loading')
       assert.equal(state.stale, 'true')
       assert.equal(state.continuous, true, 'All previously visible indicator paths remain drawn during replay.')
-      assert.equal(state.renderedVWAP, replay.oldVWAP)
+      assert.equal(state.renderedBand, replay.oldBand)
       assert.equal(state.sourceClose, replay.price)
       assert.equal(state.renderedClose, replay.price, 'New candle prices must be displayed during indicator replay.')
       assert.equal(state.previousNotice, true)
@@ -67,7 +67,7 @@ test('indicator replay preserves visible paths while current prices update and t
     assert.equal(replay.observations[0].sourceNull, true, 'Retained visual indicators must not enter the authoritative source.')
     assert.equal(replay.observations[2].state, 'unavailable')
     assert.equal(replay.observations[2].stale, 'false')
-    assert.equal(replay.observations[2].renderedVWAP, null, 'Terminal nulls must clear the retained curves.')
+    assert.equal(replay.observations[2].renderedBand, null, 'Terminal nulls must clear the retained curves.')
     assert.equal(await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFocused()), false)
     assert.deepEqual(pageErrors, [])
   } finally {

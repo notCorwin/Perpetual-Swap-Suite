@@ -357,7 +357,7 @@ test('prepared native chart pages preserve canonical indicator values across eve
       assert.equal(visible.length, 96)
       for (const bar of visible) {
         const oracle = expected.get(bar.hour)
-        for (const field of ['open', 'high', 'low', 'close', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']) {
+        for (const field of ['open', 'high', 'low', 'close', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']) {
           assert.ok(Number.isFinite(bar[field]), `${timeframe} ${bar.hour} ${field} must be initialized.`)
           assert.ok(Math.abs(bar[field] - oracle[field]) <= Math.max(1, Math.abs(oracle[field])) * 1e-10,
             `${timeframe} ${bar.hour} ${field} changed from its canonical initialization.`)
@@ -508,7 +508,7 @@ test('the paint probe selects the first ready target RAF and retains its mutable
   await openChart(page, fixture)
   await page.waitForFunction(instId => {
     const chart = document.querySelector(`[data-acceptance-target] [data-chart-inst="${instId}"]`), bars = chart?.__chartRenderedBars ?? chart?.__chartSnapshot?.bars
-    const fields = ['vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
+    const fields = ['bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
     return bars?.length >= 96 && bars.length <= 98 && bars.every(bar => bar.indicatorsObserved && fields.every(field => Number.isFinite(bar[field])))
   }, fixture.instId)
   await startPaintProbe(page, fixture, { indicatorValidation: 'deferred-canonical' })
@@ -576,7 +576,7 @@ test('DOM capture retains shared SVG evidence when curves, clips and bars change
   try {
     const evidence = await page.evaluate(async instId => {
       const chart = document.querySelector(`[data-acceptance-target] [data-chart-inst="${instId}"]`), probe = window.__chartPaintProbe
-      const svg = chart.querySelector('svg[data-rendered-inst]'), path = svg.querySelector('[data-chart-indicator="vwap"]')
+      const svg = chart.querySelector('svg[data-rendered-inst]'), path = svg.querySelector('[data-chart-boll-band]')
       const clipOwner = svg.querySelector('[data-chart-wheel-content]').parentElement
       const reference = clipOwner.getAttribute('clip-path')
       const clipId = reference.slice(reference.indexOf('#') + 1, reference.indexOf(')'))
@@ -588,7 +588,7 @@ test('DOM capture retains shared SVG evidence when curves, clips and bars change
       let sharedSVG = false, changedBarsSameSVG = false, invalidEvidence
       try {
         probe.phase = 'first invalid curve'
-        path.setAttribute('d', 'M0,0')
+        path.setAttribute('d', 'M0,0 L1,1 L1,2 L0,2 Z')
         await Promise.resolve()
         const invalidSVG = probe.observations.at(-1).surface.svg
         invalidEvidence = invalidSVG
@@ -607,7 +607,7 @@ test('DOM capture retains shared SVG evidence when curves, clips and bars change
         clipOwner.setAttribute('clip-path', reference); clip.setAttribute('width', clipValue); path.setAttribute('d', pathValue)
         await Promise.resolve()
         const restoredSVG = probe.observations.at(-1).surface.svg
-        bars[0].vwap = null
+        bars[0].bollUpper = null
         probe.phase = 'changed bars'
         Object.defineProperty(chart, '__chartSnapshot', { configurable: true, value: snapshot })
         Object.defineProperty(chart, '__chartRenderedBars', { configurable: true, value: bars })
@@ -646,7 +646,7 @@ test('DOM capture retains shared SVG evidence when curves, clips and bars change
         }
       }
       return { sharedSVG, changedBarsSameSVG, mappingFailures, observations: probe.observations.length, errorsBeforeFinish: probe.errors.length,
-        retainedCorruption: probe.observations.some(observation => observation.surface.svg === invalidEvidence && observation.surface.svg.curves.includes('M0,0')) }
+        retainedCorruption: probe.observations.some(observation => observation.surface.svg === invalidEvidence && observation.surface.svg.curves.some(curve => curve.includes('M0 0 L1 1'))) }
     }, fixture.instId)
     report = await finishPaintProbe(page)
     assert.equal(evidence.sharedSVG, true, 'Repeated RAFs must use the same captured SVG record.')
@@ -760,13 +760,45 @@ test('the paint probe reports capture failures without dropping observations', a
 
 test('prepared resident indicators and statistics stay drawn through rapid scrolling, latest pushes and reversal', async context => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
-  const indicatorFields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
+  // Verify the fixture is stable under the production 5m-to-parent derivation.
+  // Otherwise a routine aggregation write can invalidate indicators mid-test.
+  for (const frame of ['15m', '1H']) {
+    const interval = fixture.series[frame].intervalMS
+    const hour = fixture.end - 2 * interval
+    const parent = fixture.series[frame].bars.find(bar => bar.hour === hour)
+    const children = fixture.series['5m'].bars.filter(bar => bar.hour >= hour && bar.hour < hour + interval)
+    assert.equal(children.length, interval / fixture.series['5m'].intervalMS)
+    assert.deepEqual([parent.open, parent.high, parent.low, parent.close],
+      [children[0].open, Math.max(...children.map(bar => bar.high)), Math.min(...children.map(bar => bar.low)), children.at(-1).close])
+  }
+  const indicatorFields = ['ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
   await installRequestProbe(electron, fixture.instId)
   try {
     await openChart(page, fixture)
     for (const timeframe of fixture.timeframes) {
       await selectTimeframe(page, timeframe)
-      await waitForRendered(page, fixture, timeframe)
+      // The lower panels occupy half the workspace width. Recalibrate the
+      // selected panel after switching, while preserving the 96-slot workload
+      // used by the paint probe and the resident-history performance checks.
+      for (let attempt = 0; attempt < 12; attempt++) {
+        const { span, spacing, scale } = await page.locator('[data-acceptance-target] [data-chart-inst]').evaluate(chart => ({
+          span: Number(chart.dataset.chartVisibleBars), spacing: Number(chart.dataset.chartBarSpacing),
+          scale: Number(document.querySelector('[data-layout="market-workspace"]').dataset.uiScale),
+        }))
+        if (Math.abs(span - 96.5) <= .05) break
+        const viewport = page.viewportSize()
+        await page.setViewportSize({ ...viewport, width: Math.round(viewport.width + (96.5 - span) * spacing * scale * (timeframe === '1H' ? 1 : 2)) })
+        await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+      }
+      // Other periods may end after this panel's newest confirmed candle. The
+      // shared live edge therefore leaves legitimate empty future slots in a
+      // shorter-period panel. Warm and measure a complete historical viewport.
+      await wheelBurst(page, { deltaY: -100_000 })
+      await page.waitForFunction(end => Number(document.querySelector('[data-acceptance-target] [data-chart-inst]')?.dataset.chartTimeEnd) > end, fixture.end)
+      const resident = await waitForLocalHistory(electron, page, fixture, timeframe, { requireIndicators: true, stayHistorical: true })
+      const intervalMS = fixture.series[timeframe].intervalMS
+      const baselineEnd = fixture.end - intervalMS
+      await waitForRendered(page, fixture, timeframe, baselineEnd)
       // Establish a complete canonical starting frame. The regression concerns
       // losing mature data during navigation, not first-time indicator seeding.
       await page.waitForFunction(({ timeframe, fields }) => {
@@ -775,22 +807,21 @@ test('prepared resident indicators and statistics stay drawn through rapid scrol
         return snapshot?.timeframe === timeframe && bars?.length >= 96 && bars.length <= 98
           && bars.every(bar => [...fields, 'oi', 'buy', 'sell'].every(field => Number.isFinite(bar[field])))
       }, { timeframe, fields: indicatorFields }, { timeout: 20_000 })
-      await assertCompleteChartViewport(page, fixture.instId, { endHour: fixture.end })
-      const resident = await waitForLocalHistory(electron, page, fixture, timeframe, { requireIndicators: true })
+      await assertCompleteChartViewport(page, fixture.instId, { endHour: baselineEnd })
       assert.ok(resident >= 96 + 972, 'Every measured target must lie inside the fully calculated resident reserve.')
-      await waitForRendered(page, fixture, timeframe)
+      await waitForRendered(page, fixture, timeframe, baselineEnd)
       await startPaintProbe(page, fixture, { requireMatureData: true })
       const phase = value => page.evaluate(value => { window.__chartPaintProbe.phase = value }, value)
       const settle = () => page.evaluate(async () => { for (let frame = 0; frame < 12; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
-      const intervalMS = fixture.series[timeframe].intervalMS
+      const pitch = Number(await page.locator('[data-acceptance-target] [data-chart-inst]').getAttribute('data-chart-bar-spacing'))
       await phase('first resident wheel frame')
-      await wheelBurst(page, { deltaY: 3_600 })
-      await waitForRendered(page, fixture, timeframe, fixture.end - 300 * intervalMS)
+      await wheelBurst(page, { deltaY: 300 * pitch })
+      await waitForRendered(page, fixture, timeframe, baselineEnd - 300 * intervalMS)
       await phase('continuous resident scrolling')
-      await wheelBurst(page, { frames: 6, eventsPerFrame: 32, deltaY: 36 })
-      await waitForRendered(page, fixture, timeframe, fixture.end - 876 * intervalMS)
-      await wheelBurst(page, { deltaY: 96 * 12 })
-      const historicalEnd = fixture.end - 972 * intervalMS
+      await wheelBurst(page, { frames: 6, eventsPerFrame: 32, deltaY: 3 * pitch })
+      await waitForRendered(page, fixture, timeframe, baselineEnd - 876 * intervalMS)
+      await wheelBurst(page, { deltaY: 96 * pitch })
+      const historicalEnd = baselineEnd - 972 * intervalMS
       await waitForRendered(page, fixture, timeframe, historicalEnd)
       await phase('scroll end and asynchronous completions')
       await settle()
@@ -805,9 +836,9 @@ test('prepared resident indicators and statistics stay drawn through rapid scrol
       }, { instId: fixture.instId, timeframe })
       await settle()
       assert.equal(Number(await page.locator('[data-acceptance-target] [data-chart-inst]').getAttribute('data-chart-completed-end')), historicalEnd, 'A latest publication must preserve the historical viewport.')
-      await phase('reverse to latest and stop')
-      await wheelBurst(page, { deltaY: -972 * 12 })
-      await waitForRendered(page, fixture, timeframe)
+      await phase('reverse to the baseline and stop')
+      await wheelBurst(page, { deltaY: -972 * pitch })
+      await waitForRendered(page, fixture, timeframe, baselineEnd)
       await settle()
       const paint = await finishPaintProbe(page)
       const incomplete = paint.quality.filter(frame => frame.indicators !== frame.bars || frame.oi !== frame.bars || frame.taker !== frame.bars)
@@ -823,7 +854,7 @@ test('prepared resident indicators and statistics stay drawn through rapid scrol
 for (const mode of ['gap', 'prepend']) test(`first historical acquisition preserves requested prices and source panels while ${mode === 'gap' ? 'later gaps fill' : 'an earlier prefix rebuilds exact indicators'}`, async context => {
   const probe = value => electron.evaluate((_, value) => globalThis.__marketBackend.probe(value), value)
   const fixture = await probe({ action: 'acquisitionInstall', timeframe: '15m', mode })
-  const fields = ['vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
+  const fields = ['bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
   let desired
   const settle = () => page.evaluate(async () => { for (let frame = 0; frame < 8; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
   try {
@@ -920,7 +951,7 @@ test('a held old history read leaves backend demand and the latest wheel target 
 test('the live price overlay follows its actual price without changing the completed candle viewport', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   const visible = fixture.series[fixture.timeframe].bars.slice(-96)
-  const prices = visible.flatMap(bar => ['low', 'high', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower'].map(field => bar[field]))
+  const prices = visible.flatMap(bar => ['low', 'high', 'ema', 'bollUpper', 'bollMiddle', 'bollLower'].map(field => bar[field]))
   // The arithmetic midpoint maps to the midpoint of the linear relative scale.
   const livePrice = (Math.min(...prices) + Math.max(...prices)) / 2
   await installPreparedTransform({ mode: 'live', instId: fixture.instId, livePrice })
@@ -1018,20 +1049,24 @@ test('the live price overlay follows its actual price without changing the compl
 test('relative price curves remain accurate during fractional scrolling in both directions', async () => {
   const fixture = await request({ e2e: { action: 'seedChartScrollBenchmark' } })
   await openChart(page, fixture)
-  await wheelBurst(page, { deltaY: 120 })
+  const pitch = Number(await page.locator('[data-acceptance-target] [data-chart-inst]').getAttribute('data-chart-bar-spacing'))
+  await wheelBurst(page, { deltaY: 10 * pitch })
   await waitForRendered(page, fixture, fixture.timeframe, fixture.end - 10 * fixture.intervalMS)
   await startPaintProbe(page, fixture)
-  const readOffset = () => page.evaluate(() => Number(document.querySelector('[data-acceptance-target] [data-chart-wheel-content]')?.dataset.chartWheelOffset))
+  // Shared-time navigation projects fractional motion into the plot geometry,
+  // not the legacy wheel-content translation. Measure the displayed edge.
+  const readEdge = () => page.evaluate(() => Number(document.querySelector('[data-acceptance-target] [data-chart-inst]')?.dataset.chartTimeEnd))
+  const baseline = await readEdge()
   await wheelBurst(page, { deltaY: 6 })
-  await page.waitForFunction(() => Math.abs(Number(document.querySelector('[data-acceptance-target] [data-chart-wheel-content]')?.dataset.chartWheelOffset)) > 0.01)
-  const backwardOffset = await readOffset()
+  await page.waitForFunction(previous => Number(document.querySelector('[data-acceptance-target] [data-chart-inst]')?.dataset.chartTimeEnd) < previous, baseline)
+  const backward = await readEdge()
   await wheelBurst(page, { deltaY: -3 })
   await page.waitForFunction(previous => {
-    const offset = Number(document.querySelector('[data-acceptance-target] [data-chart-wheel-content]')?.dataset.chartWheelOffset)
-    return Math.abs(offset) > 0.01 && Math.abs(offset - previous) > 0.01
-  }, backwardOffset)
-  const forwardOffset = await readOffset()
-  assert.ok(Math.abs(forwardOffset) < Math.abs(backwardOffset), 'Reverse scrolling must move the fractional offset toward its starting position.')
+    const edge = Number(document.querySelector('[data-acceptance-target] [data-chart-inst]')?.dataset.chartTimeEnd)
+    return edge > previous
+  }, backward)
+  const forward = await readEdge()
+  assert.ok(backward < forward && forward < baseline, 'Reverse scrolling must move the fractional edge toward its starting position.')
   const report = await finishPaintProbe(page)
   assert.ok(report.frames > 0 && report.paints > 0)
   assert.deepEqual(report.violations, [])

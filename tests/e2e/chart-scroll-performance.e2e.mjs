@@ -263,7 +263,7 @@ test('cached reserve scrolling keeps one final intent and the complete canonical
       'Cached chart movement must not download historical market data.')
 
     const oracle = new Map(fixture.series[timeframe].bars.map(bar => [bar.hour, bar]))
-    const fields = ['open', 'high', 'low', 'close', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower',
+    const fields = ['open', 'high', 'low', 'close', 'ema', 'bollUpper', 'bollMiddle', 'bollLower',
       'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
     for (const [index, bar] of rendered.bars.entries()) {
       assert.equal(bar.hour, rendered.expectedHours[index], 'The selected frame must contain every native slot in its visible geometric domain.')

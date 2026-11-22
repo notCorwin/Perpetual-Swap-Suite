@@ -11,7 +11,7 @@ const hour = 3_600_000, btc = 'BTC-USDT-SWAP', eth = 'ETH-USDT-SWAP'
 const bars = (first: number, count: number): PreparedChartBar[] => Array.from({ length: count }, (_, index) => ({
   hour: (first + index) * hour, open: 100, high: 102, low: 99, close: 101,
   confirmed: true, statisticsSources: 3, statisticsObserved: true, indicatorsObserved: true,
-  vwap: 100, ema: 100, bollUpper: 102, bollMiddle: 100, bollLower: 99,
+  ema: 100, bollUpper: 102, bollMiddle: 100, bollLower: 99,
   roc: 1, maroc: .5, rsi6: 50, rsi12: 51, rsi24: 52, atrPercent: 2.5, bbw: 6, oi: 1_000, buy: 20, sell: 30,
 }))
 const prepared = (instId: string, end: number, overrides: Partial<PreparedChartResponse> = {}): PreparedChartResponse => ({
@@ -290,7 +290,7 @@ test('uncached scroll declares current demand immediately and preserves calculat
 
 test('historical navigation presents its prices immediately while missing indicators remain explicit', async () => {
   const raw = prepared(btc, 599, { latestEnd: 1199 * hour, revision: 2, indicatorState: 'loading',
-    bars: bars(504, 96).map(bar => ({ ...bar, indicatorsObserved: false, ema: null, vwap: null, bollUpper: null, bollMiddle: null, bollLower: null, roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null, atrPercent: null, bbw: null })) })
+    bars: bars(504, 96).map(bar => ({ ...bar, indicatorsObserved: false, ema: null, bollUpper: null, bollMiddle: null, bollLower: null, roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null, atrPercent: null, bbw: null })) })
   const controller = new ChartController(transport({ history: async () => raw }), cached())
   const close = controller.open(btc, '1H')
   controller.scroll(-600); await settled()
@@ -323,7 +323,7 @@ test('a historical price gap does not hold navigation on the previous cursor or 
 test('initial prices display while optional statistics and native indicators prepare independently', async () => {
   const raw = prepared(btc, 199, { indicatorState: 'loading', oiState: 'loading', takerState: 'loading',
     bars: bars(104, 96).map(bar => ({ ...bar, indicatorsObserved: false, statisticsObserved: false, statisticsSources: 0,
-      ema: null, vwap: null, bollUpper: null, bollMiddle: null, bollLower: null, roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null, atrPercent: null, bbw: null, oi: null, buy: null, sell: null })) })
+      ema: null, bollUpper: null, bollMiddle: null, bollLower: null, roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null, atrPercent: null, bbw: null, oi: null, buy: null, sell: null })) })
   const controller = new ChartController(transport({ local: async () => raw }))
   const close = controller.open(btc, '1H'); await settled()
   assert.equal(controller.getSnapshot().presented?.bars.length, 96)

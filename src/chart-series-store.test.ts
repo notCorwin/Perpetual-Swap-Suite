@@ -10,7 +10,7 @@ const instId = 'BTC-USDT-SWAP'
 const bar = (index: number, intervalMS = hour, overrides: Partial<PreparedChartBar> = {}): PreparedChartBar => ({
   hour: index * intervalMS, open: 100, high: 102, low: 99, close: 101,
   confirmed: true, statisticsSources: 3, statisticsObserved: true, indicatorsObserved: true,
-  vwap: 100, ema: 100, bollUpper: 102, bollMiddle: 100, bollLower: 99,
+  ema: 100, bollUpper: 102, bollMiddle: 100, bollLower: 99,
   roc: 1, maroc: .5, rsi6: 50, rsi12: 51, rsi24: 52, atrPercent: 2.5, bbw: 6, oi: 1_000, buy: 20, sell: 30,
   ...overrides,
 })
@@ -275,12 +275,12 @@ test('price-only history refreshes cannot erase calculated indicators or observe
   const original = store.window(instId, '1H', 100 * hour)!
   const pending = bars(0, 150).map(value => ({ ...value,
     indicatorsObserved: false, statisticsObserved: false, oiObserved: false, takerObserved: false, statisticsSources: 0,
-    vwap: null, ema: null, bollUpper: null, bollMiddle: null, bollLower: null,
+    ema: null, bollUpper: null, bollMiddle: null, bollLower: null,
     roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null, atrPercent: null, bbw: null, oi: null, buy: null, sell: null,
   }))
   store.ingest(response(pending, { revision: 11, indicatorState: 'loading', oiState: 'loading', takerState: 'loading' }))
   const next = store.window(instId, '1H', 100 * hour)!
-  for (const [index, value] of next.bars.entries()) for (const field of ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell'] as const) assert.equal(value[field], original.bars[index][field])
+  for (const [index, value] of next.bars.entries()) for (const field of ['ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell'] as const) assert.equal(value[field], original.bars[index][field])
   assert.equal(next.indicatorState, 'ready')
   assert.equal(next.oiState, 'ready')
   assert.equal(next.takerState, 'ready')
@@ -1035,7 +1035,7 @@ test('price generation resets retain bounded independent statistics without cert
   const previous = store.window(instId, '1H', 95 * hour)!
   const raw = (values: PreparedChartBar[]) => values.map(value => ({ ...value,
     indicatorsObserved: false, statisticsObserved: false, oiObserved: false, takerObserved: false, statisticsSources: 0,
-    vwap: null, ema: null, bollUpper: null, bollMiddle: null, bollLower: null,
+    ema: null, bollUpper: null, bollMiddle: null, bollLower: null,
     roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null, atrPercent: null, bbw: null, oi: null, buy: null, sell: null,
   }))
   store.ingestLatest(response(raw(bars(104, 96)), { generation: 2, revision: 2 }))
@@ -1061,7 +1061,7 @@ test('compact latest generation changes retain proven statistics but accept expl
   store.ingestLatest(response(bars(104, 96)))
   const raw = bars(104, 96).map(value => ({ ...value, close: 102,
     indicatorsObserved: false, statisticsObserved: false, oiObserved: false, takerObserved: false, statisticsSources: 0,
-    vwap: null, ema: null, bollUpper: null, bollMiddle: null, bollLower: null,
+    ema: null, bollUpper: null, bollMiddle: null, bollLower: null,
     roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null, atrPercent: null, bbw: null, oi: null, buy: null, sell: null,
   }))
   store.ingestLatest(response(raw, { generation: 2, revision: 2 }))

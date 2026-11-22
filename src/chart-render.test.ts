@@ -10,13 +10,13 @@ const window = (instId = 'BTC-USDT-SWAP'): ReadyChartWindow => ({
   priceState: 'ready', indicatorState: 'ready', oiState: 'ready', takerState: 'ready',
   bars: Array.from({ length: 96 }, (_, index) => ({
     hour: index * step, open: 100, high: 103, low: 99, close: 102, confirmed: true,
-    ema: 101, vwap: 101, bollUpper: 104, bollMiddle: 101, bollLower: 98, roc: 1, maroc: 1,
+    ema: 101, bollUpper: 104, bollMiddle: 101, bollLower: 98, roc: 1, maroc: 1,
     rsi6: 50, rsi12: 50, rsi24: 50, atrPercent: 2, bbw: 6, oi: 10, buy: 7, sell: 3,
   })),
 })
 
 const loadingWindow = (frame: ReadyChartWindow): ReadyChartWindow => ({ ...frame, generation: frame.generation + 1, indicatorState: 'loading',
-  bars: frame.bars.map(bar => ({ ...bar, indicatorsObserved: false, ema: null, vwap: null, bollUpper: null, bollMiddle: null,
+  bars: frame.bars.map(bar => ({ ...bar, indicatorsObserved: false, ema: null, bollUpper: null, bollMiddle: null,
     bollLower: null, roc: null, maroc: null, rsi6: null, rsi12: null, rsi24: null, atrPercent: null, bbw: null })),
 })
 
@@ -34,12 +34,12 @@ test('uncommitted render projections cannot replace or invalidate the displayed 
   cache.project(frame)
   assert.equal(cache.project(loadingWindow(frame)).stale, false)
   cache.commit(frame)
-  cache.project({ ...frame, bars: frame.bars.map(bar => ({ ...bar, vwap: 999 })) })
+  cache.project({ ...frame, bars: frame.bars.map(bar => ({ ...bar, bollUpper: 999 })) })
   cache.project({ ...frame, indicatorState: 'error' })
   cache.project(null)
   const result = cache.project(loadingWindow(frame))
   assert.equal(result.stale, true)
-  assert.equal(result.window!.bars[0].vwap, frame.bars[0].vwap)
+  assert.equal(result.window!.bars[0].bollUpper, frame.bars[0].bollUpper)
 })
 
 test('indicator replay retains continuous curves while current prices, statistics and source flags update', () => {
@@ -55,21 +55,21 @@ test('indicator replay retains continuous curves while current prices, statistic
   assert.equal(retained.window!.bars[0].indicatorsObserved, false)
   assert.equal(retained.window!.bars[0].close, 103)
   assert.equal(retained.window!.bars[0].oi, 20)
-  assert.equal(loading.bars[0].vwap, null, 'Presentation must not mutate the invalidated source.')
+  assert.equal(loading.bars[0].bollUpper, null, 'Presentation must not mutate the invalidated source.')
   const retainedPlot = plots(retained.window, size)!
-  assert.equal(retainedPlot.geometry.lines.vwap, initial.geometry.lines.vwap)
+  assert.deepEqual(retainedPlot.geometry.bollBands, initial.geometry.bollBands)
   assert.equal(retainedPlot.geometry.lines.rsi6, initial.geometry.lines.rsi6)
   assert.equal(present(loading), retained, 'Repeated renders reuse the same presentation projection.')
-  const partial = { ...loading, bars: loading.bars.map((bar, index) => index < 40 ? { ...bar, vwap: 105, indicatorsObserved: true } : bar) }
-  assert.deepEqual(present(partial).window!.bars.map(bar => bar.vwap), frame.bars.map(bar => bar.vwap), 'Chunked replay cannot repeatedly reshape the cached curves.')
-  const complete = { ...frame, generation: loading.generation, bars: frame.bars.map(bar => ({ ...bar, vwap: 105 })) }
+  const partial = { ...loading, bars: loading.bars.map((bar, index) => index < 40 ? { ...bar, bollUpper: 105, indicatorsObserved: true } : bar) }
+  assert.deepEqual(present(partial).window!.bars.map(bar => bar.bollUpper), frame.bars.map(bar => bar.bollUpper), 'Chunked replay cannot repeatedly reshape the cached curves.')
+  const complete = { ...frame, generation: loading.generation, bars: frame.bars.map(bar => ({ ...bar, bollUpper: 105 })) }
   assert.equal(present(complete).window, complete)
   assert.equal(present(complete).stale, false)
   const secondReplay = present(loadingWindow(complete))
   assert.equal(secondReplay.stale, true)
-  assert.equal(secondReplay.window!.bars[0].vwap, 105, 'A second replay uses the latest complete snapshot.')
+  assert.equal(secondReplay.window!.bars[0].bollUpper, 105, 'A second replay uses the latest complete snapshot.')
   const unavailable = { ...loadingWindow(complete), indicatorState: 'unavailable' as const }
-  assert.equal(present(unavailable).window!.bars[0].vwap, null, 'Authoritative terminal nulls erase the previous curve.')
+  assert.equal(present(unavailable).window!.bars[0].bollUpper, null, 'Authoritative terminal nulls erase the previous curve.')
 })
 
 test('indicator snapshots expire on viewport changes, null, and every terminal result', () => {
@@ -96,10 +96,10 @@ test('forming prices update during replay and a new forming slot cannot inherit 
   const present = committedPresentation()
   const frame = window(), live = { ...frame.bars.at(-1)!, confirmed: false, hour: 96 * step }
   present({ ...frame, liveBar: live })
-  const loading = { ...loadingWindow(frame), liveBar: { ...live, close: 103, vwap: null, indicatorsObserved: false } }
+  const loading = { ...loadingWindow(frame), liveBar: { ...live, close: 103, bollUpper: null, indicatorsObserved: false } }
   const result = present(loading)
   assert.equal(result.window!.liveBar!.close, 103)
-  assert.equal(result.window!.liveBar!.vwap, live.vwap)
+  assert.equal(result.window!.liveBar!.bollUpper, live.bollUpper)
   const next = { ...loading, liveBar: { ...loading.liveBar, hour: 97 * step } }
   assert.equal(present(next).window!.liveBar, next.liveBar)
 })
@@ -139,10 +139,10 @@ test('fractional overscan paths retain the exact 96-bar presentation window', ()
   assert.equal(extended.geometry.x.length, 96)
   assert.equal(extended.geometry.priceAxis.min, baseline.geometry.priceAxis.min)
   assert.equal(extended.geometry.priceAxis.max, baseline.geometry.priceAxis.max)
-  const vwapPoints = [...extended.geometry.lines.vwap.matchAll(/[ML]([\d.-]+) ([\d.-]+)/g)].map(([, x]) => Number(x))
-  assert.equal(vwapPoints.length, 98)
-  assert.ok(vwapPoints[0] < extended.geometry.layout.left)
-  assert.ok(vwapPoints.at(-1)! > extended.geometry.layout.right)
+  const bandPoints = [...extended.geometry.bollBands[0].matchAll(/[ML]([\d.-]+) ([\d.-]+)/g)].map(([, x]) => Number(x))
+  assert.equal(bandPoints.length, 196)
+  assert.ok(bandPoints[0] < extended.geometry.layout.left)
+  assert.ok(Math.max(...bandPoints) > extended.geometry.layout.right)
   assert.equal(cache(frame, size, { before, after }), extended, 'Repeating an unchanged overscan frame reuses its geometry.')
 })
 

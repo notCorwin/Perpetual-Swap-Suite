@@ -10,8 +10,8 @@ const axisFormatters = new Map<number, Intl.NumberFormat>()
 export const chartCompact = (value: number | null) => value === null ? '—' : compactFormatter.format(value)
 export const chartPercent = (value: number | null, decimals = 2) => value === null ? '—' : `${value.toFixed(decimals)}%`
 const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value)
-const priceFields = ['low', 'high', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower'] as const
-const lineFields = ['bollUpper', 'bollMiddle', 'bollLower', 'vwap', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'roc', 'maroc', 'oi'] as const
+const priceFields = ['low', 'high', 'bollUpper', 'bollLower'] as const
+const lineFields = ['rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'roc', 'maroc', 'oi'] as const
 const axisLabelLimit = (panel: readonly [number, number], maximum: number) =>
   Math.min(maximum, Math.max(2, Math.floor((panel[1] - panel[0]) / 32) + 1))
 const axisFormatter = (decimals: number) => {
@@ -169,7 +169,7 @@ function buildGeometry(sourceBars: readonly Bar[], options: ChartGeometryOptions
     if (segment) segments.push(segment)
     return segments.join(' ')
   }
-  const lines = Object.fromEntries(lineFields.map(field => [field, options.priceOnly && !priceFields.includes(field as typeof priceFields[number]) ? '' : line(field,
+  const lines = Object.fromEntries(lineFields.map(field => [field, options.priceOnly ? '' : line(field,
     field.startsWith('rsi') ? rsiY : field === 'atrPercent' ? atrY : field === 'bbw' ? bbwY : field === 'roc' || field === 'maroc' ? rocY : field === 'oi' ? oiY : priceY)])) as Record<typeof lineFields[number], string>
   const rocArea = (key: 'roc' | 'maroc') => {
     const segments: string[] = []

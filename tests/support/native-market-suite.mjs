@@ -225,7 +225,7 @@ export async function runNativeMarketAcceptance({ directory, launch, close = ele
       // Every completed input before this point is a flat 100 close, typical price
       // 100, high 101, low 99 and positive base volume. No production calculation
       // or rendered output supplies these expected mathematical values.
-      for (const field of ['open', 'close', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'vwap']) {
+      for (const field of ['open', 'close', 'ema', 'bollUpper', 'bollMiddle', 'bollLower']) {
         assert.ok(Number.isFinite(indicatorEvidence[field]) && Math.abs(indicatorEvidence[field] - 100) <= 1e-10 * 100, `${field} must match the independent flat-source expectation: ${indicatorEvidence[field]}`)
       }
       for (const field of ['roc', 'maroc', 'bbw']) assert.equal(indicatorEvidence[field], 0, `${field} must be zero for flat closes.`)

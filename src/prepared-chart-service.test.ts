@@ -37,7 +37,7 @@ class MemoryStore {
   async readIndicatorCheckpoint(query: any) { return this.checkpoints.filter(value => value.timestamp <= query.before && value.formulaVersion === query.formulaVersion).at(-1) ?? null }
   async writeIndicatorCheckpoint(value: any) {
     if (String(value.sourceRevision) !== String(this.priceRevision)) return false
-    this.checkpoints = [...this.checkpoints.filter(checkpoint => checkpoint.timestamp !== value.timestamp), structuredClone(value)].sort((a, b) => a.timestamp - b.timestamp)
+    this.checkpoints = [...this.checkpoints.filter(checkpoint => checkpoint.timestamp !== value.timestamp || checkpoint.formulaVersion !== value.formulaVersion), structuredClone(value)].sort((a, b) => a.timestamp - b.timestamp)
     return true
   }
   change(row: any) {
@@ -68,7 +68,7 @@ const focusHistory = async (pipeline: any, id: string, timeframe: string, endHou
   return frame
 }
 const finishSeed = async (pipeline: any) => { while (pipeline.liveSeeds.size) await Promise.all([...pipeline.liveSeeds.values()]) }
-const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw'] as const
+const indicatorFields = ['ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw'] as const
 const sqliteFixture = async (rows: any[]) => {
   const root = await mkdtemp(join(tmpdir(), 'perp-prefix-fence-')), store = await MarketStore.open(root)
   await store.appendCandles(rows)
@@ -488,16 +488,63 @@ test('a verified recent listing uses the first completed native slot without req
 test('a persisted resident gap repair rebuilds descendant indicators before its observer arrives', async () => {
   const canonical = source(500), absent = canonical[450]
   const { pipeline, store } = fixture(canonical.filter(row => row !== absent))
+  ;(store as any).candleRevision = () => store.priceRevision
   try {
     await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
     const state = pipeline.state(instId, '15m'), generation = state.generation
     assert.equal(pipeline.cached(state.key).bars.at(-1).ema, null)
+    state.historyReadRange = { from: canonical[400].timestamp, through: canonical.at(-1)!.timestamp, revision: store.priceRevision, priceVersion: state.priceVersion }
     store.change(absent)
     await pipeline.read(state); await pipeline.seed(state); await finishSeed(pipeline)
     const repaired = pipeline.cached(state.key), oracle = buildIndicatorSeries(canonical, interval).bars as any[]
     assert.ok(repaired.generation > generation)
     for (const value of repaired.bars) for (const field of indicatorFields) assert.equal(value[field], oracle.find(row => row.hour === value.hour)![field])
     assert.equal(repaired.priceState, 'ready'); assert.equal(repaired.indicatorState, 'ready')
+  } finally { await pipeline.dispose() }
+})
+
+test('admitting uninspected rows between history and the latest tail preserves calculated indicators', async () => {
+  const rows = source(500), { pipeline, store } = fixture(rows)
+  ;(store as any).candleRevision = () => store.priceRevision
+  ;(store as any).withCandleCommitFence = (callback: () => number) => Promise.resolve(callback())
+  try {
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
+    const state = pipeline.state(instId, '15m'), generation = state.generation
+    const latestHour = rows.at(-1)!.timestamp, previous = state.indicators.get(latestHour)
+    assert.ok(previous)
+    // The historical reserve and latest tail can coexist across an uninspected
+    // interval after a late read. Its absent slots are not repaired holes.
+    state.rows.set(rows[0].timestamp, Object.freeze({ ...rows[0] }))
+    state.historyReadRange = { from: rows[0].timestamp, through: rows[100].timestamp, revision: store.priceRevision, priceVersion: state.priceVersion }
+    await pipeline.read(state, rows[350].timestamp, 300)
+    assert.equal(state.generation, generation)
+    assert.strictEqual(state.indicators.get(latestHour), previous)
+  } finally { await pipeline.dispose() }
+})
+
+test('a committed gap seen before its writer notification cannot reuse descendant indicators', async () => {
+  const canonical = source(500), absent = canonical[350]
+  const { pipeline, store } = fixture(canonical.filter(row => row !== absent))
+  ;(store as any).candleRevision = () => store.priceRevision
+  try {
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
+    const state = pipeline.state(instId, '15m'), generation = state.generation
+    state.rows.set(canonical[0].timestamp, Object.freeze({ ...canonical[0] }))
+    state.historyReadRange = { from: canonical[0].timestamp, through: canonical[100].timestamp, revision: store.priceRevision, priceVersion: state.priceVersion }
+    // The reader observes the commit before the writer reports its revision.
+    store.rows = [...store.rows, absent]
+    let fenced = false
+    ;(store as any).withCandleCommitFence = (callback: () => number) => {
+      if (!fenced) { fenced = true; store.priceRevision += 1 }
+      return Promise.resolve(callback())
+    }
+    await pipeline.read(state, absent.timestamp, 300)
+    assert.ok(fenced, 'The source revision must be checked behind the writer fence.')
+    assert.ok(state.generation > generation, 'An observed durable correction cannot retain stale descendant indicators.')
+    await pipeline.seed(state); await finishSeed(pipeline)
+    const expected = new Map(buildIndicatorSeries(canonical, interval).bars.map(value => [value.hour, value]))
+    for (const value of pipeline.cached(state.key).bars) for (const field of indicatorFields)
+      assert.equal(value[field], expected.get(value.hour)![field])
   } finally { await pipeline.dispose() }
 })
 
@@ -626,26 +673,6 @@ test('indicator warmup acquisition retries after source recovery while complete 
   } finally { await pipeline.dispose() }
 })
 
-test('missing offscreen VWAP volumes repair even when every visible EMA is already numeric', async () => {
-  const canonical = source(400), incomplete = { ...canonical[300], baseVolume: null, quoteVolume: null }
-  let requests = 0
-  const { pipeline, store } = fixture(canonical.map(row => row.timestamp === incomplete.timestamp ? incomplete : row) as any, {
-    async ensurePrices(_instrument: string, _timeframe: string, from: number, through: number) {
-      requests += 1; assert.ok(from <= incomplete.timestamp); assert.ok(through >= incomplete.timestamp)
-      store.change(canonical[300])
-      return { rows: store.rows.filter(row => row.timestamp >= from && row.timestamp <= through) }
-    },
-  })
-  try {
-    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
-    await Promise.all([...pipeline.sourceTasks.values()].map((job: any) => job.task)); await finishSeed(pipeline)
-    const repaired = pipeline.cached(`${instId}:15m`)
-    assert.equal(requests, 1); assert.equal(repaired.indicatorState, 'ready')
-    const oracle = new Map((buildIndicatorSeries(canonical, interval).bars as any[]).map(row => [row.hour, row]))
-    for (const value of repaired.bars) assert.equal(value.vwap, oracle.get(value.hour).vwap)
-  } finally { await pipeline.dispose() }
-})
-
 test('a wider indicator warmup demand respects the failed viewport source retry deadline', async context => {
   const now = Math.floor(Date.now() / interval) * interval + 1000, retryAt = now + 60_000
   context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
@@ -672,7 +699,7 @@ test('a wider indicator warmup demand respects the failed viewport source retry 
   } finally { gate.resolve(); await pipeline.dispose() }
 })
 
-test('genuine listing warmup and zero-volume VWAP do not cause repeated history acquisition', async () => {
+test('genuine listing warmup and zero-volume data do not cause repeated history acquisition', async () => {
   for (const count of [12, 220, 400]) {
     const rows = source(count).map(row => ({ ...row, baseVolume: 0, quoteVolume: 0 }))
     let requests = 0
@@ -681,7 +708,7 @@ test('genuine listing warmup and zero-volume VWAP do not cause repeated history 
     try {
       await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
       await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
-      assert.equal(requests, 0); assert.equal(pipeline.cached(`${instId}:15m`).indicatorState, 'unavailable')
+      assert.equal(requests, 0); assert.equal(pipeline.cached(`${instId}:15m`).indicatorState, count < 295 ? 'unavailable' : 'ready')
     } finally { await pipeline.dispose() }
   }
 })
@@ -1277,8 +1304,8 @@ test('forming indicators reuse their price basis across status, lease and statis
       const changed = await pipeline.setLive(instId, '15m', changedVolume, { receivedAt: now + 3 })
       const expected = buildIndicatorSeries([...rows, changedVolume], interval).bars.at(-1) as any
       for (const field of indicatorFields) assert.equal(changed.liveBar[field], expected[field], field)
-      assert.equal(operations.filter(operation => operation.name === 'indicators.project').length, 2,
-        'A VWAP input change must calculate a fresh projection.')
+      assert.equal(operations.filter(operation => operation.name === 'indicators.project').length, 1,
+        'A volume-only update must reuse the existing projection.')
 
       const corrected = { ...rows[100], close: rows[100].close + .5 }, previous = store.change(corrected)
       pipeline.observe([corrected], previous)
@@ -1286,7 +1313,7 @@ test('forming indicators reuse their price basis across status, lease and statis
       await finishSeed(pipeline)
       const rebuilt = pipeline.cached(`${instId}:15m`), oracle = buildIndicatorSeries([...store.rows, changedVolume], interval).bars.at(-1) as any
       for (const field of indicatorFields) assert.equal(rebuilt.liveBar[field], oracle[field], field)
-      assert.equal(operations.filter(operation => operation.name === 'indicators.project').length, 3,
+      assert.equal(operations.filter(operation => operation.name === 'indicators.project').length, 2,
         'A corrected confirmed basis must calculate a fresh projection.')
 
       const confirmed = { ...changedVolume, confirmed: true }
@@ -1296,7 +1323,7 @@ test('forming indicators reuse their price basis across status, lease and statis
       const next = await pipeline.setLive(instId, '15m', nextQuote, { receivedAt: now + 4 })
       const nextOracle = buildIndicatorSeries([...store.rows, nextQuote], interval).bars.at(-1) as any
       for (const field of indicatorFields) assert.equal(next.liveBar[field], nextOracle[field], field)
-      assert.equal(operations.filter(operation => operation.name === 'indicators.project').length, 4,
+      assert.equal(operations.filter(operation => operation.name === 'indicators.project').length, 3,
         'Advancing the mutable confirmed basis must calculate the next candle.')
       assert.ok(published.some(frame => frame.priceObservedAt === now + 1))
     } finally { detach() }
@@ -1710,7 +1737,7 @@ test('restored latest prefixes remain unchanged during appends and volume correc
     assert.equal(live.indicatorState.lastTimestamp, next.timestamp)
     const generation = state.generation, corrected = { ...rows[490], baseVolume: 10_000 }
     pipeline.observe([corrected], store.change(corrected))
-    assert.ok(state.generation > generation, 'VWAP input changes invalidate derived values even when OHLC is unchanged.')
+    assert.ok(state.generation > generation, 'A corrected price source invalidates derived values even when OHLC is unchanged.')
     await finishSeed(pipeline)
     const oracle = buildIndicatorSeries(store.rows, interval).bars.at(-1) as any
     for (const key of indicatorFields) assert.equal(pipeline.cached(`${instId}:15m`).bars.at(-1)[key], oracle[key])
@@ -2322,6 +2349,27 @@ test('cold history publishes a mature nearest viewport before farther reserve pa
   } finally { hold.resolve(); await preparation; await pipeline.dispose() }
 })
 
+test('v5 checkpoints are reused without overwriting the legacy volume state', async () => {
+  const rows = source(3500), { pipeline, store } = fixture(rows)
+  const version = 'native-exact-chunks-ema200-wilder-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-wilder-atr14-percent-bbw20-2-v5'
+  const seed = { ...buildIndicatorSeries(rows.slice(0, 3072), interval).state, volumes: [{ typicalPrice: 100, volume: 42 }] }
+  await store.writeIndicatorCheckpoint({ instrument: instId, timeframe: '15m', timestamp: seed.lastTimestamp,
+    formulaVersion: version, state: seed, sourceRevision: await store.priceWatermark() })
+  try {
+    await focusLatest(pipeline, instId, '15m'); await finishSeed(pipeline)
+    assert.equal(store.queries.find(query => query.order === 'asc').from, seed.lastTimestamp! + interval,
+      'A compatible persisted seed avoids replaying the full source history.')
+    const oracle = new Map(buildIndicatorSeries(rows, interval).bars.map(value => [value.hour, value]))
+    for (const value of pipeline.cached(`${instId}:15m`).bars) for (const field of indicatorFields)
+      assert.equal(value[field], oracle.get(value.hour)![field])
+    assert.deepEqual(store.checkpoints.find(value => value.formulaVersion === version).state.volumes, seed.volumes,
+      'The old producer must still be able to read its unmodified state.')
+    const replacement = store.checkpoints.find(value => value.formulaVersion.endsWith('-v6'))
+    assert.ok(replacement)
+    assert.equal(Object.hasOwn(replacement.state, 'volumes'), false)
+  } finally { await pipeline.dispose() }
+})
+
 test('an ATR upgrade ignores v4 checkpoints without ATR state even when they carry the current durable watermark', async () => {
   const rows = source(3500), { pipeline, store } = fixture(rows)
   const legacyVersion = 'native-exact-chunks-ema200-wilder-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-v4'
@@ -2341,7 +2389,7 @@ test('an ATR upgrade ignores v4 checkpoints without ATR state even when they car
       assert.equal(value[field], (oracle.get(value.hour) as any)[field], `The upgraded producer must reconstruct ${field} from canonical candles.`)
     }
     assert.equal(store.queries.find(query => query.order === 'asc').from, 0, 'An unsafe producer checkpoint cannot establish the canonical prefix.')
-    assert.ok(store.checkpoints.some(value => value.formulaVersion.endsWith('-v5')))
+    assert.ok(store.checkpoints.some(value => value.formulaVersion.endsWith('-v6')))
     assert.deepEqual(store.rows, rows, 'Only derived checkpoints are replaced; canonical market records remain unchanged.')
   } finally { await pipeline.dispose() }
 })
@@ -2459,7 +2507,7 @@ test('a durable prefix correction with a late observer retains the strict fence 
     for (const value of actual) if (value.indicatorsObserved) for (const key of indicatorFields) assert.equal(value[key], (oracle.get(value.hour) as any)[key])
     assert.equal(actual.filter((value: any) => value.hour >= target - 95 * interval && value.hour <= target && value.indicatorsObserved).length, 96)
     const checkpoint = await store.readIndicatorCheckpoint({ instrument: instId, timeframe: '15m', before: target,
-      formulaVersion: 'native-exact-chunks-ema200-wilder-rsi6-12-24-boll20-2-base-vwap14-roc9-maroc9-wilder-atr14-percent-bbw20-2-v5' })
+      formulaVersion: 'native-exact-chunks-ema200-wilder-rsi6-12-24-boll20-2-roc9-maroc9-wilder-atr14-percent-bbw20-2-v6' })
     assert.ok(checkpoint)
     assert.equal(checkpoint.state.ema, (oracle.get(checkpoint.timestamp) as any).ema)
   } finally { hold.resolve(); await f.close() }
@@ -3010,8 +3058,8 @@ test('repeated worker failures stop automatic recovery and a healthy worker resu
   } finally { await pipeline.dispose() }
 })
 
-test('observed indicator warmup and mathematically undefined values are distinguished from failures', async () => {
-  for (const [count, zeroVolume, reason] of [[12, false, 'insufficient-history'], [400, true, 'undefined-value']] as const) {
+test('observed indicator warmup is distinguished from failures', async () => {
+  for (const [count, zeroVolume, reason] of [[12, false, 'insufficient-history']] as const) {
     const rows = source(count).map(row => zeroVolume ? { ...row, baseVolume: 0, quoteVolume: 0 } : row)
     const { pipeline } = fixture(rows)
     try {

@@ -97,11 +97,9 @@ const chartTokens = {
   legendValue: chartTokenNumber('--space-annotation-value'),
   priceLabelPaddingY: chartTokenNumber('--chart-price-label-padding-y'),
 } as const
-const vwapOverlay = { label: 'VWAP(14)', color: 'var(--chart-2)', dash: '2 3',
-  value: (bar: Bar, compact?: boolean) => formatIndicatorPrice(bar.vwap, compact) }
 const bollOverlay = { label: 'BOLL(20,2)', color: 'var(--chart-1)', dash: undefined,
   value: (bar: Bar, compact?: boolean) => `U ${formatIndicatorPrice(bar.bollUpper, compact)}\u00a0·\u00a0M ${formatIndicatorPrice(bar.bollMiddle, compact)}\u00a0·\u00a0L ${formatIndicatorPrice(bar.bollLower, compact)}` }
-const priceOverlays = [vwapOverlay, bollOverlay]
+const priceOverlays = [bollOverlay]
 
 const legendContext = document.createElement("canvas").getContext("2d")
 const chartTextWidths = new Map<string, number>()
@@ -173,12 +171,6 @@ const PlotPaths = memo(function PlotPaths({ bars, geometry, areaClipId, oiState,
       <path data-chart-taker-sell-samples={geometry.sellSamples} d={sells} fill="var(--negative)" stroke="var(--foreground)" opacity="0.9" />
       <path d={sells} fill={`url(#${areaClipId}-sell-hatch)`} opacity="0.7" />
     </g>}
-    <g clipPath={`url(#${areaClipId}-price)`} visibility={priceVisible ? "visible" : "hidden"}>
-    {lineStroke('bollUpper', lines.bollUpper, bollOverlay.color)}
-    {lineStroke('bollMiddle', lines.bollMiddle, bollOverlay.color)}
-    {lineStroke('bollLower', lines.bollLower, bollOverlay.color)}
-    {lineStroke('vwap', lines.vwap, vwapOverlay.color, vwapOverlay.dash)}
-    </g>
     {!geometry.priceOnly && <g clipPath={`url(#${areaClipId}-rsi)`}>
     {lineStroke("rsi6", lines.rsi6, "var(--chart-1)")}
     {lineStroke("rsi12", lines.rsi12, "var(--chart-2)", "7 4")}
@@ -260,7 +252,8 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
         return <g key={label} transform={`translate(${itemStart},0)`} data-chart-legend-source-hour={sourceHour}>
         <title>{label} {value}{contexts[index]}</title>
         {key === "taker" && !dash && <line data-chart-legend-outline={label} x1="0" x2={chartTokens.legendSymbol} stroke="var(--foreground)" />}
-        <line data-chart-legend={label} x1="0" x2={chartTokens.legendSymbol} stroke={color} strokeDasharray={key === "taker" && !dash ? "2 3" : dash} />
+        {key === "price" ? <rect data-chart-legend={label} x="0" y="-3" width={chartTokens.legendSymbol} height="6" fill={color} fillOpacity="0.3" />
+          : <line data-chart-legend={label} x1="0" x2={chartTokens.legendSymbol} stroke={color} strokeDasharray={key === "taker" && !dash ? "2 3" : dash} />}
         <text x={chartTokens.legendLabel} dominantBaseline="middle" fill={labelColor}>{label}</text>
         <text data-chart-legend-value x={chartTokens.legendLabel + legendWidth(label) + chartTokens.legendValue} dominantBaseline="middle" fill="var(--foreground)">{value}</text>
         {contexts[index] && <text data-chart-legend-source-context x={chartTokens.legendLabel + legendWidth(label) + chartTokens.legendValue + legendWidth(value)} dominantBaseline="middle" fill="var(--muted-foreground)">{contexts[index]}</text>}

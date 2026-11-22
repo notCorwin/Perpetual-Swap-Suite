@@ -10,7 +10,7 @@ export type Bar = {
   oiObserved?: boolean
   takerObserved?: boolean
   indicatorsObserved?: boolean
-  vwap: number | null; ema: number | null; bollUpper: number | null; bollMiddle: number | null; bollLower: number | null
+  ema: number | null; bollUpper: number | null; bollMiddle: number | null; bollLower: number | null
   roc: PercentageValue; maroc: PercentageValue; rsi6: number | null; rsi12: number | null; rsi24: number | null
   atrPercent: number | null; bbw: number | null
   oi: number | null; buy: number | null; sell: number | null

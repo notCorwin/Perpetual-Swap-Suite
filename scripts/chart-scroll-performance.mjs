@@ -57,7 +57,7 @@ function assertOracle(fixture, timeframe, rendered, expectedEnd) {
   assert.equal(rendered.endHour, expectedEnd)
   assert.equal(rendered.bars.length, 96)
   const oracle = new Map(fixture.series[timeframe].bars.map(bar => [bar.hour, bar]))
-  const fields = ['open', 'high', 'low', 'close', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower',
+  const fields = ['open', 'high', 'low', 'close', 'ema', 'bollUpper', 'bollMiddle', 'bollLower',
     'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
   const intervalMS = fixture.series[timeframe].intervalMS
   for (const [index, bar] of rendered.bars.entries()) {
@@ -133,7 +133,7 @@ async function measureCachedScenario(electron, page, cdp, fixture, timeframe, {
     return { instId: snapshot?.instId, timeframe: snapshot?.timeframe, endHour: snapshot?.endHour,
       loading: chart.dataset.chartLoading, bars: (chart.__chartRenderedBars ?? snapshot?.bars ?? []).map(bar => ({
         hour: bar.hour, open: bar.open, high: bar.high, low: bar.low, close: bar.close,
-        vwap: bar.vwap, ema: bar.ema, bollUpper: bar.bollUpper, bollMiddle: bar.bollMiddle, bollLower: bar.bollLower,
+        ema: bar.ema, bollUpper: bar.bollUpper, bollMiddle: bar.bollMiddle, bollLower: bar.bollLower,
         roc: bar.roc, maroc: bar.maroc, rsi6: bar.rsi6, rsi12: bar.rsi12, rsi24: bar.rsi24,
         atrPercent: bar.atrPercent, bbw: bar.bbw, oi: bar.oi, buy: bar.buy, sell: bar.sell,
       })) }

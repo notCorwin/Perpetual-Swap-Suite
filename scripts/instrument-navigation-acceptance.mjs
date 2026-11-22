@@ -100,7 +100,7 @@ export async function startupNavigationReport(page, launchedAt, fixture, { prese
   })
   const report = await page.evaluate(({ launchedAt, instruments }) => {
     const probe = window.__navigationStartup
-    const fields = ['open', 'high', 'low', 'close', 'ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
+    const fields = ['open', 'high', 'low', 'close', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
     const oracle = new Map(instruments.map(({ instId, series }) => [instId, new Map(Object.entries(series).map(([frame, value]) => [frame, new Map(value.bars.map(bar => [bar.hour, bar]))]))]))
     for (const snapshot of probe.samples) for (const bar of snapshot.bars) {
       const expected = oracle.get(snapshot.instId)?.get(snapshot.timeframe)?.get(bar.hour)
@@ -327,7 +327,7 @@ export async function finishNavigationFrameProbe(page) {
     cancelAnimationFrame(probe.raf)
     probe.observer.disconnect()
     const validationStartedAt = performance.now()
-    const fields = ['open', 'high', 'low', 'close', 'ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
+    const fields = ['open', 'high', 'low', 'close', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
     const fail = message => { if (probe.violations.length < 20) probe.violations.push(message) }
     for (const { snapshot, geometry } of probe.observations) {
       if (snapshot.bars.length !== 96) fail(`A switch snapshot contains ${snapshot.bars.length} candles.`)

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { validateStoppedPaintCapture } from '../../scripts/chart-acceptance.mjs'
 
-const curveFields = ['vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi']
+const curveFields = ['bollUpper', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi']
 
 function fixture(context) {
   const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'window')
@@ -11,7 +11,7 @@ function fixture(context) {
     else delete globalThis.window
   })
   const bars = Array.from({ length: 96 }, (_, index) => ({ hour: 100 + index, confirmed: true, priceComplete: true,
-    indicatorsObserved: true, statisticsObserved: true, open: 1, high: 2, low: 0, close: 1, ema: 1, buy: 1, sell: 1,
+    indicatorsObserved: true, statisticsObserved: true, bollMiddle: 1, open: 1, high: 2, low: 0, close: 1, ema: 1, buy: 1, sell: 1,
     ...Object.fromEntries(curveFields.map(field => [field, 1])) }))
   const snapshot = { instId: 'BTC', timeframe: '5m', endHour: 195, intervalMS: 1, generation: 1,
     priceState: 'ready', indicatorState: 'ready', oiState: 'ready', takerState: 'ready' }
@@ -39,11 +39,11 @@ function fixture(context) {
 // These are captured evidence records, not simulated DOM objects. Real
 // MutationObserver/RAF capture and immutable retention remain Electron tests.
 const corruptions = [
-  ['curve corruption', svg => { svg.curves[7] = 'M0,0' }, /rsi12 SVG has 1 points/],
-  ['missing curve', svg => { svg.curves[7] = '' }, /lost its rsi12 SVG curve/],
-  ['extra sample', svg => { svg.curves[7] += ' L99999 0' }, /rsi12 SVG has 97 points/],
-  ['wrong sample position', svg => { svg.curves[7] = svg.curves[7].replace('M0.5 1', 'M99999 0') }, /rsi12 SVG has 96 points/],
-  ['nonfinite curve', svg => { svg.curves[7] = 'MNaN 0' }, /Nonfinite SVG geometry/],
+  ['curve corruption', svg => { svg.curves[5] = 'M0,0' }, /rsi12 SVG has 1 points/],
+  ['missing curve', svg => { svg.curves[5] = '' }, /lost its rsi12 SVG curve/],
+  ['extra sample', svg => { svg.curves[5] += ' L99999 0' }, /rsi12 SVG has 97 points/],
+  ['wrong sample position', svg => { svg.curves[5] = svg.curves[5].replace('M0.5 1', 'M99999 0') }, /rsi12 SVG has 96 points/],
+  ['nonfinite curve', svg => { svg.curves[5] = 'MNaN 0' }, /Nonfinite SVG geometry/],
   ['clip corruption', svg => { svg.clipWidth = 0 }, /SVG has .* points/],
   ['nonfinite path', svg => { svg.pathData = ['MNaN 0'] }, /Nonfinite SVG geometry/],
   ['range corruption', svg => { svg.start = -1 }, /SVG labels and the drawn range disagree/],
@@ -82,7 +82,7 @@ for (const [phase, corrupt, expected] of corruptions) test(`stopped chart valida
 test('shared SVG evidence is rechecked against every phase, clip, and bar set', context => {
   const { probe, observation, finish } = fixture(context)
   const invalid = structuredClone(observation.surface.svg)
-  invalid.curves[7] = 'M0,0'
+  invalid.curves[5] = 'M0,0'
   const record = (phase, svg, bars = observation.bars) => ({ ...observation, phase, bars,
     surface: { ...observation.surface, svg } })
   const changedBars = structuredClone(observation.bars)

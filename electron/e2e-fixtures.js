@@ -1,4 +1,5 @@
 import { barsWithIndicators } from './services/indicators.js'
+import { aggregatePriceCandles } from './services/candle-aggregation.js'
 import { quoteTurnover24h } from './services/liquidity.js'
 
 const FIVE_MINUTES = 300_000
@@ -130,6 +131,21 @@ export async function seedChartScrollBenchmark(store, marketService, { instId = 
   // so a later page cannot silently change the value at an existing timestamp.
   const intervals = { '5m': FIVE_MINUTES, '15m': 3 * FIVE_MINUTES, '1H': HOUR }
   const candlesByFrame = Object.fromEntries(timeframes.map(frame => [frame, buildCandles(frame, intervals[frame])]))
+  // Native parent rows overlapping complete 5m buckets must agree with their
+  // authoritative source. Otherwise normal local derivation rewrites the
+  // fixture mid-scroll and invalidates its deliberately precomputed oracle.
+  const source = candlesByFrame['5m']
+  const sourceStart = source[0].timestamp
+  for (const frame of ['15m', '1H']) {
+    const size = intervals[frame] / FIVE_MINUTES
+    candlesByFrame[frame] = candlesByFrame[frame].map(row => {
+      const offset = (row.timestamp - sourceStart) / FIVE_MINUTES
+      if (!Number.isInteger(offset) || offset < 0 || offset + size > source.length) return row
+      const aggregate = aggregatePriceCandles(source.slice(offset, offset + size), frame)
+      if (!aggregate) throw new Error(`Incomplete ${frame} fixture aggregate at ${row.timestamp}`)
+      return { ...row, ...aggregate }
+    })
+  }
   if (unavailableStatistics) candlesByFrame[timeframe] = candlesByFrame[timeframe].map(row => ({ ...row, oi: null, buy: null, sell: null }))
   const hourly = candlesByFrame[timeframe]
   for (const frame of timeframes) await persistNativeFixture(store, marketService, candlesByFrame[frame])
@@ -393,7 +409,7 @@ export async function createChartColdBoundaryFixture(store, marketService, {
   // Observe only existing history publications. In particular, this listener
   // never creates demand, queries storage, or schedules preparation itself.
   const priceFields = ['open', 'high', 'low', 'close']
-  const indicatorFields = ['ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
+  const indicatorFields = ['ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
   let preparedTarget = null
   const unsubscribe = scenario === 'single-missing-boundary' ? marketService.subscribePreparedCharts(frame => {
     if (preparedTarget || frame?.instId !== instId || frame.timeframe !== timeframe || !Array.isArray(frame.bars) || frame.bars.length <= 96) return

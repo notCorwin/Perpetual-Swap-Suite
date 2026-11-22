@@ -3,7 +3,7 @@ import { test } from 'node:test'
 import { finishNavigationFrameProbe } from '../../scripts/instrument-navigation-acceptance.mjs'
 
 async function validateProjection(context, { project = bar => ({ ...bar }), requirePreparedStatistics = true, statisticsState = 'ready', zeroTaker = false } = {}) {
-  const fields = ['open', 'high', 'low', 'close', 'ema', 'vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
+  const fields = ['open', 'high', 'low', 'close', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
   const bars = Array.from({ length: 96 }, (_, index) => ({ hour: index * 900_000, confirmed: true, indicatorsObserved: true,
     statisticsObserved: true, ...Object.fromEntries(fields.map(field => [field, 100 + index])),
     ...(zeroTaker ? { buy: 0, sell: 0 } : {}) }))
@@ -36,7 +36,7 @@ test('navigation validates projected statistics independently of the complete ca
 })
 
 test('navigation rejects projected observation loss and numerically corrupted values', async context => {
-  const report = await validateProjection(context, { project: bar => ({ ...bar, statisticsObserved: false, indicatorsObserved: false, close: bar.close + 1, vwap: bar.vwap + 1 }) })
+  const report = await validateProjection(context, { project: bar => ({ ...bar, statisticsObserved: false, indicatorsObserved: false, close: bar.close + 1, bollUpper: bar.bollUpper + 1 }) })
   for (const source of ['OI', 'Taker']) assert.ok(report.violations.some(value => value.includes(`Fixture-known ${source} observation disappeared`)), source)
   assert.ok(report.violations.some(value => value.includes('Fixture-known indicator observation disappeared')))
   for (const field of ['close']) assert.ok(report.violations.some(value => value.includes(`${field} has the wrong source value`)), field)

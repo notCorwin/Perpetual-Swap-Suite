@@ -28,7 +28,7 @@ test('prepared windows retain the full-history EMA seed through corrections, evi
     assert.equal(chart.bars.filter(bar => bar.hour >= rows.at(-1)!.timestamp - 95 * step && bar.hour <= rows.at(-1)!.timestamp).length, 96)
     const shared = chart.bars.filter(bar => byHour.has(bar.hour))
     assert.equal(shared.length, prepared.bars.length, 'The chart navigation history must contain the bounded prepared tail.')
-    for (const bar of shared) for (const field of ['ema', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'vwap', 'bollMiddle'] as const) {
+    for (const bar of shared) for (const field of ['ema', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'bollMiddle'] as const) {
       assert.equal(bar[field], (byHour.get(bar.hour) as any)[field], `${field} at ${bar.hour}`)
     }
     return prepared.bars.at(-1)

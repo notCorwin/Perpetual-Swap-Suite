@@ -35,17 +35,6 @@ test('BBW reuses the BOLL20 population bands and preserves flat zero while rejec
   near(barsWithIndicators(source).at(-1)!.bbw, 4 * Math.sqrt(399 / 12) / 11.5 * 100)
 })
 
-test('rolling VWAP14 weights typical price by base quantity, never quote amount', () => {
-  const source = Array.from({ length: 14 }, (_, index) => candle(index < 7 ? 100 : 200, index))
-  const bars = barsWithIndicators(source)
-  assert.equal(bars[12].vwap, null)
-  near(bars[13].vwap, 150)
-  assert.equal(barsWithIndicators(source.map(row => ({ ...row, baseVolume: 0 }))).at(-1)?.vwap, null)
-  assert.equal(barsWithIndicators(source.map((row, index) => index === 3 ? { ...row, baseVolume: null } : row)).at(-1)?.vwap, null)
-  const typical = source.map(row => ({ ...row, high: row.close + 6, low: row.close - 3 }))
-  near(barsWithIndicators(typical).at(-1)!.vwap, 151)
-})
-
 test('ROC9 and MAROC9 preserve percentage units and exact warmup boundaries', () => {
   const bars = barsWithIndicators(Array.from({ length: 18 }, (_, index) => candle(2 ** index, index)))
   assert.equal(bars[8].roc, null)
@@ -107,7 +96,6 @@ test('a source gap restarts recursive and windowed indicator initialization', ()
   assert.equal(bar.ema, null)
   assert.equal(bar.rsi24, null)
   assert.equal(bar.atrPercent, null)
-  assert.equal(bar.vwap, null)
   assert.equal(bar.bollMiddle, null)
   assert.equal(bar.bbw, null)
   assert.equal(bar.maroc, null)

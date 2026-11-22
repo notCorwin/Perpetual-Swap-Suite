@@ -64,7 +64,7 @@ before(async () => {
         const close = state.bollMode === 'constant' ? 100 : 100 + index * .01
         return { hour: endHour - (windowBars - 1 - index) * intervalMS, open: close + (index % 2 ? -.05 : .05), high: close + .2, low: close - .2, close,
           confirmed: true, statisticsSources: 3, statisticsObserved: true, indicatorsObserved: true,
-          ema: close, vwap: close - .02, bollUpper: state.bollMode === 'constant' ? 100 : close + .5,
+          ema: close, bollUpper: state.bollMode === 'constant' ? 100 : close + .5,
           bollMiddle: state.bollMode === 'constant' ? 100 : close, bollLower: state.bollMode === 'negative' ? -1 : state.bollMode === 'constant' ? 100 : close - .5,
           roc: .5, maroc: .25, rsi6: 50, rsi12: 55, rsi24: 60, atrPercent: .4 / close * 100, bbw: state.bollMode === 'constant' ? 0 : state.bollMode === 'negative' ? (close + 1.5) / close * 100 : 1 / close * 100, oi: 1_000_000 + index, buy: 12_000, sell: 10_000 }
       })
@@ -279,7 +279,7 @@ const backToMarkets = async () => {
   await closed
   await page.locator('[data-market-status-row]').waitFor({ state: 'visible' })
 }
-const vwapCandleTarget = async (position, fixture) => {
+const candleTarget = async (position, fixture) => {
   const viewport = await page.locator(`[data-acceptance-target] [data-chart-inst="${fixture.instId}"]`).evaluate(captureChartViewport)
   const available = new Set([...fixture.bars, ...(fixture.liveBar ? [fixture.liveBar] : [])].map(bar => bar.hour))
   viewport.expectedHours = chartViewportHours(viewport).filter(hour => available.has(hour))
@@ -520,7 +520,7 @@ test('contract precision updates pad current quotes while preserving historical 
       const frame = await state.request(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } })
       Object.assign(frame.bars.at(-1), { open: 100.1, high: 101, low: 99, close: 100.123456789 })
       frame.liveBar = { ...frame.bars.at(-1), hour: frame.endHour + frame.intervalMS, open: 100.1, high: 101, low: 99, close: 100.12,
-        vwap: 100.123456789, confirmed: false }
+        bollUpper: 100.123456789, confirmed: false }
       state.sendChart(frame)
       return frame
     })
@@ -547,14 +547,14 @@ test('contract precision updates pad current quotes while preserving historical 
       const background = chart.querySelector('[data-chart-price-label-background]').getBoundingClientRect()
       return { fits: label.right <= background.right + 1, width: background.width,
         sameInputs: chart.__chartSnapshot.bars === globalThis.__precisionBars && chart.__chartSnapshot.liveBar === globalThis.__precisionLive,
-        historicalClose: chart.__chartSnapshot.bars.at(-1).close, vwap: chart.__chartSnapshot.liveBar.vwap }
+        historicalClose: chart.__chartSnapshot.bars.at(-1).close, bollUpper: chart.__chartSnapshot.liveBar.bollUpper }
     })
     assert.ok(layout.fits && layout.width === baseline, 'Price precision must not alter the percentage label gutter.')
     assert.equal(layout.sameInputs, true, 'A precision-only update must reuse source bars and calculated values.')
     assert.equal(layout.historicalClose, 100.123456789)
-    assert.equal(layout.vwap, 100.123456789)
+    assert.equal(layout.bollUpper, 100.123456789)
     assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), reads, 'Precision updates must not request chart data again.')
-    const target = await vwapCandleTarget('previous', frame)
+    const target = await candleTarget('previous', frame)
     await page.mouse.move(target.x, target.y)
     await page.mouse.down()
     await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-ohlc="close"] span[title]')?.textContent === '100.123456789')
@@ -622,6 +622,13 @@ test('chart source updates stay outside the plot without resizing its viewport a
 
 test('pointer inspection selects the first fully visible, middle, and latest candle before and after a forming candle shifts the window', async () => {
   await selectTimeframe(page, '15m')
+  // Freeze the advancing live time axis while sampling candle coordinates and
+  // sending pointer input. Timers still run; only the wall-clock value is fixed.
+  await page.evaluate(() => {
+    const now = Date.now()
+    window.__inspectionOriginalNow = Date.now
+    Date.now = () => now
+  })
   const publish = forming => electron.evaluate(async ({ ipcMain, BrowserWindow }, forming) => {
     const state = globalThis.__workspaceFixture
     state.chartGeneration += 1
@@ -639,13 +646,15 @@ test('pointer inspection selects the first fully visible, middle, and latest can
     for (const forming of [false, true]) {
       const frame = await publish(forming)
       await waitForFrame(frame)
+      // Wait for geometry and the DOM's hit surface to commit together.
+      await page.evaluate(async () => { await new Promise(requestAnimationFrame); await new Promise(requestAnimationFrame) })
       for (const slot of ['first', 'middle', 'last']) {
-        const target = await vwapCandleTarget(slot, frame)
+        const target = await candleTarget(slot, frame)
         const fixtureBar = [...frame.bars, ...(frame.liveBar ? [frame.liveBar] : [])].find(bar => bar.hour === target.hour)
         assert.equal(target.close, fixtureBar.close)
         await page.mouse.move(target.x, target.y)
         await page.mouse.down()
-        await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
+        await page.waitForFunction(hour => Number(document.querySelector('[data-acceptance-target] [data-chart-inspected-hour]')?.dataset.chartInspectedHour) === hour, target.hour)
         const close = await page.locator('[data-acceptance-target] [data-chart-ohlc="close"] span[title]').getAttribute('title')
         assert.equal(Number(close), target.close, `${forming ? 'The forming' : 'The completed-only'} window must inspect its drawn candle at slot ${slot}.`)
         await page.mouse.up()
@@ -654,7 +663,8 @@ test('pointer inspection selects the first fully visible, middle, and latest can
     }
   } finally {
     await page.mouse.up()
-    await waitForFrame(await publish(false))
+    try { await waitForFrame(await publish(false)) }
+    finally { await page.evaluate(() => { Date.now = window.__inspectionOriginalNow; delete window.__inspectionOriginalNow }) }
   }
 })
 
@@ -817,7 +827,7 @@ test('selection persists while six width/DPR combinations share page, pointer, a
         return chart?.dataset.chartLoading === 'false' && Number(chart.dataset.chartRenderedBars) > 0
       })
       const currentFixture = await electron.evaluate(() => globalThis.__workspaceFixture.request(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } }))
-      const target = await vwapCandleTarget('middle', currentFixture)
+      const target = await candleTarget('middle', currentFixture)
       await page.mouse.move(target.x, target.y)
       await page.mouse.down()
       await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
@@ -1231,7 +1241,7 @@ test('constant Bollinger bands stay finite and negative lower bands retain the r
     await page.waitForFunction(() => document.querySelector('[data-chart-inst]').__chartSnapshot?.bars.every(bar => bar.bollLower === -1))
     const paths = await page.locator('svg[data-rendered-inst] path[d]').evaluateAll(paths => paths.map(path => path.getAttribute('d')))
     assert.doesNotMatch(paths.join(' '), /NaN|Infinity|undefined/)
-    assert.equal(await page.locator('svg[data-rendered-inst] [data-chart-indicator="bollLower"]').first().evaluate(path => path.getAttribute('d').length > 0), true)
+    assert.equal(await page.locator('svg[data-rendered-inst] [data-chart-boll-band]').first().evaluate(path => path.getAttribute('d').length > 0), true)
   } finally { await publishMode('standard') }
 })
 
@@ -1882,7 +1892,7 @@ test('compact density reserves at least eighty-five percent of each stacked char
       if (!baseline) {
         assert.ok(reading.sidebar <= Math.max(280, reading.width * .2) + 1)
         assert.ok(reading.rowHeight >= 28 && reading.rowHeight <= 30)
-        assert.equal(reading.fontSize, '11px')
+        assert.equal(reading.fontSize, '12px')
         assert.ok(reading.charts.every(chart => chart.ratio >= .85), JSON.stringify(reading))
         assert.ok(reading.charts.every(chart => chart.ticks > 0 && chart.clippedTicks.length === 0), JSON.stringify(reading))
       }
@@ -1905,14 +1915,14 @@ test('compact density reserves at least eighty-five percent of each stacked char
         await page.mouse.down()
         await chart.locator('[data-chart-inspection-readout]').waitFor({ state: 'visible' })
         assert.deepEqual(await chart.locator('[data-chart-plot]').boundingBox(), plot)
-        assert.equal(await chart.locator('[data-chart-legend-value]').count(), 2)
+        assert.equal(await chart.locator('[data-chart-legend-value]').count(), 1)
         const expected = await chart.locator('[data-chart-inst]').evaluate(element => {
           const hour = Number(element.querySelector('[data-chart-inspected-hour]').dataset.chartInspectedHour)
           const bar = element.__chartSnapshot.bars.find(bar => bar.hour === hour)
-          return { close: bar.close, vwap: new Intl.NumberFormat('en-US', { maximumSignificantDigits: 6 }).format(bar.vwap) }
+          return { close: bar.close }
         })
         assert.equal(Number(await chart.locator('[data-chart-ohlc="close"] span[title]').textContent()), expected.close)
-        assert.equal(await chart.locator('[data-chart-inspection-indicator="VWAP(14)"] [data-chart-legend-value]').textContent(), expected.vwap)
+        assert.equal(await chart.locator('[data-chart-inspection-indicator="VWAP(14)"]').count(), 0)
         await page.mouse.up()
         await chart.locator('[data-chart-inspection-readout]').waitFor({ state: 'hidden' })
       }

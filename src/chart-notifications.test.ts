@@ -17,7 +17,7 @@ const source = (close = 100) => ({ instrument: instId, timeframe, timestamp: Mat
 const completedBars = (firstHour: number, count: number): PreparedChartBar[] => Array.from({ length: count }, (_, index) => ({
   hour: firstHour + index * intervalMS, open: 100, high: 102, low: 99, close: 101, confirmed: true,
   statisticsSources: 3, statisticsObserved: true, indicatorsObserved: true,
-  vwap: 100, ema: 100, bollUpper: 102, bollMiddle: 100, bollLower: 99,
+  ema: 100, bollUpper: 102, bollMiddle: 100, bollLower: 99,
   roc: 1, maroc: .5, rsi6: 50, rsi12: 51, rsi24: 52, atrPercent: 2.5, bbw: 6,
   oi: 1_000, buy: 20, sell: 30,
 }))

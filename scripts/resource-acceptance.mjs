@@ -208,11 +208,9 @@ export function installResourcePaintProbe(fixture) {
             if (value.indicatorsObserved) {
               const middle = close - .095, deviation = .01 * Math.sqrt(399 / 12)
               const roc = i => (baseline + i * .01 - (baseline + (i - 9) * .01)) / Math.abs(baseline + (i - 9) * .01) * 100
-              let numerator = 0, denominator = 0
-              for (let i = Math.max(0, index - 13); i <= index; i += 1) { const volume = 100 + i % 7; numerator += (baseline + i * .01 + .01 / 3) * volume; denominator += volume }
               const expected = { ema: index >= 199 ? close - .995 : null,
                 bollMiddle: index >= 19 ? middle : null, bollUpper: index >= 19 ? middle + 2 * deviation : null, bollLower: index >= 19 ? middle - 2 * deviation : null,
-                vwap: index >= 13 ? numerator / denominator : null, roc: index >= 9 ? roc(index) : null,
+                roc: index >= 9 ? roc(index) : null,
                 maroc: index >= 17 ? Array.from({ length: 9 }, (_, offset) => roc(index - offset)).reduce((a, b) => a + b, 0) / 9 : null,
                 rsi6: index >= 6 ? 100 : null, rsi12: index >= 12 ? 100 : null, rsi24: index >= 24 ? 100 : null,
                 atrPercent: index >= 13 ? .11 / close * 100 : null, bbw: index >= 19 ? 4 * deviation / middle * 100 : null }

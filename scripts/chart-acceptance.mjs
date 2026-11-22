@@ -181,22 +181,15 @@ export async function assertIndicatorLegends(page) {
   const reading = await page.locator('[data-multi-timeframe-charts] svg[data-rendered-inst]').evaluateAll(charts => charts.map(svg => ({
     timeframe: svg.dataset.renderedTimeframe,
     panels: svg.querySelectorAll('[data-chart-panel-header]').length,
-    curves: ['vwap', 'bollUpper', 'bollMiddle', 'bollLower'].map(field => {
-      const curve = svg.querySelector(`[data-chart-indicator="${field}"]`)
-      return { field, path: curve?.getAttribute('d') ?? '', stroke: curve ? getComputedStyle(curve).stroke : null,
-        width: curve ? Number.parseFloat(getComputedStyle(curve).strokeWidth) : null }
-    }),
+    removed: svg.querySelectorAll('[data-chart-indicator="vwap"], [data-chart-indicator="bollUpper"], [data-chart-indicator="bollMiddle"], [data-chart-indicator="bollLower"]').length,
+    bands: [...svg.querySelectorAll('[data-chart-boll-band]')].map(path => ({ path: path.getAttribute('d'), fill: getComputedStyle(path).fill, opacity: Number(getComputedStyle(path).fillOpacity) })),
   })))
   assert.deepEqual(reading.map(chart => chart.timeframe), ['1H', '15m', '5m'])
   assert.equal(await page.locator('[data-shared-chart-legend]').count(), 0)
   for (const chart of reading) {
     assert.equal(chart.panels, 0, `${chart.timeframe} should contain only its price chart.`)
-    for (const curve of chart.curves) {
-      assert.ok(curve.path, `${chart.timeframe} ${curve.field} must have a drawn curve.`)
-      assert.equal(curve.width, 1, `${chart.timeframe} ${curve.field} must use a 1 px stroke.`)
-      assert.equal(curve.stroke, reading[0].curves.find(first => first.field === curve.field).stroke, `${chart.timeframe} ${curve.field} must use the same color across timeframes.`)
-    }
-    assert.ok(chart.curves[0].stroke !== chart.curves[1].stroke, `${chart.timeframe} VWAP and BOLL must remain visually distinct.`)
+    assert.equal(chart.removed, 0, `${chart.timeframe} must not draw VWAP or BOLL lines.`)
+    assert.ok(chart.bands.length && chart.bands.every(band => band.path && band.fill !== 'none' && band.opacity > 0 && !/NaN|Infinity|undefined/.test(band.path)), `${chart.timeframe} must retain a finite BOLL background.`)
   }
   return reading
 }
@@ -319,7 +312,6 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
     if (!(chart instanceof HTMLElement)) throw new Error('No chart surface to inspect.')
     const expectedTimeframe = chart.__chartSnapshot?.timeframe
     if (!series[expectedTimeframe]) throw new Error('The initial chart needs a known fixture timeframe.')
-    const curveFields = ['vwap', 'bollUpper', 'bollMiddle', 'bollLower']
     const probe = {
       instId, expectedTimeframe, series, requireMatureData, requireWarmStatistics, indicatorValidation, priceOnly: true,
       active: true, frames: 0, pendingFrames: 0, paints: 0, minimumBars: Infinity, errors: [],
@@ -438,13 +430,24 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
         return lastSurface
       }
       const previousSVG = previous?.svg
-      let curves = null
-      for (let index = 0; index < curveFields.length; index += 1) {
-        const d = svg.querySelector(`[data-chart-indicator="${curveFields[index]}"]`)?.getAttribute('d') ?? ''
-        if (!curves && (!previousSVG || previousSVG.curves[index] !== d)) curves = previousSVG ? previousSVG.curves.slice(0, index) : []
-        if (curves) curves.push(d)
+      // Recover each boundary from the filled band polygon only when its
+      // geometry changes; immutable observations share the parsed result.
+      const pathsNow = [...svg.querySelectorAll('[data-chart-boll-band]')].map(path => path.getAttribute('d') ?? '')
+      const changedBands = !previousSVG?.bandPaths || pathsNow.length !== previousSVG.bandPaths.length
+        || pathsNow.some((path, index) => path !== previousSVG.bandPaths[index])
+      const bandPaths = changedBands ? Object.freeze(pathsNow) : previousSVG.bandPaths
+      let curves = previousSVG?.curves
+      if (changedBands) {
+        const boundaries = [[], []]
+        for (const band of bandPaths) {
+          const points = [...band.matchAll(/[ML]([\d.e+-]+)[ ,]+([\d.e+-]+)/gi)].map(match => `${match[1]} ${match[2]}`)
+          const half = points.length / 2
+          if (!Number.isInteger(half)) continue
+          for (const [index, values] of [points.slice(0, half), points.slice(half).reverse()].entries())
+            if (values.length) boundaries[index].push(values.map((value, i) => `${i ? 'L' : 'M'}${value}`).join(' '))
+        }
+        curves = Object.freeze(boundaries.map(boundary => boundary.join(' ')))
       }
-      curves = curves ? Object.freeze(curves) : previousSVG.curves
       const paths = svg.querySelectorAll('path[d]')
       let pathData = previousSVG?.pathData
       let pathsChanged = !pathData || pathData.length !== paths.length
@@ -460,7 +463,7 @@ export async function startPaintProbe(page, fixture, { requireMatureData = false
       const svgState = shareRecord(previousSVG, {
         instId: svg.dataset.renderedInst, timeframe: svg.dataset.renderedTimeframe, start: svg.dataset.renderedStart, end: svg.dataset.renderedEnd,
         label: svg.getAttribute('aria-label'),
-        plotRight: svg.dataset.chartPlotRight, barWidth: svg.dataset.chartBarWidth, domainEnd: svg.dataset.chartDomainEnd, domainStart: svg.dataset.chartDomainStart, clipPath, hasClip: Boolean(clip), clipX: clip?.getAttribute('x'), clipWidth: clip?.getAttribute('width'), curves, pathData,
+        plotRight: svg.dataset.chartPlotRight, barWidth: svg.dataset.chartBarWidth, domainEnd: svg.dataset.chartDomainEnd, domainStart: svg.dataset.chartDomainStart, clipPath, hasClip: Boolean(clip), clipX: clip?.getAttribute('x'), clipWidth: clip?.getAttribute('width'), curves, bandPaths, pathData,
         oi: oi?.getAttribute('data-chart-oi'), oiState: oi?.getAttribute('data-chart-oi-state'), oiSamples: oi?.getAttribute('data-chart-oi-samples'),
         taker: taker?.getAttribute('data-chart-taker'), takerState: taker?.getAttribute('data-chart-taker-state'),
         buySamples: taker?.querySelector('[data-chart-taker-buy-samples]')?.getAttribute('data-chart-taker-buy-samples'),
@@ -653,10 +656,10 @@ export function validateStoppedPaintCapture({ readyTarget = null, includeRequest
   if (!probe || probe.active) throw new Error('Paint validation requires the stopped capture.')
 
   const validationStartedAt = performance.now()
-  const fields = ['open', 'high', 'low', 'close', 'vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
+  const fields = ['open', 'high', 'low', 'close', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi', 'buy', 'sell']
   const indicatorFields = fields.slice(4, -3), statisticFields = ['oi', 'buy', 'sell']
-  const curveFields = probe.priceOnly ? ['vwap', 'bollUpper', 'bollMiddle', 'bollLower']
-    : ['vwap', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi']
+  const curveFields = probe.priceOnly ? ['bollUpper', 'bollLower']
+    : ['bollUpper', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'oi']
   const { instId, requireMatureData, requireWarmStatistics, indicatorValidation } = probe
   const oracles = Object.fromEntries(Object.entries(series).map(([frame, entry]) => [frame, new Map(entry.bars.map(bar => [bar.hour, bar]))]))
   const expectedGeometry = new WeakMap(), svgGeometry = new WeakMap(), known = new Map(), seenErrors = new Set(probe.errors)
@@ -1038,7 +1041,7 @@ export async function measureChartIntentLatency(page, { inputs, targets, require
   return report
 }
 
-export async function waitForLocalHistory(electron, page, fixture, timeframe = fixture.timeframe, { requireIndicators = false } = {}) {
+export async function waitForLocalHistory(electron, page, fixture, timeframe = fixture.timeframe, { requireIndicators = false, stayHistorical = false } = {}) {
   const intervalMS = fixture.series[timeframe].intervalMS, warmEnd = fixture.end - intervalMS
   const geometry = await page.locator('[data-acceptance-target] [data-chart-inst]').evaluate(chart => ({
     edge: Number(chart.dataset.chartTimeEnd), spacing: Number(chart.dataset.chartBarSpacing),
@@ -1061,7 +1064,9 @@ export async function waitForLocalHistory(electron, page, fixture, timeframe = f
     if (resident > 96 && (!requireIndicators || calculatedReserve())) break
     await new Promise(resolve => setTimeout(resolve, 20))
   }
-  assert.ok(resident > 96 && resident <= 1536, `History hydration must return a bounded price reserve: ${resident}`)
+  // The prepared service may retain overlapping reads around a 144-bar demand
+  // bucket; its resident ceiling is 2304, not the 1536-row base read size.
+  assert.ok(resident > 96 && resident <= 2304, `History hydration must return a bounded price reserve: ${resident}`)
   if (requireIndicators) {
     assert.ok(calculatedReserve(), `The resident ${timeframe} reserve must finish canonical indicator preparation: ${JSON.stringify(historyFrame)}`)
     // Keep the historical target active until both the calculated reserve and
@@ -1069,7 +1074,7 @@ export async function waitForLocalHistory(electron, page, fixture, timeframe = f
     await page.waitForFunction(({ instId, timeframe, end }) => {
       const chart = document.querySelector(`[data-acceptance-target] [data-chart-inst="${instId}"]`), snapshot = chart?.__chartSnapshot
       const bars = chart?.__chartRenderedBars ?? snapshot?.bars
-      const fields = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
+      const fields = ['ema', 'bollUpper', 'bollMiddle', 'bollLower', 'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
       return snapshot?.instId === instId && snapshot.timeframe === timeframe && snapshot.endHour === end
         && snapshot.indicatorState === 'ready' && chart.dataset.chartLoading === 'false'
         && Math.floor(Number(chart.dataset.chartVisibleBars)) === 96 && bars?.length >= 96 && bars.length <= 98
@@ -1078,10 +1083,12 @@ export async function waitForLocalHistory(electron, page, fixture, timeframe = f
   }
   await page.evaluate(async () => { for (let frame = 0; frame < 2; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve)) })
   await assertCompleteChartViewport(page, fixture.instId, { endHour: warmEnd })
-  // Go past the original edge to resume the shared live-follow state.
-  await wheelBurst(page, { deltaY: -distance - geometry.spacing })
-  await waitForRendered(page, fixture, timeframe)
-  await assertCompleteChartViewport(page, fixture.instId, { endHour: fixture.end, availableThrough: fixture.end })
+  if (!stayHistorical) {
+    // Go past the original edge to resume the shared live-follow state.
+    await wheelBurst(page, { deltaY: -distance - geometry.spacing })
+    await waitForRendered(page, fixture, timeframe)
+    await assertCompleteChartViewport(page, fixture.instId, { endHour: fixture.end, availableThrough: fixture.end })
+  }
   return resident
 }
 
@@ -1806,7 +1813,7 @@ async function assertColdCanonicalViewport(electron, page, fixture, endHour, cap
   } }), fixture)
   assert.ok(canonicalCandles.length > 0, `The cold ${timeframe} canonical SQLite prefix must be readable.`)
   const oracle = new Map(barsWithIndicators(canonicalCandles, fixture.intervalMS).map(bar => [bar.hour, bar]))
-  const priceFields = ['open', 'high', 'low', 'close'], indicatorFieldsObserved = ['vwap', 'ema', 'bollUpper', 'bollMiddle', 'bollLower',
+  const priceFields = ['open', 'high', 'low', 'close'], indicatorFieldsObserved = ['ema', 'bollUpper', 'bollMiddle', 'bollLower',
     'roc', 'maroc', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw']
   let observedIndicatorBars = 0, observedOIBars = 0, observedTakerBars = 0
   const assertCanonical = (actual, expected, field) => {

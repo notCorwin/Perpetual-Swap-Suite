@@ -6,7 +6,7 @@ import { chartPanelClip } from './chart-layout.ts'
 
 const intervalMS = 900_000
 const candle = (index: number): Bar => ({ hour: index * intervalMS, open: 100, high: 103, low: 99, close: 102, confirmed: true,
-  vwap: 101, ema: 100, bollUpper: 104, bollMiddle: 101, bollLower: 98,
+  ema: 100, bollUpper: 104, bollMiddle: 101, bollLower: 98,
   roc: index - 3, maroc: index - 4, rsi6: 25, rsi12: 50, rsi24: 75, atrPercent: 2.5, bbw: 6, oi: index * 10, buy: 7, sell: 3 })
 const rows = () => Object.freeze(Array.from({ length: 96 }, (_, index) => Object.freeze(candle(index))))
 const viewport = { width: 960, height: 700, endHour: 95 * intervalMS, intervalMS }
@@ -79,12 +79,12 @@ test('fractional overscan extends paths and crossings without changing the 96-ba
   assert.deepEqual(geometry.oiAxis, baseline.oiAxis)
   assert.equal(geometry.x.length, 96)
   close(geometry.barPitch, geometry.x[1] - geometry.x[0])
-  const vwapX = [...geometry.lines.vwap.matchAll(/[ML]([\d.-]+) ([\d.-]+)/g)].map(([, x]) => Number(x))
-  assert.equal(vwapX.length, 98)
-  assert.ok(vwapX[0] < geometry.layout.left)
-  assert.ok(vwapX.at(-1)! > geometry.layout.right)
+  const bandX = [...geometry.bollBands[0].matchAll(/[ML]([\d.-]+) ([\d.-]+)/g)].map(([, x]) => Number(x))
+  assert.equal(bandX.length, 196)
+  assert.ok(bandX[0] < geometry.layout.left)
+  assert.ok(Math.max(...bandX) > geometry.layout.right)
   const priceClip = chartPanelClip(geometry.layout, 'price', geometry.barPitch)
-  assert.ok(vwapX[0] >= priceClip.x && vwapX.at(-1)! <= priceClip.x + priceClip.width,
+  assert.ok(bandX[0] >= priceClip.x && Math.max(...bandX) <= priceClip.x + priceClip.width,
     'The translated price panel clip must admit adjacent bar centers on both sides.')
   const leftCrossing = geometry.rsiMarkers.find(marker => marker.hour === bars[0].hour && marker.field === 'rsi6')
   const rightCrossing = geometry.rsiMarkers.find(marker => marker.hour === after.hour && marker.field === 'rsi6')
@@ -98,11 +98,10 @@ test('fractional overscan extends paths and crossings without changing the 96-ba
 })
 
 test('missing periods and unavailable observations break paths and filled areas without inventing zero samples', () => {
-  const bars = [0, 1, 3, 4, 5].map(index => ({ ...candle(index), vwap: index === 3 ? null : 100,
+  const bars = [0, 1, 3, 4, 5].map(index => ({ ...candle(index),
     atrPercent: index === 3 ? null : 2.5, bbw: index === 3 ? null : 6,
     buy: index === 3 ? null : 7, sell: index === 3 ? null : 3, oi: index === 3 ? null : index * 10 }))
   const geometry = createChartGeometryCache(text => text.length * 6)(bars, viewport)
-  assert.equal((geometry.lines.vwap.match(/M/g) ?? []).length, 2)
   assert.equal((geometry.lines.oi.match(/M/g) ?? []).length, 2)
   assert.equal((geometry.lines.atrPercent.match(/M/g) ?? []).length, 2)
   assert.equal((geometry.lines.bbw.match(/M/g) ?? []).length, 2)
@@ -201,7 +200,6 @@ test('Bollinger values crossing zero retain a relative domain and genuine warmup
   assert.ok(geometry.priceAxis.min <= -102 && geometry.priceAxis.max >= 4)
   close(geometry.priceY(0) - geometry.priceY(1), geometry.priceY(1) - geometry.priceY(2))
   assert.equal('ema' in geometry.lines, false)
-  assert.equal((geometry.lines.bollLower.match(/[ML]/g) ?? []).length, 77)
   assert.equal(geometry.bollBands.length, 1)
 })
 
@@ -230,7 +228,7 @@ test('immutable window revisits reuse geometry while corrections, resize, native
   assert.notEqual(otherPeriod.x[1] - otherPeriod.x[0], initial.x[1] - initial.x[0])
   const quote = get(bars, { ...viewport, liveClose: 1000 })
   assert.ok(quote.priceAxis.max >= 900)
-  assert.notEqual(quote.lines.vwap, initial.lines.vwap)
+  assert.notDeepEqual(quote.bollBands, initial.bollBands)
   assert.ok(quote.priceY(1000) >= quote.layout.panels.price[0])
 })
 
@@ -254,7 +252,8 @@ test('price-only geometry fills the plot and has a separate reusable cache varia
   assert.equal(geometry(bars, { ...viewport, height: 240, priceOnly: true }), multi)
   assert.equal(multi.layout.panels.price[1], 224)
   assert.ok(multi.layout.panels.price[1] - multi.layout.panels.price[0] > 180)
-  assert.ok(multi.lines.bollUpper && multi.lines.vwap)
+  assert.ok(multi.bollBands.length > 0)
+  assert.equal(Object.values(multi.lines).every(path => path === ''), true)
 })
 
 test('unplotted EMA values cannot widen the main price scale or generate a path', () => {
@@ -264,7 +263,8 @@ test('unplotted EMA values cannot widen the main price scale or generate a path'
     const extremeEMA = get(bars.map(bar => ({ ...bar, ema: 1_000_000 })), { ...viewport, priceOnly })
     assert.deepEqual(extremeEMA.priceAxis, baseline.priceAxis)
     assert.equal('ema' in extremeEMA.lines, false)
-    assert.ok(extremeEMA.lines.vwap && extremeEMA.lines.bollUpper && extremeEMA.lines.bollMiddle && extremeEMA.lines.bollLower)
+    assert.ok(extremeEMA.bollBands.length > 0)
+    for (const field of ['vwap', 'bollUpper', 'bollMiddle', 'bollLower']) assert.equal(field in extremeEMA.lines, false)
   }
 })
 
@@ -328,7 +328,7 @@ test('rebased labels preserve fractional offsets and cached paths across invalid
 })
 
 test('nonfinite OHLC never produces invalid cached price paths', () => {
-  const broken = rows().map((bar, index) => ({ ...bar, open: index === 0 ? 100 : NaN, high: NaN, low: NaN, close: NaN, vwap: null, bollUpper: null, bollMiddle: null, bollLower: null }))
+  const broken = rows().map((bar, index) => ({ ...bar, open: index === 0 ? 100 : NaN, high: NaN, low: NaN, close: NaN, bollUpper: null, bollMiddle: null, bollLower: null }))
   const geometry = createChartGeometryCache(text => text.length * 6)(broken, viewport)
   assert.equal(geometry.priceAxis.base, 100)
   for (const path of [geometry.upWicks, geometry.downWicks, geometry.upBodies, geometry.downBodies, ...Object.values(geometry.lines), ...geometry.bollBands]) assert.doesNotMatch(path, /NaN|Infinity/)
