@@ -14,6 +14,33 @@ const workspace = async t => {
   return root
 }
 
+test('acceptance requires an explicitly chosen output directory', async () => {
+  let executions = 0
+  for (const options of [{}, { report: '/tmp/report.json' }]) await assert.rejects(runAcceptance({ ...options, app: '/candidate.app', revision }, {
+    sandbox: async () => { executions++ },
+  }), /--output/)
+  assert.equal(executions, 0)
+})
+
+test('acceptance writes results at the explicit output and optional report', async t => {
+  const root = await workspace(t)
+  for (const options of [{ output: 'results' }, { output: 'results', report: 'report.json' }]) {
+    const expected = join(root, options.output)
+    const result = await runAcceptance({ root, ...options, app: '/candidate.app', revision }, {
+      sandbox: async ({ args, output }) => {
+        assert.equal(output, join(expected, 'sandbox'))
+        const smoke = args[args.indexOf('--report') + 1]
+        assert.equal(smoke, join(expected, 'smoke.json'))
+        await writeFile(smoke, JSON.stringify({ ok: true, revision }))
+        return { exitCode: 0, directory: output }
+      },
+    })
+    assert.equal(result.ok, true)
+    assert.equal(JSON.parse(await readFile(join(root, options.report ?? 'results/result.json'), 'utf8')).ok, true)
+  }
+  await assert.rejects(readFile(join(root, 'artifacts', 'acceptance', 'result.json')), { code: 'ENOENT' })
+})
+
 for (const change of ['source', 'output']) test(`packaging rejects a stale renderer ${change} without silently rebuilding`, async t => {
   const root = await workspace(t), manifestPath = join(root, 'artifacts/renderer.json')
   await mkdir(join(root, 'src'), { recursive: true })
@@ -34,7 +61,7 @@ for (const change of ['source', 'output']) test(`packaging rejects a stale rende
 test('a packaging failure prevents smoke execution and produces a failed report', async t => {
   const root = await workspace(t), report = join(root, 'result.json')
   let executions = 0
-  await assert.rejects(runAcceptance({ root, report }, {
+  await assert.rejects(runAcceptance({ root, report, output: 'results' }, {
     readRevision: async () => revision,
     packageApp: async () => { throw new Error('Packaging inputs changed') },
     sandbox: async () => { executions++ },
@@ -47,7 +74,7 @@ test('a packaging failure prevents smoke execution and produces a failed report'
 
 test('a sandbox recording failure cannot be hidden by a passing smoke report', async t => {
   const root = await workspace(t), report = join(root, 'result.json')
-  await assert.rejects(runAcceptance({ root, report, app: '/candidate.app', revision }, {
+  await assert.rejects(runAcceptance({ root, report, output: 'results', app: '/candidate.app', revision }, {
     packageApp: async () => { assert.fail('Explicit artifacts must not trigger packaging.') },
     sandbox: async ({ args }) => {
       await writeFile(args[args.indexOf('--report') + 1], JSON.stringify({ ok: true, revision }))
@@ -59,7 +86,7 @@ test('a sandbox recording failure cannot be hidden by a passing smoke report', a
 
 test('an explicit artifact must report the complete expected revision before acceptance passes', async t => {
   const root = await workspace(t), report = join(root, 'result.json')
-  await assert.rejects(runAcceptance({ root, report, app: '/candidate.app', revision }, {
+  await assert.rejects(runAcceptance({ root, report, output: 'results', app: '/candidate.app', revision }, {
     sandbox: async ({ args }) => {
       await writeFile(args[args.indexOf('--report') + 1], JSON.stringify({ ok: true, revision: 'b'.repeat(40) }))
       return { exitCode: 0, directory: join(root, 'recordings') }

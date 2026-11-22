@@ -31,7 +31,9 @@ const marketEpochMS = Number(option('--market-epoch-ms', Math.floor(Date.now() /
 if (!Number.isSafeInteger(marketEpochMS) || Math.abs(marketEpochMS - Date.now()) > 86400000) throw new Error('Market epoch must be an integer within one day.')
 if (!['electron', 'tauri', 'all'].includes(runtimeOption) || !Number.isSafeInteger(rounds) || rounds < 1 || rounds > 5
   || !Number.isSafeInteger(count) || count < 1 || count > 1000 || !Number.isSafeInteger(durationMS) || durationMS < 500) throw new Error('Invalid comparison options.')
-const directory = resolve(root, option('--output', `artifacts/runtime-comparison/${new Date().toISOString().replaceAll(':', '-')}`))
+const output = option('--output')
+if (!output || output.startsWith('--')) throw new Error('Specify --output <directory> for comparison results and temporary runtime files.')
+const directory = resolve(root, output)
 await mkdir(directory, { recursive: true })
 const log = message => console.log(`${new Date().toISOString()} ${message}`)
 const pause = ms => new Promise(done => setTimeout(done, ms))
@@ -129,10 +131,10 @@ async function connected(url) {
 const shell = async runtime => {
   if (runtime === 'electron') {
     const sourceApp = join(root, 'node_modules/electron/dist/Electron.app')
-    const prepared = await prepareBackgroundApp({ sourceApp, executableName: 'Electron', cacheRoot: join(root, 'artifacts/runtime-comparison/electron-cache') })
+    const prepared = await prepareBackgroundApp({ sourceApp, executableName: 'Electron', cacheRoot: join(directory, 'electron-cache') })
     return { executable: prepared.executable, args: [join(root, 'experiments/runtime-comparison/electron.cjs')], metadata: { version: JSON.parse(await readFile(join(root, 'node_modules/electron/package.json'))).version, backgroundGuard: prepared } }
   }
-  const executable = process.env.RADAR_COMPARE_TAURI_EXECUTABLE ?? join(root, 'artifacts/runtime-comparison/Radar Tauri Comparison.app/Contents/MacOS/radar-tauri-compare')
+  const executable = process.env.RADAR_COMPARE_TAURI_EXECUTABLE ?? join(directory, 'Radar Tauri Comparison.app/Contents/MacOS/radar-tauri-compare')
   await access(executable, constants.X_OK)
   return { executable, args: [], metadata: { executable } }
 }

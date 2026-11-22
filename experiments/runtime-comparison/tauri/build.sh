@@ -2,7 +2,7 @@
 set -eu
 
 shell_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-repo_root=$(CDPATH= cd -- "$shell_dir/../../.." && pwd)
-export CARGO_TARGET_DIR="$repo_root/artifacts/runtime-comparison/tauri-target"
+: "${CARGO_TARGET_DIR:?Set CARGO_TARGET_DIR explicitly or run build.mjs with --output <directory>.}"
+export CARGO_TARGET_DIR
 cargo build --manifest-path "$shell_dir/Cargo.toml" --release --locked
 printf 'Executable: %s\n' "$CARGO_TARGET_DIR/release/radar-tauri-compare"

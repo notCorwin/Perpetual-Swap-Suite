@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -18,8 +17,9 @@ export async function runAcceptance({ app, revision, report: reportPath, output,
   assert.ok(!app || !reuseBuildManifest, '--app and --reuse-build-manifest cannot be combined.')
   revision ??= await readRevision(root)
   assert.match(revision, /^[0-9a-f]{40}$/i, 'Acceptance requires a full expected Git revision.')
-  const directory = resolve(root, output ?? join('artifacts', 'acceptance', `${new Date().toISOString().replaceAll(':', '').replaceAll('.', '')}-${randomUUID().slice(0, 8)}`))
-  reportPath = resolve(root, reportPath ?? join(directory, 'result.json'))
+  assert.ok(output?.trim(), 'Choose an output directory with --output for the acceptance report and recordings.')
+  const directory = resolve(root, output)
+  reportPath = resolve(root, reportPath?.trim() ? reportPath : join(directory, 'result.json'))
   const smokeReport = join(directory, 'smoke.json')
   const report = { schemaVersion: 1, startedAt: new Date().toISOString(), revision, ok: false,
     scope: 'Signed packaged artifact; deterministic native HTTP/WebSocket, workers, SQLite, IPC and hidden renderer. Live OKX and native visible GPU timing are separate checks.',

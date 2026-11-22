@@ -1,12 +1,23 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { spawnSync } from 'node:child_process'
+import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { classifyLiveArtifacts, classifyLiveResults } from '../../scripts/okx-live-classify.mjs'
 
 const successful = () => ({ historyExitCode: '0', statisticsExitCode: '0', streamsExitCode: '0', chartExitCode: '0', chart: { classification: 'passed', observations: [1, 2, 3, 4] } })
 const outage = { probes: [{ url: 'https://www.okx.com/api/v5/rubik/stat/taker-volume-contract', ok: false, status: 503 }] }
+
+test('classification requires an explicit evidence directory and creates no default report', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'okx-classify-no-default-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  await assert.rejects(classifyLiveArtifacts(), /explicit artifact directory/)
+  const command = spawnSync(process.execPath, [resolve('scripts/okx-live-classify.mjs')], { cwd: directory, encoding: 'utf8' })
+  assert.equal(command.status, 1)
+  assert.match(command.stderr, /--artifacts DIRECTORY/)
+  assert.deepEqual(await readdir(directory), [])
+})
 
 test('scheduled checks preserve exact chart defects and do not invent WebSocket outage causes', async t => {
   const cases = [

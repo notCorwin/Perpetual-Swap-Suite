@@ -33,7 +33,8 @@ export function classifyLiveResults({ historyExitCode, statisticsExitCode, strea
       .map(({ url, status, code, error }) => ({ url, status, code, error })) }
 }
 
-export async function classifyLiveArtifacts({ artifacts = 'artifacts', environment = process.env } = {}) {
+export async function classifyLiveArtifacts({ artifacts, environment = process.env } = {}) {
+  if (typeof artifacts !== 'string' || !artifacts.trim()) throw new Error('An explicit artifact directory is required.')
   let availability, chart
   try { availability = JSON.parse(await readFile(join(artifacts, 'okx-endpoints.json'), 'utf8')) } catch {}
   try { chart = JSON.parse(await readFile(join(artifacts, 'okx-live-chart/result.json'), 'utf8')) } catch {}
@@ -51,8 +52,8 @@ export async function classifyLiveArtifacts({ artifacts = 'artifacts', environme
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const args = process.argv.slice(2)
-    if (args.length && (args.length !== 2 || args[0] !== '--artifacts')) throw new Error('Usage: node scripts/okx-live-classify.mjs [--artifacts DIRECTORY]')
-    const result = await classifyLiveArtifacts({ artifacts: args[1] ?? 'artifacts' })
+    if (args.length !== 2 || args[0] !== '--artifacts' || !args[1]?.trim()) throw new Error('Usage: node scripts/okx-live-classify.mjs --artifacts DIRECTORY')
+    const result = await classifyLiveArtifacts({ artifacts: args[1] })
     console.log(JSON.stringify(result, null, 2))
     if (result.classification !== 'passed') process.exitCode = 1
   } catch (error) { console.error(error.stack ?? error.message); process.exitCode = 1 }
