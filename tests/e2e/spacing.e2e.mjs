@@ -14,6 +14,16 @@ test('shared spacing resolves calc lengths in the hidden renderer without changi
       env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_USER_DATA: userData } })
     const page = await electron.firstWindow()
     await page.waitForLoadState('domcontentloaded')
+    const font = await page.evaluate(async () => {
+      await document.fonts.ready
+      return {
+        family: getComputedStyle(document.body).fontFamily,
+        faces: [...document.fonts].filter(face => face.family === 'Ubuntu Mono').map(face => ({ weight: face.weight, status: face.status })),
+      }
+    })
+    assert.match(font.family, /Ubuntu Mono/)
+    assert.ok(font.faces.some(face => face.weight === '400' && face.status === 'loaded'), 'Regular font must be loaded before rendering.')
+    assert.ok(font.faces.some(face => face.weight === '500 900' && face.status === 'loaded'), 'Bold font must be loaded before rendering.')
     const result = await page.evaluate(async reader => {
       await document.fonts.ready
       const read = (0, eval)(`(${reader})`)
@@ -35,9 +45,12 @@ test('shared spacing resolves calc lengths in the hidden renderer without changi
     assert.deepEqual(result.doubled, { '--space-4': 24, '--chart-legend-gap': 32, '--space-annotation-label': 52 })
     assert.deepEqual(result.density, { gap: '12px', padding: '12px' })
     assert.equal(result.leftoverNodes, 0)
-    await page.evaluate(() => { location.hash = '#/settings/liquidity' })
-    await page.locator('#slippageNotional').waitFor()
-    const alignment = await page.evaluate(() => {
+    const settingsOpened = electron.waitForEvent('window')
+    await electron.evaluate(({ Menu }) => Menu.getApplicationMenu().getMenuItemById('open-settings').click())
+    const settingsPage = await settingsOpened
+    await settingsPage.getByRole('link', { name: 'Liquidity filters', exact: true }).click()
+    await settingsPage.locator('#slippageNotional').waitFor()
+    const alignment = await settingsPage.evaluate(() => {
       const threshold = document.getElementById('threshold-slippage').closest('[data-slot="input-group"]')
       const amount = document.getElementById('slippageNotional')
       const a = threshold.getBoundingClientRect(), b = amount.getBoundingClientRect()
@@ -47,9 +60,9 @@ test('shared spacing resolves calc lengths in the hidden renderer without changi
     assert.ok(alignment.delta < 1, `Dependent controls must share their parent grid column: ${JSON.stringify(alignment)}`)
     assert.equal(alignment.width, alignment.amountWidth)
     assert.ok(alignment.height >= 24 && alignment.controlHeight >= 24)
-    await page.evaluate(() => { location.hash = '#/settings/data' })
-    await page.getByText('Data integrity', { exact: true }).waitFor()
-    const legendGap = await page.getByText('Data integrity', { exact: true }).evaluate(legend => {
+    await settingsPage.getByRole('link', { name: 'Market data', exact: true }).click()
+    await settingsPage.getByText('Data integrity', { exact: true }).waitFor()
+    const legendGap = await settingsPage.getByText('Data integrity', { exact: true }).evaluate(legend => {
       const next = legend.nextElementSibling
       return next.getBoundingClientRect().top - legend.getBoundingClientRect().bottom + parseFloat(getComputedStyle(legend).paddingBottom)
     })

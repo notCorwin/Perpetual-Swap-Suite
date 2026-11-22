@@ -3,6 +3,12 @@ const { contextBridge, ipcRenderer } = require('electron')
 const operationRecording = process.argv.includes('--perpetual-swap-operation-recording')
 const pendingNotifications = []
 let notificationReceiver, presentationReceiver, flushOperations
+let pendingPreferences
+const isSettingsWindow = process.argv.includes('--perpetual-swap-settings-window')
+let settingsCloseGuard = { dirty: false, busy: false }
+ipcRenderer.on('radar:settings-query-close', (_event, value) => {
+  if (isSettingsWindow && typeof value?.id === 'string') ipcRenderer.send('radar:settings-close-state', { id: value.id, ...settingsCloseGuard })
+})
 let presentation = { epoch: 0, active: !process.argv.includes('--perpetual-swap-presentation-idle'), startedAt: 0 }
 let presentationEvents = 0
 const updatePresentation = value => {
@@ -34,6 +40,10 @@ const receive = operationRecording
 for (const channel of ['radar:chart-prepared', 'radar:market-changed', 'radar:audit-changed', 'radar:history-download-changed']) {
   ipcRenderer.on(channel, (_event, detail, context, epoch) => receive(channel, detail, context, epoch))
 }
+ipcRenderer.on('radar:preferences-changed', (_event, detail) => {
+  if (notificationReceiver) notificationReceiver('radar:preferences-changed', detail)
+  else pendingPreferences = detail
+})
 if (operationRecording) {
   ipcRenderer.on('radar:operations-drain', async (_event, { id }) => {
     try {
@@ -50,12 +60,16 @@ const requireRecording = () => {
 const transport = {
   nativeWindowControls: process.platform === 'darwin',
   operationRecording,
+  isSettingsWindow,
+  setSettingsCloseGuard: value => { if (!isSettingsWindow) throw new Error('Not a settings window.'); settingsCloseGuard = { dirty: value.dirty, busy: value.busy }; ipcRenderer.send('radar:settings-close-guard', settingsCloseGuard) },
+  closeSettingsWindow: () => { if (!isSettingsWindow) throw new Error('Not a settings window.'); return ipcRenderer.invoke('radar:settings-close') },
   request: operationRecording
     ? (value, context) => ipcRenderer.invoke('radar:request', value, context)
     : value => ipcRenderer.invoke('radar:request', value),
   subscribeNotifications: receiver => {
     if (notificationReceiver || typeof receiver !== 'function') throw new Error('The notification receiver is already subscribed or invalid.')
     notificationReceiver = receiver
+    if (pendingPreferences !== undefined) { receiver('radar:preferences-changed', pendingPreferences); pendingPreferences = undefined }
     for (const notification of pendingNotifications.splice(0)) {
       if (presentation.active && (typeof notification[3] !== 'number' || notification[3] >= presentation.epoch)) receiver(...notification)
     }

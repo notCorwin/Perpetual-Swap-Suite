@@ -5,6 +5,9 @@ import type { OperationContext } from '../electron/services/operations.js'
 type DesktopTransport = {
   readonly nativeWindowControls: boolean
   readonly operationRecording: boolean
+  readonly isSettingsWindow: boolean
+  setSettingsCloseGuard(value: { dirty: boolean; busy: boolean }): void
+  closeSettingsWindow(): Promise<void>
   request(value: unknown, context?: OperationContext): Promise<unknown>
   subscribeNotifications(receiver: (channel: string, detail: unknown, context?: OperationContext) => void): void
   subscribePresentation(receiver: (update: Omit<PresentationUpdate, 'snapshot'> & { snapshot?: unknown }) => void): void
@@ -63,6 +66,9 @@ bridge.subscribeNotifications(bridge.operationRecording
 const desktop: RadarDesktop = {
   nativeWindowControls: bridge.nativeWindowControls,
   operationRecording: bridge.operationRecording,
+  isSettingsWindow: bridge.isSettingsWindow,
+  setSettingsCloseGuard: value => bridge.setSettingsCloseGuard(value),
+  closeSettingsWindow: () => bridge.closeSettingsWindow(),
   subscribePresentation(receiver) {
     presentationListeners.add(receiver)
     try { receiver(presentation) }

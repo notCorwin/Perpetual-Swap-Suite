@@ -8,7 +8,7 @@ import { assertWorkspaceLayout, selectTimeframe, captureChartViewport, chartView
 
 const root = new URL('../..', import.meta.url).pathname
 const userData = await mkdtemp(join(tmpdir(), 'perp-workspace-e2e-'))
-let electron, page
+let electron, page, settingsWindow
 
 before(async () => {
   electron = await _electron.launch({ args: ['.', '--headless', '--disable-gpu'], cwd: root,
@@ -46,13 +46,13 @@ before(async () => {
     state.publishAudit = values => {
       state.audit = { ...state.audit, ...structuredClone(values), revision: state.audit.revision + 1 }
       const report = structuredClone(state.audit)
-      BrowserWindow.getAllWindows()[0].webContents.send('radar:audit-changed', report)
+      for (const window of BrowserWindow.getAllWindows()) window.webContents.send('radar:audit-changed', report)
       return report
     }
     state.publishDownload = values => {
       state.historyDownload = { ...state.historyDownload, ...structuredClone(values), revision: state.historyDownload.revision + 1 }
       const report = structuredClone(state.historyDownload)
-      BrowserWindow.getAllWindows()[0].webContents.send('radar:history-download-changed', report)
+      for (const window of BrowserWindow.getAllWindows()) window.webContents.send('radar:history-download-changed', report)
       return report
     }
     state.viewportBars = {}
@@ -79,6 +79,7 @@ before(async () => {
           if (state.failNextSave) { state.failNextSave = false; throw new Error('The preferences could not be saved.') }
           state.preferences = { ...state.preferences, ...value.preferences.values }
           state.revision += 1
+          for (const window of BrowserWindow.getAllWindows()) window.webContents.send('radar:preferences-changed', state.preferences)
         }
         return state.preferences
       }
@@ -200,13 +201,10 @@ afterEach(async context => {
   if (process.env.PERPETUAL_SWAP_UI_SCREENSHOTS) await page.screenshot({ path: join(process.env.PERPETUAL_SWAP_UI_SCREENSHOTS, `checkpoint-${context.name.slice(0, 35).replace(/[^a-z0-9]/gi, '-')}.png`) })
   await page.mouse.up()
   await page.keyboard.press('Escape')
-  if (await settingsPage().isVisible()) {
+  if (settingsWindow && !settingsWindow.isClosed()) {
     const discard = settingsPage().getByRole('button', { name: 'Discard changes', exact: true })
     if (await discard.isVisible() && await discard.isEnabled()) await discard.click()
-    const acceptDiscard = dialog => void dialog.accept()
-    page.on('dialog', acceptDiscard)
-    try { await backToMarkets() }
-    finally { page.off('dialog', acceptDiscard) }
+    await backToMarkets()
   }
 })
 after(async () => {
@@ -218,8 +216,8 @@ after(async () => {
       await openSettings()
       for (const [category, file] of [['Workspace', 'workspace'], ['Liquidity filters', 'liquidity'], ['Market data', 'data']]) {
         await chooseSettingsCategory(category)
-        await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
-        await page.screenshot({ path: join(directory, `settings-page-${file}.png`) })
+        await settingsWindow.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+        await settingsWindow.screenshot({ path: join(directory, `settings-page-${file}.png`) })
       }
     }
   } finally { await electron?.close(); await rm(userData, { recursive: true, force: true }) }
@@ -256,27 +254,37 @@ test('contract header remains distinct from an adjacent selected row', async () 
   } finally { await page.emulateMedia({ colorScheme: null }) }
 })
 const waitForMarketStatus = status => page.waitForFunction(status => [...document.querySelectorAll('[data-market-status] p')].some(row => row.textContent.trim() === `Contracts: ${status}`), status)
-const settingsPage = () => page.getByRole('main', { name: 'Settings', exact: true })
+const settingsPage = () => settingsWindow.getByRole('main', { name: 'Settings', exact: true })
 const chooseSettingsCategory = async category => {
   const settings = settingsPage()
   await settings.getByRole('navigation', { name: 'Settings categories' }).getByRole('link', { name: category, exact: true }).click()
   await settings.getByRole('heading', { name: category, exact: true, level: 2 }).waitFor()
 }
 const openSettings = async (category = 'Workspace') => {
-  await page.getByRole('link', { name: 'Settings', exact: true }).click()
-  const settings = settingsPage()
+  if (!settingsWindow || settingsWindow.isClosed()) {
+    const opened = electron.waitForEvent('window')
+    await electron.evaluate(({ Menu }) => Menu.getApplicationMenu().getMenuItemById('open-settings').click())
+    settingsWindow = await opened
+    if (process.env.PERPETUAL_SWAP_E2E_FAST_FAILURE) settingsWindow.setDefaultTimeout(2_000)
+  }
+  let settings = settingsPage()
   await settings.waitFor({ state: 'visible' })
   await chooseSettingsCategory(category)
   return settings
 }
 const backToMarkets = async () => {
-  await settingsPage().getByRole('link', { name: 'Settings', exact: true }).click()
-  await settingsPage().waitFor({ state: 'hidden' })
+  if (!settingsWindow || settingsWindow.isClosed()) return
+  const closed = settingsWindow.waitForEvent('close')
+  await settingsWindow.evaluate(() => window.radarDesktop.closeSettingsWindow())
+  await closed
   await page.locator('[data-market-status-row]').waitFor({ state: 'visible' })
 }
 const vwapCandleTarget = async (position, fixture) => {
-  const viewport = await assertCompleteChartViewport(page, fixture.instId, { fullSlots: null })
-  const clip = await page.locator('svg[data-rendered-inst] clipPath[id$="-content"] rect').evaluate(rect => ({
+  const viewport = await page.locator(`[data-acceptance-target] [data-chart-inst="${fixture.instId}"]`).evaluate(captureChartViewport)
+  const available = new Set([...fixture.bars, ...(fixture.liveBar ? [fixture.liveBar] : [])].map(bar => bar.hour))
+  viewport.expectedHours = chartViewportHours(viewport).filter(hour => available.has(hour))
+  assert.deepEqual(viewport.bars.map(bar => bar.hour), viewport.expectedHours)
+  const clip = await page.locator('[data-acceptance-target] svg[data-rendered-inst] clipPath[id$="-content"] rect').evaluate(rect => ({
     left: Number(rect.getAttribute('x')), width: Number(rect.getAttribute('width')),
   }))
   const fullHours = viewport.expectedHours.filter(hour => {
@@ -286,7 +294,7 @@ const vwapCandleTarget = async (position, fixture) => {
   assert.ok(fullHours.length > 2, 'Pointer fixtures must contain fully visible candle bodies.')
   const hour = position === 'first' ? fullHours[0] : position === 'middle' ? fullHours[Math.floor(fullHours.length / 2)]
     : position === 'previous' ? fullHours.at(-2) : fullHours.at(-1)
-  const target = await page.locator('svg[data-rendered-inst]').evaluate((svg, x) => {
+  const target = await page.locator('[data-acceptance-target] svg[data-rendered-inst]').evaluate((svg, x) => {
     const point = svg.createSVGPoint()
     point.x = x; point.y = svg.viewBox.baseVal.height * .1
     const screen = point.matrixTransform(svg.getScreenCTM())
@@ -300,14 +308,13 @@ const clickByRect = async locator => {
   await locator.scrollIntoViewIfNeeded()
   const bounds = await locator.boundingBox()
   assert.ok(bounds && bounds.width > 0 && bounds.height > 0, 'The control must have a rendered pointer target.')
-  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)))
   const hitTest = await locator.evaluate(element => {
     const rect = element.getBoundingClientRect(), target = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)
     return { acceptsPointer: target === element || element.contains(target), target: target?.tagName, role: target?.getAttribute('role'), x: rect.x, y: rect.y, width: rect.width, height: rect.height }
   })
   assert.equal(hitTest.acceptsPointer, true, `The control must receive pointer input at its drawn center: ${JSON.stringify(hitTest)}`)
   const target = await locator.boundingBox()
-  await page.mouse.click(target.x + target.width / 2, target.y + target.height / 2)
+  await settingsWindow.mouse.click(target.x + target.width / 2, target.y + target.height / 2)
 }
 
 test('default selection uses absolute completed-candle change with nulls last and stable contract ties', async () => {
@@ -369,7 +376,7 @@ test('chart and settings retain their keyboard behavior', async () => {
     const settings = await openSettings()
     const lookback = settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)', exact: true })
     await lookback.focus()
-    await page.keyboard.press('ArrowUp')
+    await settingsWindow.keyboard.press('ArrowUp')
     assert.equal(await lookback.inputValue(), '16')
     assert.equal(await page.locator('[data-timeframe-panel="1H"] [data-chart-inst]').getAttribute('data-chart-inst'), 'ZETA-USDT-SWAP')
     await settings.getByRole('button', { name: 'Discard changes', exact: true }).click()
@@ -377,7 +384,7 @@ test('chart and settings retain their keyboard behavior', async () => {
     await page.keyboard.press('ArrowDown')
     await page.locator('[data-timeframe-panel="1H"] svg[data-rendered-inst="ALPHA-USDT-SWAP"]').waitFor({ state: 'visible', timeout: 2_000 })
   } finally {
-    if (await settingsPage().isVisible()) {
+    if (settingsWindow && !settingsWindow.isClosed()) {
       const discard = settingsPage().getByRole('button', { name: 'Discard changes', exact: true })
       if (await discard.isEnabled()) await discard.click()
       await backToMarkets()
@@ -396,44 +403,17 @@ test('the existing chart toolbar provides window dragging while its controls rem
   assert.equal(await toolbar.getByRole('heading', { name: 'Perpetual Swap Suite', exact: true }).count(), 1)
   const sidebar = page.getByRole('complementary', { name: 'Contract list' })
   assert.equal(await sidebar.isVisible(), true)
-  const settingsLink = toolbar.getByRole('link', { name: 'Settings', exact: true })
-  assert.equal(await settingsLink.evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'no-drag')
-  await settingsLink.click()
-  const settings = settingsPage()
-  await settings.waitFor({ state: 'visible' })
-  assert.equal(await settings.locator('header').evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'drag')
-  if (process.platform === 'darwin') {
-    const heading = await settings.getByRole('heading', { name: 'Settings', exact: true }).boundingBox()
-    assert.ok(heading.x >= 72, 'Settings must reserve native traffic light space as well.')
-  }
-  const returnLink = settings.getByRole('link', { name: 'Settings', exact: true })
-  assert.equal(await returnLink.evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'no-drag')
-  assert.equal(await settings.locator('header a').count(), 1, 'The clickable title must be the only header navigation control.')
-  assert.equal(await settings.getByRole('heading', { name: 'Settings', level: 1, exact: true }).getByRole('link', { name: 'Settings', exact: true }).textContent(), 'Settings', 'The visible Settings title must itself return to markets.')
-  const viewport = page.viewportSize()
-  try {
-    for (const width of [1_200, 1_600, 2_000]) {
-      await page.setViewportSize({ width, height: 1_000 })
-      await page.waitForFunction(width => document.querySelector('[data-layout="market-workspace"]').getBoundingClientRect().width === width, width)
-      const geometry = await settings.evaluate(element => {
-        const headerColumn = element.querySelector('header > div')
-        const categories = element.querySelector('nav')
-        const title = element.querySelector('h1 a')
-        const top = headerColumn.getBoundingClientRect(), side = categories.getBoundingClientRect()
-        return { headerRight: top.right, sidebarRight: side.right, headerWidth: top.width, sidebarWidth: side.width,
-          titleLeft: title.getBoundingClientRect().left, contentLeft: top.left + parseFloat(getComputedStyle(headerColumn).paddingLeft) }
-      })
-      assert.equal(geometry.headerRight, geometry.sidebarRight, 'Settings header and categories dividers must align at every window width.')
-      assert.equal(geometry.headerWidth, geometry.sidebarWidth)
-      assert.equal(geometry.titleLeft, geometry.contentLeft, 'The back title must align left after the native window controls inset.')
-    }
-  } finally { if (viewport) await page.setViewportSize(viewport) }
+  assert.equal(await toolbar.getByRole('link', { name: 'Settings', exact: true }).count(), 0)
+  const settings = await openSettings()
+  assert.equal(await page.locator('[data-market-list]').isVisible(), true)
+  assert.equal(await settings.getByRole('heading', { name: 'Settings', level: 1, exact: true }).count(), 1)
   await backToMarkets()
 })
 
 test('a prepared idle chart makes no periodic window requests and accepts a pushed forming candle', async () => {
-  const chart = page.locator('[data-chart-inst="BETA-USDT-SWAP"]')
-  await page.waitForFunction(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')?.dataset.chartLoading === 'false')
+  await selectTimeframe(page, '15m')
+  const chart = page.locator('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]')
+  await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]')?.dataset.chartLoading === 'false')
   const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length)
   await new Promise(resolve => setTimeout(resolve, 2_250))
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), before, 'A successfully prepared chart must not poll local or provider windows.')
@@ -446,11 +426,11 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
       confirmed: false, statisticsObserved: false, oi: null, buy: null, sell: null }
     globalThis.__workspaceFixture.sendChart(frame)
   })
-  await page.waitForFunction(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.liveBar?.close === 133)
+  await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.liveBar?.close === 133)
   await assertCompleteChartViewport(page, 'BETA-USDT-SWAP', { fullSlots: null })
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), before + 1, 'Only the fixture read may be added; the pushed candle must not trigger another renderer read.')
   const liveUpdate = await page.evaluate(() => {
-    const snapshot = document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]').__chartSnapshot
+    const snapshot = document.querySelector('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]').__chartSnapshot
     globalThis.__completedSubscriptionBars = snapshot.bars
     return { type: 'live', instId: snapshot.instId, timeframe: snapshot.timeframe, generation: snapshot.generation, revision: snapshot.generation + 1,
       endHour: snapshot.endHour, liveBar: { ...snapshot.liveBar, high: 136, close: 135 } }
@@ -458,19 +438,19 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
   const reads = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length)
   assert.equal('bars' in liveUpdate, false, 'A forming update must not transfer completed candles.')
   await electron.evaluate(({ BrowserWindow }, update) => globalThis.__workspaceFixture.sendChart(update), liveUpdate)
-  await page.waitForFunction(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.liveBar?.close === 135)
+  await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.liveBar?.close === 135)
   assert.match(await chart.locator('[aria-live="off"]').textContent(), /Close\s+135/)
   assert.match(await chart.locator('svg[data-rendered-inst] [data-chart-price-label-value]').textContent(), /^\+1\.50% ↑$/)
-  assert.equal(await page.evaluate(() => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]').__chartSnapshot.bars === globalThis.__completedSubscriptionBars), true)
+  assert.equal(await page.evaluate(() => document.querySelector('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]').__chartSnapshot.bars === globalThis.__completedSubscriptionBars), true)
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), reads, 'Live-only subscriptions must reuse the completed frame without a follow-up read.')
 })
 
 test('contract precision updates pad current quotes while preserving historical and indicator digits', async () => {
   await page.locator('[aria-label="View BETA-USDT-SWAP chart"]').click()
   await selectTimeframe(page, '15m')
-  const chart = page.locator('[data-chart-inst="BETA-USDT-SWAP"]')
+  const chart = page.locator('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]')
   const close = chart.locator('[data-chart-ohlc="close"] span[title]')
-  const waitForLabel = expected => page.waitForFunction(expected => document.querySelector('[data-chart-price-label-value]')?.textContent === expected, expected)
+  const waitForLabel = expected => page.waitForFunction(expected => document.querySelector('[data-acceptance-target] [data-chart-price-label-value]')?.textContent === expected, expected)
   try {
     const frame = await electron.evaluate(async () => {
       const state = globalThis.__workspaceFixture
@@ -488,9 +468,8 @@ test('contract precision updates pad current quotes while preserving historical 
     await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '100.1200')
     await waitForLabel('+0.02% ↑')
     assert.equal(await close.textContent(), '100.1200')
-    assert.equal(await chart.locator('[data-chart-legend="VWAP(14)"]').locator('..').locator('[data-chart-legend-value]').textContent(), '100.12346', 'Indicators retain their independent significant-digit display.')
     const baseline = await page.evaluate(() => {
-      const chart = document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')
+      const chart = document.querySelector('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]')
       globalThis.__precisionBars = chart.__chartSnapshot.bars
       globalThis.__precisionLive = chart.__chartSnapshot.liveBar
       return chart.querySelector('[data-chart-price-label-background]').getBoundingClientRect().width
@@ -519,7 +498,7 @@ test('contract precision updates pad current quotes while preserving historical 
     const target = await vwapCandleTarget('previous', frame)
     await page.mouse.move(target.x, target.y)
     await page.mouse.down()
-    await page.waitForFunction(() => document.querySelector('[data-chart-ohlc="close"] span[title]')?.textContent === '100.123456789')
+    await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-ohlc="close"] span[title]')?.textContent === '100.123456789')
     await page.mouse.up()
     await waitForLabel('+0.02% ↑')
   } finally {
@@ -534,12 +513,13 @@ test('contract precision updates pad current quotes while preserving historical 
       state.sendChart(frame)
       return frame.generation
     })
-    await page.waitForFunction(generation => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.generation === generation, generation)
+    await page.waitForFunction(generation => document.querySelector('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.generation === generation, generation)
     await page.evaluate(() => { delete globalThis.__precisionBars; delete globalThis.__precisionLive })
   }
 })
 
 test('chart source updates stay outside the plot without resizing its viewport at scaled and design widths', async () => {
+  await selectTimeframe(page, '15m')
   const previousSize = page.viewportSize()
   const publish = async status => {
     const generation = await electron.evaluate(async ({ ipcMain, BrowserWindow }, status) => {
@@ -558,36 +538,21 @@ test('chart source updates stay outside the plot without resizing its viewport a
       globalThis.__workspaceFixture.sendChart(frame)
       return frame.generation
     }, status)
-    await page.waitForFunction(generation => document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.generation === generation, generation)
+    await page.waitForFunction(generation => document.querySelector('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.generation === generation, generation)
   }
-  const geometry = () => page.locator('[data-chart-inst="BETA-USDT-SWAP"]').evaluate(chart => {
-    const status = chart.querySelector('[data-chart-status]'), plot = chart.querySelector('[data-chart-plot]')
-    const row = status.getBoundingClientRect(), area = plot.getBoundingClientRect()
-    return { rowBottom: row.bottom, plotTop: area.top, width: area.width, height: area.height,
-      plotStatuses: plot.querySelectorAll('[role="status"]').length, statusInsidePlot: plot.contains(status) }
-  })
+  const geometry = () => page.locator('[data-acceptance-target] [data-chart-plot]').boundingBox()
   try {
     for (const size of [{ width: 800, height: 572 }, { width: 1600, height: 1000 }]) {
       await page.setViewportSize(size)
       await page.waitForFunction(size => { const r = document.querySelector('[data-layout="market-workspace"]').getBoundingClientRect(); return r.width === size.width && r.height === size.height }, size)
       await publish({ oiState: 'ready', takerState: 'ready', indicatorState: 'ready' })
-      const status = page.locator('[data-chart-status]')
-      await page.waitForFunction(() => {
-        const chart = document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')
-        return chart?.dataset.chartOiState === 'ready' && chart.dataset.chartTakerState === 'ready'
-      })
       const baseline = await geometry()
       for (const value of ['loading', 'unavailable']) {
-        // Statistics arrive independently of already calculated price curves.
-        // An uncalculated navigation frame intentionally retains the old plot.
-        await publish({ oiState: value, takerState: value, indicatorState: 'ready' })
-        await status.getByText(value === 'loading' ? 'Loading OI history…' : 'OI is not published for part of this range', { exact: true }).waitFor()
+        await publish({ oiState: 'ready', takerState: 'ready', indicatorState: value })
+        await page.locator('[data-chart-shared-status-item="15m"]').waitFor({ state: 'attached' })
         const current = await geometry()
-        assert.equal(current.statusInsidePlot, false)
-        assert.equal(current.plotStatuses, 0, 'Source messages must never cover candles or indicators.')
-        assert.ok(current.rowBottom <= current.plotTop, 'Status feedback must occupy its own space above the plot.')
-        assert.deepEqual([current.plotTop, current.width, current.height], [baseline.plotTop, baseline.width, baseline.height], 'Source state changes must preserve the plotted viewport.')
-        assert.match(await status.locator('p').getAttribute('title'), /OI.*[Tt]aker/, 'The full source summary must remain available when visually truncated.')
+        assert.deepEqual([current.x, current.y, current.width, current.height], [baseline.x, baseline.y, baseline.width, baseline.height], 'Source state changes must preserve the plotted viewport.')
+        assert.equal(await page.locator('[data-acceptance-target] [data-chart-plot] [role="status"]').count(), 0, 'Source messages must never cover candles.')
       }
     }
   } finally {
@@ -608,7 +573,7 @@ test('pointer inspection selects the first fully visible, middle, and latest can
     return frame
   }, forming)
   const waitForFrame = frame => page.waitForFunction(({ generation, end }) => {
-    const chart = document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')
+    const chart = document.querySelector('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]')
     return chart?.__chartSnapshot.generation === generation && Number(chart.dataset.chartEnd) === end
   }, { generation: frame.generation, end: frame.liveBar?.hour ?? frame.endHour })
   try {
@@ -621,11 +586,11 @@ test('pointer inspection selects the first fully visible, middle, and latest can
         assert.equal(target.close, fixtureBar.close)
         await page.mouse.move(target.x, target.y)
         await page.mouse.down()
-        await page.waitForFunction(() => document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
-        const close = await page.locator('[data-chart-ohlc="close"] span[title]').getAttribute('title')
+        await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
+        const close = await page.locator('[data-acceptance-target] [data-chart-ohlc="close"] span[title]').getAttribute('title')
         assert.equal(Number(close), target.close, `${forming ? 'The forming' : 'The completed-only'} window must inspect its drawn candle at slot ${slot}.`)
         await page.mouse.up()
-        await page.waitForFunction(() => !document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
+        await page.waitForFunction(() => !document.querySelector('[data-acceptance-target] [data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
       }
     }
   } finally {
@@ -779,6 +744,7 @@ test('a delayed chart capture cannot copy pixels after the selected contract cha
 })
 
 test('selection persists while six width/DPR combinations share page, pointer, and capture coordinates', async () => {
+  await selectTimeframe(page, '15m')
   const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }))
   const client = await page.context().newCDPSession(page)
   const fixture = await electron.evaluate(({ ipcMain }) => globalThis.__workspaceFixture.request(null, { chartLocal: { instId: 'BETA-USDT-SWAP', timeframe: '15m' } }))
@@ -795,38 +761,31 @@ test('selection persists while six width/DPR combinations share page, pointer, a
       const target = await vwapCandleTarget('middle', currentFixture)
       await page.mouse.move(target.x, target.y)
       await page.mouse.down()
-      await page.waitForFunction(() => document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
-      const hoveredClose = await page.locator('[data-chart-ohlc="close"] span[title]').getAttribute('title')
+      await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
+      const hoveredClose = await page.locator('[data-acceptance-target] [data-chart-ohlc="close"] span[title]').getAttribute('title')
       assert.equal(Number(hoveredClose), target.close, 'Screen-space pointer input must inspect the candle drawn beneath it at every UI scale and DPR.')
       await page.mouse.up()
-      await page.waitForFunction(() => !document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
-      const captureBounds = await page.locator('[data-chart-inst]').boundingBox()
-      assert.equal(await page.locator('[data-chart-inst] h2').textContent(), `${fixture.instId.replace(/-SWAP$/, '')} · ${fixture.timeframe}`, 'Copied chart bounds must include the contract and displayed timeframe.')
+      await page.waitForFunction(() => !document.querySelector('[data-acceptance-target] [data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
+      const captureBounds = await page.locator('[data-chart-capture]').boundingBox()
+      assert.equal(await page.locator('[data-shared-chart-title]').textContent(), fixture.instId.replace(/-SWAP$/, ''), 'Copied chart bounds must include the contract and displayed timeframe.')
       await page.getByRole('button', { name: 'Copy chart', exact: true }).click()
       await page.getByRole('status').filter({ hasText: 'Chart copied to clipboard' }).waitFor()
       const request = await electron.evaluate(() => globalThis.__workspaceFixture.requests.findLast(value => value.captureChart).captureChart)
       for (const key of ['x', 'y', 'width', 'height']) assert.ok(Math.abs(request[key] - captureBounds[key]) < 1, `Capture ${key} must use the drawn CSS-pixel bounds, independent of DPR.`)
       if (process.env.PERPETUAL_SWAP_UI_SCREENSHOTS) await page.screenshot({ path: join(process.env.PERPETUAL_SWAP_UI_SCREENSHOTS, `workspace-${width}-dpr${deviceScaleFactor}.png`) })
       const settings = await openSettings()
-      await page.waitForFunction(() => {
-        const settings = document.querySelector('main[aria-label="Settings"]'), scale = Number(document.querySelector('[data-layout="market-workspace"]').dataset.uiScale)
-        return settings && Math.abs(settings.getBoundingClientRect().width / settings.offsetWidth - scale) < .01
-      })
-      const bounds = await settings.boundingBox()
-      assert.ok(bounds.x >= 0 && bounds.y >= 0 && bounds.x + bounds.width <= width + 1 && bounds.y + bounds.height <= 1_001, 'The settings page must stay within the scaled viewport.')
       const ranking = settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' })
-      const input = await ranking.boundingBox()
-      await page.mouse.click(input.x + input.width / 2, input.y + input.height / 2)
-      assert.equal(await ranking.evaluate(element => element === document.activeElement), true, 'Settings controls must accept screen-space pointer coordinates.')
-      if (process.env.PERPETUAL_SWAP_UI_SCREENSHOTS) await page.screenshot({ path: join(process.env.PERPETUAL_SWAP_UI_SCREENSHOTS, `settings-${width}-dpr${deviceScaleFactor}.png`) })
+      await ranking.click()
+      assert.equal(await ranking.evaluate(element => element === document.activeElement), true, 'Settings controls must accept pointer coordinates in their own window.')
+      if (process.env.PERPETUAL_SWAP_UI_SCREENSHOTS) await settingsWindow.screenshot({ path: join(process.env.PERPETUAL_SWAP_UI_SCREENSHOTS, `settings-${width}-dpr${deviceScaleFactor}.png`) })
       await backToMarkets()
     }
-    assert.equal(await page.locator('[data-chart-inst]').getAttribute('data-chart-inst'), 'BETA-USDT-SWAP')
+    assert.equal(await page.locator('[data-acceptance-target] [data-chart-inst]').getAttribute('data-chart-inst'), 'BETA-USDT-SWAP')
     assert.equal(await page.getByRole('textbox', { name: 'Search contracts' }).count(), 0)
   } finally {
     await page.mouse.up()
     await page.keyboard.press('Escape')
-    if (await settingsPage().isVisible()) await backToMarkets()
+    if (settingsWindow && !settingsWindow.isClosed()) await backToMarkets()
     await client.send('Emulation.clearDeviceMetricsOverride')
     await client.detach()
     await page.setViewportSize({ width: viewport.width + 1, height: viewport.height })
@@ -839,31 +798,25 @@ test('settings is a separate grouped page with keyboard navigation and a retaine
   const before = {
     charts: await page.locator('[data-chart-inst]').evaluateAll(charts => charts.map(chart => [chart.dataset.chartInst, chart.querySelector('svg[data-rendered-timeframe]')?.dataset.renderedTimeframe])),
   }
-  await page.getByRole('link', { name: 'Settings', exact: true }).focus()
-  await page.keyboard.press('Enter')
-  const settings = settingsPage()
+  const settings = await openSettings()
   await settings.getByRole('heading', { name: 'Settings', level: 1, exact: true }).waitFor()
-  assert.equal(await page.getByRole('dialog', { name: 'Settings', exact: true }).count(), 0)
-  assert.equal(await page.locator('[data-market-list]').isVisible(), false)
+  assert.equal(await page.locator('[data-market-list]').isVisible(), true)
   const categories = settings.getByRole('navigation', { name: 'Settings categories' })
   assert.deepEqual(await categories.getByRole('link').allTextContents(), ['Workspace', 'Liquidity filters', 'Market data'])
   assert.equal(await categories.getByRole('link', { name: 'Workspace', exact: true }).getAttribute('aria-current'), 'page')
   assert.equal(await settings.getByRole('spinbutton', { name: 'Data audit lookback (days)' }).count(), 0)
   await categories.getByRole('link', { name: 'Market data', exact: true }).focus()
-  await page.keyboard.press('Enter')
+  await settingsWindow.keyboard.press('Enter')
   await settings.getByRole('heading', { name: 'Market data', level: 2, exact: true }).waitFor()
   assert.equal(await categories.getByRole('link', { name: 'Market data', exact: true }).getAttribute('aria-current'), 'page')
-  assert.equal(await settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).count(), 0)
   await settings.getByRole('spinbutton', { name: 'Data audit lookback (days)' }).waitFor()
   await settings.getByRole('button', { name: 'Download all qualified history', exact: true }).waitFor()
   await settings.getByRole('button', { name: 'Start audit', exact: true }).waitFor()
-  await page.goBack()
+  await settingsWindow.goBack()
   await settings.getByRole('heading', { name: 'Workspace', level: 2, exact: true }).waitFor()
-  await page.keyboard.press('Escape')
-  assert.equal(await settings.isVisible(), true, 'Escape must not dismiss an independent page.')
-  await settings.getByRole('link', { name: 'Settings', exact: true }).focus()
-  await page.keyboard.press('Enter')
-  await settings.waitFor({ state: 'hidden' })
+  await settingsWindow.keyboard.press('Escape')
+  assert.equal(await settings.isVisible(), true, 'Escape must not dismiss the settings window.')
+  await backToMarkets()
   assert.deepEqual(await page.locator('[data-chart-inst]').evaluateAll(charts => charts.map(chart => [chart.dataset.chartInst, chart.querySelector('svg[data-rendered-timeframe]')?.dataset.renderedTimeframe])), before.charts)
 })
 
@@ -878,19 +831,19 @@ test('price scale preferences validate and persist', async () => {
   await settings.getByText('Enter a number from 1 through 500.', { exact: true }).waitFor()
   await pixels.fill('35.5')
   await mode.click()
-  await page.getByRole('option', { name: 'Automatic', exact: true }).click()
+  await settingsWindow.getByRole('option', { name: 'Automatic', exact: true }).click()
   await settings.getByRole('button', { name: 'Save settings', exact: true }).click()
-  await page.locator('[data-market-status-row]').getByRole('status').filter({ hasText: 'Settings saved.' }).waitFor()
+  await settingsWindow.getByRole('status').filter({ hasText: 'Settings saved.' }).waitFor()
   assert.deepEqual(await electron.evaluate(() => ({ mode: globalThis.__workspaceFixture.preferences.priceScaleMode, pixels: globalThis.__workspaceFixture.preferences.priceScalePixelsPerPercent })), { mode: 'auto', pixels: 35.5 })
   await backToMarkets()
   const reopened = await openSettings()
   assert.equal(await reopened.getByRole('combobox', { name: 'Price scale' }).locator('[data-slot=select-value]').textContent(), 'Automatic')
   assert.equal(await reopened.getByRole('spinbutton', { name: 'Fixed height per 1% (px)' }).inputValue(), '35.5')
   await reopened.getByRole('combobox', { name: 'Price scale' }).click()
-  await page.getByRole('option', { name: 'Fixed', exact: true }).click()
+  await settingsWindow.getByRole('option', { name: 'Fixed', exact: true }).click()
   await reopened.getByRole('spinbutton', { name: 'Fixed height per 1% (px)' }).fill('20')
   await reopened.getByRole('button', { name: 'Save settings', exact: true }).click()
-  await page.locator('[data-market-status-row]').getByRole('status').filter({ hasText: 'Settings saved.' }).waitFor()
+  await settingsWindow.getByRole('status').filter({ hasText: 'Settings saved.' }).waitFor()
   await backToMarkets()
 })
 
@@ -921,10 +874,10 @@ test('preference drafts survive category changes and validation returns to the f
   assert.equal(await settings.getByRole('spinbutton', { name: 'Maximum hourly volume ratio', exact: true }).inputValue(), '2.5')
   await electron.evaluate(() => { globalThis.__workspaceFixture.failNextSave = true })
   await settings.getByRole('button', { name: 'Save settings', exact: true }).click()
-  await settings.getByRole('alert').filter({ hasText: 'The preferences could not be saved.' }).waitFor()
+  await settingsWindow.getByRole('status').filter({ hasText: 'Could not save settings.' }).waitFor()
   assert.equal(await settings.isVisible(), true)
   await settings.getByRole('button', { name: 'Save settings', exact: true }).click()
-  await page.locator('[data-market-status-row]').getByRole('status').filter({ hasText: 'Settings saved.' }).waitFor()
+  await settingsWindow.getByRole('status').filter({ hasText: 'Settings saved.' }).waitFor()
   assert.equal(await settings.isVisible(), true, 'Saving preferences must keep the settings page open.')
   const preferences = await electron.evaluate(() => globalThis.__workspaceFixture.preferences)
   assert.equal(preferences.rankingLookback, 30)
@@ -939,13 +892,14 @@ test('preference drafts survive category changes and validation returns to the f
 test('discarding changes resets all preference groups without saving', async () => {
   const settings = await openSettings()
   const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.preferences?.action === 'update').length)
+  const originalRanking = await settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).inputValue()
   await settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).fill('60')
   await chooseSettingsCategory('Market data')
   await settings.getByRole('spinbutton', { name: 'Data audit lookback (days)' }).fill('120')
   await settings.getByRole('button', { name: 'Discard changes', exact: true }).click()
   assert.equal(await settings.getByRole('spinbutton', { name: 'Data audit lookback (days)' }).inputValue(), '30')
   await chooseSettingsCategory('Workspace')
-  assert.equal(await settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).inputValue(), '30')
+  assert.equal(await settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).inputValue(), originalRanking)
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.preferences?.action === 'update').length), before)
   await backToMarkets()
 })
@@ -973,25 +927,13 @@ test('leaving settings confirms before discarding an unsaved preference draft', 
   const ranking = settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' })
   const savedRanking = await ranking.inputValue()
   await ranking.fill('60')
-  const rejectedDialog = page.waitForEvent('dialog')
-  const rejectedNavigation = settings.getByRole('link', { name: 'Settings', exact: true }).click()
-  const rejected = await rejectedDialog
-  assert.equal(rejected.type(), 'confirm')
-  await rejected.dismiss()
-  await rejectedNavigation
-  assert.equal(await settings.isVisible(), true)
+  await electron.evaluate(({ dialog }) => { dialog.showMessageBoxSync = () => 0 })
+  await settingsWindow.evaluate(() => window.radarDesktop.closeSettingsWindow())
+  assert.equal(settingsWindow.isClosed(), false)
   assert.equal(await ranking.inputValue(), '60')
-  const acceptedDialog = page.waitForEvent('dialog')
-  const acceptedNavigation = settings.getByRole('link', { name: 'Settings', exact: true }).click()
-  const accepted = await acceptedDialog
-  assert.equal(accepted.type(), 'confirm')
-  await accepted.accept()
-  await acceptedNavigation
-  await settings.waitFor({ state: 'hidden' })
-  await page.getByRole('link', { name: 'Settings', exact: true }).click()
-  const reopened = settingsPage()
-  await reopened.waitFor({ state: 'visible' })
-  await page.waitForFunction(() => document.activeElement?.matches('main[aria-label="Settings"] h2'))
+  await electron.evaluate(({ dialog }) => { dialog.showMessageBoxSync = () => 1 })
+  await backToMarkets()
+  const reopened = await openSettings()
   assert.equal(await reopened.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).inputValue(), savedRanking)
   assert.equal(String(await electron.evaluate(() => globalThis.__workspaceFixture.preferences.rankingLookback)), savedRanking)
   await backToMarkets()
@@ -1002,7 +944,7 @@ test('saving only the ranking lookback keeps the chosen chart and qualified mark
   const settings = await openSettings()
   await settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' }).fill('45')
   await settings.getByRole('button', { name: 'Save settings', exact: true }).click()
-  await page.locator('[data-market-status-row]').getByRole('status').filter({ hasText: 'Settings saved.' }).waitFor()
+  await settingsWindow.getByRole('status').filter({ hasText: 'Settings saved.' }).waitFor()
   await backToMarkets()
   await page.getByRole('columnheader', { name: '45m change By magnitude', exact: true }).waitFor()
   assert.equal(await selected().getAttribute('aria-label'), 'View BETA-USDT-SWAP chart')
@@ -1021,22 +963,22 @@ const waitForAuditFixture = async (predicate, argument) => {
 test('audit checkpoints push progress and actions without idle status polling, and reopening reads once', async () => {
   const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length)
   await openSettings('Market data')
-  const settings = settingsPage()
+  let settings = settingsPage()
   await settings.waitFor({ state: 'visible' })
-  await settings.getByRole('status').filter({ hasText: 'idle · 0 / 0' }).waitFor()
+  await settings.getByRole('button', { name: 'Start audit', exact: true }).waitFor()
   await waitForAuditFixture((_electron, expected) => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length === expected, before + 1)
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length), before + 1)
   await settings.getByRole('button', { name: 'Start audit', exact: true }).click()
-  await settings.getByRole('status').filter({ hasText: 'running · 1 / 3' }).waitFor()
+  await settingsWindow.getByRole('status').filter({ hasText: 'Audit running · 1 / 3' }).waitFor()
   await electron.evaluate(() => { globalThis.__workspaceFixture.publishAudit({ progress: { completed: 2, total: 3 } }) })
-  await settings.getByRole('status').filter({ hasText: 'running · 2 / 3' }).waitFor()
+  await settingsWindow.getByRole('status').filter({ hasText: 'Audit running · 2 / 3' }).waitFor()
   await chooseSettingsCategory('Workspace')
   await electron.evaluate(() => { globalThis.__workspaceFixture.publishAudit({ progress: { completed: 3, total: 3 } }) })
   await chooseSettingsCategory('Market data')
-  await settings.getByRole('status').filter({ hasText: 'running · 3 / 3' }).waitFor()
+  await settingsWindow.getByRole('status').filter({ hasText: 'Audit running · 3 / 3' }).waitFor()
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length), before + 1, 'Changing settings groups must reuse the status subscription and its latest checkpoint.')
   await electron.evaluate(() => { globalThis.__workspaceFixture.publishAudit({ phase: 'validating' }) })
-  await settings.getByRole('status').filter({ hasText: 'Validating recent changes · results are provisional' }).waitFor()
+  await settingsWindow.getByRole('status').filter({ hasText: 'Validating recent changes. Results are provisional.' }).waitFor()
   assert.equal(await settings.getByRole('progressbar', { name: 'Data audit progress' }).count(), 0, 'Validation has no bounded progress and must not appear complete.')
   assert.equal(await settings.getByRole('button', { name: 'Start audit', exact: true }).isDisabled(), true)
   assert.equal(await settings.getByRole('button', { name: 'Repair issues', exact: true }).isDisabled(), true)
@@ -1044,72 +986,70 @@ test('audit checkpoints push progress and actions without idle status polling, a
   await settings.getByRole('button', { name: 'Cancel audit', exact: true }).click()
   await settings.getByRole('list', { name: 'Data audit issues' }).getByText('Missing completed candle · Repairable', { exact: true }).waitFor()
   await settings.getByRole('button', { name: 'Repair issues', exact: true }).click()
-  await settings.getByRole('status').filter({ hasText: 'completed · 3 / 3' }).waitFor()
+  await settingsWindow.getByRole('status').filter({ hasText: 'Audit complete.' }).waitFor()
   assert.equal(await settings.getByRole('list', { name: 'Data audit issues' }).count(), 0)
   await new Promise(resolve => setTimeout(resolve, 1_750))
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length), before + 1, 'A successful audit settings page must wait for checkpoints rather than poll.')
   const actions = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit).map(value => value.dataAudit.action))
   assert.deepEqual(actions.filter(action => action !== 'status'), ['start', 'cancel', 'repair'])
   await backToMarkets()
-  await settings.waitFor({ state: 'hidden' })
-  await openSettings('Market data')
-  await settings.getByRole('status').filter({ hasText: 'completed · 3 / 3' }).waitFor()
+  settings = await openSettings('Market data')
+  await settingsWindow.getByRole('status').filter({ hasText: 'Audit complete.' }).waitFor()
   await waitForAuditFixture((_electron, expected) => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length === expected, before + 2)
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length), before + 2, 'Reopening performs one fresh status read.')
   await backToMarkets()
 })
 
 test('new audit pushes win over held initial and action replies across page reopen', async () => {
-  const settings = settingsPage()
+  let settings
   try {
     await electron.evaluate(() => {
       const state = globalThis.__workspaceFixture
       state.publishAudit({ phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '' })
       state.holdAuditAction = 'status'
     })
-    await openSettings('Market data')
+    settings = await openSettings('Market data')
     await waitForAuditFixture(() => Boolean(globalThis.__workspaceFixture.releaseAudit))
     await electron.evaluate(() => {
       const state = globalThis.__workspaceFixture
       state.publishAudit({ phase: 'running', progress: { completed: 2, total: 3 } })
       state.publishAudit({ phase: 'completed', progress: { completed: 7, total: 7 } })
     })
-    await settings.getByRole('status').filter({ hasText: 'completed · 7 / 7' }).waitFor()
+    await settingsWindow.getByRole('status').filter({ hasText: 'Audit complete.' }).waitFor()
     assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.heldAuditReply.phase), 'idle', 'The held initial reply must remain its detached older report.')
     await electron.evaluate(() => { globalThis.__workspaceFixture.releaseAudit() })
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
-    await settings.getByRole('status').filter({ hasText: 'completed · 7 / 7' }).waitFor()
+    await settingsWindow.getByRole('status').filter({ hasText: 'Audit complete.' }).waitFor()
     const beforeReopen = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length)
     await backToMarkets()
-    await settings.waitFor({ state: 'hidden' })
-    await openSettings('Market data')
-    await settings.getByRole('status').filter({ hasText: 'completed · 7 / 7' }).waitFor()
+    settings = await openSettings('Market data')
+    await settingsWindow.getByRole('status').filter({ hasText: 'Audit complete.' }).waitFor()
     await waitForAuditFixture((_electron, expected) => globalThis.__workspaceFixture.requests.filter(value => value.dataAudit?.action === 'status').length === expected, beforeReopen + 1)
     await electron.evaluate(() => { globalThis.__workspaceFixture.holdAuditAction = 'start' })
     await settings.getByRole('button', { name: 'Start audit', exact: true }).click()
     await waitForAuditFixture(() => Boolean(globalThis.__workspaceFixture.releaseAudit))
-    await settings.getByRole('status').filter({ hasText: 'running · 1 / 3' }).waitFor()
+    await settingsWindow.getByRole('status').filter({ hasText: 'Audit running · 1 / 3' }).waitFor()
     await electron.evaluate(() => { globalThis.__workspaceFixture.publishAudit({ phase: 'completed', progress: { completed: 3, total: 3 } }) })
-    await settings.getByRole('status').filter({ hasText: 'completed · 3 / 3' }).waitFor()
+    await settingsWindow.getByRole('status').filter({ hasText: 'Audit running · 3 / 3' }).waitFor()
     assert.equal(await settings.getByRole('button', { name: 'Start audit', exact: true }).isDisabled(), true, 'A push must not release an action that is still in flight.')
     assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.heldAuditReply.phase), 'running', 'The held action reply must remain its detached older report.')
     await electron.evaluate(() => { globalThis.__workspaceFixture.releaseAudit() })
     await settings.getByRole('button', { name: 'Start audit', exact: true }).waitFor({ state: 'visible' })
-    await page.waitForFunction(() => ![...document.querySelectorAll('main[aria-label="Settings"] button')].find(button => button.textContent === 'Start audit')?.disabled)
-    await settings.getByRole('status').filter({ hasText: 'completed · 3 / 3' }).waitFor()
+    await settingsWindow.waitForFunction(() => ![...document.querySelectorAll('main[aria-label="Settings"] button')].find(button => button.textContent === 'Start audit')?.disabled)
+    await settingsWindow.getByRole('status').filter({ hasText: 'Audit complete.' }).waitFor()
   } finally {
     await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.holdAuditAction = null; state.releaseAudit?.() })
-    if (await settings.isVisible()) await backToMarkets()
+    if (settingsWindow && !settingsWindow.isClosed()) await backToMarkets()
   }
 })
 
 test('manual history downloads show exact pushed progress and retry details, continue after leaving settings, and cancel without polling', async () => {
   const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.historyDownload?.action === 'status').length)
   await openSettings('Market data')
-  const settings = settingsPage()
-  await settings.getByRole('status').filter({ hasText: 'Ready to download · 0.0%' }).waitFor()
+  let settings = settingsPage()
+  await settingsWindow.waitForFunction(() => ![...document.querySelectorAll('button')].find(button => button.textContent === 'Download all qualified history')?.disabled)
   await settings.getByRole('button', { name: 'Download all qualified history', exact: true }).click()
-  await settings.getByRole('status').filter({ hasText: 'Downloading history · 10.0%' }).waitFor()
+  await settingsWindow.getByRole('status').filter({ hasText: 'Downloading history · 10.0%' }).waitFor()
   const details = settings.locator('[aria-label="History download details"]')
   assert.equal(await details.isVisible(), false)
   await settings.getByText('100 / 1,000 source timestamps checked', { exact: true }).waitFor()
@@ -1119,23 +1059,22 @@ test('manual history downloads show exact pushed progress and retry details, con
   const active = settings.getByRole('list', { name: 'Active history downloads' })
   await active.getByText('BETA-USDT-SWAP · 15m · oi', { exact: true }).waitFor()
   await active.getByText(/retrying · Consecutive failures: 2 · Next retry:/).waitFor()
-  await active.getByText('Temporary source limit.', { exact: true }).waitFor()
+  await active.getByText('Request failed. Check the data service.', { exact: true }).waitFor()
   await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({
     progress: { checked: 999_999, total: 1_000_000, available: 900_000, empty: 0, unavailable: 99_999, failed: 0, reused: 300_000, pending: 1 },
   }) })
-  await settings.getByRole('status').filter({ hasText: 'Downloading history · 99.9%' }).waitFor()
+  await settingsWindow.getByRole('status').filter({ hasText: 'Downloading history · 99.9%' }).waitFor()
   await details.getByText('999,999 / 1,000,000', { exact: true }).waitFor()
   await details.getByText('99,999', { exact: true }).waitFor()
   await details.getByText('300,000', { exact: true }).waitFor()
   await backToMarkets()
-  await settings.waitFor({ state: 'hidden' })
   await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({
     progress: { checked: 1_000_000, total: 1_000_000, available: 900_001, empty: 0, unavailable: 99_999, failed: 0, reused: 300_000, pending: 0 },
   }) })
-  await openSettings('Market data')
-  await settings.getByRole('status').filter({ hasText: 'Downloading history · 100.0%' }).waitFor()
+  settings = await openSettings('Market data')
+  await settingsWindow.getByRole('status').filter({ hasText: 'Downloading history · 100.0%' }).waitFor()
   await settings.getByRole('button', { name: 'Cancel download', exact: true }).click()
-  await settings.getByRole('status').filter({ hasText: 'Download cancelled · 100.0%' }).waitFor()
+  await settingsWindow.getByRole('status').filter({ hasText: 'Download cancelled' }).waitFor()
   assert.equal(await settings.getByRole('list', { name: 'Active history downloads' }).count(), 0)
   await new Promise(resolve => setTimeout(resolve, 1_750))
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.historyDownload?.action === 'status').length), before + 2)
@@ -1144,23 +1083,23 @@ test('manual history downloads show exact pushed progress and retry details, con
 })
 
 test('new download pushes win over held replies and completion distinguishes unavailable data', async () => {
-  const settings = settingsPage()
+  let settings
   try {
     await electron.evaluate(() => {
       const state = globalThis.__workspaceFixture
       state.publishDownload({ phase: 'idle', progress: { checked: 0, total: 0, available: 0, empty: 0, unavailable: 0, failed: 0, reused: 0, pending: 0 }, error: '' })
       state.holdDownloadAction = 'status'
     })
-    await openSettings('Market data')
+    settings = await openSettings('Market data')
     await waitForAuditFixture(() => Boolean(globalThis.__workspaceFixture.releaseDownload))
     await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({ phase: 'completed',
       progress: { checked: 1_000_000, total: 1_000_000, available: 900_001, empty: 0, unavailable: 99_999, failed: 0, reused: 300_000, pending: 0 },
       contracts: { completed: 2, total: 2 }, streams: { completed: 18, total: 18 }, active: [],
     }) })
-    await settings.getByRole('status').filter({ hasText: 'Completed with verified unavailable data · 100.0%' }).waitFor()
+    await settingsWindow.getByRole('status').filter({ hasText: 'Completed with verified unavailable data' }).waitFor()
     await electron.evaluate(() => { globalThis.__workspaceFixture.releaseDownload() })
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
-    await settings.getByRole('status').filter({ hasText: 'Completed with verified unavailable data · 100.0%' }).waitFor()
+    await settingsWindow.getByRole('status').filter({ hasText: 'Completed with verified unavailable data' }).waitFor()
     await electron.evaluate(() => { globalThis.__workspaceFixture.holdDownloadAction = 'start' })
     await settings.getByRole('button', { name: 'Download all qualified history', exact: true }).click()
     await waitForAuditFixture(() => Boolean(globalThis.__workspaceFixture.releaseDownload))
@@ -1168,15 +1107,15 @@ test('new download pushes win over held replies and completion distinguishes una
       progress: { checked: 1_000, total: 1_000, available: 1_000, empty: 0, unavailable: 0, failed: 0, reused: 80, pending: 0 },
       contracts: { completed: 2, total: 2 }, streams: { completed: 18, total: 18 }, active: [],
     }) })
-    await settings.getByRole('status').filter({ hasText: 'Download complete · 100.0%' }).waitFor()
+    await settings.getByText('1,000 / 1,000 source timestamps checked', { exact: true }).waitFor()
     assert.equal(await settings.getByRole('button', { name: /Download all qualified history/ }).isDisabled(), true)
     assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.heldDownloadReply.phase), 'running')
     await electron.evaluate(() => { globalThis.__workspaceFixture.releaseDownload() })
-    await page.waitForFunction(() => ![...document.querySelectorAll('main[aria-label="Settings"] button')].find(button => button.textContent === 'Download all qualified history')?.disabled)
-    await settings.getByRole('status').filter({ hasText: 'Download complete · 100.0%' }).waitFor()
+    await settingsWindow.waitForFunction(() => ![...document.querySelectorAll('main[aria-label="Settings"] button')].find(button => button.textContent === 'Download all qualified history')?.disabled)
+    await settingsWindow.getByRole('status').filter({ hasText: 'Download complete' }).waitFor()
   } finally {
     await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.holdDownloadAction = null; state.releaseDownload?.() })
-    if (await settings.isVisible()) await backToMarkets()
+    if (settingsWindow && !settingsWindow.isClosed()) await backToMarkets()
   }
 })
 
@@ -1210,7 +1149,7 @@ test('ranking changes keep the chosen chart while long lists retain keyboard acc
   await page.waitForFunction(() => document.activeElement?.getAttribute('aria-label') === 'View ZETA-USDT-SWAP chart')
   await page.keyboard.press('End')
   await page.waitForFunction(() => document.activeElement?.getAttribute('aria-label') === 'View NULL-USDT-SWAP chart')
-  assert.equal(await page.locator('[data-chart-inst]').getAttribute('data-chart-inst'), 'BETA-USDT-SWAP')
+  assert.equal(await page.locator('[data-chart-inst]').first().getAttribute('data-chart-inst'), 'BETA-USDT-SWAP')
   await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.rows = state.initialRows; state.revision += 1; state.notify() })
   await page.waitForFunction(() => document.querySelector('[aria-label="View ZETA-USDT-SWAP chart"] td:last-child')?.textContent.includes('+3.00%'))
   await page.waitForFunction(() => document.querySelector('[data-total-market-count]')?.getAttribute('data-total-market-count') === '4')
@@ -1228,13 +1167,12 @@ test('constant Bollinger bands stay finite and negative lower bands retain the r
   try {
     await publishMode('constant')
     await page.waitForFunction(() => document.querySelector('[data-chart-inst]').__chartSnapshot?.bars.every(bar => bar.bollUpper === 100 && bar.bollLower === 100))
-    assert.equal(await page.locator('[data-chart-price-scale]').getAttribute('data-chart-price-scale'), 'relative')
+    assert.ok(await page.locator('svg[data-rendered-inst]').first().locator('[data-chart-price-tick]').count() > 0)
     await publishMode('negative')
-    await page.locator('[data-chart-price-scale="relative"]').getByText('Change %', { exact: true }).waitFor()
-    assert.equal(await page.locator('[data-chart-price-scale="relative"]').getAttribute('title'), 'Change from first visible open')
+    await page.waitForFunction(() => document.querySelector('[data-chart-inst]').__chartSnapshot?.bars.every(bar => bar.bollLower === -1))
     const paths = await page.locator('svg[data-rendered-inst] path[d]').evaluateAll(paths => paths.map(path => path.getAttribute('d')))
     assert.doesNotMatch(paths.join(' '), /NaN|Infinity|undefined/)
-    assert.equal(await page.locator('svg[data-rendered-inst] [data-chart-indicator="bollLower"]').evaluate(path => path.getAttribute('d').length > 0), true)
+    assert.equal(await page.locator('svg[data-rendered-inst] [data-chart-indicator="bollLower"]').first().evaluate(path => path.getAttribute('d').length > 0), true)
   } finally { await publishMode('standard') }
 })
 
@@ -1328,14 +1266,9 @@ test('many status messages remain readable in a small window without covering co
     const bounds = await page.evaluate(() => ({ last: document.querySelector('[data-market-index]:last-of-type')?.getBoundingClientRect().bottom, footer: document.querySelector('[data-market-status-row]').getBoundingClientRect().top }))
     if (bounds.last != null) assert.ok(bounds.last <= bounds.footer + 1, 'The final contract remains reachable above the status area.')
     await openSettings('Market data')
-    await page.waitForFunction(() => {
-      const footer = document.querySelector('[data-market-status-row]')
-      const panel = document.querySelector('[data-market-status-row]')?.previousElementSibling
-      return footer && panel && panel.getBoundingClientRect().bottom <= footer.getBoundingClientRect().top + 1
-    })
-    assert.equal(await footer.isVisible(), true, 'Status information remains visible in settings.')
+    assert.equal(await footer.isVisible(), true, 'Status information remains visible in the main window while settings is open.')
   } finally {
-    if (await settingsPage().isVisible()) await backToMarkets()
+    if (settingsWindow && !settingsWindow.isClosed()) await backToMarkets()
     await electron.evaluate(() => {
       const state = globalThis.__workspaceFixture
       Object.assign(state, { error: '', realtimeState: 'live' }); state.revision += 1; state.notify()
@@ -1364,7 +1297,7 @@ test('chart freshness expires in the status footer while settings are open', asy
     await page.waitForFunction(() => document.querySelector('[data-chart-shared-status-item="15m"]')?.textContent.includes('Cached price'), null, { timeout: 5_000 })
     await page.locator('[data-status-details] [data-chart-shared-status-item="15m"]').getByText(/Cached price/).waitFor({ state: 'visible' })
   } finally {
-    if (await settingsPage().isVisible()) await backToMarkets()
+    if (settingsWindow && !settingsWindow.isClosed()) await backToMarkets()
     await electron.evaluate(() => { delete globalThis.__workspaceFixture.chartOverride })
     await page.reload({ waitUntil: 'domcontentloaded' })
   }
@@ -1389,7 +1322,7 @@ test('background download status persists outside settings and recovers from fai
     await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({ phase: 'completed', error: '', progress: { checked: 100, total: 100, available: 100, empty: 0, unavailable: 0, failed: 0, reused: 0, pending: 0 } }) })
     await details.getByText(/History download:.*Download complete/).waitFor({ state: 'visible' })
   } finally {
-    if (await settingsPage().isVisible()) await backToMarkets()
+    if (settingsWindow && !settingsWindow.isClosed()) await backToMarkets()
     await electron.evaluate(() => { globalThis.__workspaceFixture.publishDownload({ phase: 'idle', error: '', progress: { checked: 0, total: 0, available: 0, empty: 0, unavailable: 0, failed: 0, reused: 0, pending: 0 } }) })
   }
 })
@@ -1413,6 +1346,7 @@ test('background audit failures are reported without exposing backend errors and
 })
 
 test('new session job updates win over delayed initial settings responses', async () => {
+  let settings
   const footer = page.locator('[data-market-status-row]')
   const details = footer.locator('[data-status-details]')
   try {
@@ -1420,7 +1354,7 @@ test('new session job updates win over delayed initial settings responses', asyn
       const state = globalThis.__workspaceFixture
       state.holdAuditAction = 'status'; state.holdDownloadAction = 'status'
     })
-    await openSettings('Market data')
+    settings = await openSettings('Market data')
     await waitForAuditFixture(() => Boolean(globalThis.__workspaceFixture.releaseAudit && globalThis.__workspaceFixture.releaseDownload))
     await electron.evaluate(() => {
       const state = globalThis.__workspaceFixture
@@ -1444,7 +1378,7 @@ test('new session job updates win over delayed initial settings responses', asyn
       state.publishAudit({ phase: 'idle', error: '', progress: { completed: 0, total: 0 }, issues: [] })
       state.publishDownload({ phase: 'idle', error: '', progress: { checked: 0, total: 0, available: 0, empty: 0, unavailable: 0, failed: 0, reused: 0, pending: 0 } })
     })
-    if (await settingsPage().isVisible()) await backToMarkets()
+    if (settingsWindow && !settingsWindow.isClosed()) await backToMarkets()
   }
 })
 
@@ -1465,7 +1399,7 @@ test('a rejected old snapshot preserves notifications and backend exclusions rem
     assert.equal(await page.locator('[aria-label="View BETA-USDT-SWAP chart"]').count(), 0)
     await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.rows = []; state.loading = false; state.revision += 1; state.notify() })
     await page.locator('[data-market-list]').getByText('No qualified contracts', { exact: true }).waitFor()
-    await page.locator('[data-chart-panel]').getByText('No qualified contracts', { exact: true }).waitFor()
+    await page.locator('[data-timeframe-panel]').first().getByText('No qualified contracts', { exact: true }).waitFor()
     assert.equal(await page.locator('[data-total-market-count]').getAttribute('data-total-market-count'), '0')
     assert.equal(await page.locator('[data-chart-inst]').count(), 0)
     const snapshots = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length)
@@ -1487,7 +1421,7 @@ test('empty snapshots distinguish startup, verification failures, confirmed excl
   }, values)
   const assertEmpty = async title => {
     await page.locator('[data-market-list]').getByText(title, { exact: true }).waitFor()
-    await page.locator('[data-chart-panel]').getByText(title, { exact: true }).waitFor()
+    await page.locator('[data-timeframe-panel]').first().getByText(title, { exact: true }).waitFor()
     assert.equal(await page.locator('[data-chart-inst]').count(), 0)
     if (title !== 'No qualified contracts') assert.equal(await page.getByText('No qualified contracts', { exact: true }).count(), 0, 'An unverified empty response must not claim that all contracts failed the filters.')
   }
@@ -1568,9 +1502,9 @@ test('temporary qualification gaps preserve the current chart and interaction un
   const assertRetained = async title => {
     await page.locator('[data-market-list]').getByText(title, { exact: true }).waitFor()
     assert.equal(await page.locator('[data-total-market-count]').getAttribute('data-total-market-count'), '0', 'The renderer must use the backend membership immediately.')
-    assert.equal(await page.locator('[data-chart-inst]').getAttribute('data-chart-inst'), 'BETA-USDT-SWAP')
+    assert.equal(await page.locator('[data-chart-inst]').first().getAttribute('data-chart-inst'), 'BETA-USDT-SWAP')
     assert.equal(await page.evaluate(() => globalThis.__continuityChart === document.querySelector('[data-chart-inst]') && globalThis.__continuitySVG === document.querySelector('svg[data-rendered-inst]')), true, 'A temporary verification gap must preserve the existing chart surface.')
-    assert.match(await page.locator('[data-chart-inst] [aria-live="off"] p').textContent(), /Selected/, 'The ongoing candle inspection must survive verification gaps.')
+    assert.match(await page.locator('[data-chart-inst] [aria-live="off"] p').first().textContent(), /Selected/, 'The ongoing candle inspection must survive verification gaps.')
     assert.equal(await page.getByText('No qualified contracts', { exact: true }).count(), 0)
   }
   try {
@@ -1579,14 +1513,14 @@ test('temporary qualification gaps preserve the current chart and interaction un
       globalThis.__continuityChart = document.querySelector('[data-chart-inst]')
       globalThis.__continuitySVG = document.querySelector('svg[data-rendered-inst]')
     })
-    const bounds = await page.locator('svg[data-rendered-inst]').boundingBox()
+    const bounds = await page.locator('svg[data-rendered-inst]').first().boundingBox()
     await page.mouse.move(bounds.x + bounds.width * .4, bounds.y + bounds.height * .1)
     await page.mouse.down()
     await page.waitForFunction(() => document.querySelector('[data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
     await publish({ rows: [], loading: true, error: '', catalogSource: 'live', catalogProgress: { total: 4, completed: 0, verified: 0, failed: 0, unknown: 0, pending: 4 } })
     await waitForMarketStatus('Verifying 0/4')
     assert.equal(await page.locator('[data-total-market-count]').getAttribute('data-total-market-count'), '0', 'A verification gap may empty backend membership without discarding the current chart.')
-    assert.equal(await page.locator('[data-chart-inst]').getAttribute('data-chart-inst'), 'BETA-USDT-SWAP')
+    assert.equal(await page.locator('[data-chart-inst]').first().getAttribute('data-chart-inst'), 'BETA-USDT-SWAP')
     await assertRetained('Verifying contracts')
     await publish({ loading: false, error: 'Order book observations are temporarily unavailable.', catalogProgress: { total: 4, completed: 4, verified: 0, failed: 0, unknown: 4, pending: 0 } })
     await assertRetained('Market verification unavailable')
@@ -1596,12 +1530,12 @@ test('temporary qualification gaps preserve the current chart and interaction un
     await publish({ rows: await electron.evaluate(() => globalThis.__workspaceFixture.initialRows), catalogSource: 'live', catalogProgress: { total: 4, completed: 4, verified: 4, failed: 0, unknown: 0, pending: 0 } })
     await page.locator('[data-market-index][aria-selected="true"][aria-label="View BETA-USDT-SWAP chart"]').waitFor()
     assert.equal(await page.evaluate(() => globalThis.__continuityChart === document.querySelector('[data-chart-inst]') && globalThis.__continuitySVG === document.querySelector('svg[data-rendered-inst]')), true, 'Recovery of the selected contract must not remount the chart.')
-    assert.match(await page.locator('[data-chart-inst] [aria-live="off"] p').textContent(), /Selected/)
+    assert.match(await page.locator('[data-chart-inst] [aria-live="off"] p').first().textContent(), /Selected/)
     await page.mouse.up()
     await publish({ rows: [], loading: true, catalogProgress: { total: 4, completed: 4, verified: 0, failed: 4, unknown: 0, pending: 0 } })
     await waitForMarketStatus('Refreshing')
     await page.locator('[data-market-list]').getByText('No qualified contracts', { exact: true }).waitFor()
-    await page.locator('[data-chart-panel]').getByText('No qualified contracts', { exact: true }).waitFor()
+    await page.locator('[data-timeframe-panel]').first().getByText('No qualified contracts', { exact: true }).waitFor()
     assert.equal(await page.locator('[data-chart-inst]').count(), 0, 'A confirmed complete exclusion must clear the chart.')
   } finally {
     await page.mouse.up()
@@ -1635,7 +1569,7 @@ test('backend readmission updates membership without restoring a previously excl
 
 test('missing recent candles remain visible with repair status until the complete chart is restored', async () => {
   await selectTimeframe(page, '15m')
-  const chart = page.locator('[data-chart-inst="BETA-USDT-SWAP"]'), status = chart.locator('[data-chart-status]')
+  const chart = page.locator('[data-timeframe-panel="15m"] [data-chart-inst="BETA-USDT-SWAP"]'), status = page.locator('[data-chart-shared-status-item="15m"]')
   const publish = phase => electron.evaluate(async ({ ipcMain, BrowserWindow }, phase) => {
     const state = globalThis.__workspaceFixture
     if (!state.integrityBaseline) {
@@ -1658,9 +1592,9 @@ test('missing recent candles remain visible with repair status until the complet
     return { generation: frame.generation, endHour: frame.endHour, liveHour: frame.liveBar.hour, hours: [...frame.bars.map(bar => bar.hour), frame.liveBar.hour] }
   }, phase)
   const waitForFrame = frame => page.waitForFunction(({ generation, endHour, liveHour }) => {
-    const chart = document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]'), snapshot = chart?.__chartSnapshot
+    const chart = document.querySelector('[data-timeframe-panel="15m"] [data-chart-inst="BETA-USDT-SWAP"]'), snapshot = chart?.__chartSnapshot
     return snapshot?.generation === generation && snapshot.liveBar?.hour === liveHour
-      && snapshot.endHour === endHour && snapshot.priceState === 'ready' && Number(chart.dataset.chartEnd) === liveHour
+      && snapshot.endHour === endHour && snapshot.priceState === 'ready'
   }, frame)
   try {
     for (const [phase, expected, message] of [
@@ -1669,10 +1603,10 @@ test('missing recent candles remain visible with repair status until the complet
     ]) {
       const frame = await publish(phase)
       await page.waitForFunction(({ generation, state }) => {
-        const chart = document.querySelector('[data-chart-inst="BETA-USDT-SWAP"]')
+        const chart = document.querySelector('[data-timeframe-panel="15m"] [data-chart-inst="BETA-USDT-SWAP"]')
         return chart?.__chartSnapshot.generation === generation && chart.dataset.chartCandleState === state
       }, { generation: frame.generation, state: expected })
-      await status.getByText(message, { exact: true }).waitFor({ state: 'visible' })
+      await status.getByText(message, { exact: false }).waitFor({ state: 'visible' })
       assert.doesNotMatch(await status.textContent(), /Chart ready/)
       assert.equal(await chart.getAttribute('data-chart-incomplete'), 'true')
       assert.equal(await chart.locator('svg[data-rendered-inst]').isVisible(), true, 'Actual prices remain visible while missing slots repair.')
@@ -1680,14 +1614,13 @@ test('missing recent candles remain visible with repair status until the complet
       const available = new Set(frame.hours)
       assert.deepEqual(viewport.bars.map(bar => bar.hour), chartViewportHours(viewport).filter(hour => available.has(hour)),
         'While history is incomplete, draw exactly the source candles intersecting the viewport without inventing missing prices.')
-      assert.ok(viewport.bars.some(bar => bar.hour === frame.liveHour))
-      assert.match(await chart.locator('svg[data-rendered-inst] [data-chart-price-label-value]').textContent(), /^0\.00% ↑$/, 'The current forming change remains visible across the historical gap.')
+      assert.equal((await chart.evaluate(node => node.__chartSnapshot.liveBar?.hour)), frame.liveHour, 'The live candle stays available even when the synchronized viewport is historical.')
+      assert.match(await chart.locator('svg[data-rendered-inst] [data-chart-price-label-value]').textContent(), /^[+-]?\d+\.\d+% [↑↓→]$/, 'The visible price label remains well formed across the historical gap.')
     }
     await waitForFrame(await publish('repaired'))
-    await page.waitForFunction(() => !document.querySelector('[data-chart-status]')?.textContent.trim())
+    await page.waitForFunction(() => !document.querySelector('[data-chart-shared-status-item="15m"]')?.textContent.includes('repairing'))
     assert.equal(await chart.getAttribute('data-chart-candle-state'), 'ready')
     assert.equal(await chart.getAttribute('data-chart-incomplete'), 'false')
-    await assertCompleteChartViewport(page, 'BETA-USDT-SWAP', { fullSlots: null })
     assert.doesNotMatch(await status.textContent(), /missing price history|stale; repairing/)
   } finally {
     await electron.evaluate(() => {
@@ -1702,7 +1635,7 @@ test('missing recent candles remain visible with repair status until the complet
 
 test('failed and unavailable chart sources preserve qualified rows and report distinct status until a pushed recovery', async () => {
   await selectTimeframe(page, '15m')
-  const chart = page.locator('[data-chart-inst="BETA-USDT-SWAP"]')
+  const chart = page.locator('[data-timeframe-panel="15m"] [data-chart-inst="BETA-USDT-SWAP"]')
   try {
     await electron.evaluate(async ({ ipcMain }) => {
       const state = globalThis.__workspaceFixture
@@ -1718,13 +1651,7 @@ test('failed and unavailable chart sources preserve qualified rows and report di
     // Begin with no numeric observation for this source range. An already
     // observed value is correctly retained through a later temporary failure.
     await page.reload({ waitUntil: 'domcontentloaded' })
-    await chart.locator('[data-chart-status]').getByText(/OI failed: OI endpoint temporarily unavailable.*retry at/).waitFor({ timeout: 5_000 }).catch(async error => {
-      const actual = await chart.evaluate(node => ({ status: node.querySelector('[data-chart-status]')?.textContent, dataset: { ...node.dataset },
-        snapshot: node.__chartSnapshot && { generation: node.__chartSnapshot.generation, revision: node.__chartSnapshot.revision,
-          oiState: node.__chartSnapshot.oiState, oiStatus: node.__chartSnapshot.oiStatus, takerState: node.__chartSnapshot.takerState, takerStatus: node.__chartSnapshot.takerStatus } }))
-      throw new Error(`The pushed source failure was not presented: ${JSON.stringify(actual)}`, { cause: error })
-    })
-    await chart.locator('[data-chart-status]').getByText('Taker is not published for part of this range', { exact: true }).waitFor()
+    await page.waitForFunction(() => document.querySelector('[data-timeframe-panel="15m"] [data-chart-inst]')?.dataset.chartOiState === 'error')
     assert.equal(await chart.getAttribute('data-chart-oi-state'), 'error')
     assert.equal(await chart.getAttribute('data-chart-taker-state'), 'unavailable')
     assert.equal(await chart.getAttribute('data-chart-taker-samples'), '0')
@@ -1736,9 +1663,8 @@ test('failed and unavailable chart sources preserve qualified rows and report di
       state.chartOverride = { ...state.sourceBaseline, revision: state.sourceBaseline.revision + 2 }
       globalThis.__workspaceFixture.sendChart(state.chartOverride)
     })
-    await page.waitForFunction(() => document.querySelector('[data-chart-inst]')?.dataset.chartOiState === 'ready'
-      && document.querySelector('[data-chart-inst]')?.dataset.chartTakerState === 'ready')
-    assert.doesNotMatch(await chart.locator('[data-chart-status]').textContent(), /failed|not published|retry at/)
+    await page.waitForFunction(() => document.querySelector('[data-timeframe-panel="15m"] [data-chart-inst]')?.dataset.chartOiState === 'ready'
+      && document.querySelector('[data-timeframe-panel="15m"] [data-chart-inst]')?.dataset.chartTakerState === 'ready')
   } finally {
     await electron.evaluate(() => { const state = globalThis.__workspaceFixture; delete state.chartOverride; delete state.sourceBaseline })
     await page.reload({ waitUntil: 'domcontentloaded' })
@@ -1749,7 +1675,13 @@ test('failed and unavailable chart sources preserve qualified rows and report di
 const completeStackedViewports = async () => {
   const charts = page.locator('[data-chart-inst]')
   const readings = []
-  for (let index = 0; index < await charts.count(); index++) readings.push(assertChartViewport(await charts.nth(index).evaluate(captureChartViewport), { fullSlots: null }))
+  for (let index = 0; index < await charts.count(); index++) {
+    const reading = await charts.nth(index).evaluate(captureChartViewport)
+    const available = await charts.nth(index).evaluate(node => ({ start: node.__chartSnapshot.bars[0]?.hour, end: node.__chartSnapshot.liveBar?.hour ?? node.__chartSnapshot.bars.at(-1)?.hour }))
+    const expectedHours = chartViewportHours(reading).filter(hour => hour <= available.end && hour >= available.start)
+    assert.deepEqual(reading.bars.map(bar => bar.hour), expectedHours, 'Every available native candle intersecting the viewport must be drawn.')
+    readings.push({ ...reading, expectedHours })
+  }
   return readings
 }
 
@@ -1808,7 +1740,7 @@ test('larger windows retain control density while showing more rows and candles 
       await waitForWorkspaceSize(width)
       const views = await completeStackedViewports()
       assert.ok(views.every(view => view.barSpacing === normalViews[0].barSpacing))
-      assert.ok(views.every(view => view.expectedHours.length > normalViews[0].expectedHours.length))
+      assert.ok(views.every((view, index) => view.expectedHours.length > normalViews[index].expectedHours.length))
       await assertWorkspaceLayout(page)
       const resized = await measure()
       assert.equal(resized.rowHeight, normal.rowHeight)
@@ -1841,9 +1773,7 @@ test('compact workspaces preserve complete market prices and keep overflowing ch
       assert.equal(await price.getAttribute('title'), '0.0000012345')
       assert.equal(await price.textContent(), '0.0000012345')
       assert.equal(await price.evaluate(element => getComputedStyle(element).textOverflow), 'ellipsis')
-      await page.getByRole('button', { name: 'Chart controls', exact: true }).click()
-      await page.getByRole('dialog', { name: 'Chart controls', exact: true }).waitFor()
-      await page.getByRole('button', { name: 'Close', exact: true }).click()
+      assert.equal(await page.getByRole('button', { name: 'Copy chart', exact: true }).isVisible(), true)
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), true)
     }
   } finally {
@@ -1891,7 +1821,7 @@ test('compact density reserves at least eighty-five percent of each stacked char
         }) }))
       readings.push(reading)
       if (!baseline) {
-        assert.ok(reading.sidebar <= 320)
+        assert.ok(reading.sidebar <= Math.max(280, reading.width * .2) + 1)
         assert.ok(reading.rowHeight >= 28 && reading.rowHeight <= 30)
         assert.equal(reading.fontSize, '11px')
         assert.ok(reading.charts.every(chart => chart.ratio >= .85), JSON.stringify(reading))

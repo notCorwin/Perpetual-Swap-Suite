@@ -73,6 +73,9 @@ export type DesktopResponse<Request extends DesktopRequest> = Request extends { 
 export interface RadarDesktop {
   readonly nativeWindowControls: boolean
   readonly operationRecording: boolean
+  readonly isSettingsWindow: boolean
+  setSettingsCloseGuard(value: { dirty: boolean; busy: boolean }): void
+  closeSettingsWindow(): Promise<void>
   subscribePresentation(receiver: (update: PresentationUpdate) => void): () => void
   initializeOperations(hooks: OperationBridgeHooks): Promise<OperationSourceIdentity>
   recordOperations(batch: OperationBatch): Promise<OperationAcknowledgment>

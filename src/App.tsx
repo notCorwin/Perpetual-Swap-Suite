@@ -1,15 +1,12 @@
-import { lazy, memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { DeferredPanel } from '@/DeferredPanel'
-import { Camera, Settings2 } from 'lucide-react'
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { Camera } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { captureStableChart, chartCaptureBounds, eraseCapturedAction } from '@/chart-capture'
-import { buttonVariants } from '@/components/ui/button'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
 import { ChartTimeSyncProvider, MarketChart, type SharedChartStatusValue } from '@/MarketChart'
 import { MarketRowsViewport } from '@/MarketRowsViewport'
 import { WorkspaceViewport } from '@/WorkspaceViewport'
-import { settingsHref, useSettingsSection, type SettingsNavigationState } from '@/settings-navigation'
 import { chartCoordinator, multiChartControllers, ingestPreparedChart } from '@/chart-controller'
 import { reconcileMarketOrder, reconcileMarketRows } from '@/market-snapshot'
 import { SnapshotOrder } from '@/snapshot-order'
@@ -18,11 +15,8 @@ import type { DataAudit, HistoryDownload, MarketSnapshot, RankedMarketRow, Uncha
 import type { PreparedChartNotification } from '@/chart-data'
 import { cn } from '@/lib/utils'
 import { formatCurrentPrice } from '@/price-format'
-import { getPresentation, subscribePresentationTransition, usePresentation, waitForPresentation } from '@/presentation-store'
+import { getPresentation, subscribePresentationTransition, usePresentation } from '@/presentation-store'
 import { timeframeLabel, type RadarTimeframe } from '@/timeframe'
-import type { SettingsStatusValue } from '@/WorkspaceSettings'
-
-const WorkspaceSettings = lazy(() => import('@/WorkspaceSettings').then(module => ({ default: module.WorkspaceSettings })))
 
 const qualificationPending = (progress: MarketSnapshot['catalogProgress']) => !progress || progress.total === 0 || progress.completed < progress.total || progress.pending > 0
 const collectorStatus = (snapshot: MarketSnapshot | UnchangedSnapshot) => {
@@ -53,27 +47,6 @@ const MarketRowView = memo(function MarketRowView({ row, index, selected, lookba
 
 function App() {
   const statusRow = useRef<HTMLElement>(null)
-  const [statusHeight, setStatusHeight] = useState(0)
-  const settingsGuard = useRef<SettingsNavigationState>({ dirty: false, busy: false })
-  const settingsSection = useSettingsSection(settingsGuard)
-  useLayoutEffect(() => {
-    const row = statusRow.current
-    if (!row) return
-    const update = () => setStatusHeight(row.offsetHeight)
-    update()
-    const observer = new ResizeObserver(update)
-    observer.observe(row)
-    return () => observer.disconnect()
-  }, [settingsSection])
-  const lastVisibleSettings = useRef(settingsSection)
-  if (settingsSection) lastVisibleSettings.current = settingsSection
-  const settingsLauncher = useRef<HTMLAnchorElement>(null)
-  const lastSettingsSection = useRef(settingsSection)
-  const updateSettingsGuard = useCallback((value: SettingsNavigationState) => { settingsGuard.current = value }, [])
-  useEffect(() => {
-    if (lastSettingsSection.current && !settingsSection) settingsLauncher.current?.focus()
-    lastSettingsSection.current = settingsSection
-  }, [settingsSection])
   const [preferences, setPreferences] = useState<Preferences>(DEFAULT_PREFERENCES)
   const [preferencesLoaded, setPreferencesLoaded] = useState(false)
   const [preferencesError, setPreferencesError] = useState('')
@@ -95,17 +68,9 @@ function App() {
   const downloadOrder = useRef(new SnapshotOrder())
   const receiveAudit = useCallback((value: DataAudit) => { if (auditOrder.current.accept(value)) { setGlobalAudit(value); setAuditStatusUnavailable(false) } }, [])
   const receiveDownload = useCallback((value: HistoryDownload) => { if (downloadOrder.current.accept(value)) { setGlobalDownload(value); setDownloadStatusUnavailable(false) } }, [])
-  const receiveSettingsJob = useCallback((kind: 'audit' | 'download', value: DataAudit | HistoryDownload) => {
-    // The settings page can recover a failed initial read. Once a global
-    // snapshot exists, only the shared notification stream can replace it.
-    if (kind === 'audit' && auditOrder.current.revision < 0) receiveAudit(value as DataAudit)
-    if (kind === 'download' && downloadOrder.current.revision < 0) receiveDownload(value as HistoryDownload)
-  }, [receiveAudit, receiveDownload])
   const order = useRef(new SnapshotOrder())
   const retainSelection = useRef(false)
   const preferenceWrite = useRef(0)
-  const committedPreferences = useRef<Preferences>(DEFAULT_PREFERENCES)
-  const preferenceQueue = useRef<Promise<void>>(Promise.resolve())
   const timeframe = preferences.chartTimeframe
   const presentation = usePresentation()
 
@@ -133,11 +98,11 @@ function App() {
   useLayoutEffect(() => subscribePresentationTransition(update => {
     if (!update.active) { retainSelection.current = true; chartCoordinator.setPresentationActive(false); return }
     if (update.snapshot) {
+      preferenceWrite.current += 1
       chartCoordinator.setPresentationActive(true, update.snapshot.frames)
       applyMarket(update.snapshot.market, true)
       receiveAudit(update.snapshot.audit)
       receiveDownload(update.snapshot.download)
-      committedPreferences.current = update.snapshot.preferences
       setPreferences(update.snapshot.preferences); setPreferencesError(''); setPreferencesLoaded(true)
     } else chartCoordinator.setPresentationActive(true)
   }), [applyMarket, receiveAudit, receiveDownload])
@@ -184,12 +149,21 @@ function App() {
     return () => window.removeEventListener('radar-chart-prepared', receive)
   }, [])
   useEffect(() => {
+    const receive = (event: Event) => {
+      preferenceWrite.current += 1
+      const value = (event as CustomEvent<Preferences>).detail
+      setPreferences(value); setPreferencesError(''); setPreferencesLoaded(true)
+    }
+    window.addEventListener('radar-preferences-changed', receive)
+    return () => window.removeEventListener('radar-preferences-changed', receive)
+  }, [])
+  useEffect(() => {
     let stopped = false
     const write = preferenceWrite.current
     const epoch = getPresentation().epoch
     window.radarDesktop.request({ preferences: { action: 'read' } }).then(value => {
-      if (!stopped && getPresentation().active && epoch === getPresentation().epoch && write === preferenceWrite.current) { committedPreferences.current = value; setPreferences(value); setPreferencesError('') }
-    }).catch(cause => { if (!stopped && getPresentation().active && epoch === getPresentation().epoch) setPreferencesError(message(cause)) }).finally(() => { if (!stopped && getPresentation().active && epoch === getPresentation().epoch) setPreferencesLoaded(true) })
+      if (!stopped && getPresentation().active && epoch === getPresentation().epoch && write === preferenceWrite.current) { setPreferences(value); setPreferencesError('') }
+    }).catch(cause => { if (!stopped && getPresentation().active && epoch === getPresentation().epoch && write === preferenceWrite.current) setPreferencesError(message(cause)) }).finally(() => { if (!stopped && getPresentation().active && epoch === getPresentation().epoch) setPreferencesLoaded(true) })
     return () => { stopped = true }
   }, [])
   useEffect(() => {
@@ -245,10 +219,6 @@ function App() {
   const sharedPrice = typeof selectedPrice === 'number' && Number.isFinite(selectedPrice) && selectedPrice > 0 ? selectedPrice : undefined
   const sharedPriceText = sharedPrice === undefined ? undefined : formatCurrentPrice(sharedPrice, selectedRow?.tickSz)
   const [chartStatuses, setChartStatuses] = useState<Partial<Record<RadarTimeframe, SharedChartStatusValue>>>({})
-  const [settingsStatuses, setSettingsStatuses] = useState<SettingsStatusValue[]>([])
-  const updateSettingsStatuses = useCallback((items: SettingsStatusValue[]) => {
-    setSettingsStatuses(current => JSON.stringify(current) === JSON.stringify(items) ? current : items)
-  }, [])
   const updateChartStatus = useCallback((frame: RadarTimeframe, value: SharedChartStatusValue | null) => {
     setChartStatuses(current => {
       const previous = current[frame]
@@ -275,45 +245,6 @@ function App() {
   const connectionFailure = ['reconnecting', 'disconnected'].includes(realtime.toLowerCase())
   const listOrder = candidateIds
   useEffect(() => { if (ready) void chartCoordinator.setUniverse(retainedChart && selectedID ? [...candidateIds, selectedID] : candidateIds, timeframe) }, [ready, candidateIds, timeframe, retainedChart, selectedID])
-  const savePreferences = useCallback(async (values: Partial<Preferences>) => {
-    const write = ++preferenceWrite.current
-    const epoch = getPresentation().epoch
-    const task = preferenceQueue.current.then(() => window.radarDesktop.request({ preferences: { action: 'update', values } }))
-    preferenceQueue.current = task.then(() => undefined, () => undefined)
-    let saved: Preferences
-    try {
-      saved = await task
-      await waitForPresentation()
-      if (epoch !== getPresentation().epoch) {
-        // A write can finish during the barrier; read the current committed
-        // preferences instead of letting its older response replace it.
-        const readEpoch = getPresentation().epoch
-        try {
-          const actual = await window.radarDesktop.request({ preferences: { action: 'read' } })
-          await waitForPresentation()
-          saved = readEpoch === getPresentation().epoch ? actual : committedPreferences.current
-        } catch { await waitForPresentation(); saved = committedPreferences.current }
-      }
-    }
-    catch (cause) {
-      await waitForPresentation()
-      if (write !== preferenceWrite.current) return
-      // A failed response does not prove that the backend did not commit.
-      try {
-        const actual = await window.radarDesktop.request({ preferences: { action: 'read' } })
-        await waitForPresentation()
-        if (write !== preferenceWrite.current) return
-        committedPreferences.current = actual
-        setPreferences(actual)
-      } catch { await waitForPresentation() /* Keep the last confirmed value if reconciliation is unavailable. */ }
-      if (write !== preferenceWrite.current) return
-      throw cause
-    }
-    committedPreferences.current = saved
-    if (write !== preferenceWrite.current) return
-    // Backend notifications own market updates; view preferences do not reload rows.
-    setPreferences(saved); setPreferencesError('')
-  }, [])
   const marketOverlayRef = useRef<HTMLDivElement>(null)
   const chartsRef = useRef<HTMLDivElement>(null)
   const copyButtonRef = useRef<HTMLButtonElement>(null)
@@ -323,7 +254,7 @@ function App() {
     copyOwner.current = null
     setCopyState({ status: 'idle', error: '' })
     return () => { copyOwner.current = null }
-  }, [selectedID, settingsSection])
+  }, [selectedID])
   useEffect(() => {
     if (copyState.status !== 'copied') return
     const timer = window.setTimeout(() => setCopyState({ status: 'idle', error: '' }), 2000)
@@ -345,28 +276,23 @@ function App() {
       const bounds = chartCaptureBounds(element)
       const buttonBounds = button.getBoundingClientRect()
       const content = charts.map(chart => chart.innerHTML)
-      const settings = settingsLauncher.current
-      if (!settings) throw new Error('Settings action is unavailable.')
-      const settingsBounds = settings.getBoundingClientRect()
       const overlay = marketOverlayRef.current
       if (!overlay) throw new Error('Contract list is unavailable.')
       const overlayBounds = overlay.getBoundingClientRect()
       const current = () => {
-        if (copyOwner.current !== owner || chartsRef.current !== element || copyButtonRef.current !== button || settingsLauncher.current !== settings || charts.some((chart, index) => chart.innerHTML !== content[index]) || marketOverlayRef.current !== overlay) return false
+        if (copyOwner.current !== owner || chartsRef.current !== element || copyButtonRef.current !== button || charts.some((chart, index) => chart.innerHTML !== content[index]) || marketOverlayRef.current !== overlay) return false
         const overlayRect = overlay.getBoundingClientRect()
         if (overlayRect.x !== overlayBounds.x || overlayRect.y !== overlayBounds.y || overlayRect.width !== overlayBounds.width || overlayRect.height !== overlayBounds.height) return false
         const rect = element.getBoundingClientRect()
         const action = button.getBoundingClientRect()
-        const settingsRect = settings.getBoundingClientRect()
-        return settingsRect.x === settingsBounds.x && settingsRect.y === settingsBounds.y && settingsRect.width === settingsBounds.width && settingsRect.height === settingsBounds.height
-          && rect.x === bounds.x && rect.y === bounds.y && rect.width === bounds.width && rect.height === bounds.height
+        return rect.x === bounds.x && rect.y === bounds.y && rect.width === bounds.width && rect.height === bounds.height
           && action.x === buttonBounds.x && action.y === buttonBounds.y && action.width === buttonBounds.width && action.height === buttonBounds.height
       }
       const image = await captureStableChart(() => window.radarDesktop.request({ captureChart: { ...bounds, output: 'png' } }), current)
       if (copyOwner.current !== owner) return
       if (!current()) throw new Error('Chart changed during capture. Start again.')
       const background = getComputedStyle(document.documentElement).getPropertyValue('--background')
-      const dataURL = await eraseCapturedAction(image.imageDataURL, bounds, [buttonBounds, settingsBounds], background, overlayBounds)
+      const dataURL = await eraseCapturedAction(image.imageDataURL, bounds, [buttonBounds], background, overlayBounds)
       if (copyOwner.current !== owner) return
       if (!current()) throw new Error('Chart changed during capture. Start again.')
       const result = await window.radarDesktop.request({ copyImage: dataURL })
@@ -390,20 +316,15 @@ function App() {
   if (connectionProblem) issues.push({ id: 'connection', label: 'Market', detail: `${connectionFailure ? 'Market connection interrupted' : 'Waiting for a live market connection'}. Check the connection for current prices.`, severity: 'warning' })
   if (status !== 'Live' && status !== 'Connecting') issues.push({ id: 'catalog', label: 'Contracts', detail: status === 'Cached' ? 'Cached market data' : status, severity: status === 'Incomplete' || status === 'Unavailable' || status === 'Cached' ? 'warning' : 'info' })
   if (copyState.error) issues.push({ id: 'copy', label: 'Copy chart', detail: copyState.error, severity: 'error' })
-  // App owns the authoritative job snapshots. Settings only contributes local
-  // requests and request errors so an older settings view cannot mask a newer
-  // background snapshot from another service session.
-  const transientSettingsStatuses = settingsStatuses.filter(item => !['data-audit', 'history-download'].includes(item.id) || item.transient)
-  for (const item of transientSettingsStatuses) issues.push({ ...item, id: `settings-${item.id}` })
-  if (auditStatusUnavailable && !transientSettingsStatuses.some(item => item.id === 'data-audit')) issues.push({ id: 'data-audit-status', label: 'Data audit', detail: 'Audit status unavailable. Check the data service in Data settings.', severity: 'warning' })
-  if (downloadStatusUnavailable && !transientSettingsStatuses.some(item => item.id === 'history-download')) issues.push({ id: 'history-download-status', label: 'History download', detail: 'Download status unavailable. Check the data service in Data settings.', severity: 'warning' })
-  if (globalAudit && !transientSettingsStatuses.some(item => item.id === 'data-audit')) {
+  if (auditStatusUnavailable) issues.push({ id: 'data-audit-status', label: 'Data audit', detail: 'Audit status unavailable. Check the data service in Data settings.', severity: 'warning' })
+  if (downloadStatusUnavailable) issues.push({ id: 'history-download-status', label: 'History download', detail: 'Download status unavailable. Check the data service in Data settings.', severity: 'warning' })
+  if (globalAudit) {
     if (globalAudit.error || globalAudit.phase === 'failed') issues.push({ id: 'data-audit', label: 'Data audit', detail: 'Audit failed. Check the data service and retry.', severity: 'error' })
     else if (globalAudit.phase === 'running' || globalAudit.phase === 'validating') issues.push({ id: 'data-audit', label: 'Data audit', detail: globalAudit.phase === 'validating' ? 'Validating recent changes. Results are provisional.' : `Audit running · ${globalAudit.progress.completed} / ${globalAudit.progress.total}`, severity: 'info' })
     else if (globalAudit.issues.length) issues.push({ id: 'data-audit', label: 'Data audit', detail: `${globalAudit.issues.length} issues found. Review them in Data settings.`, severity: 'warning' })
     else if (globalAudit.phase === 'completed' || globalAudit.phase === 'cancelled') issues.push({ id: 'data-audit', label: 'Data audit', detail: globalAudit.phase === 'completed' ? 'Audit complete.' : 'Audit cancelled.', severity: 'info' })
   }
-  if (globalDownload && !transientSettingsStatuses.some(item => item.id === 'history-download')) {
+  if (globalDownload) {
     if (globalDownload.error || globalDownload.phase === 'failed') issues.push({ id: 'history-download', label: 'History download', detail: 'Download failed. Check the data service and retry.', severity: 'error' })
     else if (globalDownload.phase === 'running') issues.push({ id: 'history-download', label: 'History download', detail: `Downloading history · ${globalDownload.progress.checked} / ${globalDownload.progress.total}`, severity: 'info' })
     else if (globalDownload.phase === 'completed' && (globalDownload.progress.empty || globalDownload.progress.unavailable || globalDownload.progress.failed)) issues.push({ id: 'history-download', label: 'History download', detail: 'Download finished with incomplete coverage. Review Data settings.', severity: 'warning' })
@@ -427,14 +348,14 @@ function App() {
   }, [errorKey])
   const statusText = updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString('en-US')}` : 'Waiting for market data'
 
-  const renderStatus = (ref: React.Ref<HTMLElement> | undefined, settings = false) => <footer ref={ref} data-market-status-row tabIndex={0} aria-label="Application status" onKeyDown={event => {
+  const renderStatus = (ref: React.Ref<HTMLElement> | undefined) => <footer ref={ref} data-market-status-row tabIndex={0} aria-label="Application status" onKeyDown={event => {
       const row = event.currentTarget
       if (row.scrollHeight <= row.clientHeight) return
       const offset = event.key === 'ArrowDown' ? row.clientHeight / 4 : event.key === 'ArrowUp' ? -row.clientHeight / 4
         : event.key === 'PageDown' ? row.clientHeight : event.key === 'PageUp' ? -row.clientHeight : null
       if (offset !== null) { event.preventDefault(); row.scrollTop += offset }
       else if (event.key === 'Home' || event.key === 'End') { event.preventDefault(); row.scrollTop = event.key === 'Home' ? 0 : row.scrollHeight }
-    }} className={cn('min-h-0 shrink-0 overflow-y-auto border-t bg-background px-4 py-1 text-xs text-muted-foreground focus-visible:outline-2 focus-visible:outline-ring', settings ? 'max-h-full' : 'max-h-[40%]')}>
+    }} className="min-h-0 max-h-[40%] shrink-0 overflow-y-auto border-t bg-background px-4 py-1 text-xs text-muted-foreground focus-visible:outline-2 focus-visible:outline-ring">
       <div data-status-details data-market-status>
         {rankedIssues.map(issue => <p key={issue.id} role={issue.severity === 'error' ? undefined : 'status'} aria-atomic="true" data-chart-shared-status-item={issue.frame} data-timeframe={issue.frame} data-chart-status={issue.frame !== undefined ? '' : undefined} className={cn('break-words py-1', issue.severity === 'error' && 'text-destructive')}><span className="font-medium">{issue.label}: </span>{issue.detail}</p>)}
         <p aria-live="off">{statusText}</p>
@@ -442,13 +363,13 @@ function App() {
     </footer>
 
   const renderChart = (frame: '1H' | '15m' | '5m', navigation = false) => <div key={frame} data-timeframe-panel={frame} className="min-h-0 min-w-0 flex-1 overflow-hidden rounded-lg border bg-background">
-    {selectedID ? <MarketChart priceScaleMode={preferences.priceScaleMode} priceScalePixelsPerPercent={preferences.priceScalePixelsPerPercent} controller={multiChartControllers[frame]} priceOnly onStatus={updateChartStatus} navigation={navigation} active={settingsSection === null} instId={selectedID} tickSz={selectedRow?.tickSz} timeframe={frame} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={selectFromChart} /> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}
+    {selectedID ? <MarketChart priceScaleMode={preferences.priceScaleMode} priceScalePixelsPerPercent={preferences.priceScalePixelsPerPercent} controller={multiChartControllers[frame]} priceOnly onStatus={updateChartStatus} navigation={navigation} instId={selectedID} tickSz={selectedRow?.tickSz} timeframe={frame} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={selectFromChart} /> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}
   </div>
 
   return <WorkspaceViewport>
     <div className="relative flex h-full min-w-0 flex-1">
       <span role="status" aria-atomic="true" className="sr-only">{errorAnnouncement}</span>
-      <div hidden={settingsSection !== null} inert={settingsSection !== null} className={cn('h-full min-w-0 flex-1', settingsSection === null ? 'flex' : 'hidden')}>
+      <div className="flex h-full min-w-0 flex-1">
         <section data-chart-panel className="h-full min-w-0 flex-1" aria-label="Market chart workspace">
           <div data-chart-display-mode="multi" className="flex h-full min-h-0 flex-col">
             <span role="status" className="sr-only">{copyState.status === 'copying' ? 'Copying chart' : copyState.status === 'copied' ? 'Chart copied to clipboard' : ''}</span>
@@ -460,7 +381,6 @@ function App() {
                   {sharedPriceText !== undefined && <><span className="sr-only">Market price</span><span data-shared-chart-price className="max-w-32 truncate" title={sharedPriceText}>{sharedPriceText}</span></>}
                 </div>
                 {selectedID && <Button ref={copyButtonRef} data-window-no-drag variant="outline" size="sm" disabled={copyState.status === 'copying'} onClick={() => { void copyChart() }}><Camera data-icon="inline-start" aria-hidden="true" />{copyState.status === 'copying' ? 'Copying…' : copyState.status === 'copied' ? 'Copied' : 'Copy chart'}</Button>}
-                <a ref={settingsLauncher} href={settingsHref('workspace')} aria-label="Settings" title="Settings" className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}><Settings2 aria-hidden="true" /></a>
               </header>
               <ChartTimeSyncProvider key={selectedID}><div className="grid min-h-0 flex-1 grid-rows-2 gap-2 p-2 pt-0" data-multi-timeframe-charts>
                 <div className="flex min-h-0 min-w-0 gap-2">
@@ -476,7 +396,7 @@ function App() {
         </Table>
       </section>
                   </aside>
-                  {settingsSection === null && renderStatus(statusRow)}
+                  {renderStatus(statusRow)}
                 </div>
                 {renderChart('1H', true)}
                 </div>
@@ -489,8 +409,6 @@ function App() {
           </div>
         </section>
       </div>
-      {lastVisibleSettings.current && <div hidden={!settingsSection} inert={!settingsSection} className={cn('min-w-0 flex-1', settingsSection ? 'flex' : 'hidden')} style={{ height: `calc(100% - ${statusHeight}px)` }}><DeferredPanel name="Settings" className="p-4 pb-8" onClose={() => { window.location.hash = '#/' }}><WorkspaceSettings section={settingsSection ?? lastVisibleSettings.current} active={settingsSection !== null} preferences={preferences} loaded={preferencesLoaded} loadError={preferencesError} onSave={savePreferences} onNavigationStateChange={updateSettingsGuard} onStatusChange={updateSettingsStatuses} onJobSnapshot={receiveSettingsJob} /></DeferredPanel></div>}
-      {settingsSection && <div className="absolute bottom-0 left-4 flex max-h-[40%] w-[var(--market-list-width)] overflow-hidden rounded-lg border bg-background">{renderStatus(statusRow, true)}</div>}
     </div>
   </WorkspaceViewport>
 }

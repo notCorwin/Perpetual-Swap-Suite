@@ -3,18 +3,18 @@
 @import "shadcn/tailwind.css";
 
 @font-face {
-  font-family: "DM Mono";
-  src: url("./../public/fonts/dm-mono-latin-400-normal.woff2") format("woff2");
+  font-family: "Ubuntu Mono";
+  src: url("./../public/fonts/ubuntu-mono-regular.ttf") format("truetype");
   font-style: normal;
   font-weight: 400;
   font-display: swap;
 }
 
 @font-face {
-  font-family: "DM Mono";
-  src: url("./../public/fonts/dm-mono-latin-500-normal.woff2") format("woff2");
+  font-family: "Ubuntu Mono";
+  src: url("./../public/fonts/ubuntu-mono-bold.ttf") format("truetype");
   font-style: normal;
-  font-weight: 500;
+  font-weight: 500 900;
   font-display: swap;
 }
 
@@ -28,7 +28,7 @@
   --text-base--line-height: var(--ui-line-height);
   --text-lg: var(--ui-font-heading);
   --text-lg--line-height: var(--ui-line-height);
-  --font-mono: "DM Mono", ui-monospace, monospace;
+  --font-mono: "Ubuntu Mono", ui-monospace, monospace;
   --font-sans: var(--font-mono);
   --font-heading: var(--font-sans);
   --color-positive: var(--positive);

@@ -64,18 +64,18 @@ try {
   await page.reload({ waitUntil: 'domcontentloaded' })
   await page.locator('svg[data-rendered-inst="BETA-USDT-SWAP"]').first().waitFor({ state: 'visible' })
   const client = await page.context().newCDPSession(page)
-  const stablePaint = async () => {
-    await page.evaluate(() => document.fonts.ready)
-    await page.evaluate(() => Promise.all(document.getAnimations().filter(animation => animation.effect?.getTiming().iterations !== Infinity).map(animation => animation.finished.catch(() => {}))))
-    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+  const stablePaint = async (target = page) => {
+    await target.evaluate(() => document.fonts.ready)
+    await target.evaluate(() => Promise.all(document.getAnimations().filter(animation => animation.effect?.getTiming().iterations !== Infinity).map(animation => animation.finished.catch(() => {}))))
+    await target.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
   }
-  const screenshot = async (name, width, height, dpr) => {
+  const screenshot = async (name, width, height, dpr, target = page, session = client) => {
     // Playwright's Electron context retains its original DPR; page.screenshot
     // can reset an overridden DPR during capture. Capture through the same CDP
     // session that emulates metrics, then verify the actual PNG dimensions.
-    await stablePaint()
+    await stablePaint(target)
     const path = join(output, `${name}.png`)
-    const captured = await client.send('Page.captureScreenshot', { format: 'png', fromSurface: true, captureBeyondViewport: true, clip: { x: 0, y: 0, width, height, scale: 1 } })
+    const captured = await session.send('Page.captureScreenshot', { format: 'png', fromSurface: true, captureBeyondViewport: true, clip: { x: 0, y: 0, width, height, scale: 1 } })
     const bytes = Buffer.from(captured.data, 'base64')
     await writeFile(path, bytes)
     const pixels = { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) }
@@ -83,7 +83,7 @@ try {
     assert.equal(pixels.width, width * dpr, `Unexpected screenshot width: ${name}`)
     assert.equal(pixels.height, height * dpr, `Unexpected screenshot height: ${name}`)
   }
-  const measure = () => page.evaluate(() => {
+  const measure = (target = page) => target.evaluate(() => {
     const context = document.createElement('canvas').getContext('2d', { willReadFrequently: true })
     const rgba = color => {
       context.clearRect(0, 0, 1, 1)
@@ -206,16 +206,22 @@ try {
         assert.equal(measured.semantics.upFill, 'hollow')
         assert.equal(measured.semantics.downFill, 'solid')
         report.measurements.push({ theme, surface: 'workspace', ...measured })
-        await page.getByRole('link', { name: 'Settings', exact: true }).click()
-        const settings = page.getByRole('main', { name: 'Settings', exact: true })
+        const settingsOpened = electron.waitForEvent('window')
+        await electron.evaluate(({ Menu }) => Menu.getApplicationMenu().getMenuItemById('open-settings').click())
+        const settingsPage = await settingsOpened
+        await settingsPage.emulateMedia({ colorScheme: theme, reducedMotion: 'reduce' })
+        await settingsPage.setViewportSize({ width, height: 1000 })
+        const settingsClient = await settingsPage.context().newCDPSession(settingsPage)
+        await settingsClient.send('Emulation.setDeviceMetricsOverride', { width, height: 1000, deviceScaleFactor: dpr, mobile: false })
+        const settings = settingsPage.getByRole('main', { name: 'Settings', exact: true })
         await settings.waitFor({ state: 'visible' })
-        await screenshot(`settings-${theme}-top`, width, 1000, dpr)
-        report.measurements.push({ theme, surface: 'settings-top', ...await measure() })
+        await screenshot(`settings-${theme}-top`, width, 1000, dpr, settingsPage, settingsClient)
+        report.measurements.push({ theme, surface: 'settings-top', ...await measure(settingsPage) })
         await settings.getByRole('link', { name: 'Market data', exact: true }).click()
-        await screenshot(`settings-${theme}-bottom`, width, 1000, dpr)
-        report.measurements.push({ theme, surface: 'settings-bottom', ...await measure() })
-        await settings.getByRole('link', { name: 'Settings', exact: true }).click()
-        await settings.waitFor({ state: 'hidden' })
+        await screenshot(`settings-${theme}-bottom`, width, 1000, dpr, settingsPage, settingsClient)
+        report.measurements.push({ theme, surface: 'settings-bottom', ...await measure(settingsPage) })
+        await settingsClient.detach()
+        await settingsPage.evaluate(() => window.radarDesktop.closeSettingsWindow())
       }
     }
   }

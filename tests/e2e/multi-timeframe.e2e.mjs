@@ -256,8 +256,11 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
     await waitForSynchronizedViewports(null, null)
     await live(btc, 141.25, 35)
     await assertFormingCandlesFit()
-    await page.evaluate(() => { location.hash = '#/settings/workspace' })
-    await page.getByRole('main', { name: 'Settings', exact: true }).getByRole('link', { name: 'Settings', exact: true }).click()
+    const settingsOpened = electron.waitForEvent('window')
+    await electron.evaluate(({ Menu }) => Menu.getApplicationMenu().getMenuItemById('open-settings').click())
+    const settingsPage = await settingsOpened
+    await settingsPage.getByRole('main', { name: 'Settings', exact: true }).waitFor()
+    await settingsPage.evaluate(() => window.radarDesktop.closeSettingsWindow())
     await page.waitForFunction(() => document.querySelectorAll('[data-multi-timeframe-charts] svg[data-rendered-inst]').length === 3)
     await page.locator(`[aria-label="View ${eth} chart"]`).click()
     await page.waitForFunction(() => [...document.querySelectorAll('[data-chart-inst]')].every(chart => chart.__chartSnapshot?.instId === 'ETH-USDT-SWAP'))
@@ -343,17 +346,15 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
         const left = Math.floor(bounds.x), top = Math.floor(bounds.y)
         const sx = canvas.width / (Math.ceil(bounds.x + bounds.width) - left), sy = canvas.height / (Math.ceil(bounds.y + bounds.height) - top)
         const pixelsIn = (rect, inset = 0) => context.getImageData(Math.ceil((rect.left - left + inset) * sx), Math.ceil((rect.top - top + inset) * sy), Math.floor((rect.width - inset * 2) * sx), Math.floor((rect.height - inset * 2) * sy)).data
-        const settings = pixelsIn(document.querySelector('[aria-label="Settings"]').getBoundingClientRect())
-        const settingsBlank = settings.every((value, index) => value === settings[index % 4])
         const chartsHaveContent = [...document.querySelectorAll('[data-timeframe-panel]')].map(panel => {
           const pixels = pixelsIn(panel.getBoundingClientRect(), 3)
           let different = 0
           for (let i = 4; i < pixels.length; i += 4) if (pixels[i] !== pixels[0] || pixels[i + 1] !== pixels[1] || pixels[i + 2] !== pixels[2]) different++
           return different > 10
         })
-        return { settingsBlank, chartsHaveContent }
+        return { chartsHaveContent }
       }, captured)
-      assert.ok(output.settingsBlank, 'The settings button must be absent from the copied image.')
+      assert.equal(await page.getByRole('link', { name: 'Settings', exact: true }).count(), 0, 'Settings is accessed through the native application menu.')
       assert.deepEqual(output.chartsHaveContent, [true, true, true], 'The copied image must retain all three charts.')
       return masked.background
     }

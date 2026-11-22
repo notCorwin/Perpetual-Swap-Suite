@@ -14,13 +14,16 @@ test('a missing settings chunk leaves the market workspace usable', async () => 
     await page.locator('[data-market-status-row]').waitFor()
     await electron.evaluate(({ BrowserWindow }, chunk) => {
       BrowserWindow.getAllWindows()[0].webContents.session.webRequest.onBeforeRequest((details, callback) => callback({ cancel: details.url.includes(chunk) }))
-    }, '/WorkspaceSettings-')
-    await page.getByRole('link', { name: 'Settings', exact: true }).click()
-    const region = page.getByRole('region', { name: 'Settings', exact: true })
-    await region.getByRole('alert').waitFor({ timeout: 10_000 })
+    }, '/SettingsWindow-')
+    const settingsOpened = electron.waitForEvent('window')
+    await electron.evaluate(({ Menu }) => Menu.getApplicationMenu().getMenuItemById('open-settings').click())
+    const settingsPage = await settingsOpened
+    const region = settingsPage.getByRole('alert')
+    await region.waitFor({ timeout: 10_000 })
     assert.match(await region.textContent(), /could not load.*Restart the app/)
+    const closed = settingsPage.waitForEvent('close')
     await region.getByRole('button', { name: 'Close settings', exact: true }).click()
-    await region.waitFor({ state: 'detached' })
+    await closed
     await page.locator('[data-market-status-row]').waitFor()
     assert.equal(await page.locator('[data-chart-panel]').count(), 1)
   } finally {

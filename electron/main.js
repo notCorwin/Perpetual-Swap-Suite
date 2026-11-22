@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, ClipboardItem, contentTracing, ipcMain, nativeImage, net, screen, session, shell } from 'electron'
+import { app, BrowserWindow, clipboard, ClipboardItem, contentTracing, dialog, ipcMain, Menu, nativeImage, net, screen, session, shell } from 'electron'
 import { mkdirSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -59,6 +59,10 @@ let stopGraphicsRecording
 const security = createDesktopSecurity({ rendererURL, rendererFile: join(root, 'dist', 'index.html') })
 const e2eLiveRefresh = testMode && process.env.PERPETUAL_SWAP_E2E_LIVE_REFRESH === '1'
 let window
+let settingsWindow
+let settingsOpening
+let settingsCloseGuard = { dirty: false, busy: false }
+let latestPreferences
 let backend
 const desktopRequests = new Set()
 let shuttingDown = false
@@ -69,10 +73,20 @@ let testOwnerExitTimer
 let presentation
 const windowNotifications = new Set()
 function publishPresentation(update) {
-  if (!window || window.isDestroyed()) return
-  const value = update.snapshot ? { ...update, snapshot: encodeChartWire(update.snapshot) } : update
-  window.webContents.send('radar:presentation', value)
+  const value = update.snapshot ? { ...update, snapshot: encodeChartWire({ ...update.snapshot, preferences: latestPreferences ?? update.snapshot.preferences }) } : update
+  if (window && !window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('radar:presentation', value)
+  if (settingsWindow && !settingsWindow.isDestroyed() && !settingsWindow.webContents.isDestroyed()) {
+    const { snapshot: _snapshot, ...state } = update
+    settingsWindow.webContents.send('radar:presentation', state)
+  }
 }
+
+function assertApplicationSender(event) {
+  if (security.isTrustedSender(event, window) || security.isTrustedSender(event, settingsWindow)) return
+  throw new Error('Desktop requests are restricted to application windows.')
+}
+
+function assertSettingsSender(event) { security.assertTrustedSender(event, settingsWindow) }
 
 function sendNotification(sender, channel, detail) {
   if (!presentation?.getState().active) return
@@ -111,8 +125,9 @@ async function copyImage(image) {
 }
 
 async function handleRequest(event, payload, context) {
-  security.assertTrustedSender(event, window)
+  assertApplicationSender(event)
   const request = parseDesktopRequest(payload, { allowE2E: testMode })
+  if (security.isTrustedSender(event, settingsWindow) && !request.preferences && !request.dataAudit && !request.historyDownload) throw new Error('This request is unavailable in settings.')
   if (shuttingDown) throw new Error('The application is closing.')
   const displayRead = Boolean(request.snapshot || request.chartWindow || request.chartLocal || request.chartHistory || request.chartUniverse)
   const epoch = presentation.getState().epoch
@@ -137,6 +152,12 @@ async function handleRequest(event, payload, context) {
   }
   const response = await backend.request(request)
   assertPresentation()
+  if (request.preferences?.action === 'update') {
+    latestPreferences = response
+    // Preference commits are control state, not presentation data. Deliver them
+    // even while a window is idle or an activation snapshot is being prepared.
+    for (const target of [window, settingsWindow]) if (target && !target.isDestroyed() && !target.webContents.isDestroyed()) target.webContents.send('radar:preferences-changed', response)
+  }
   if (request.e2e?.action === 'smokeStatus') {
     const build = await readFile(join(process.resourcesPath, 'build-revision.json'), 'utf8').then(JSON.parse).catch(() => null)
     return { ...response, revision: build?.revision ?? null }
@@ -152,6 +173,106 @@ async function handleRequest(event, payload, context) {
 }
 
 const backgroundLaunch = backgroundWindowLaunch(process.argv, testMode, backgroundTests)
+
+async function openSettings() {
+  if (settingsOpening) return settingsOpening
+  settingsOpening = (async () => {
+    await startupTask
+    if (shuttingDown) return
+    if (!settingsWindow || settingsWindow.isDestroyed()) await createSettingsWindow()
+    const target = settingsWindow
+    if (!target || target.isDestroyed()) return
+    if (!backgroundTests) {
+      if (target.isMinimized()) target.restore()
+      target.show(); target.focus()
+    }
+  })().finally(() => { settingsOpening = undefined })
+  return settingsOpening
+}
+
+function canCloseSettings() {
+  if (settingsCloseGuard.busy) return false
+  if (!settingsCloseGuard.dirty) return true
+  return dialog.showMessageBoxSync(settingsWindow, { type: 'warning', buttons: ['Keep Editing', 'Discard Changes'], defaultId: 0, cancelId: 0,
+    message: 'Discard your unsaved settings changes?', detail: 'Your changes have not been saved.' }) === 1
+}
+
+function querySettingsCloseGuard(target) {
+  if (!target || target.isDestroyed() || target.webContents.isDestroyed()) return Promise.resolve()
+  return new Promise(resolve => {
+    const id = randomUUID()
+    const finish = value => {
+      clearTimeout(timer); ipcMain.off('radar:settings-close-state', reply)
+      if (settingsWindow === target && value && typeof value.dirty === 'boolean' && typeof value.busy === 'boolean') settingsCloseGuard = { dirty: value.dirty, busy: value.busy }
+      resolve()
+    }
+    const reply = (event, value) => {
+      if (!security.isTrustedSender(event, target) || value?.id !== id) return
+      finish(value)
+    }
+    const timer = setTimeout(() => finish({ dirty: true, busy: settingsCloseGuard.busy }), 1000)
+    ipcMain.on('radar:settings-close-state', reply)
+    target.webContents.send('radar:settings-query-close', { id })
+  })
+}
+
+async function createSettingsWindow() {
+  settingsCloseGuard = { dirty: false, busy: false }
+  const target = settingsWindow = new BrowserWindow({
+    ...testWindowOptions(backgroundTests), width: 1000, height: 720, minWidth: 800, minHeight: 560,
+    title: 'Settings — Perpetual Swap Suite', backgroundColor: '#101114', show: false,
+    ...(process.platform === 'darwin' ? { titleBarStyle: 'hidden', trafficLightPosition: windowToolbarLayout(1600, true).buttonsPosition } : {}),
+    webPreferences: { ...testWindowOptions(backgroundTests).webPreferences,
+      additionalArguments: ['--perpetual-swap-settings-window', ...(operationRecording ? ['--perpetual-swap-operation-recording'] : []),
+        ...(!presentation.getState().active ? ['--perpetual-swap-presentation-idle'] : [])],
+      preload: join(root, 'electron', 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true },
+  })
+  subscribeWindowNotifications(target, true)
+  let allowClose = false, closing = false
+  target.on('close', event => {
+    if (allowClose || shuttingDown) return
+    event.preventDefault()
+    if (closing) return
+    closing = true
+    void querySettingsCloseGuard(target).then(async () => {
+      if (target.isDestroyed() || !canCloseSettings()) { closing = false; return }
+      await drainRendererOperations(target).catch(error => console.error('Settings operation shutdown failed:', error))
+      for (const executionId of rendererOperations?.sourcesFor(target.webContents.id) ?? []) await closeExternalOperationSource(executionId)
+      allowClose = true
+      if (!target.isDestroyed()) target.close()
+    }).catch(error => { closing = false; console.error('Settings operation source close failed:', error) })
+  })
+  target.once('closed', () => { if (settingsWindow === target) settingsWindow = undefined; settingsCloseGuard = { dirty: false, busy: false } })
+  for (const name of ['will-navigate', 'will-redirect', 'will-frame-navigate']) target.webContents.on(name, event => { if (!security.isAllowedNavigation(event.url)) event.preventDefault() })
+  target.webContents.setWindowOpenHandler(({ url }) => {
+    if (security.isAllowedExternalURL(url)) void shell.openExternal(url).catch(error => console.error('Could not open external link:', error))
+    return { action: 'deny' }
+  })
+  try {
+    if (rendererURL) await target.loadURL(rendererURL)
+    else await target.loadFile(join(root, 'dist', 'index.html'))
+  } catch (error) { if (!target.isDestroyed()) target.destroy(); throw error }
+}
+
+function installApplicationMenu() {
+  const settings = { id: 'open-settings', label: 'Settings…', accelerator: 'CmdOrCtrl+,', click: () => {
+    void openSettings().catch(error => console.error('Could not open settings:', error))
+  } }
+  const template = [
+    ...(process.platform === 'darwin' ? [{ label: 'Perpetual Swap Suite', submenu: [
+      { role: 'about' }, { type: 'separator' }, settings, { type: 'separator' }, { role: 'services' },
+      { type: 'separator' }, { role: 'hide' }, { role: 'hideOthers' }, { role: 'unhide' },
+      { type: 'separator' }, { role: 'quit' },
+    ] }] : []),
+    { role: 'fileMenu' },
+    ...(process.platform === 'darwin' ? [{ role: 'editMenu' }] : [{ label: 'Edit', submenu: [
+      { role: 'undo' }, { role: 'redo' }, { type: 'separator' }, { role: 'cut' }, { role: 'copy' },
+      { role: 'paste' }, { role: 'selectAll' }, { type: 'separator' }, settings,
+    ] }]),
+    { role: 'viewMenu' }, { role: 'windowMenu' },
+  ]
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template))
+}
 
 async function createWindow() {
   if (shuttingDown || window && !window.isDestroyed()) return
@@ -213,11 +334,11 @@ async function createWindow() {
   else await window.loadFile(join(root, 'dist', 'index.html'))
 }
 
-function subscribeWindowNotifications(target) {
+function subscribeWindowNotifications(target, settingsOnly = false) {
   const listeners = [
     ['chart', 'radar:chart-prepared'], ['market', 'radar:market-changed'],
     ['audit', 'radar:audit-changed'], ['history-download', 'radar:history-download-changed'],
-  ].map(([name, channel]) => [name, value => {
+  ].filter(([name]) => !settingsOnly || name === 'audit' || name === 'history-download').map(([name, channel]) => [name, value => {
     if (!shuttingDown && !target.isDestroyed() && !target.webContents.isDestroyed()) sendNotification(target.webContents, channel, value)
   }])
   let attached = false
@@ -238,7 +359,7 @@ function subscribeWindowNotifications(target) {
     detach()
   })
   target.webContents.on('render-process-gone', detach)
-  target.webContents.on('did-start-loading', () => {
+  if (!settingsOnly) target.webContents.on('did-start-loading', () => {
     if (presentation.desiredActive) void presentation.setActive(true, { refresh: true })
   })
   attach()
@@ -278,18 +399,23 @@ async function startDesktop() {
   }
   backend.on('failure', error => { console.error('Market backend failed:', error); send('radar:market-changed') })
   ipcMain.handle('radar:request', handleRequest)
-  ipcMain.handle('radar:presentation-state', event => { security.assertTrustedSender(event, window); return presentation.getState() })
+  ipcMain.handle('radar:presentation-state', event => { assertApplicationSender(event); return presentation.getState() })
+  ipcMain.on('radar:settings-close-guard', (event, value) => {
+    try { assertSettingsSender(event) } catch { return }
+    if (typeof value?.dirty === 'boolean' && typeof value?.busy === 'boolean') settingsCloseGuard = { dirty: value.dirty, busy: value.busy }
+  })
+  ipcMain.handle('radar:settings-close', event => { assertSettingsSender(event); settingsWindow.close() })
   if (rendererOperations) {
   ipcMain.handle('radar:operations-initialize', (event, value) => {
-    security.assertTrustedSender(event, window)
+    assertApplicationSender(event)
     return rendererOperations.initialize(event.sender.id, value?.nonce)
   })
   ipcMain.handle('radar:operations', (event, batch) => {
-    security.assertTrustedSender(event, window)
+    assertApplicationSender(event)
     return rendererOperations.receive(event.sender.id, batch)
   })
   ipcMain.handle('radar:operations-failure', (event, value) => {
-    security.assertTrustedSender(event, window)
+    assertApplicationSender(event)
     rendererOperations.fail(event.sender.id, value)
   })
   }
@@ -298,6 +424,7 @@ async function startDesktop() {
 }
 
 app.whenReady().then(() => {
+  installApplicationMenu()
   if (operationRecording) {
     installElectronOperationHooks({ app, net, session })
     void operationRecording.flush().catch(error => console.error('Operation hook checkpoint failed:', error.message))
@@ -314,12 +441,10 @@ app.whenReady().then(() => {
 }).catch(error => { console.error('Desktop startup failed:', error); app.quit() })
 app.once('will-quit', () => { stopTestOwner(); clearTimeout(testOwnerExitTimer) })
 app.on('activate', () => {
-  if (!backgroundTests && app.isReady() && !shuttingDown && BrowserWindow.getAllWindows().length === 0) void startupTask.then(createWindow).catch(error => console.error('Could not open application window:', error))
+  if (!backgroundTests && app.isReady() && !shuttingDown && (!window || window.isDestroyed())) void startupTask.then(createWindow).catch(error => console.error('Could not open application window:', error))
 })
-app.on('before-quit', event => {
-  if (shutdownComplete) return
-  event.preventDefault()
-  if (shuttingDown) return
+let quitChecking = false
+function startShutdown() {
   shuttingDown = true
   ipcMain.removeHandler('radar:request')
   void (async () => {
@@ -329,9 +454,7 @@ app.on('before-quit', event => {
       try { await backend?.dispose() }
       catch (error) { console.error('Market backend shutdown failed:', error) }
       await Promise.allSettled([...desktopRequests])
-      if (window && !window.isDestroyed() && !window.webContents.isDestroyed()) {
-        await drainRendererOperations(window).catch(error => console.error('Renderer operation shutdown failed:', error))
-      }
+      await Promise.all([window, settingsWindow].filter(target => target && !target.isDestroyed() && !target.webContents.isDestroyed()).map(target => drainRendererOperations(target).catch(error => console.error('Renderer operation shutdown failed:', error))))
       await stopGraphicsRecording?.()
       await closeOperationRecording()
       recordingComplete = true
@@ -350,5 +473,18 @@ app.on('before-quit', event => {
       shutdownComplete = true; app.quit()
     }
   })()
+}
+app.on('before-quit', event => {
+  if (shutdownComplete) return
+  event.preventDefault()
+  if (shuttingDown || quitChecking) return
+  const target = settingsWindow
+  if (!target || target.isDestroyed()) { startShutdown(); return }
+  quitChecking = true
+  void querySettingsCloseGuard(target).then(() => {
+    quitChecking = false
+    if (settingsWindow === target && !target.isDestroyed() && !canCloseSettings()) return
+    startShutdown()
+  }).catch(error => { quitChecking = false; console.error('Could not check settings before quitting:', error) })
 })
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })

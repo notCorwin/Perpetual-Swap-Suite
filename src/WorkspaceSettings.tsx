@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { ChevronLeft, ChevronRight, Database, Settings2, SlidersHorizontal } from 'lucide-react'
+import { ChevronRight, Database, Settings2, SlidersHorizontal } from 'lucide-react'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Field, FieldContent, FieldDescription, FieldError, FieldGroup, FieldLabel, FieldLegend, FieldSet } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
@@ -70,8 +70,11 @@ function HistoryDownloadSettings({ open, onStatusChange, onJobSnapshot }: { open
     setReady(false)
     const published = (event: Event) => accept((event as CustomEvent<HistoryDownload>).detail)
     window.addEventListener('radar-history-download-changed', published)
-    const stop = subscribePresentationTransition(update => { if (update.active && update.snapshot) accept(update.snapshot.download) })
-    if (getPresentation().active) void request('status')
+    const stop = subscribePresentationTransition(update => {
+      if (update.active && update.snapshot) accept(update.snapshot.download)
+      else if (update.active && update.epoch > 0) void request('status')
+    })
+    if (getPresentation().active && getPresentation().epoch === 0) void request('status')
     return () => { stop(); window.removeEventListener('radar-history-download-changed', published); lifecycle.current++ }
   }, [open, accept, request])
   const { progress, contracts, streams } = download
@@ -189,7 +192,7 @@ export function WorkspaceSettings({ section, active, preferences, loaded, loadEr
       focusAfterValidation.current = null
     } else heading.current?.focus({ preventScroll: true })
   }, [active, section])
-  useEffect(() => { onNavigationStateChange({ dirty: active && dirty, busy: saving }) }, [active, dirty, saving, onNavigationStateChange])
+  useLayoutEffect(() => { onNavigationStateChange({ dirty: active && dirty, busy: saving }) }, [active, dirty, saving, onNavigationStateChange])
   useEffect(() => () => onNavigationStateChange({ dirty: false, busy: false }), [onNavigationStateChange])
   const [audit, setAudit] = useState<DataAudit>(emptyAudit)
   const [auditError, setAuditError] = useState('')
@@ -208,13 +211,12 @@ export function WorkspaceSettings({ section, active, preferences, loaded, loadEr
   useEffect(() => {
     if (!dataMounted) return
     const lifecycle = ++auditLifecycle.current
-    const accepted = auditAccepted.current
-    const epoch = getPresentation().epoch
     setAuditBusy(false); setAuditError(''); setAuditStatusError('')
     const published = (event: Event) => acceptAudit((event as CustomEvent<DataAudit>).detail)
     window.addEventListener('radar-audit-changed', published)
-    const stop = subscribePresentationTransition(update => { if (update.active && update.snapshot) acceptAudit(update.snapshot.audit) })
     const status = async () => {
+      const accepted = auditAccepted.current
+      const epoch = getPresentation().epoch
       try {
         const value = await window.radarDesktop.request({ dataAudit: { action: 'status' } })
         if (lifecycle === auditLifecycle.current && getPresentation().active && epoch === getPresentation().epoch && accepted === auditAccepted.current) acceptAudit(value)
@@ -222,7 +224,11 @@ export function WorkspaceSettings({ section, active, preferences, loaded, loadEr
         if (lifecycle === auditLifecycle.current && getPresentation().active && epoch === getPresentation().epoch && accepted === auditAccepted.current) setAuditStatusError('Audit status unavailable. Check the data service and reopen Data settings.')
       }
     }
-    if (getPresentation().active) void status()
+    const stop = subscribePresentationTransition(update => {
+      if (update.active && update.snapshot) acceptAudit(update.snapshot.audit)
+      else if (update.active && update.epoch > 0) void status()
+    })
+    if (getPresentation().active && getPresentation().epoch === 0) void status()
     return () => { stop(); window.removeEventListener('radar-audit-changed', published); auditLifecycle.current++ }
   }, [dataMounted, acceptAudit])
   const auditAction = async (action: 'start' | 'cancel' | 'repair') => {
@@ -282,7 +288,7 @@ export function WorkspaceSettings({ section, active, preferences, loaded, loadEr
   return <main aria-label="Settings" data-layout="settings-workspace" className="flex h-full min-w-0 flex-1 flex-col bg-background">
     <header data-window-toolbar data-window-drag-region className="flex border-b">
       <div data-native-window-controls-row className="flex h-full w-64 shrink-0 items-center border-r px-4">
-        <h1><a href="#/" className={buttonVariants({ variant: 'ghost' })}><ChevronLeft aria-hidden="true" data-icon="inline-start" />Settings</a></h1>
+        <h1 className="text-sm font-medium">Settings</h1>
       </div>
     </header>
     <div className="flex min-h-0 flex-1">
