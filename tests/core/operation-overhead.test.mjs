@@ -238,7 +238,7 @@ test('native traffic and the real renderer retain matched trials and separate fa
     assert.ok(report.failures.some(failure => failure.phase === 'nativeMarket' && failure.metric === 'wallMS'))
     assert.deepEqual(report.failures, assessBudgets(report, budgets))
     assert.equal(report.runs.length, 8, 'Diagnostic runs cannot enter gated medians.')
-    assert.ok(report.sourceHashes['src/rsi-crossings.ts'], 'Renderer source identity must include transitive chart calculations.')
+    assert.ok(report.sourceHashes['src/chart-layout.ts'], 'Renderer source identity must include transitive chart calculations.')
     assert.equal(report.sourceHashes['electron/services/market-store.js'], createHash('sha256')
       .update(await readFile(new URL('../../electron/services/market-store.js', import.meta.url))).digest('hex'),
     'The measured backend source identity includes the candle reuse implementation.')

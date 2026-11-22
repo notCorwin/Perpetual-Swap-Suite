@@ -29,7 +29,7 @@ export class SettingsRevisionConflictError extends Error {
 /** SQLite stores settings, audits, catalog entries, and manual download reports. */
 export class MetadataStore {
   private constructor(database: unknown)
-  static open(root: string, options?: { legacySettingsPath?: string }): Promise<MetadataStore>
+  static open(root: string): Promise<MetadataStore>
   getSettings(): SettingsSnapshot
   /** Deep merge reads the latest revision inside a transaction; optional CAS. */
   updateSettings(patch: PreferencesPatch, options?: { expectedRevision?: number }): SettingsSnapshot

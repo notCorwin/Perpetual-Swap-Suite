@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
-import { mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -426,84 +426,39 @@ test('close joins accepted transactions and rejects subsequent requests', async 
   } finally { await f.close() }
 })
 
-test('removing archive bookkeeping preserves committed SQLite history across restart', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-sqlite-cutover-'))
-  let store = await MarketStore.open(root)
+
+test('unsupported market schemas are rejected without changing existing data', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-unsupported-market-'))
   try {
-    await store.appendCandles([candle(0)])
-    await store.appendStatistics({ ...query, from: base, through: base, source: 'oi', values: [[base, 1234]] })
-    const saved = await store.candles(query)
-    await store.close()
     const database = new DatabaseSync(join(root, 'market.sqlite'))
-    try {
-      database.exec(`CREATE TABLE migration_partitions(path TEXT PRIMARY KEY, status TEXT);
-        CREATE TABLE import_issues(path TEXT PRIMARY KEY);
-        CREATE TABLE replacements(series_id INTEGER);
-        PRAGMA user_version=3;`)
-    } finally { database.close() }
-    store = await MarketStore.open(root)
-    assert.deepEqual(await store.candles(query), saved)
-    assert.deepEqual(await store.integrityCheck(), ['ok'])
-    await store.close()
-    const migrated = new DatabaseSync(join(root, 'market.sqlite'), { readOnly: true })
-    try {
-      assert.equal(migrated.prepare('PRAGMA user_version').get()!.user_version, 4)
-      const tables = migrated.prepare("SELECT name FROM sqlite_schema WHERE type='table'").all().map(row => row.name)
-      for (const name of ['migration_partitions', 'import_issues', 'replacements']) assert.ok(!tables.includes(name))
-      assert.ok(migrated.prepare('PRAGMA table_info(candles)').all().some(row => row.name === 'import_version'), 'Upgrade must avoid rewriting history merely to remove an inert column.')
-    } finally { migrated.close() }
-    store = await MarketStore.open(root)
-    assert.deepEqual(await store.candles(query), saved)
-  } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
+    try { database.exec("CREATE TABLE retained(value TEXT); INSERT INTO retained VALUES('preserved'); PRAGMA user_version=3;") }
+    finally { database.close() }
+    await assert.rejects(MarketStore.open(root), /Unsupported market database schema version/)
+    const retained = new DatabaseSync(join(root, 'market.sqlite'), { readOnly: true })
+    try { assert.equal(retained.prepare('SELECT value FROM retained').get()!.value, 'preserved') }
+    finally { retained.close() }
+  } finally { await rm(root, { recursive: true, force: true }) }
 })
 
-for (const completed of [false, true]) test(`legacy archives ${completed ? 'with durable cutover keep SQLite available' : 'without cutover reject with recovery guidance'}`, async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-archive-upgrade-'))
+test('current market database with retained import columns preserves facts across writes and restart', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'perp-current-market-'))
   let store: MarketStore | undefined
   try {
     store = await MarketStore.open(root)
     await store.appendCandles([candle(0)])
-    await store.close()
-    await mkdir(join(root, 'candles'))
-    const db = new DatabaseSync(join(root, 'market.sqlite'))
+    await store.close(); store = undefined
+    const database = new DatabaseSync(join(root, 'market.sqlite'))
     try {
-      db.exec(`CREATE TABLE migration_partitions(path TEXT PRIMARY KEY, status TEXT);
-        PRAGMA user_version=3;`)
-      if (completed) db.exec("INSERT INTO migration_partitions VALUES('__complete__','completed')")
-    } finally { db.close() }
-    if (completed) {
-      store = await MarketStore.open(root)
-      assert.equal((await store.candles(query))[0].close, 100)
-      await store.close()
-      store = await MarketStore.open(root)
-      assert.equal((await store.candles(query))[0].close, 100)
-    } else await assert.rejects(MarketStore.open(root), /Finish the SQLite migration using the previous app version/)
-    assert.ok((await readdir(root)).includes('candles'), 'Original archives must remain untouched.')
+      database.exec('ALTER TABLE candles ADD COLUMN import_version INTEGER NOT NULL DEFAULT 0; ALTER TABLE statistics ADD COLUMN import_version INTEGER NOT NULL DEFAULT 0;')
+    } finally { database.close() }
+    store = await MarketStore.open(root)
+    await store.appendCandles([candle(1, 102)])
+    await store.appendStatistics({ ...query, from: base, through: base, source: 'oi', values: [[base, 1234]] })
+    await store.close(); store = undefined
+    store = await MarketStore.open(root)
+    const rows = await store.candles({ ...query, through: base + step })
+    assert.deepEqual(rows.map(row => row.close), [100, 102])
+    assert.equal(rows[0].oi, 1234)
+    assert.deepEqual(await store.integrityCheck(), ['ok'])
   } finally { await store?.close(); await rm(root, { recursive: true, force: true }) }
-})
-
-for (const failure of ['manifest', 'issue'] as const) test(`cutover preserves unresolved ${failure} recovery information despite a completion marker`, async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-failed-archive-upgrade-'))
-  const store = await MarketStore.open(root)
-  try {
-    await store.appendCandles([candle(0)])
-    await store.close()
-    const db = new DatabaseSync(join(root, 'market.sqlite'))
-    try {
-      db.exec(`CREATE TABLE migration_partitions(path TEXT PRIMARY KEY, status TEXT, value TEXT);
-        CREATE TABLE import_issues(path TEXT PRIMARY KEY, detail TEXT);
-        INSERT INTO migration_partitions VALUES('__complete__','completed','{}');
-        PRAGMA user_version=3;`)
-      if (failure === 'manifest') db.prepare('INSERT INTO migration_partitions VALUES(?,?,?)').run('failed-partition', 'failed', 'invalid-schema')
-      else db.prepare('INSERT INTO import_issues VALUES(?,?)').run('failed-partition', 'original failure detail')
-    } finally { db.close() }
-    await assert.rejects(MarketStore.open(root), /Resolve failed partitions using the previous app version/)
-    const retained = new DatabaseSync(join(root, 'market.sqlite'), { readOnly: true })
-    try {
-      assert.equal(retained.prepare('PRAGMA user_version').get()!.user_version, 3)
-      assert.equal(retained.prepare('SELECT COUNT(*) AS count FROM candles').get()!.count, 1)
-      if (failure === 'manifest') assert.deepEqual({ ...retained.prepare('SELECT status,value FROM migration_partitions WHERE path=?').get('failed-partition') }, { status: 'failed', value: 'invalid-schema' })
-      else assert.equal(retained.prepare('SELECT detail FROM import_issues WHERE path=?').get('failed-partition')!.detail, 'original failure detail')
-    } finally { retained.close() }
-  } finally { await store.close(); await rm(root, { recursive: true, force: true }) }
 })

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { _electron } from 'playwright'
@@ -20,7 +20,6 @@ test('resource paint capture stops before oracle work and retains repaired corru
   const fixture = { intervals: { '15m': step }, periods, asOf }
   let electron, page, counter
   try {
-    await writeFile(join(directory, 'settings.json'), JSON.stringify({ monitoringPaused: true, backgroundMonitoringEnabled: false }))
     electron = await _electron.launch({ args: ['.'], cwd: new URL('../..', import.meta.url).pathname,
       env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PERPETUAL_SWAP_E2E: '1', PERPETUAL_SWAP_USER_DATA: directory } })
     page = await electron.firstWindow()
@@ -33,11 +32,11 @@ test('resource paint capture stops before oracle work and retains repaired corru
         chartRenderedBars: '96', chartVisualStale: 'false', chartLoading: 'false' })
       Object.assign(svg.dataset, { renderedInst: 'SCALE000-USDT-SWAP', renderedTimeframe: '15m', renderedEnd: String(asOf) })
       svg.setAttribute('aria-hidden', 'false'); svg.style.visibility = 'visible'
-      label.dataset.chartPriceLabelValue = ''; label.textContent = '113.204 ↑'
+      label.dataset.chartPriceLabelValue = ''; label.textContent = '+0.18% ↑'
       svg.append(label); chart.append(svg); document.body.prepend(chart)
       bars.forEach(Object.freeze)
       const snapshot = Object.freeze({ instId: 'SCALE000-USDT-SWAP', timeframe: '15m', endHour: asOf - step,
-        bars: Object.freeze(bars), liveBar: Object.freeze({ hour: asOf, close: 113.204 }), priceObservedAt: 402,
+        bars: Object.freeze(bars), liveBar: Object.freeze({ hour: asOf, open: 113, close: 113.204 }), priceObservedAt: 402,
         indicatorState: 'ready', oiState: 'loading', takerState: 'loading' })
       chart.__chartSnapshot = snapshot
       window.__resourcePaintFixture = { chart, label, snapshot }
@@ -57,7 +56,7 @@ test('resource paint capture stops before oracle work and retains repaired corru
     assert.equal(await page.evaluate(() => window.__resourcePaint.indicatorValuesChecked), 0, 'CPU capture must end before numerical validation begins.')
     const healthy = await page.evaluate(() => window.__resourcePaint.finish())
     assert.equal(healthy.complete, true, JSON.stringify(healthy.violations))
-    assert.equal(healthy.indicatorValuesChecked, 96 * 12)
+    assert.equal(healthy.indicatorValuesChecked, 96 * 11)
     assert.equal(healthy.cpuMarkerTimings.samples, cpu.totalSamples)
     assert.equal(healthy.stopped.endedAt, stopped.endedAt)
     assert.ok(healthy.deferredValidation.reusedBarChecks > 0)
@@ -69,14 +68,14 @@ test('resource paint capture stops before oracle work and retains repaired corru
       const mutableBars = snapshot.bars.map(bar => ({ ...bar }))
       mutableBars[0].ema += 7
       chart.__chartSnapshot = { ...snapshot, bars: mutableBars }
-      label.textContent = '113.203 ↑'
+      label.textContent = '+0.17% ↑'
     })
     await page.evaluate(installResourcePaintProbe, fixture)
     await page.waitForFunction(() => window.__resourcePaint.records.some(record => Number.isFinite(record.nextFrameAt)))
     await page.evaluate(() => {
       const { chart, label, snapshot } = window.__resourcePaintFixture
       chart.__chartSnapshot.bars[0].ema = snapshot.bars[0].ema
-      label.textContent = '113.204 ↑'
+      label.textContent = '+0.18% ↑'
       window.__resourcePaint.stop()
     })
     const corrupted = await page.evaluate(() => window.__resourcePaint.finish())
@@ -92,15 +91,15 @@ test('resource paint capture stops before oracle work and retains repaired corru
     assert.equal(await page.evaluate(() => window.__resourcePaint.records.length), count)
     await page.evaluate(() => {
       const { chart, label, snapshot } = window.__resourcePaintFixture
-      chart.__chartSnapshot = snapshot; label.textContent = '113.204 ↑'
+      chart.__chartSnapshot = snapshot; label.textContent = '+0.18% ↑'
     })
     await page.evaluate(installResourcePaintProbe, fixture)
     await page.waitForFunction(() => window.__resourcePaint.records.some(window.__resourcePaint.isFrame))
     await page.evaluate(async () => {
       const { label } = window.__resourcePaintFixture
-      label.textContent = '113.203 ↑'
+      label.textContent = '+0.17% ↑'
       await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
-      label.textContent = '113.204 ↑'
+      label.textContent = '+0.18% ↑'
       window.__resourcePaint.stop()
     })
     const domOnly = await page.evaluate(() => window.__resourcePaint.finish())

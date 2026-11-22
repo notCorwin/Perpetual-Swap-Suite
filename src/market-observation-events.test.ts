@@ -59,7 +59,7 @@ test('canonical snapshot and prepared frame reads never admit source or calculat
     assert.equal(service.revision, revision)
     assert.deepEqual([...service.rankings], ranking)
     assert.deepEqual([...service.rankingWindows], windows)
-    assert.deepEqual(await service.getPreparedCharts(), { frames: [] })
+    assert.deepEqual(await service.preparedCharts.residentFrames(), { frames: [] })
     assert.equal(f.requests(), 0)
   } finally { await f.close() }
 })

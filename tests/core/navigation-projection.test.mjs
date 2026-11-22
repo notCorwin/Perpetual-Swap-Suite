@@ -32,7 +32,6 @@ async function validateProjection(context, { project = bar => ({ ...bar }), requ
 test('navigation validates projected statistics independently of the complete canonical snapshot', async context => {
   const report = await validateProjection(context, { project: bar => ({ ...bar, oi: null, buy: null, sell: null }) })
   for (const field of ['oi', 'buy', 'sell']) assert.ok(report.violations.some(value => value.includes(`${field} has the wrong source value`)), field)
-  for (const source of ['OI', 'Taker buy', 'Taker sell']) assert.ok(report.violations.some(value => value.startsWith(`${source} geometry was incomplete`)), source)
 })
 
 test('navigation rejects projected observation loss and numerically corrupted values', async context => {

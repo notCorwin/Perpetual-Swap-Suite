@@ -71,7 +71,6 @@ const delayedHistory = await withBenchmarkApp(async (electron, page, fixture) =>
     const heldRequests = await readRequestProbe(electron)
     assert.equal(heldRequests.heldSettled, false, 'The latest cursor must finish before the older disk reply is released.')
     assert.ok(heldRequests.maxHistoricalActive <= 2 && heldRequests.maxLocalActive <= 2, 'Navigation must bound each pure read lane independently of backend focus demand.')
-    assert.equal(heldRequests.legacyWindowCalls, 0)
     const heldEnd = Number(await page.locator('svg[data-rendered-inst]').getAttribute('data-rendered-end'))
     assert.equal(heldEnd, expectedEnd)
     const beforeRelease = await page.evaluate(() => window.__chartPaintProbe.commits.length)

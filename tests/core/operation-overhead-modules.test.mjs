@@ -10,11 +10,11 @@ import { loadRendererModules } from '../../scripts/operation-overhead-modules.mj
 test('the actual benchmark serves and fingerprints the chart runtime dependencies', async () => {
   const root = fileURLToPath(new URL('../..', import.meta.url))
   const { modules, hashes } = await loadRendererModules(root)
-  assert.ok(modules.has('/src/rsi-crossings.ts'), 'Chart geometry must load its crossing calculator in the benchmark.')
+  assert.ok(modules.has('/src/chart-layout.ts'), 'Chart geometry must load its layout calculations in the benchmark.')
   assert.ok(modules.has('/electron/services/operations.js'))
   assert.equal(modules.has('/src/chart-data.ts'), false, 'Erased type imports do not create browser requests.')
-  const source = await readFile(join(root, 'src/rsi-crossings.ts'), 'utf8')
-  assert.equal(hashes['src/rsi-crossings.ts'], createHash('sha256').update(source).digest('hex'))
+  const source = await readFile(join(root, 'src/chart-layout.ts'), 'utf8')
+  assert.equal(hashes['src/chart-layout.ts'], createHash('sha256').update(source).digest('hex'))
 })
 
 test('new transitive imports load automatically and invalidate fingerprints through cycles and re-exports', async t => {

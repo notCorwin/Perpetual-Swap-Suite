@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { advanceChartWheel, chartWheelIntent, chartZoomDemand, chartZoomSpacing, chartRsiNavigationTarget, chartWheelContentOffset, chartPresentedWheelFraction, createChartWheelBatch, createChartWheelScheduler } from './chart-navigation.ts'
+import { advanceChartWheel, chartWheelIntent, chartZoomDemand, chartZoomSpacing, chartWheelContentOffset, chartPresentedWheelFraction, createChartWheelBatch, createChartWheelScheduler } from './chart-navigation.ts'
 
 function wheelSchedulerHarness() {
   const microtasks: Array<() => void> = []
@@ -24,16 +24,6 @@ function wheelSchedulerHarness() {
     },
   }
 }
-
-test('RSI keyboard navigation excludes overscan crossings and stops at visible boundaries', () => {
-  const indices = [-1, 0, 25, 25, 60, -1]
-  assert.equal(chartRsiNavigationTarget(indices, 0, -1), undefined)
-  assert.equal(chartRsiNavigationTarget(indices, 25, -1), 0)
-  assert.equal(chartRsiNavigationTarget(indices, -1, 1), 0)
-  assert.equal(chartRsiNavigationTarget(indices, 60, 1), undefined)
-  assert.equal(chartRsiNavigationTarget(indices, -1, -1), undefined, 'Moving outward from a left neighbour cannot wrap to the last crossing.')
-  assert.equal(chartRsiNavigationTarget(indices, 96, 1), undefined, 'Moving outward from a right neighbour cannot wrap to the first crossing.')
-})
 
 test('wheel input moves by fractions immediately and commits exactly the accumulated whole bars', () => {
   let remainder = 0

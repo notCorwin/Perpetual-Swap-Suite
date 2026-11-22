@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { chartAxis, chartAxisForLabels, chartTimeLabels, chartTimeTicks, chartTimeTickStep, logarithmicChartAxis, logarithmicScale } from "./chart-axis.ts"
+import { chartTimeLabels, chartTimeTicks, chartTimeTickStep } from "./chart-axis.ts"
 
 test('time labels preserve date context across days and stay inside the axis without overlaps', () => {
   const start = new Date(2026, 10, 20, 22, 0).getTime()
@@ -45,54 +45,4 @@ test('time ticks track pixel spacing and stay aligned to actual candle times', (
   }
   // Local midnight and subsequent six-hour ticks in UTC+8.
   assert.deepEqual(chartTimeTicks(Date.UTC(2026, 10, 19, 16), Date.UTC(2026, 10, 19, 17), 3_600_000, 6, -480), [Date.UTC(2026, 10, 19, 16)])
-})
-
-test("linear axes keep data bounds independent of rounded ticks", () => {
-  const price = chartAxis(90.23, 94.34, 8)
-  assert.deepEqual([price.min, price.max], [90.23, 94.34])
-  assert.deepEqual(price.ticks, [91, 92, 93, 94])
-  assert.deepEqual(chartAxis(0.0000482, 0.0000491, 8).ticks, [0.0000482, 0.0000484, 0.0000486, 0.0000488, 0.000049])
-  assert.deepEqual(chartAxis(2_567_200, 4_813_800).ticks, [3_000_000, 3_500_000, 4_000_000, 4_500_000])
-  const flat = chartAxis(42, 42)
-  assert.ok(flat.min < 42 && flat.max > 42)
-  const roc = chartAxis(-38.9, 38.9, 8)
-  assert.deepEqual([roc.min, roc.max], [-38.9, 38.9])
-  assert.ok(roc.ticks.every(tick => tick >= roc.min && tick <= roc.max))
-})
-
-test("indicator labels use an even, rounded interval within the available height", () => {
-  for (const [min, max] of [[1_450_000_000, 1_700_000_000], [1_430_000_000, 1_730_000_000], [0, 519_660]]) {
-    const axis = chartAxisForLabels(min, max, 4)
-    assert.deepEqual([axis.min, axis.max], [min, max])
-    assert.ok(axis.ticks.length <= 4)
-    assert.ok(axis.ticks.every((tick, index) => tick >= min && tick <= max && (!index || Math.abs(tick - axis.ticks[index - 1] - axis.step) < axis.step * 1e-9)))
-  }
-})
-
-test("price log axis gives equal space to equal price ratios and handles narrow ranges", () => {
-  const axis = logarithmicChartAxis(10, 1_000, 7)
-  const panel: readonly [number, number] = [0, 300]
-  const y = logarithmicScale(axis, panel)
-  assert.ok(Math.abs((y(10) - y(100)) - (y(100) - y(1_000))) < 1e-9)
-  assert.ok(axis.ticks.length <= 7 && axis.ticks.every(tick => tick > 0))
-  for (const [min, max] of [[90, 94.34], [0.0000482, 0.0000491], [42, 42]]) {
-    const narrow = logarithmicChartAxis(min, max, 8)
-    const narrowY = logarithmicScale(narrow, panel)
-    assert.ok(narrow.min > 0 && narrow.min < min && narrow.max > max)
-    assert.ok(narrow.ticks.length >= 2 && narrow.ticks.length <= 8)
-    assert.ok(narrow.ticks.every((tick, index) => index === 0 || tick > narrow.ticks[index - 1]))
-    assert.ok(narrow.ticks.every(tick => Number.isFinite(narrowY(tick))))
-  }
-})
-
-test("zero-inclusive log axes retain zero for open interest", () => {
-  const axis = logarithmicChartAxis(0, 1_000, 6, true)
-  const panel: readonly [number, number] = [0, 150]
-  const y = logarithmicScale(axis, panel)
-  assert.equal(y(0), panel[1])
-  assert.ok(Math.abs((y(0) - y(1)) - (y(1) - y(3))) < 1e-9)
-  assert.ok(y(500) < y(200))
-  const empty = logarithmicChartAxis(0, 0, 4, true)
-  assert.ok(empty.max > 0 && empty.ticks.includes(0))
-  assert.ok(logarithmicChartAxis(0, 100, 5, true).ticks.length <= 5)
 })

@@ -1,28 +1,9 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { chartCandleWidth, chartContentClip, chartHourX, chartIndicatorLabelLayout, chartLayout, chartPanelClip, chartPriceInPanel, chartPriceLabelLayout, type ChartPanel } from "./chart-layout.ts"
-
-test("stacked chart layout stays aligned and bounded", () => {
-  const order: ChartPanel[] = ["price", "roc", "rsi", "atr", "oi", "taker"]
-  for (const [width, height] of [[900, 700], [1440, 900], [2560, 900]]) {
-    const layout = chartLayout(width, height, 48)
-    assert.equal(layout.left, 0)
-    assert.equal(layout.right + 48, width - 4)
-    assert.ok(Math.abs((layout.panels.price[1] - layout.panels.price[0]) / (layout.panels.roc[1] - layout.panels.roc[0]) - 40 / 12) < 0.001)
-    for (const [index, key] of order.entries()) {
-      assert.deepEqual(layout.columns[key], layout.columns.price)
-      assert.ok(layout.axisStarts[key] - layout.columns[key][1] >= 8)
-      assert.ok(layout.axisStarts[key] < width)
-      assert.ok(layout.columns[key][0] < layout.columns[key][1] && layout.columns[key][1] <= width)
-      assert.ok(layout.panels[key][0] < layout.panels[key][1] && layout.panels[key][1] <= height)
-      assert.ok(layout.headerY[key] < layout.panels[key][0])
-      if (index) assert.ok(layout.panels[order[index - 1]][1] < layout.panels[key][0])
-    }
-  }
-})
+import { chartCandleWidth, chartContentClip, chartHourX, chartIndicatorLabelLayout, chartLayout, chartPanelClip, chartPriceInPanel, chartPriceLabelLayout } from "./chart-layout.ts"
 
 test("price-only plot meets the top of the viewport while reserving its axes", () => {
-  const layout = chartLayout(960, 700, 64, true)
+  const layout = chartLayout(960, 700, 64)
   assert.equal(layout.panels.price[0], 0)
   assert.equal(layout.panels.price[1], 684)
   assert.ok(layout.right < 960)
@@ -46,16 +27,13 @@ test("fractional content clipping stops before axis labels and legends", () => {
   assert.equal(clip.width, layout.right - layout.columns.price[0])
   assert.equal(clip.y + clip.height, height)
   assert.ok(clip.x + clip.width < layout.axisStarts.price)
-  assert.ok(clip.y > layout.headerY.price)
 
   const pitch = 8.5
-  for (const panel of ["price", "roc", "rsi", "atr", "oi", "taker"] as const) {
-    const inner = chartPanelClip(layout, panel, pitch)
-    assert.equal(inner.x, layout.columns[panel][0] - pitch)
-    assert.equal(inner.x + inner.width, layout.columns[panel][1] + pitch)
-    assert.equal(inner.y, layout.panels[panel][0])
-    assert.equal(inner.height, layout.panels[panel][1] - layout.panels[panel][0])
-  }
+  const inner = chartPanelClip(layout, 'price', pitch)
+  assert.equal(inner.x, layout.columns.price[0] - pitch)
+  assert.equal(inner.x + inner.width, layout.columns.price[1] + pitch)
+  assert.equal(inner.y, layout.panels.price[0])
+  assert.equal(inner.height, layout.panels.price[1] - layout.panels.price[0])
   assert.equal(clip.x + clip.width, layout.right, 'The stationary outer clip still ends before the axis gutter.')
 })
 

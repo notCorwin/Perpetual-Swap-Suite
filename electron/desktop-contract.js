@@ -68,8 +68,7 @@ function optional(target, source, key, parse) {
 function chart(value, path) {
   const fields = ['instId', 'timeframe']
   if (path !== 'chartLocal') fields.push('endHour')
-  if (path === 'chartWindow') fields.push('historyBars')
-  if (path === 'chartWindow' || path === 'chartHistory') fields.push('focusId')
+  if (path === 'chartHistory') fields.push('focusId')
   if (path === 'chartFocus.target' || path === 'chartHistory') fields.push('windowBars')
   record(value, path, fields, ['instId', 'timeframe'])
   const result = { instId: text(value.instId, `${path}.instId`, { maximum: 256 }), timeframe: choice(value.timeframe, `${path}.timeframe`, TIMEFRAMES) }
@@ -77,7 +76,6 @@ function chart(value, path) {
     if (!validChartWindowBars(input)) throw new DesktopRequestError(`${path}.windowBars`, 'must be a supported chart window size')
     return input
   })
-  optional(result, value, 'historyBars', input => number(input, `${path}.historyBars`, 96, 4_096, true))
   optional(result, value, 'focusId', input => text(input, `${path}.focusId`, { maximum: 256 }))
   return optional(result, value, 'endHour', input => number(input, `${path}.endHour`, 0, Number.MAX_SAFE_INTEGER, true))
 }
@@ -190,7 +188,7 @@ function candle(value, index) {
 
 /** Validate the complete request before dispatching any operation or side effect. */
 export function parseDesktopRequest(value, { allowE2E = false } = {}) {
-  const operations = ['snapshot', 'preferences', 'dataAudit', 'historyDownload', 'chartFocus', 'chartWindow', 'chartLocal', 'chartHistory', 'chartUniverse', 'captureChart', 'screenshot', 'copyText', 'copyImage', 'statusLog', 'e2e']
+  const operations = ['snapshot', 'preferences', 'dataAudit', 'historyDownload', 'chartFocus', 'chartLocal', 'chartHistory', 'chartUniverse', 'captureChart', 'screenshot', 'copyText', 'copyImage', 'statusLog', 'e2e']
   record(value, 'request', operations)
   const keys = Object.keys(value)
   if (keys.length !== 1) invalid('request', 'must contain exactly one operation')
@@ -220,7 +218,6 @@ export function parseDesktopRequest(value, { allowE2E = false } = {}) {
       record(input, operation, ['action'], ['action'])
       return { historyDownload: { action: choice(input.action, 'historyDownload.action', ['start', 'cancel', 'status']) } }
     }
-    case 'chartWindow': return { chartWindow: chart(input, operation) }
     case 'chartFocus': {
       record(input, operation, ['id', 'target', 'slot'], ['id', 'target'])
       return { chartFocus: optional({ id: text(input.id, 'chartFocus.id', { maximum: 256 }), target: input.target === null ? null : chart(input.target, 'chartFocus.target') }, input, 'slot', value => choice(value, 'chartFocus.slot', ['primary', ...TIMEFRAMES])) }

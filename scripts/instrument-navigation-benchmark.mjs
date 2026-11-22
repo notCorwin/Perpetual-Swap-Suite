@@ -121,7 +121,7 @@ try {
   const requests = await electron.evaluate(() => globalThis.__navigationStartupRequests.requests)
   startup.selectionIPC = selectionRequests({ requests }).filter(request => request.instId === startup.instId
     && request.at >= startup.inputEpoch - 1 && request.at <= startup.commitEpoch + 1).length
-  if (startup.framesToCommit > 1 || !presentation.offscreen && startup.inputToSVGCommitMS > 50 || startup.selectionIPC > 2 || startup.violations.length
+  if (startup.framesToCommit > 1 || !presentation.offscreen && startup.inputToSVGCommitMS > 50 || startup.selectionIPC > 6 || startup.violations.length
     || !startup.rendererFramesBeforeInput.includes(`${startup.timeframe}:${startup.instId}`)) throw new Error(`Warm startup selection exceeded the local-read budget: ${JSON.stringify(startup)}`)
   await installNavigationProbe(electron)
   report.restart = { startup, ...await exerciseInstrumentNavigation(electron, page, fixture, { holdHistory: false }) }

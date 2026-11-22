@@ -148,7 +148,7 @@ function nativeExchangeFixture() {
   }
 }
 const initialize = runWorkerInitialization('market-backend', async () => {
-  metadata = await MetadataStore.open(workerData.userData, { legacySettingsPath: join(workerData.userData, 'settings.json') })
+  metadata = await MetadataStore.open(workerData.userData)
   preferences = metadata.getSettings().preferences
   store = await MarketStore.open(join(workerData.userData, 'MarketData'))
   const exchange = nativeExchangeFixture()
@@ -172,12 +172,11 @@ async function request(value) {
   if (value.snapshot) return service.snapshot(value.snapshot)
   if (value.dataAudit) return service.dataAuditRequest(value.dataAudit)
   if (value.historyDownload) return service.historyDownloadRequest(value.historyDownload)
-  if (value.chartFocus || value.chartWindow || value.chartLocal || value.chartHistory) {
+  if (value.chartFocus || value.chartLocal || value.chartHistory) {
     if (service.closing || service.disposed) throw new Error('Market service is closed.')
     const task = service.ready.then(() => {
       if (value.chartFocus) { service.preparedCharts.setFocus(value.chartFocus.target, value.chartFocus.id, value.chartFocus.slot); return { ok: true } }
-      const { instId, timeframe, endHour, historyBars, focusId, windowBars } = value.chartWindow ?? value.chartLocal ?? value.chartHistory
-      if (value.chartWindow) return service.preparedCharts.prepare(instId, timeframe, endHour, historyBars, { focusId })
+      const { instId, timeframe, endHour, focusId, windowBars } = value.chartLocal ?? value.chartHistory
       if (value.chartLocal) return service.preparedCharts.local(instId, timeframe)
       return focusId === undefined ? service.preparedCharts.localHistory(instId, timeframe, endHour)
         : service.preparedCharts.localHistory(instId, timeframe, endHour, { focusId, windowBars })

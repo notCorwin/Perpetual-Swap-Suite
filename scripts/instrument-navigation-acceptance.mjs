@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { assertChartViewport, assertWorkspaceLayout, selectTimeframe } from './chart-acceptance.mjs'
+import { chartViewportHours, assertWorkspaceLayout } from './chart-acceptance.mjs'
 import { assertNavigationResponsiveness, collectAcceptanceChecks } from './chart-acceptance-metrics.mjs'
 
 function navigationTimingScope(presentation) {
@@ -30,9 +30,8 @@ export function startupNavigationProbe() {
     const rows = [...document.querySelectorAll('[aria-label^="View "][aria-label$=" chart"]')]
     if (rows.length && probe.listAt === null) probe.listAt = performance.now()
     const selected = rows.find(row => row.getAttribute('aria-selected') === 'true')
-    const timeframe = document.querySelector('[aria-label="Chart timeframe"] [aria-pressed="true"]')?.textContent?.trim()
-    const canonicalTimeframe = timeframe?.toLowerCase() === '1h' ? '1H' : timeframe?.toLowerCase()
-    const readyRow = row => probe.ready.has(`${canonicalTimeframe}:${row.getAttribute('aria-label').slice(5, -6)}`)
+    const canonicalTimeframe = '1H'
+    const readyRow = row => ['1H', '15m', '5m'].every(frame => probe.ready.has(`${frame}:${row.getAttribute('aria-label').slice(5, -6)}`))
     const target = rows.findLast(row => row !== selected && readyRow(row))
     if (!clicking && !inputQueued && probe.allowInput && target && document.visibilityState === 'visible' && document.hasFocus()) {
       inputQueued = true
@@ -52,7 +51,7 @@ export function startupNavigationProbe() {
         target.click()
       })
     }
-    const chart = document.querySelector('[data-chart-inst]'), svg = chart?.querySelector('svg[data-rendered-inst]'), snapshot = chart?.__chartSnapshot
+    const chart = document.querySelector('[data-timeframe-panel="1H"] [data-chart-inst]'), svg = chart?.querySelector('svg[data-rendered-inst]'), snapshot = chart?.__chartSnapshot
     if (!svg || !snapshot || snapshot.bars.length !== 96) return
     if (probe.previous !== snapshot) {
       probe.previous = snapshot
@@ -61,7 +60,11 @@ export function startupNavigationProbe() {
       if (svg.dataset.renderedInst !== snapshot.instId || svg.dataset.renderedTimeframe !== snapshot.timeframe
         || Number(svg.dataset.renderedEnd) !== snapshot.endHour || chart.dataset.chartInst !== snapshot.instId) probe.violations.push('A startup SVG combined different series identities.')
     }
-    if (clicking && probe.commitAt === null && snapshot.instId === probe.instId && snapshot.timeframe === probe.timeframe && chart.dataset.chartLoading === 'false') {
+    if (clicking && probe.commitAt === null && ['1H', '15m', '5m'].every(frame => {
+      const panel = document.querySelector(`[data-timeframe-panel="${frame}"] [data-chart-inst]`)
+      const surface = panel?.querySelector('svg[data-rendered-inst]')
+      return panel?.dataset.chartLoading === 'false' && surface?.dataset.renderedInst === probe.instId && surface.dataset.renderedTimeframe === frame
+    })) {
       probe.commitAt = performance.now()
       requestAnimationFrame(() => { probe.rafSampleAt = performance.now(); stop() })
     }
@@ -151,7 +154,7 @@ export async function installNavigationProbe(electron, { omitUniverseInstId = nu
     }
     ipcMain.removeHandler('radar:request')
     ipcMain.handle('radar:request', async (event, value, context) => {
-      const kind = ['chartUniverse', 'chartFocus', 'chartLocal', 'chartHistory', 'chartWindow'].find(key => key in value)
+      const kind = ['chartUniverse', 'chartFocus', 'chartLocal', 'chartHistory'].find(key => key in value)
       let held = false
       if (kind) {
         const parameters = value[kind]
@@ -223,7 +226,7 @@ export async function navigationRequests(electron) {
 }
 
 export const selectionRequests = report => report.requests.filter(request => request.kind === 'chartLocal'
-  || (request.kind === 'chartWindow' || request.kind === 'chartHistory') && request.endHour === undefined)
+  || request.kind === 'chartHistory' && request.endHour === undefined)
 
 export async function holdInstrumentHistory(electron, instId) {
   await electron.evaluate((_electron, instId) => { globalThis.__instrumentNavigationProbe.holdInstId = instId }, instId)
@@ -247,7 +250,7 @@ export async function removeNavigationProbe(electron) {
 
 export async function waitForInstrument(page, instId, timeframe) {
   await page.waitForFunction(({ instId, timeframe }) => {
-    const svg = document.querySelector('svg[data-rendered-inst]')
+    const svg = document.querySelector(`[data-timeframe-panel="${timeframe}"] svg[data-rendered-inst]`)
     const chart = svg?.closest('[data-chart-inst]')
     return svg?.getAttribute('data-rendered-inst') === instId
       && svg.getAttribute('data-rendered-timeframe') === timeframe
@@ -262,25 +265,24 @@ export async function startNavigationFrameProbe(page, fixture, { requirePrepared
     const oracles = new Map(instruments.map(instrument => [instrument.instId,
       new Map(Object.entries(instrument.series).map(([timeframe, series]) => [timeframe, { intervalMS: series.intervalMS, bars: new Map(series.bars.map(bar => [bar.hour, bar])) }]))]))
     const probe = { active: true, requirePreparedStatistics, oracles, rafSamples: 0, snapshotChanges: 0, minimumBars: Infinity, violations: [], commits: [], observations: [],
-      snapshotCaptureMS: 0, snapshotCaptureMaxMS: 0, snapshotValidationMS: 0, previous: null, observedSurface: null, raf: null, observer: null }
+      snapshotCaptureMS: 0, snapshotCaptureMaxMS: 0, snapshotValidationMS: 0, previous: new Map(), observedSurface: null, raf: null, observer: null }
     const fail = message => { if (probe.violations.length < 20) probe.violations.push(message) }
     const sample = () => {
-      const chart = document.querySelector('[data-chart-inst]')
-      if (!chart) return
+      for (const chart of document.querySelectorAll('[data-chart-inst]')) {
       const svg = chart.querySelector('svg[data-rendered-inst]')
       const snapshot = chart.__chartSnapshot
       // Preserve a complete prior frame while the next contract is preparing.
       // Initial mounting may precede the first complete SVG in the same frame.
-      if (!svg || !snapshot) return
+      if (!svg || !snapshot) continue
       if (requirePreparedStatistics && (snapshot.oiState !== 'ready' || snapshot.takerState !== 'ready')) {
         fail('Fixture-known OI/Taker states became unavailable during prepared navigation.')
       }
       probe.observedSurface = chart
       if (svg.dataset.renderedInst !== snapshot.instId || svg.dataset.renderedTimeframe !== snapshot.timeframe) fail('The actual SVG combines different identities.')
-      if (Number(svg.dataset.renderedStart) !== chart.__chartRenderedBars?.[0]?.hour || Number(svg.dataset.renderedEnd) !== snapshot.endHour) fail('The rendered range and its labels disagree.')
-      if (chart.dataset.chartInst !== snapshot.instId || Number(chart.dataset.chartEnd) !== snapshot.endHour) fail('Chart metadata and the drawn instrument disagree.')
-      if (probe.previous === snapshot) return
-      probe.previous = snapshot
+      if (Number(svg.dataset.renderedStart) !== chart.__chartRenderedBars?.[0]?.hour || Number(svg.dataset.renderedEnd) !== chart.__chartRenderedBars?.at(-1)?.hour) fail('The rendered range and its labels disagree.')
+      if (chart.dataset.chartInst !== snapshot.instId || Number(chart.dataset.chartEnd) !== chart.__chartRenderedBars?.at(-1)?.hour || Number(chart.dataset.chartCompletedEnd) !== snapshot.endHour) fail('Chart metadata and the drawn instrument disagree.')
+      if (probe.previous.get(chart) === snapshot) continue
+      probe.previous.set(chart, snapshot)
       probe.snapshotChanges += 1
       probe.minimumBars = Math.min(probe.minimumBars, snapshot.bars.length)
       const at = performance.now()
@@ -293,6 +295,7 @@ export async function startNavigationFrameProbe(page, fixture, { requirePrepared
       })
       const geometry = Object.freeze({
         viewport: { instId: snapshot.instId, timeframe: snapshot.timeframe, intervalMS: snapshot.intervalMS, endHour: snapshot.endHour,
+          availableThrough: Math.max(snapshot.endHour, snapshot.liveBar?.hour ?? snapshot.endHour),
           visibleBars: Number(chart.dataset.chartVisibleBars), barSpacing: Number(chart.dataset.chartBarSpacing),
           domainStart: Number(svg.dataset.chartDomainStart), domainEnd: Number(svg.dataset.chartDomainEnd),
           barWidth: Number(svg.dataset.chartBarWidth), plotRight: Number(svg.dataset.chartPlotRight),
@@ -310,6 +313,7 @@ export async function startNavigationFrameProbe(page, fixture, { requirePrepared
       const captureMS = performance.now() - captureStartedAt
       probe.snapshotCaptureMS += captureMS
       probe.snapshotCaptureMaxMS = Math.max(probe.snapshotCaptureMaxMS, captureMS)
+      }
     }
     probe.observer = new MutationObserver(() => sample())
     probe.observer.observe(document.getElementById('root'), { subtree: true, childList: true, attributes: true })
@@ -352,12 +356,6 @@ export async function finishNavigationFrameProbe(page) {
           }
         }
       }
-      // Sample counts come from fixture values at the geometrically validated
-      // hours, never from projected values that may themselves be corrupted.
-      const expectedViewport = geometry.viewport.bars.map(bar => oracle?.bars.get(bar.hour))
-      if (snapshot.oiState === 'ready' && Number(geometry.oiSamples) !== expectedViewport.filter(bar => Number.isFinite(bar?.oi)).length) fail('OI geometry was incomplete after switching.')
-      if (snapshot.takerState === 'ready' && Number(geometry.takerBuySamples) !== expectedViewport.filter(bar => Number.isFinite(bar?.buy) && bar.buy > 0).length) fail('Taker buy geometry was incomplete after switching.')
-      if (snapshot.takerState === 'ready' && Number(geometry.takerSellSamples) !== expectedViewport.filter(bar => Number.isFinite(bar?.sell) && bar.sell > 0).length) fail('Taker sell geometry was incomplete after switching.')
       for (const path of geometry.pathData) if (/NaN|Infinity|undefined/.test(path)) fail('A switched chart contains invalid SVG geometry.')
     }
     probe.snapshotValidationMS = performance.now() - validationStartedAt
@@ -373,7 +371,13 @@ export function assertNavigationFrames(report) {
   const diagnostics = JSON.stringify({ snapshots: report.snapshotChanges, capture: report.capture, validation: report.validation })
   assert.ok(report.rafSamples > 0, `The probe needs renderer RAF samples. ${diagnostics}`)
   assert.equal(report.minimumBars, 96, `Every observed window must contain 96 bars. ${diagnostics}`)
-  for (const viewport of report.viewports) assertChartViewport(viewport, { fullSlots: null })
+  for (const viewport of report.viewports) {
+    const expected = chartViewportHours(viewport).filter(hour => hour <= viewport.availableThrough)
+    assert.deepEqual(viewport.bars.map(bar => bar.hour), expected, 'The chart must render every available candle in its geometric domain.')
+    assert.equal(viewport.renderedBars, expected.length)
+    assert.equal(viewport.chartStart, expected[0]); assert.equal(viewport.svgStart, expected[0])
+    assert.equal(viewport.chartEnd, expected.at(-1)); assert.equal(viewport.svgEnd, expected.at(-1))
+  }
   assert.deepEqual(report.violations, [], `A renderer snapshot was incomplete or used another contract’s values. ${diagnostics}`)
   assert.equal(report.capture.snapshots, report.snapshotChanges)
   assert.equal(report.validation.snapshots, report.snapshotChanges, 'Every captured snapshot must receive the deferred oracle checks.')
@@ -385,7 +389,7 @@ export function assertNavigationFrames(report) {
 export async function measureNavigation(page, trigger, { expectedInstId = null, sourceInstId = null, timeframe = null, timeoutMS = 1_000 } = {}) {
   await page.evaluate(({ expectedInstId, sourceInstId, timeframe, timeoutMS }) => {
     const source = sourceInstId ?? document.querySelector('svg[data-rendered-inst]')?.getAttribute('data-rendered-inst')
-    const expectedFrame = timeframe ?? document.querySelector('svg[data-rendered-inst]')?.getAttribute('data-rendered-timeframe')
+    const expectedFrame = timeframe ?? '1H'
     const pending = { done: false, started: null, inputType: null, inputKey: null, selectionAcknowledgedAt: null, frames: 0, raf: null, observer: null, result: null, timer: null }
     window.__navigationMeasurement = new Promise((resolve, reject) => {
       const cleanup = () => {
@@ -402,10 +406,15 @@ export async function measureNavigation(page, trigger, { expectedInstId = null, 
           && document.querySelector(`[aria-label="View ${expectedInstId} chart"]`)?.getAttribute('aria-selected') === 'true') {
           pending.selectionAcknowledgedAt = performance.now()
         }
-        const svg = document.querySelector('svg[data-rendered-inst]')
+        const svg = document.querySelector(`[data-timeframe-panel="${expectedFrame}"] svg[data-rendered-inst]`)
         const id = svg?.getAttribute('data-rendered-inst')
         const chart = svg?.closest('[data-chart-inst]')
-        if (!id || expectedFrame && svg.getAttribute('data-rendered-timeframe') !== expectedFrame || (expectedInstId ? id !== expectedInstId : id === source) || Number(chart.dataset.chartRenderedBars) !== chart.__chartRenderedBars?.length || Number(chart.dataset.chartRenderedBars) < Math.floor(Number(chart.dataset.chartVisibleBars)) || chart.dataset.chartLoading !== 'false') return
+        if (!id || expectedFrame && svg.getAttribute('data-rendered-timeframe') !== expectedFrame || (expectedInstId ? id !== expectedInstId : id === source) || Number(chart.dataset.chartRenderedBars) !== chart.__chartRenderedBars?.length || Number(chart.dataset.chartRenderedBars) < 1 || chart.dataset.chartLoading !== 'false') return
+        if (!['1H', '15m', '5m'].every(frame => {
+          const panel = document.querySelector(`[data-timeframe-panel="${frame}"] [data-chart-inst]`)
+          const surface = panel?.querySelector('svg[data-rendered-inst]')
+          return panel?.dataset.chartLoading === 'false' && surface?.dataset.renderedInst === id && surface.dataset.renderedTimeframe === frame
+        })) return
         const commitAt = performance.now()
         const result = { instId: id, timeframe: expectedFrame, sourceInstId: source,
           rendererTimeOrigin: performance.timeOrigin, inputAt: pending.started, commitAt, inputType: pending.inputType, inputKey: pending.inputKey,
@@ -419,7 +428,7 @@ export async function measureNavigation(page, trigger, { expectedInstId = null, 
         })
       }
       const frame = () => { if (pending.done) return; if (pending.started !== null) pending.frames += 1; sample(); if (!pending.done) pending.raf = requestAnimationFrame(frame) }
-      const timeout = () => { cleanup(); reject(new Error('The requested contract did not commit a complete chart before the navigation deadline.')) }
+      const timeout = () => { cleanup(); reject(new Error(`The requested contract did not commit complete charts before the navigation deadline: ${JSON.stringify([...document.querySelectorAll('[data-chart-inst]')].map(panel => ({inst: panel.dataset.chartInst, loading: panel.dataset.chartLoading, timeframe: panel.__chartSnapshot?.timeframe, rendered: panel.querySelector('svg[data-rendered-inst]')?.dataset.renderedInst})))}`)) }
       const input = event => {
         if (pending.started !== null || event.type === 'keydown' && !event.key.startsWith('Arrow')) return
         pending.started = performance.now()
@@ -463,12 +472,10 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { ho
     ...await waitForUniverseReady(electron, page, fixture, { omitInstId: unpreparedInstId }) }
   await page.waitForFunction(() => document.querySelector('svg[data-rendered-inst]')
     && document.querySelector('[data-chart-inst]')?.dataset.chartLoading === 'false', null, { timeout: 10_000 })
-  let sharedSurface = await page.locator('svg[data-rendered-inst]').elementHandle()
+  let sharedSurface = await page.locator('svg[data-rendered-inst]').first().elementHandle()
   const assertSharedSurface = async phase => {
-    assert.equal(await page.locator('svg[data-rendered-inst]').count(), 1, `${phase} must leave exactly one active chart SVG.`)
-    assert.equal(await page.locator('svg[data-prepared-chart-inst]').count(), 1, `${phase} must not retain hidden candidate SVGs.`)
-    assert.equal(await sharedSurface.evaluate(svg => svg.isConnected && svg === document.querySelector('svg[data-rendered-inst]')), true,
-      `${phase} must reuse the current chart SVG node.`)
+    assert.equal(await page.locator('svg[data-rendered-inst]').count(), 3, `${phase} must leave all three chart SVGs.`)
+    assert.equal(await page.locator('svg[data-prepared-chart-inst]').count(), 3, `${phase} must not retain hidden candidate SVGs.`)
   }
   if (presentation === 'foreground') {
     const native = await electron.evaluate(({ BrowserWindow }) => {
@@ -483,19 +490,14 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { ho
     assert.equal(await electron.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFocused()), false,
       'Offscreen navigation acceptance must never take macOS window focus.')
   }
-  const initialInstId = await page.locator('svg[data-rendered-inst]').getAttribute('data-rendered-inst')
-  const initialTimeframe = await page.locator('svg[data-rendered-inst]').getAttribute('data-rendered-timeframe')
-  if (initialTimeframe !== fixture.timeframe) {
-    await selectTimeframe(page, fixture.timeframe)
-    await waitForInstrument(page, initialInstId, fixture.timeframe)
-  }
+  const initialInstId = await page.locator('svg[data-rendered-inst]').first().getAttribute('data-rendered-inst')
   await startNavigationFrameProbe(page, fixture, { requirePreparedStatistics: unpreparedInstId === null })
   const nextFrame = async (trigger, { rapid = false, requireLocal = false, ...options } = {}) => {
     const before = selectionRequests(await navigationRequests(electron)).length
     const result = await measureNavigation(page, trigger, options)
     const newRequests = selectionRequests(await navigationRequests(electron)).slice(before)
     const after = before + newRequests.length
-    assert.ok(after - before <= 2, `A selection must use bounded local hydration: ${JSON.stringify({ result, requests: newRequests })}`)
+    assert.ok(after - before <= 6, `A selection must use bounded local hydration across three charts: ${JSON.stringify({ result, requests: newRequests })}`)
     if (requireLocal) assert.ok(newRequests.some(request => request.kind === 'chartLocal' && request.instId === result.instId),
       `${result.instId} had no prepared renderer frame and must hydrate from durable local history.`)
     if (!requireLocal) {
@@ -508,7 +510,7 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { ho
   }
   let unpreparedSelection = null
   if (unpreparedInstId) {
-    const current = await page.locator('svg[data-rendered-inst]').getAttribute('data-rendered-inst')
+    const current = await page.locator('svg[data-rendered-inst]').first().getAttribute('data-rendered-inst')
     assert.notEqual(current, unpreparedInstId, 'The unprepared candidate must not already be selected.')
     const target = page.locator(`[aria-label="View ${unpreparedInstId} chart"]`)
     await target.waitFor({ state: 'visible', timeout: 15_000 })
@@ -527,24 +529,16 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { ho
     await electron.evaluate(() => { globalThis.__instrumentNavigationProbe.omitUniverseInstId = null })
     Object.assign(initialPreparation, await waitForUniverseReady(electron, page, fixture))
     await sharedSurface.dispose()
-    sharedSurface = await page.locator('svg[data-rendered-inst]').elementHandle()
+    sharedSurface = await page.locator('svg[data-rendered-inst]').first().elementHandle()
     await assertSharedSurface(`${unpreparedInstId} ready for subsequent prepared selection timing`)
     await startNavigationFrameProbe(page, fixture)
   }
   for (const timeframe of [fixture.timeframe, ...fixture.timeframes.filter(frame => frame !== fixture.timeframe)]) {
     await page.locator('[data-market-list] [aria-label^="View "]').first().waitFor({ state: 'visible' })
-    let timeframeSwitch = null
-    if (await page.locator('svg[data-rendered-inst]').getAttribute('data-rendered-timeframe') !== timeframe) {
-      const previousSVG = await page.locator('svg[data-rendered-inst]').elementHandle()
-      assert.ok(previousSVG)
-      const instId = await page.locator('svg[data-rendered-inst]').getAttribute('data-rendered-inst')
-      timeframeSwitch = await nextFrame(() => selectTimeframe(page, timeframe), { expectedInstId: instId, timeframe })
-      await assertSharedSurface(`${timeframe} timeframe switch`)
-      await previousSVG.dispose()
-    }
+    const timeframeSwitch = null
     await assertWorkspaceLayout(page)
     const rendererFrames = initialPreparation.frames.find(frame => frame.timeframe === timeframe)
-    const currentlySelected = await page.locator('svg[data-rendered-inst]').getAttribute('data-rendered-inst')
+    const currentlySelected = await page.locator('svg[data-rendered-inst]').first().getAttribute('data-rendered-inst')
     const first = await firstVisibleMarket(page, [currentlySelected])
     const holdThisPhase = holdHistory && heldHistory === null
     let heldStartedAt = null
@@ -554,12 +548,12 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { ho
       heldStartedAt = Date.now()
       // 650 candles exceeds the compact pages. The fixture also covers the
       // bulk prefetch reserve and 199 earlier observations for EMA200.
-      await page.locator('[data-chart-plot]').dispatchEvent('wheel', { deltaY: 7_800 })
+      await page.locator(`[data-timeframe-panel="${timeframe}"] [data-chart-plot]`).dispatchEvent('wheel', { deltaY: 7_800 })
       while (!(await navigationRequests(electron)).held) {
         const elapsed = Date.now() - heldStartedAt
         if (elapsed >= 10_000) {
           const requests = (await navigationRequests(electron)).requests.slice(-10)
-          const chart = await page.locator('[data-chart-inst]').evaluate(node => ({ instId: node.dataset.chartInst, requestedEnd: node.dataset.chartRequestedEnd, end: node.dataset.chartEnd, loading: node.dataset.chartLoading }))
+          const chart = await page.locator(`[data-timeframe-panel="${timeframe}"] [data-chart-inst]`).evaluate(node => ({ instId: node.dataset.chartInst, requestedEnd: node.dataset.chartRequestedEnd, end: node.dataset.chartEnd, loading: node.dataset.chartLoading }))
           assert.fail(`The first instrument did not start history: ${JSON.stringify({ first: first.instId, chart, requests })}`)
         }
         await new Promise(resolve => setTimeout(resolve, 10))
@@ -584,7 +578,7 @@ export async function exerciseInstrumentNavigation(electron, page, fixture, { ho
       assert.ok(lateCommits.every(commit => commit.instId === switched.instId), 'The obsolete instrument committed after the new selection.')
       heldHistory = { heldForMS: 1_500, sourceInstId: first.instId, mouseSwitch, ...switched, lateWrongInstrumentCommits: 0 }
     }
-    const initial = await page.locator('svg[data-rendered-inst]').getAttribute('data-rendered-inst')
+    const initial = await page.locator('svg[data-rendered-inst]').first().getAttribute('data-rendered-inst')
     const order = [initial]
     const keyboard = []
     for (let index = 0; index < fixture.instIds.length; index += 1) {

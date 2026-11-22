@@ -5,8 +5,6 @@ import { hasOperationRecording } from './operations.js'
 import { parentPort, workerData } from 'node:worker_threads'
 import { DatabaseSync } from 'node:sqlite'
 import { performance } from 'node:perf_hooks'
-import { existsSync } from 'node:fs'
-import { dirname, join } from 'node:path'
 import { CANDLE_INTERVALS, validateCandle, validateQuery } from './market-records.js'
 import { statisticsMask, validTakerVolumes } from './statistics-state.js'
 import { statisticsAbsenceExpiryAt } from './statistics-coverage.js'
@@ -16,23 +14,14 @@ const database = openRecordedDatabase(DatabaseSync, workerData.path, { readOnly:
 database.exec('PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA cache_size=-8192;')
 if (workerData.reader) database.exec('PRAGMA query_only=ON;')
 else {
-  const previousVersion = database.prepare('PRAGMA user_version').get().user_version
-  if (previousVersion < 4) {
-    const hasTable = name => database.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?").get(name)
-    const hasManifest = hasTable('migration_partitions')
-    const failed = hasManifest && database.prepare("SELECT 1 FROM migration_partitions WHERE status='failed' LIMIT 1").get()
-      || hasTable('import_issues') && database.prepare('SELECT 1 FROM import_issues LIMIT 1').get()
-    const complete = hasManifest && database.prepare("SELECT 1 FROM migration_partitions WHERE path='__complete__' AND status='completed'").get()
-    const incomplete = existsSync(join(dirname(workerData.path), 'candles')) && !complete
-    if (failed || incomplete) {
-      database.close()
-      await closeOperationRecording()
-      throw new Error(failed
-        ? 'Legacy archive migration has unresolved failures. Resolve failed partitions using the previous app version before upgrading. Recovery details remain in market.sqlite and original archive files are unchanged.'
-        : 'Legacy archive migration is incomplete. Finish the SQLite migration using the previous app version before upgrading, or use a new data directory to download history again. Original archive files are unchanged.')
-    }
+  const version = database.prepare('PRAGMA user_version').get().user_version
+  if (![0, 4].includes(version) || version === 0 && database.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1").get()) {
+    database.close()
+    await closeOperationRecording()
+    throw new Error('Unsupported market database schema version.')
   }
-  database.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=2000;
+  database.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=2000;')
+  if (version === 0) database.exec(`BEGIN IMMEDIATE;
     CREATE TABLE IF NOT EXISTS series (
       id INTEGER PRIMARY KEY, instrument TEXT NOT NULL, timeframe TEXT NOT NULL,
       revision INTEGER NOT NULL DEFAULT 0, price_revision INTEGER NOT NULL DEFAULT 0,
@@ -41,44 +30,17 @@ else {
     CREATE TABLE IF NOT EXISTS candles (
       series_id INTEGER NOT NULL, timestamp INTEGER NOT NULL, open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL,
       close REAL NOT NULL, volume REAL NOT NULL, base_volume REAL, quote_volume REAL,
-      written_at INTEGER NOT NULL, origin INTEGER NOT NULL, import_version INTEGER NOT NULL DEFAULT 0,
+      written_at INTEGER NOT NULL, origin INTEGER NOT NULL,
       PRIMARY KEY(series_id,timestamp)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS statistics (
       series_id INTEGER NOT NULL, source INTEGER NOT NULL, timestamp INTEGER NOT NULL,
       value1 REAL, value2 REAL, expires_at INTEGER, written_at INTEGER NOT NULL,
-      origin INTEGER NOT NULL, import_version INTEGER NOT NULL DEFAULT 0,
+      origin INTEGER NOT NULL, absence_attempts INTEGER NOT NULL DEFAULT 0, observed_volume REAL,
       PRIMARY KEY(series_id,source,timestamp)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS indicator_checkpoints (
       series_id INTEGER NOT NULL, formula TEXT NOT NULL, timestamp INTEGER NOT NULL, value TEXT NOT NULL,
-      PRIMARY KEY(series_id,formula,timestamp)) WITHOUT ROWID;`)
-  const version = database.prepare('PRAGMA user_version').get().user_version
-  if (version < 2) {
-    database.exec('BEGIN IMMEDIATE')
-    try {
-      database.exec('ALTER TABLE statistics ADD COLUMN absence_attempts INTEGER NOT NULL DEFAULT 0;')
-      // Keep observation times and downloaded values. Old imported nulls lack
-      // versioned absence proof and must be checked again, never leased anew.
-      database.exec(`UPDATE statistics SET absence_attempts=1 WHERE origin=1 AND (value1 IS NULL OR (source=2 AND value2 IS NULL));
-        UPDATE statistics SET expires_at=NULL WHERE origin=0 AND (value1 IS NULL OR (source=2 AND value2 IS NULL));
-        PRAGMA user_version=2; COMMIT;`)
-    } catch (error) { database.exec('ROLLBACK'); throw error }
-  }
-  if (version < 3) {
-    database.exec('BEGIN IMMEDIATE')
-    try {
-      database.exec('ALTER TABLE statistics ADD COLUMN observed_volume REAL; PRAGMA user_version=3; COMMIT;')
-    } catch (error) { database.exec('ROLLBACK'); throw error }
-  }
-  // Keep inert legacy columns to avoid rewriting every historical row on upgrade.
-  if (version < 4) {
-    database.exec('BEGIN IMMEDIATE')
-    try {
-      database.exec(`DROP TABLE IF EXISTS migration_partitions;
-        DROP TABLE IF EXISTS import_issues;
-        DROP TABLE IF EXISTS replacements;
-        PRAGMA user_version=4; COMMIT;`)
-    } catch (error) { database.exec('ROLLBACK'); throw error }
-  }
+      PRIMARY KEY(series_id,formula,timestamp)) WITHOUT ROWID;
+    PRAGMA user_version=4; COMMIT;`)
 }
 
 const statements = new Map()
@@ -464,7 +426,6 @@ function statisticsCoverage(query) {
     const timestamp = row.timestamp, mask = statisticsMask(row)
     const numeric = source === 'oi' ? nonnegative(row.oi) : validTakerVolumes(row)
     if ((timestamp - valid.from) % step !== 0) {
-      // Preserve the existing validation of non-grid leased legacy data.
       if ((mask & bit) && !numeric) addExpiry(row)
       continue
     }

@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -9,59 +9,6 @@ import { emptyHistoryDownload } from '../electron/services/history-download.js'
 
 const temporary = () => mkdtemp(join(tmpdir(), 'perp-metadata-'))
 const catalogEntry = (instrumentID = 'BTC-USDT-SWAP') => ({ instrumentID, status: 'verified' as const, observedAt: 1000, expiresAt: 2000, preferencesRevision: 2, observations: { spread: 0.01 } })
-
-test('metadata schema migration drops obsolete sync demand once and preserves durable business data', async () => {
-  const root = await temporary()
-  let store = await MetadataStore.open(root)
-  try {
-    const settings = store.updateSettings({ historyDays: 45 })
-    const analysis = store.updateAnalysisSettings({ model: 'fixture-model', apiKey: 'fixture-private-value' })
-    const audit = { id: 'audit-1', status: 'paused' as const, phase: 'verify' as const, checkedRows: 42 }
-    const download = { ...emptyHistoryDownload(), phase: 'cancelled' as const, startedAt: 1, finishedAt: 2 }
-    const catalog = catalogEntry()
-    store.saveAudit(audit); store.saveHistoryDownload(download); store.putCatalogEntry(catalog)
-    store.close()
-    const legacy = new DatabaseSync(join(root, 'metadata.sqlite'))
-    try {
-      legacy.exec("CREATE TABLE sync_tasks (id TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO sync_tasks VALUES ('old-demand', 'invalid obsolete task'); PRAGMA user_version=1;")
-    } finally { legacy.close() }
-    for (let attempt = 0; attempt < 2; attempt++) {
-      store = await MetadataStore.open(root)
-      assert.deepEqual(store.getSettings(), settings)
-      assert.deepEqual(store.getAnalysisSettings(), analysis)
-      assert.deepEqual(store.getAudit(audit.id), audit)
-      assert.deepEqual(store.getHistoryDownload(), download)
-      assert.deepEqual(store.getCatalogEntry(catalog.instrumentID), catalog)
-      const database = new DatabaseSync(join(root, 'metadata.sqlite'), { readOnly: true })
-      try {
-        assert.equal(database.prepare('PRAGMA user_version').get()!.user_version, 2)
-        assert.equal(database.prepare("SELECT 1 FROM sqlite_schema WHERE name='sync_tasks'").get(), undefined)
-      } finally { database.close() }
-      store.close()
-    }
-  } finally { store.close(); await rm(root, { recursive: true, force: true }) }
-})
-
-test('retired analysis settings never prevent opening or importing metadata', async () => {
-  const root = await temporary()
-  const path = join(root, 'settings.json')
-  await writeFile(path, JSON.stringify({ historyDays: 45, analysis: { model: 42 } }))
-  let store = await MetadataStore.open(root)
-  try {
-    assert.equal(store.getSettings().preferences.historyDays, 45)
-    store.close()
-    const database = new DatabaseSync(join(root, 'metadata.sqlite'))
-    try {
-      assert.equal(database.prepare('SELECT value FROM analysis_settings WHERE id = 1').get()!.value, '{"model":42}')
-      database.prepare('UPDATE analysis_settings SET value = ? WHERE id = 1').run('42')
-    } finally { database.close() }
-    store = await MetadataStore.open(root)
-    assert.equal(store.getSettings().preferences.historyDays, 45)
-    const preserved = new DatabaseSync(join(root, 'metadata.sqlite'), { readOnly: true })
-    try { assert.equal(preserved.prepare('SELECT value FROM analysis_settings WHERE id = 1').get()!.value, '42') }
-    finally { preserved.close() }
-  } finally { store.close(); await rm(root, { recursive: true, force: true }) }
-})
 
 test('preference schema owns immutable snapshots, reuses proven values and validates changed inputs', () => {
   const input = structuredClone(DEFAULT_PREFERENCES)
@@ -182,54 +129,6 @@ test('invalid partial saves have no side effects and SQLite failures roll back t
   } finally { database.close(); store.close(); await rm(root, { recursive: true, force: true }) }
 })
 
-test('one-time legacy import retains private analysis, maps stability, and discards glass settings', async () => {
-  const root = await temporary()
-  const path = join(root, 'settings.json')
-  const legacy = { hourlyVolumeStabilityEnabled: true, windowBlurRadius: 64, frostedBackgroundEnabled: true, analysis: { model: 'fixture-model', apiKey: 'fixture-private-value', provider: { name: 'fixture' } } }
-  await writeFile(path, JSON.stringify(legacy))
-  let store = await MetadataStore.open(root)
-  try {
-    const settings = store.getSettings()
-    assert.equal(settings.revision, 1)
-    assert.equal(settings.preferences.liquidity.volumeStability.enabled, true)
-    assert.deepEqual(store.getAnalysisSettings(), legacy.analysis)
-    assert.equal(JSON.stringify(settings).includes('fixture-private-value'), false)
-    assert.equal('analysis' in settings, false)
-    assert.equal('frostedBackgroundEnabled' in settings.preferences, false)
-    store.updateAnalysisSettings({ model: 'fixture-next' })
-    assert.equal(store.getAnalysisSettings().apiKey, 'fixture-private-value')
-    const returned = store.getAnalysisSettings()
-    returned.apiKey = ''
-    assert.equal(store.getAnalysisSettings().apiKey, 'fixture-private-value')
-    await writeFile(path, JSON.stringify({ ...legacy, hourlyVolumeStabilityEnabled: false, analysis: { model: 'ignored' } }))
-    store.close(); store = await MetadataStore.open(root)
-    assert.equal(store.getSettings().preferences.liquidity.volumeStability.enabled, true)
-    assert.equal(store.getAnalysisSettings().model, 'fixture-next')
-    assert.equal(store.getSettings().revision, 1)
-    assert.equal(JSON.parse(await readFile(path, 'utf8')).analysis.model, 'ignored', 'Migration never rewrites its source.')
-  } finally { store.close(); await rm(root, { recursive: true, force: true }) }
-})
-
-test('malformed legacy input is preserved without error snippets and can be retried after correction', async () => {
-  const root = await temporary()
-  const path = join(root, 'old-settings.json')
-  try {
-    const malformed = '{"analysis":{"apiKey":"fixture-private-value"},broken}'
-    await writeFile(path, malformed)
-    await assert.rejects(MetadataStore.open(root, { legacySettingsPath: path }), (error: unknown) => {
-      assert.ok(error instanceof Error)
-      assert.equal(String(error).includes('fixture-private-value'), false)
-      assert.equal(error.cause, undefined)
-      return true
-    })
-    assert.equal(await readFile(path, 'utf8'), malformed)
-    await writeFile(path, JSON.stringify({ chartTimeframe: '5m', analysis: { model: 'fixture' } }))
-    const store = await MetadataStore.open(root, { legacySettingsPath: path })
-    try { assert.equal('chartTimeframe' in store.getSettings().preferences, false); assert.equal(store.getSettings().revision, 1) }
-    finally { store.close() }
-  } finally { await rm(root, { recursive: true, force: true }) }
-})
-
 test('audit and manual download checkpoints persist across restart', async () => {
   const root = await temporary()
   let store = await MetadataStore.open(root)
@@ -247,7 +146,7 @@ test('audit and manual download checkpoints persist across restart', async () =>
     const database = new DatabaseSync(join(root, 'metadata.sqlite'))
     try {
       const tables = database.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name").all().map(row => row.name)
-      assert.deepEqual(tables, ['analysis_settings', 'audits', 'catalog', 'history_download', 'migrations', 'settings'])
+      assert.deepEqual(tables, ['analysis_settings', 'audits', 'catalog', 'history_download', 'settings'])
     } finally { database.close() }
   } finally { store.close(); await rm(root, { recursive: true, force: true }) }
 })
@@ -314,15 +213,11 @@ test('existing SQLite preferences gain the multi default and preserve a saved in
       const old = JSON.parse(row.preferences as string)
       delete old.chartDisplayMode
       delete old.showBollingerPriceLabels
-      Object.assign(old, { chartTimeframe: '5m', priceScaleMode: 'auto', priceScalePixelsPerPercent: 99 })
       database.prepare('UPDATE settings SET preferences=? WHERE id=1').run(JSON.stringify(old))
     } finally { database.close() }
     store = await MetadataStore.open(root)
     assert.equal(store.getSettings().preferences.chartDisplayMode, 'multi')
     assert.equal(store.getSettings().preferences.showBollingerPriceLabels, false)
-    assert.equal('chartTimeframe' in store.getSettings().preferences, false)
-    assert.equal('priceScaleMode' in store.getSettings().preferences, false)
-    assert.equal('priceScalePixelsPerPercent' in store.getSettings().preferences, false)
     assert.equal(store.getSettings().preferences.historyDays, 45)
     store.updateSettings({ chartDisplayMode: 'indicators', showBollingerPriceLabels: true })
     store.close(); store = await MetadataStore.open(root)
@@ -330,4 +225,17 @@ test('existing SQLite preferences gain the multi default and preserve a saved in
     assert.equal(store.getSettings().preferences.showBollingerPriceLabels, true)
     assert.throws(() => store.updateSettings({ chartDisplayMode: 'unknown' } as any), /chartDisplayMode/)
   } finally { store.close(); await rm(root, { recursive: true, force: true }) }
+})
+
+test('unsupported metadata schemas are rejected without changing existing data', async () => {
+  const root = await temporary()
+  try {
+    const database = new DatabaseSync(join(root, 'metadata.sqlite'))
+    try { database.exec("CREATE TABLE retained(value TEXT); INSERT INTO retained VALUES('preserved'); PRAGMA user_version=1;") }
+    finally { database.close() }
+    await assert.rejects(MetadataStore.open(root), /Unsupported metadata database schema version/)
+    const retained = new DatabaseSync(join(root, 'metadata.sqlite'), { readOnly: true })
+    try { assert.equal(retained.prepare('SELECT value FROM retained').get()!.value, 'preserved') }
+    finally { retained.close() }
+  } finally { await rm(root, { recursive: true, force: true }) }
 })

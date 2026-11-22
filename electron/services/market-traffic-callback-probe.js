@@ -1,7 +1,5 @@
 import { createHash } from 'node:crypto'
 
-export const marketTrafficClock = 'process.hrtime.bigint() converted to integer microseconds; same-host Node monotonic clock'
-
 export function monotonicMicroseconds() {
   return Number(process.hrtime.bigint() / 1_000n)
 }

@@ -8,8 +8,7 @@ export function chartPitchSpan(plotWidth: number, spacing = CHART_DEFAULT_SPACIN
   return Math.max(1, 1 + (Math.max(0, plotWidth) - chartPitchBodyWidth(spacing)) / spacing)
 }
 
-export const CHART_PANELS = ["price", "roc", "rsi", "atr", "oi", "taker"] as const
-export type ChartPanel = typeof CHART_PANELS[number]
+export type ChartPanel = 'price'
 
 type Range = readonly [number, number]
 
@@ -99,29 +98,14 @@ export function chartPanelClip(layout: ReturnType<typeof chartLayout>, panel: Ch
   }
 }
 
-export type ChartLayoutDensity = { top: number; priceOnlyTop: number; headerHeight: number; rowGap: number; bottomAxis: number; headerBaseline: number }
-const compactChartDensity: ChartLayoutDensity = { top: 2, priceOnlyTop: 0, headerHeight: 18, rowGap: 2, bottomAxis: 16, headerBaseline: 11 }
+export type ChartLayoutDensity = { priceOnlyTop: number; bottomAxis: number }
+const compactChartDensity: ChartLayoutDensity = { priceOnlyTop: 0, bottomAxis: 16 }
 
-export function chartLayout(width: number, height: number, labelGutter = 64, priceOnly = false, density: ChartLayoutDensity = compactChartDensity) {
-  const rightMargin = 4
-  const { headerHeight, rowGap, bottomAxis, headerBaseline } = density
-  const top = priceOnly ? density.priceOnlyTop : density.top
-  const right = width - rightMargin - labelGutter, column: Range = [0, right]
-  const order: readonly ChartPanel[] = priceOnly ? ['price'] : CHART_PANELS
-  const panelHeaderHeight = priceOnly ? 0 : headerHeight
-  const availableHeight = Math.max(1, height - top - bottomAxis - panelHeaderHeight * order.length - rowGap * (order.length - 1))
-  const weights: Record<ChartPanel, number> = { price: 0.4, roc: 0.12, rsi: 0.12, atr: 0.12, oi: 0.12, taker: 0.12 }
-  const panels = {} as Record<ChartPanel, Range>
-  const headerY = {} as Record<ChartPanel, number>
-  let cursor = top
-  for (const key of order) {
-    headerY[key] = cursor + (priceOnly ? 0 : headerBaseline)
-    cursor += panelHeaderHeight
-    panels[key] = [cursor, cursor + availableHeight * (priceOnly ? 1 : weights[key])]
-    cursor = panels[key][1] + rowGap
-  }
-  if (priceOnly) for (const key of CHART_PANELS) if (key !== 'price') { panels[key] = [height + 1, height + 1]; headerY[key] = height + 1 }
-  const columns = Object.fromEntries(CHART_PANELS.map(key => [key, column])) as Record<ChartPanel, Range>
-  const axisStarts = Object.fromEntries(CHART_PANELS.map(key => [key, right + 8])) as Record<ChartPanel, number>
-  return { panels, columns, axisStarts, headerY, left: column[0], right }
+export function chartLayout(width: number, height: number, labelGutter = 64, density: ChartLayoutDensity = compactChartDensity) {
+  const right = width - 4 - labelGutter, column: Range = [0, right]
+  const top = density.priceOnlyTop
+  const panels = { price: [top, top + Math.max(1, height - top - density.bottomAxis)] as Range }
+  const columns = { price: column }
+  const axisStarts = { price: right + 8 }
+  return { panels, columns, axisStarts, left: column[0], right }
 }

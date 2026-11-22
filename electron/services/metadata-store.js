@@ -1,12 +1,5 @@
 import { openRecordedDatabase } from './recorded-database.js'
 import { DEFAULT_PREFERENCES, validatePreferenceFields, validatePreferences } from './preferences.js'
-// Discard retired chart settings while preserving validation of every other field.
-function withoutRetiredChartSettings(value) {
-  object(value, 'Preferences')
-  const { chartTimeframe, priceScaleMode, priceScalePixelsPerPercent, ...current } = value
-  return current
-}
-
 export { DEFAULT_PREFERENCES, validatePreferences } from './preferences.js'
 
 const AUDIT_STATUSES = new Set(['queued', 'running', 'paused', 'completed', 'cancelled', 'failed'])
@@ -113,9 +106,9 @@ export class MetadataStore {
   #database
   #closed = false
 
-  static async open(root, options = {}) {
+  static async open(root) {
     identifier(root, 'Metadata root')
-    const [{ DatabaseSync }, { mkdir, readFile, chmod }, { join }] = await Promise.all([import('node:sqlite'), import('node:fs/promises'), import('node:path')])
+    const [{ DatabaseSync }, { mkdir, chmod }, { join }] = await Promise.all([import('node:sqlite'), import('node:fs/promises'), import('node:path')])
     await mkdir(root, { recursive: true })
     const path = join(root, 'metadata.sqlite')
     const database = openRecordedDatabase(DatabaseSync, path, undefined, 'metadata')
@@ -124,33 +117,20 @@ export class MetadataStore {
       await chmod(path, 0o600)
       database.exec('PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;')
       const version = database.prepare('PRAGMA user_version').get().user_version
-      if (![0, 1, 2].includes(version)) throw new Error('Unsupported metadata database schema version.')
-      if (version < 2) store.#transaction(() => {
+      if (![0, 2].includes(version)) throw new Error('Unsupported metadata database schema version.')
+      if (version === 0) store.#transaction(() => {
+        if (database.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' LIMIT 1").get()) throw new Error('Unsupported metadata database schema version.')
         database.exec(`
           CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK (id = 1), revision INTEGER NOT NULL CHECK (revision >= 0), preferences TEXT NOT NULL CHECK (json_valid(preferences)));
           CREATE TABLE IF NOT EXISTS analysis_settings (id INTEGER PRIMARY KEY CHECK (id = 1), value TEXT NOT NULL CHECK (json_valid(value)));
-          CREATE TABLE IF NOT EXISTS migrations (id TEXT PRIMARY KEY, value TEXT NOT NULL CHECK (json_valid(value)));
           CREATE TABLE IF NOT EXISTS audits (id TEXT PRIMARY KEY, value TEXT NOT NULL CHECK (json_valid(value)));
           CREATE TABLE IF NOT EXISTS history_download (id TEXT PRIMARY KEY, value TEXT NOT NULL CHECK (json_valid(value)));
           CREATE TABLE IF NOT EXISTS catalog (id TEXT PRIMARY KEY, value TEXT NOT NULL CHECK (json_valid(value)));
-          DROP TABLE IF EXISTS sync_tasks;
           PRAGMA user_version = 2;
         `)
         database.prepare('INSERT OR IGNORE INTO settings (id, revision, preferences) VALUES (1, 0, ?)').run(JSON.stringify(DEFAULT_PREFERENCES))
         database.prepare('INSERT OR IGNORE INTO analysis_settings (id, value) VALUES (1, ?)').run('{}')
       })
-      if (!database.prepare('SELECT 1 FROM migrations WHERE id = ?').get('legacy-settings-v1')) {
-        let legacy
-        try {
-          const content = await readFile(options.legacySettingsPath ?? join(root, 'settings.json'), 'utf8')
-          try { legacy = JSON.parse(content) }
-          catch { throw new Error('Legacy settings contain invalid JSON. The original file was preserved.') }
-        }
-        catch (error) {
-          if (error?.code !== 'ENOENT') throw new Error('Legacy settings could not be imported. The original file was preserved.')
-        }
-        store.#importLegacy(legacy)
-      }
       store.getSettings() // Validate persisted data on every open, not just writes.
       return store
     } catch (error) { store.close(); throw error }
@@ -167,31 +147,11 @@ export class MetadataStore {
     catch (error) { this.#database.exec('ROLLBACK'); throw error }
   }
 
-  #importLegacy(legacy) {
-    this.#transaction(() => {
-      if (this.#database.prepare('SELECT 1 FROM migrations WHERE id = ?').get('legacy-settings-v1')) return
-      if (legacy !== undefined) {
-        object(legacy, 'Legacy settings')
-        const patch = Object.fromEntries(Object.keys(DEFAULT_PREFERENCES).filter(key => Object.hasOwn(legacy, key)).map(key => [key, legacy[key]]))
-        if (Object.hasOwn(legacy, 'preferences')) { const preferences = withoutRetiredChartSettings(legacy.preferences); validatePreferenceFields(preferences, true); Object.assign(patch, preferences) }
-        if (Object.hasOwn(legacy, 'hourlyVolumeStabilityEnabled') && !patch.liquidity?.volumeStability) {
-          patch.liquidity = merge(patch.liquidity ?? {}, { volumeStability: { enabled: legacy.hourlyVolumeStabilityEnabled } })
-        }
-        validatePreferenceFields(patch, true)
-        const current = this.getSettings()
-        const preferences = validatePreferences(merge(current.preferences, patch))
-        this.#database.prepare('UPDATE settings SET revision = ?, preferences = ? WHERE id = 1').run(current.revision + 1, JSON.stringify(preferences))
-        if (Object.hasOwn(legacy, 'analysis')) this.#database.prepare('UPDATE analysis_settings SET value = ? WHERE id = 1').run(JSON.stringify(legacy.analysis))
-      }
-      this.#database.prepare('INSERT INTO migrations (id, value) VALUES (?, ?)').run('legacy-settings-v1', JSON.stringify({ schemaVersion: 1, imported: legacy !== undefined }))
-    })
-  }
-
   getSettings() {
     this.#assertOpen()
     const row = this.#database.prepare('SELECT revision, preferences FROM settings WHERE id = 1').get()
     integer(row.revision, 'Settings revision')
-    return { schemaVersion: 1, revision: row.revision, preferences: validatePreferences(merge(DEFAULT_PREFERENCES, withoutRetiredChartSettings(JSON.parse(row.preferences)))) }
+    return { schemaVersion: 1, revision: row.revision, preferences: validatePreferences(merge(DEFAULT_PREFERENCES, JSON.parse(row.preferences))) }
   }
 
   updateSettings(patch, options = {}) {

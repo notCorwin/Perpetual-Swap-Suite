@@ -12,62 +12,20 @@ const rows = () => Object.freeze(Array.from({ length: 96 }, (_, index) => Object
 const viewport = { width: 960, height: 700, endHour: 95 * intervalMS, intervalMS }
 const close = (actual: number, expected: number) => assert.ok(Math.abs(actual - expected) < 1e-9, `${actual} != ${expected}`)
 
-test('shared viewport coordinates preserve time gaps and relative price and zero-inclusive OI math', () => {
+test('viewport coordinates preserve relative price and candle time', () => {
   const bars = rows(), geometry = createChartGeometryCache(text => text.length * 6)(bars, viewport)
-  const { priceAxis, oiAxis, layout } = geometry
+  const { priceAxis, layout } = geometry
   assert.equal(priceAxis.kind, 'relative')
-  assert.ok(oiAxis)
   for (const value of [98, 100, 102, 104]) {
     const fraction = ((value / 100 - 1) * 100 - priceAxis.min) / (priceAxis.max - priceAxis.min)
     close(geometry.priceY(value), layout.panels.price[1] - fraction * (layout.panels.price[1] - layout.panels.price[0]))
   }
-  for (const value of [0, 1, 10, 950]) {
-    const fraction = Math.log((value + 1) / (oiAxis.min + 1)) / Math.log((oiAxis.max + 1) / (oiAxis.min + 1))
-    close(geometry.oiY(value), layout.panels.oi[1] - fraction * (layout.panels.oi[1] - layout.panels.oi[0]))
-  }
-  close(geometry.oiY(0), layout.panels.oi[1])
   const first = geometry.x[0], last = geometry.x.at(-1)!
   for (let index = 0; index < bars.length; index++) close(geometry.x[index], first + (last - first) * index / 95)
-  close(geometry.rsiY(0), layout.panels.rsi[1])
-  close(geometry.rsiY(100), layout.panels.rsi[0])
-  close(geometry.takerY(7) - geometry.takerY(10), (layout.panels.taker[1] - layout.panels.taker[0]) * 3 / (geometry.takerAxis.max - geometry.takerAxis.min))
   close(geometry.priceY(100) - geometry.priceY(101), 25)
-  assert.equal(geometry.buySamples, 96)
-  assert.equal(geometry.sellSamples, 96)
 })
 
-test('price uses fixed scale while indicators retain data-driven domains', () => {
-  const geometry = createChartGeometryCache(text => text.length * 6)(rows(), viewport)
-  close(geometry.priceAxis.max - geometry.priceAxis.min, (geometry.layout.panels.price[1] - geometry.layout.panels.price[0]) / 25)
-  close(geometry.takerAxis.min, 0)
-  close(geometry.takerAxis.max, 10.5)
-  close(geometry.rocAxis.max, 92 * 1.05)
-  assert.ok(geometry.priceAxis.ticks.every(tick => tick >= geometry.priceAxis.min - 1 && tick <= geometry.priceAxis.max + 1))
-  assert.ok(geometry.rocAxis.ticks.every(tick => tick >= geometry.rocAxis.min && tick <= geometry.rocAxis.max))
-})
-
-test('RSI markers use the sampled candle coordinates and combine thresholds crossed in one jump', () => {
-  const bars = rows().map((bar, index) => ({ ...bar, rsi6: index === 0 ? 20 : 80 }))
-  const get = createChartGeometryCache(text => text.length * 6)
-  const geometry = get(bars, viewport)
-  assert.equal(geometry.rsiMarkers.length, 1)
-  const marker = geometry.rsiMarkers[0]
-  assert.equal(marker.index, 1)
-  assert.equal(marker.hour, bars[1].hour)
-  assert.equal(marker.field, 'rsi6')
-  assert.equal(marker.direction, 'up')
-  assert.deepEqual(marker.levels, [30, 70])
-  close(marker.x, geometry.x[1])
-  close(marker.y, geometry.rsiY(80))
-  assert.equal(get(bars, viewport), geometry, 'Inspection reuses the prepared crossing geometry.')
-  const forming = bars.map((bar, index) => index === 95 ? { ...bar, rsi6: 20, confirmed: false } : bar)
-  const updated = get(forming, viewport).rsiMarkers.at(-1)!
-  assert.equal(updated.index, 95)
-  assert.equal(updated.direction, 'down')
-  assert.deepEqual(updated.levels, [30, 70])
-})
-
-test('fractional overscan extends paths and crossings without changing the 96-bar axes', () => {
+test('fractional overscan extends paths without changing the 96-bar axes', () => {
   const bars = rows().map(bar => ({ ...bar, rsi6: 25 }))
   const before = { ...candle(-1), rsi6: 80, high: 1000, low: 50 }
   const after = { ...candle(96), rsi6: 80, high: 2000, low: 40 }
@@ -75,7 +33,6 @@ test('fractional overscan extends paths and crossings without changing the 96-ba
   const baseline = get(bars, viewport)
   const geometry = get(bars, viewport, { before, after })
   assert.deepEqual(geometry.priceAxis, baseline.priceAxis)
-  assert.deepEqual(geometry.oiAxis, baseline.oiAxis)
   assert.equal(geometry.x.length, 96)
   close(geometry.barPitch, geometry.x[1] - geometry.x[0])
   const bandX = [...geometry.bollBands[0].matchAll(/[ML]([\d.-]+) ([\d.-]+)/g)].map(([, x]) => Number(x))
@@ -85,111 +42,8 @@ test('fractional overscan extends paths and crossings without changing the 96-ba
   const priceClip = chartPanelClip(geometry.layout, 'price', geometry.barPitch)
   assert.ok(bandX[0] >= priceClip.x && Math.max(...bandX) <= priceClip.x + priceClip.width,
     'The translated price panel clip must admit adjacent bar centers on both sides.')
-  const leftCrossing = geometry.rsiMarkers.find(marker => marker.hour === bars[0].hour && marker.field === 'rsi6')
-  const rightCrossing = geometry.rsiMarkers.find(marker => marker.hour === after.hour && marker.field === 'rsi6')
-  assert.equal(leftCrossing?.index, 0)
-  assert.equal(leftCrossing?.confirmed, true)
-  assert.equal(rightCrossing?.index, -1, 'An overscan crossing does not masquerade as a visible selection index.')
-  assert.equal(rightCrossing?.confirmed, true)
   assert.equal((geometry.upWicks + geometry.downWicks).match(/M/g)?.length, 98, 'Candle paths include both exact adjacent overscan bars.')
-  assert.equal(geometry.buySamples, baseline.buySamples, 'Overscan does not change the visible statistics sample count.')
-  assert.equal(geometry.sellSamples, baseline.sellSamples)
-})
 
-test('missing periods and unavailable observations break paths and filled areas without inventing zero samples', () => {
-  const bars = [0, 1, 3, 4, 5].map(index => ({ ...candle(index),
-    atrPercent: index === 3 ? null : 2.5, bbw: index === 3 ? null : 6,
-    buy: index === 3 ? null : 7, sell: index === 3 ? null : 3, oi: index === 3 ? null : index * 10 }))
-  const geometry = createChartGeometryCache(text => text.length * 6)(bars, viewport)
-  assert.equal((geometry.lines.oi.match(/M/g) ?? []).length, 2)
-  assert.equal((geometry.lines.atrPercent.match(/M/g) ?? []).length, 2)
-  assert.equal((geometry.lines.bbw.match(/M/g) ?? []).length, 2)
-  assert.equal(geometry.bollBands.length, 2)
-  assert.equal((geometry.rocAreas[0].match(/Z/g) ?? []).length, 2)
-  assert.equal(geometry.oiSamples.length, 4)
-  assert.equal(geometry.buySamples, 4)
-  assert.equal(geometry.sellSamples, 4)
-  assert.equal(geometry.oiComplete, false)
-  assert.equal(geometry.takerComplete, false)
-  close(geometry.x[2] - geometry.x[1], 2 * (geometry.x[1] - geometry.x[0]))
-  for (const path of [...Object.values(geometry.lines), ...geometry.bollBands, ...geometry.rocAreas, geometry.buys, geometry.sells]) {
-    assert.doesNotMatch(path, /NaN|Infinity|undefined/)
-  }
-})
-
-test('ATR% and BBW use independent nonnegative percentage axes in one panel', () => {
-  const bars = rows().map((bar, index) => ({ ...bar, atrPercent: index === 0 ? 0 : 0.5, bbw: index === 0 ? 0 : 8 }))
-  const get = createChartGeometryCache(text => text.length * 6)
-  const geometry = get(bars, viewport)
-  const panel = geometry.layout.panels.atr
-  assert.equal(geometry.atrRange.min, 0)
-  assert.ok(geometry.atrRange.max >= 0.5 && geometry.atrRange.max < 8)
-  assert.equal(geometry.bbwRange.min, 0)
-  assert.ok(geometry.bbwRange.max >= 8)
-  close(geometry.atrY(0), panel[1])
-  close(geometry.atrY(geometry.atrRange.max), panel[0])
-  close(geometry.bbwY(0), panel[1])
-  close(geometry.bbwY(geometry.bbwRange.max), panel[0])
-  for (const field of ['atrPercent', 'bbw'] as const) {
-    const coordinates = [...geometry.lines[field].matchAll(/[ML]([\d.-]+) ([\d.-]+)/g)].map(([, x, y]) => [Number(x), Number(y)])
-    assert.equal(coordinates.length, 97)
-    assert.ok(coordinates.every(([, y]) => y >= panel[0] - 0.05 && y <= panel[1] + 0.05))
-  }
-  const missing = get(bars.map(bar => ({ ...bar, atrPercent: null, bbw: null })), viewport)
-  assert.equal(missing.lines.atrPercent, '')
-  assert.equal(missing.lines.bbw, '')
-  assert.ok(Number.isFinite(missing.atrY(0)))
-  assert.ok(Number.isFinite(missing.bbwY(0)))
-
-  const higherBBW = get(bars.map(bar => ({ ...bar, bbw: bar.bbw * 100 })), viewport)
-  assert.deepEqual(higherBBW.atrRange, geometry.atrRange, 'BBW cannot alter the ATR% domain.')
-  close(higherBBW.atrY(0.5), geometry.atrY(0.5))
-  assert.ok(higherBBW.bbwRange.max >= 800)
-  const higherATR = get(bars.map(bar => ({ ...bar, atrPercent: bar.atrPercent * 100 })), viewport)
-  assert.deepEqual(higherATR.bbwRange, geometry.bbwRange, 'ATR% cannot alter the BBW domain.')
-  close(higherATR.bbwY(8), geometry.bbwY(8))
-  assert.ok(higherATR.atrRange.max >= 50)
-
-  const missingBBW = get(bars.map(bar => ({ ...bar, bbw: null })), viewport)
-  assert.deepEqual(missingBBW.atrRange, geometry.atrRange)
-  assert.equal(missingBBW.lines.bbw, '')
-  const missingATR = get(bars.map(bar => ({ ...bar, atrPercent: null })), viewport)
-  assert.deepEqual(missingATR.bbwRange, geometry.bbwRange)
-  assert.equal(missingATR.lines.atrPercent, '')
-})
-
-test('positive ATR% and BBW ranges use the panel height without a forced zero baseline', () => {
-  const bars = rows().map((bar, index) => ({ ...bar,
-    atrPercent: index === 40 ? null : 0.12 + index / 95 * 0.14,
-    bbw: index === 40 ? null : 2 + index / 95 * 6,
-  }))
-  for (const height of [400, 700, 1000]) {
-    const geometry = createChartGeometryCache(text => text.length * 6)(bars, { ...viewport, height })
-    const panel = geometry.layout.panels.atr, panelHeight = panel[1] - panel[0]
-    close(geometry.atrRange.min, 0.113)
-    close(geometry.atrRange.max, 0.267)
-    close(geometry.bbwRange.min, 1.7)
-    close(geometry.bbwRange.max, 8.3)
-    for (const [scale, min, max] of [[geometry.atrY, 0.12, 0.26], [geometry.bbwY, 2, 8]] as const) {
-      const top = scale(max), bottom = scale(min)
-      assert.ok(top > panel[0] && bottom < panel[1], 'The curves retain padding at both ends.')
-      assert.ok((bottom - top) / panelHeight > 0.9, 'The actual visible values must occupy most of the panel, even when the panel is short.')
-    }
-    assert.equal(geometry.layout.left, 0, 'Hidden volatility coordinates do not reserve a left gutter.')
-  }
-})
-
-test('constant positive and zero volatility remain finite without artificial variation', () => {
-  const get = createChartGeometryCache(text => text.length * 6)
-  for (const value of [0, 0.000001, 0.2, 20]) {
-    const geometry = get(rows().map(bar => ({ ...bar, atrPercent: value, bbw: value })), viewport)
-    const panel = geometry.layout.panels.atr
-    const expected = value === 0 ? panel[1] : (panel[0] + panel[1]) / 2
-    close(geometry.atrY(value), expected)
-    close(geometry.bbwY(value), expected)
-    assert.ok(geometry.atrRange.min >= 0 && geometry.atrRange.max > geometry.atrRange.min)
-    assert.doesNotMatch(geometry.lines.atrPercent + geometry.lines.bbw, /NaN|Infinity|undefined/)
-  }
 })
 
 test('Bollinger values crossing zero retain a relative domain and genuine warmup gaps', () => {
@@ -198,7 +52,6 @@ test('Bollinger values crossing zero retain a relative domain and genuine warmup
   assert.equal(geometry.priceAxis.kind, 'relative')
   close(geometry.priceY(100) - geometry.priceY(101), 25)
   close(geometry.priceY(0) - geometry.priceY(1), geometry.priceY(1) - geometry.priceY(2))
-  assert.equal('ema' in geometry.lines, false)
   assert.equal(geometry.bollBands.length, 1)
 })
 
@@ -243,17 +96,13 @@ test('derived geometry has a global retention bound even while source windows re
   assert.equal(get(windows[1], viewport), second, 'Recently used windows survive eviction.')
 })
 
-test('price-only geometry fills the plot and has a separate reusable cache variant', () => {
-  const bars = rows(), geometry = createChartGeometryCache(text => text.length * 6)
-  const multi = geometry(bars, { ...viewport, height: 240, priceOnly: true })
-  const full = geometry(bars, { ...viewport, height: 240, priceOnly: false })
-  assert.notEqual(multi, full)
-  assert.equal(geometry(bars, { ...viewport, height: 240, priceOnly: true }), multi)
-  assert.equal(multi.layout.panels.price[1], 224)
-  assert.ok(multi.layout.panels.price[1] - multi.layout.panels.price[0] > 180)
-  assert.ok(multi.bollBands.length > 0)
-  assert.ok(Object.values(multi.bollLines).every(path => path.length > 0), 'Price-only charts retain all three Bollinger lines.')
-  assert.equal(Object.values(multi.lines).every(path => path === ''), true)
+test('price geometry fills the plot and reuses unchanged cache entries', () => {
+  const bars = rows(), get = createChartGeometryCache(text => text.length * 6)
+  const geometry = get(bars, { ...viewport, height: 240 })
+  assert.equal(get(bars, { ...viewport, height: 240 }), geometry)
+  assert.equal(geometry.layout.panels.price[1], 224)
+  assert.ok(geometry.bollBands.length > 0)
+  assert.ok(Object.values(geometry.bollLines).every(path => path.length > 0))
 })
 
 test('Bollinger lines independently break at missing values and time gaps', () => {
@@ -264,19 +113,26 @@ test('Bollinger lines independently break at missing values and time gaps', () =
   assert.equal(moves(geometry.bollLines.bollUpper), 2)
   assert.equal(moves(geometry.bollLines.bollMiddle), 3)
   assert.equal(moves(geometry.bollLines.bollLower), 2)
+  assert.equal(geometry.bollBands.length, 2, 'A missing candle splits the filled band; a missing middle line does not.')
   for (const path of Object.values(geometry.bollLines)) assert.doesNotMatch(path, /NaN|Infinity/)
 })
 
-test('unplotted EMA values cannot widen the main price scale or generate a path', () => {
+test('Bollinger filled bands break where either outer line is missing', () => {
+  const bars = rows().map((bar, index) => ({ ...bar,
+    bollUpper: index === 10 ? null : bar.bollUpper,
+    bollLower: index === 45 ? null : bar.bollLower,
+  }))
+  const geometry = createChartGeometryCache(text => text.length * 6)(bars, viewport)
+  assert.equal(geometry.bollBands.length, 3)
+  for (const path of geometry.bollBands) assert.doesNotMatch(path, /NaN|Infinity/)
+})
+
+test('unplotted EMA values cannot widen the price scale', () => {
   const bars = rows(), get = createChartGeometryCache(text => text.length * 6)
-  for (const priceOnly of [false, true]) {
-    const baseline = get(bars, { ...viewport, priceOnly })
-    const extremeEMA = get(bars.map(bar => ({ ...bar, ema: 1_000_000 })), { ...viewport, priceOnly })
-    assert.deepEqual(extremeEMA.priceAxis, baseline.priceAxis)
-    assert.equal('ema' in extremeEMA.lines, false)
-    assert.ok(extremeEMA.bollBands.length > 0)
-    for (const field of ['vwap', 'bollUpper', 'bollMiddle', 'bollLower']) assert.equal(field in extremeEMA.lines, false)
-  }
+  const baseline = get(bars, viewport)
+  const extremeEMA = get(bars.map(bar => ({ ...bar, ema: 1_000_000 })), viewport)
+  assert.deepEqual(extremeEMA.priceAxis, baseline.priceAxis)
+  assert.ok(extremeEMA.bollBands.length > 0)
 })
 
 test('relative normalization uses a positive reference even with an invalid visible base', () => {
@@ -342,7 +198,7 @@ test('nonfinite OHLC never produces invalid cached price paths', () => {
   const broken = rows().map((bar, index) => ({ ...bar, open: index === 0 ? 100 : NaN, high: NaN, low: NaN, close: NaN, bollUpper: null, bollMiddle: null, bollLower: null }))
   const geometry = createChartGeometryCache(text => text.length * 6)(broken, viewport)
   assert.equal(geometry.priceAxis.base, 100)
-  for (const path of [geometry.upWicks, geometry.downWicks, geometry.upBodies, geometry.downBodies, ...Object.values(geometry.lines), ...geometry.bollBands]) assert.doesNotMatch(path, /NaN|Infinity/)
+  for (const path of [geometry.upWicks, geometry.downWicks, geometry.upBodies, geometry.downBodies, ...geometry.bollBands]) assert.doesNotMatch(path, /NaN|Infinity/)
   assert.ok(geometry.priceTicks.every(tick => Number.isFinite(tick.y)))
   const empty = broken.map(bar => ({ ...bar, open: NaN }))
   const unavailable = createChartGeometryCache(text => text.length * 6)(empty, viewport)
@@ -353,17 +209,17 @@ test('nonfinite OHLC never produces invalid cached price paths', () => {
 test('price scale maps one percent of its reference to 25 CSS pixels', () => {
   const bars = rows(), get = createChartGeometryCache(text => text.length * 6)
   for (const height of [240, 700]) for (const base of [100, 150]) {
-    const geometry = get(bars, { ...viewport, height, priceOnly: true, priceScaleBase: base })
+    const geometry = get(bars, { ...viewport, height, priceScaleBase: base })
     close(geometry.priceY(base) - geometry.priceY(base * 1.01), 25)
     close(geometry.priceY(bars.at(-1)!.close), (geometry.layout.panels.price[0] + geometry.layout.panels.price[1]) / 2)
-    assert.equal(get(bars, { ...viewport, height, priceOnly: true, priceScaleBase: base }), geometry)
+    assert.equal(get(bars, { ...viewport, height, priceScaleBase: base }), geometry)
   }
 })
 
 test('price axis uses one-percent ticks and 25px spacing at every panel height', () => {
   const bars = rows(), get = createChartGeometryCache(text => text.length * 6)
   for (const height of [240, 560, 1000]) {
-    const geometry = get(bars, { ...viewport, height, priceOnly: true, priceScaleBase: 100 })
+    const geometry = get(bars, { ...viewport, height, priceScaleBase: 100 })
     assert.equal(geometry.priceAxis.step, 1)
     assert.ok(geometry.priceAxis.ticks.every(Number.isInteger))
     const displayed = chartPricePresentation(geometry, 0).ticks
@@ -374,13 +230,13 @@ test('price axis uses one-percent ticks and 25px spacing at every panel height',
     }
     close(geometry.priceY(100) - geometry.priceY(101), 25)
   }
-  const tall = get(bars, { ...viewport, height: 560, priceOnly: true, priceScaleBase: 100 })
+  const tall = get(bars, { ...viewport, height: 560, priceScaleBase: 100 })
   assert.ok(tall.priceTicks.length > 9, 'A tall price-only panel is not limited to nine labels.')
 })
 
 test('price axis includes a tick beyond each panel edge for naturally clipped labels', () => {
   const bars = rows(), get = createChartGeometryCache(text => text.length * 6)
-  const geometry = get(bars, { ...viewport, height: 240, priceOnly: true, priceScaleBase: 100 })
+  const geometry = get(bars, { ...viewport, height: 240, priceScaleBase: 100 })
   const [top, bottom] = geometry.layout.panels.price
   const positions = geometry.priceTicks.map(tick => tick.y).sort((a, b) => a - b)
   assert.ok(positions[0] < top && positions[1] >= top)

@@ -124,7 +124,7 @@ export function intervalFor(previous, current) {
     unknown('combined', p.pid); unknown(p.group, p.pid)
   }
   const counters = [
-    ['cpuTimeNs', ['cpuUserNsExact', 'cpuSystemNsExact'], ['cpuPUserNsExact', 'cpuPSystemNsExact']],
+    ['cpuTimeNs', ['cpuUserTicksExact', 'cpuSystemTicksExact'], ['cpuPUserTicksExact', 'cpuPSystemTicksExact']],
     ['cpuEnergyNj', ['cpuEnergyNjExact'], ['cpuPEnergyNjExact']],
     ['cpuCycles', ['cpuCyclesExact'], ['cpuPCyclesExact']],
     ['cpuInstructions', ['cpuInstructionsExact'], ['cpuPInstructionsExact']],
@@ -132,18 +132,17 @@ export function intervalFor(previous, current) {
   for (const [name, target] of Object.entries(groups)) {
     target.breakdown = {}
     for (const [metric, nsTotals, nsPerformance] of counters) {
-      const tickTotals = ['cpuUserTicksExact', 'cpuSystemTicksExact'], tickPerformance = ['cpuPUserTicksExact', 'cpuPSystemTicksExact']
       const timebase = current.timebase
       const useTicks = metric === 'cpuTimeNs' && Number.isSafeInteger(timebase?.numer) && timebase.numer > 0 && Number.isSafeInteger(timebase?.denom) && timebase.denom > 0
         && previous.timebase?.numer === timebase.numer && previous.timebase?.denom === timebase.denom
-        && [previous, current].every(snapshot => snapshot.processes.filter(process => selected(process, name) && process.counters).every(process => tickTotals.every(key => process.counters[key] != null)))
-      const totals = useTicks ? tickTotals : nsTotals, performance = useTicks ? tickPerformance : nsPerformance
+        && [previous, current].every(snapshot => snapshot.processes.filter(process => selected(process, name) && process.counters).every(process => nsTotals.every(key => process.counters[key] != null)))
+      const totals = nsTotals, performance = nsPerformance
       const supported = metric === 'cpuEnergyNj' ? previous.cpuEnergySupported === true && current.cpuEnergySupported === true
         : metric === 'cpuCycles' ? previous.cpuCyclesSupported === true && current.cpuCyclesSupported === true
           : metric === 'cpuInstructions' ? previous.cpuInstructionsSupported === true && current.cpuInstructionsSupported === true : true
       const pSupportKey = { cpuTimeNs: 'cpuPTimeSupported', cpuEnergyNj: 'cpuPEnergySupported', cpuCycles: 'cpuPCyclesSupported', cpuInstructions: 'cpuPInstructionsSupported' }[metric]
       const observed = keys => [previous, current].some(snapshot => snapshot.processes.some(process => selected(process, name) && process.counters && keys.some(key => process.counters[key] != null && BigInt(process.counters[key]) > 0n)))
-      let total = 0n, pcore = 0n, totalValid = (supported || observed(totals)) && target.unknownPids.length === 0
+      let total = 0n, pcore = 0n, totalValid = (metric !== 'cpuTimeNs' || useTicks) && (supported || observed(totals)) && target.unknownPids.length === 0
       let valid = totalValid && ((previous[pSupportKey] === true && current[pSupportKey] === true) || observed(performance))
       for (const p of current.processes.filter(p => selected(p, name))) {
         const before = old.get(p.birthIdentity)
@@ -172,7 +171,7 @@ export function intervalFor(previous, current) {
       const adjustment = useTicks && valid ? totalDisplay - pDisplay - toNs(total - pcore) : null
       target.breakdown[metric] = { complete: valid, totalComplete: totalValid, totalExact: totalValid ? String(totalDisplay) : null,
         pCoreExact: valid ? String(pDisplay) : null, eCoreExact: valid ? String(totalDisplay - pDisplay) : null,
-        ...(metric === 'cpuTimeNs' ? { source: useTicks ? 'mach-ticks' : 'legacy-nanoseconds',
+        ...(metric === 'cpuTimeNs' ? { source: useTicks ? 'mach-ticks' : 'unavailable',
           totalTicksExact: useTicks && totalValid ? String(total) : null, pCoreTicksExact: useTicks && valid ? String(pcore) : null,
           eCoreTicksExact: useTicks && valid ? String(total - pcore) : null,
           eCoreRoundingAdjustmentNsExact: adjustment === null ? null : String(adjustment) } : {}) }

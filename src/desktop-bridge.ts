@@ -24,7 +24,7 @@ if (!transport) throw new Error('The desktop transport is unavailable.')
 const bridge = transport
 let operations: OperationBridgeHooks | undefined
 const chartRequest = (value: unknown) => value !== null && typeof value === 'object'
-  && ['chartWindow', 'chartLocal', 'chartHistory', 'chartUniverse'].some(key => Object.hasOwn(value, key))
+  && ['chartLocal', 'chartHistory', 'chartUniverse'].some(key => Object.hasOwn(value, key))
 
 const decodeResponse = (value: DesktopRequest, result: unknown) => chartRequest(value) ? decodeChartWire(result) : result
 const plainRequest = async (value: DesktopRequest) => decodeResponse(value, await bridge.request(value))

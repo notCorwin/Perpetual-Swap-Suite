@@ -1,3 +1,4 @@
+import type { PreparedChartBar } from '../electron/services/market-service.js'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { mkdtemp, rm } from 'node:fs/promises'
@@ -22,11 +23,11 @@ test('prepared windows retain the full-history EMA seed through corrections, evi
     service.instruments.set(instrument.instId, { ...instrument, listTime: String(first) })
     service.preparedCharts.setFocus({ instId: instrument.instId, timeframe: '5m', endHour: rows.at(-1)!.timestamp }, String(++focusID))
     await service.preparedCharts.focus!.task
-    const prepared = (await service.localChartWindow(instrument.instId, '5m'))!
-    const chart = (await service.localChartHistory(instrument.instId, '5m', rows.at(-1)!.timestamp))!
+    const prepared = (await service.preparedCharts.local(instrument.instId, '5m'))!
+    const chart = (await service.preparedCharts.localHistory(instrument.instId, '5m', rows.at(-1)!.timestamp))!
     const byHour = new Map(prepared.bars.map((bar: { hour: number }) => [bar.hour, bar]))
-    assert.equal(chart.bars.filter(bar => bar.hour >= rows.at(-1)!.timestamp - 95 * step && bar.hour <= rows.at(-1)!.timestamp).length, 96)
-    const shared = chart.bars.filter(bar => byHour.has(bar.hour))
+    assert.equal(chart.bars.filter((bar: PreparedChartBar) => bar.hour >= rows.at(-1)!.timestamp - 95 * step && bar.hour <= rows.at(-1)!.timestamp).length, 96)
+    const shared = chart.bars.filter((bar: PreparedChartBar) => byHour.has(bar.hour))
     assert.equal(shared.length, prepared.bars.length, 'The chart navigation history must contain the bounded prepared tail.')
     for (const bar of shared) for (const field of ['ema', 'rsi6', 'rsi12', 'rsi24', 'atrPercent', 'bbw', 'bollMiddle'] as const) {
       assert.equal(bar[field], (byHour.get(bar.hour) as any)[field], `${field} at ${bar.hour}`)
@@ -48,7 +49,7 @@ test('prepared windows retain the full-history EMA seed through corrections, evi
     await verify()
     service.preparedCharts.maxSeries = 1
     await store.appendCandles([{ ...rows[0], instrument: 'ETH-USDT-SWAP' }])
-    await service.localChartWindow('ETH-USDT-SWAP', '5m')
+    await service.preparedCharts.local('ETH-USDT-SWAP', '5m')
     await verify()
     await service.dispose()
     await store.close()

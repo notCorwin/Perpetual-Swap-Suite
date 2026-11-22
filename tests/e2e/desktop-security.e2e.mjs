@@ -117,7 +117,7 @@ test('an untrusted renderer cannot use the real IPC channel even when supplied w
   for (const attempt of attempts) {
     assert.equal(attempt.exposed, true, 'The attacker must reach the IPC bridge for this to exercise the host boundary.')
     assert.equal(attempt.accepted, false)
-    assert.match(attempt.error, /restricted to the application main frame/i)
+    assert.match(attempt.error, /restricted to application windows/i)
   }
   assert.deepEqual(await request({ preferences: { action: 'read' } }), previous)
 })

@@ -23,7 +23,7 @@ test('chart requests and publications cross Electron as wire strings and retain 
     ipcMain.handle('radar:request', async (event, value, context) => {
       if (probe.malformed && value.chartLocal) return 'invalid chart wire'
       const result = await original(event, value, context)
-      const command = ['chartWindow', 'chartLocal', 'chartHistory', 'chartUniverse'].find(key => value[key])
+      const command = ['chartLocal', 'chartHistory', 'chartUniverse'].find(key => value[key])
       if (command) probe.requests.push({ command, type: typeof result, traceId: context?.traceId, parentId: context?.parentId })
       return result
     })
@@ -36,17 +36,23 @@ test('chart requests and publications cross Electron as wire strings and retain 
   const candles = Array.from({ length: 250 }, (_, index) => ({ instrument: instId, timeframe: '5m', timestamp: through - (249 - index) * step,
     open: 100, high: 102, low: 99, close: 101, volume: 10, baseVolume: 1, quoteVolume: 1_000, confirmed: true }))
   await request({ e2e: { action: 'seedCandles', candles } })
-  const window = await request({ chartWindow: { instId, timeframe: '5m', historyBars: 96 } })
-  assert.equal(window.instId, instId)
-  assert.equal(window.timeframe, '5m')
-  assert.ok(Array.isArray(window.bars))
+  await request({ chartFocus: { id: 'wire-focus', target: { instId, timeframe: '5m', endHour: through } } })
+  await page.waitForFunction(async ({ instId, through }) => {
+    const frame = await window.radarDesktop.request({ chartHistory: { instId, timeframe: '5m', endHour: through, focusId: 'wire-focus' } })
+    return frame && frame.indicatorState !== 'loading' && frame.bars.length >= 96
+  }, { instId, through }, { timeout: 20_000 })
+  const frame = await request({ chartHistory: { instId, timeframe: '5m', endHour: through, focusId: 'wire-focus' } })
+  assert.equal(frame.instId, instId)
+  assert.equal(frame.timeframe, '5m')
+  assert.ok(frame.bars.length >= 96)
+  assert.equal(frame.bars.at(-1).close, 101)
   for (const value of [{ chartLocal: { instId, timeframe: '5m' } }, { chartHistory: { instId, timeframe: '5m', endHour: through } }, { chartUniverse: {} }]) {
     const result = await request(value)
     assert.ok(result === null || typeof result === 'object')
   }
   await assert.rejects(() => request({ chartLocal: { instId, timeframe: '5m', extra: true } }), /Invalid desktop bridge request/)
   const raw = await electron.evaluate(() => globalThis.__wireProbe.requests)
-  for (const command of ['chartWindow', 'chartLocal', 'chartHistory', 'chartUniverse']) assert.ok(raw.some(value => value.command === command))
+  for (const command of ['chartLocal', 'chartHistory', 'chartUniverse']) assert.ok(raw.some(value => value.command === command))
   assert.ok(raw.every(value => value.type === 'string' && value.traceId && value.parentId), 'The real handler must return primitives and retain request lineage.')
 
   await page.evaluate(() => {
@@ -112,5 +118,5 @@ test('chart requests and publications cross Electron as wire strings and retain 
       return results
     } finally { attacker.destroy() }
   }, page.url())
-  assert.ok(attempts.every(value => /restricted to the application main frame/i.test(value)))
+  assert.ok(attempts.every(value => /restricted to application windows/i.test(value)), JSON.stringify(attempts))
 })

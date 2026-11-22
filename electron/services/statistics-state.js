@@ -2,7 +2,6 @@ export const STATISTICS_OI = 1
 export const STATISTICS_TAKER = 2
 const COMPLETE = STATISTICS_OI | STATISTICS_TAKER
 // Source bits record actual bounded begin/end observations in one format.
-// Legacy encodings are converted only by the archive importer.
 const FORMAT = 8
 const nonnegative = value => typeof value === 'number' && Number.isFinite(value) && value >= 0
 

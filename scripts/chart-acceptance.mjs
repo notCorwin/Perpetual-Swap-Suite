@@ -1151,8 +1151,9 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
     const originalSend = contents.send
     await globalThis.__marketBackend.probe({ action: 'sourceInstall', instId })
     const probe = {
-      original, contents, originalSend, calls: [], active: 0, maxActive: 0, focusCalls: [], legacyWindowCalls: 0,
+      original, contents, originalSend, calls: [], active: 0, maxActive: 0, focusCalls: [],
       historicalActive: 0, maxHistoricalActive: 0, localActive: 0, maxLocalActive: 0,
+      historicalActiveByTimeframe: {}, maxHistoricalActiveByTimeframe: {},
       historyCalls: [], historyResponses: [], historyFrames: new Map(), transferredHistoryBars: 0,
       preparedPushes: 0, preparedPushBars: 0, fullHistoryPushes: 0, fullHistoryPushBars: 0,
       historyPushSamples: new Map(), fullHistoryPushShapes: new Map(), sourceBaseline: 0,
@@ -1277,7 +1278,6 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
         probe.focusCalls.push({ ...value.chartFocus, at: Date.now() })
         return original(event, value, context)
       }
-      if (value.chartWindow) probe.legacyWindowCalls += 1
       const kind = value.chartHistory?.instId === instId ? 'history' : value.chartLocal?.instId === instId ? 'local' : null
       if (!kind) {
         const wire = await original(event, value, context)
@@ -1292,6 +1292,12 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
       const lane = kind === 'history' ? 'historicalActive' : 'localActive'
       const maximum = kind === 'history' ? 'maxHistoricalActive' : 'maxLocalActive'
       probe[lane] += 1; probe[maximum] = Math.max(probe[maximum], probe[lane])
+      if (kind === 'history') {
+        const frame = query.timeframe
+        const active = (probe.historicalActiveByTimeframe[frame] ?? 0) + 1
+        probe.historicalActiveByTimeframe[frame] = active
+        probe.maxHistoricalActiveByTimeframe[frame] = Math.max(probe.maxHistoricalActiveByTimeframe[frame] ?? 0, active)
+      }
       if (kind === 'history') probe.historyCalls.push({ ...query })
       let held = false
       try {
@@ -1317,6 +1323,7 @@ export async function installRequestProbe(electron, instId, { holdHistorical = f
         return result === response ? wire : encodeChartWire(result)
       } finally {
         call.completedAt = Date.now(); probe.active -= 1; probe[lane] -= 1
+        if (kind === 'history') probe.historicalActiveByTimeframe[query.timeframe] -= 1
         if (held) probe.heldSettled = true
       }
     })
@@ -1353,7 +1360,8 @@ export async function readRequestProbe(electron) {
     return {
       calls: probe.calls, active: probe.active, maxActive: probe.maxActive,
       historicalActive: probe.historicalActive, maxHistoricalActive: probe.maxHistoricalActive, localActive: probe.localActive, maxLocalActive: probe.maxLocalActive,
-      focusCalls: probe.focusCalls, legacyWindowCalls: probe.legacyWindowCalls, heldCall: probe.heldCall, heldSettled: probe.heldSettled, extensions: probe.extensions,
+      maxHistoricalActiveByTimeframe: probe.maxHistoricalActiveByTimeframe,
+      focusCalls: probe.focusCalls, heldCall: probe.heldCall, heldSettled: probe.heldSettled, extensions: probe.extensions,
       historyCalls: probe.historyCalls, historyResponses: probe.historyResponses, historyFrames: Object.fromEntries(probe.historyFrames),
       transferredHistoryBars: probe.transferredHistoryBars, transferredBars: probe.transferredHistoryBars,
       traffic: { preparedPushes: probe.preparedPushes, totalBars: probe.preparedPushBars,
@@ -1374,8 +1382,9 @@ export async function resetRequestProbe(electron) {
     probe.sourceBaseline = sourceRequests.length
     probe.calls.length = 0; probe.focusCalls.length = 0; probe.historyCalls.length = 0; probe.historyResponses.length = 0
     probe.historyFrames.clear(); probe.extensions.length = 0; probe.deliveredFloors.clear()
-    probe.transferredHistoryBars = 0; probe.legacyWindowCalls = 0; probe.maxActive = 0
+    probe.transferredHistoryBars = 0; probe.maxActive = 0
     probe.maxHistoricalActive = 0; probe.maxLocalActive = 0
+    probe.maxHistoricalActiveByTimeframe = { ...probe.historicalActiveByTimeframe }
     probe.preparedPushes = 0; probe.preparedPushBars = 0; probe.fullHistoryPushes = 0; probe.fullHistoryPushBars = 0
     probe.historyPushSamples.clear()
     probe.fullHistoryPushShapes.clear()
@@ -1446,7 +1455,9 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture, { o
     await startPaintProbe(page, fixture)
     paintStarted = true
     await electron.evaluate(() => { globalThis.__chartRequestProbe.extendHistory = true })
-    const inputs = await wheelBurst(page, { frames, deltaY: 24 })
+    const spacing = Number(await page.locator('[data-acceptance-target] [data-chart-inst]').getAttribute('data-chart-bar-spacing'))
+    assert.ok(Number.isFinite(spacing) && spacing > 0, 'The chart must expose a valid candle spacing.')
+    const inputs = await wheelBurst(page, { frames, deltaY: candlesPerFrame * spacing })
     phaseData.inputs = inputs
     const expectedEnd = fixture.end - frames * candlesPerFrame * fixture.intervalMS
     await waitForRendered(page, fixture, fixture.timeframe, expectedEnd)
@@ -1489,8 +1500,7 @@ export async function measureLatencyCoveredPrefetch(electron, page, fixture, { o
         ['delivery before crossing', () => assert.ok(responseTime < inputs[crossingIndex], 'Backend reserve data must reach the renderer before the first viewport crosses the original boundary.')],
         ['request runway', () => assert.ok(runwayAtRequest >= 192, `Only ${runwayAtRequest} resident candles remained when backend history delivery started.`)],
       ] : []),
-      ['historical read lanes', () => assert.ok(requests.maxHistoricalActive <= 2, 'Continuous input must keep durable reads within two independent lanes.')],
-      ['legacy window calls', () => assert.equal(requests.legacyWindowCalls, 0)],
+      ['historical read lanes', () => assert.ok(Object.values(requests.maxHistoricalActiveByTimeframe).every(active => active <= 2), 'Continuous input must keep each chart within two independent durable read lanes.')],
       ['delayed read budget', () => assert.ok(delayedReads.length <= readBudget, `A cold-boundary traversal admitted ${delayedReads.length} delayed disk reads (budget ${readBudget}).`)],
       ['persisted sources', () => assert.deepEqual(sources.historical, [], 'Prefetch must reuse persisted source candles and statistics within the latency test range.')],
       ...(!offscreen ? prefetchPerformanceChecks(latency) : []),
@@ -1628,6 +1638,23 @@ export async function measureMissingWindow(electron, page, { timeframe = '15m', 
     await startPaintProbe(page, fixture, { indicatorValidation: 'deferred-canonical' })
     paintStarted = true
 
+    if (failSource) await page.evaluate(timeframe => {
+      const seen = new WeakMap()
+      const records = []
+      const selector = `[data-chart-shared-status-item="${CSS.escape(timeframe)}"]`
+      for (const node of document.querySelectorAll(selector)) seen.set(node, node.textContent)
+      const observer = new MutationObserver(() => {
+        for (const node of document.querySelectorAll(selector)) {
+          const text = node.textContent ?? ''
+          if (seen.get(node) === text) continue
+          seen.set(node, text)
+          records.push({ node, text, at: performance.timeOrigin + performance.now() })
+        }
+      })
+      observer.observe(document.body, { childList: true, subtree: true, characterData: true })
+      window.__coldWindowNotifications = { records, observer }
+    }, timeframe)
+
     const firstInputs = await wheelBurst(page, { deltaY: fixture.targetDistance * 12 })
     const deadline = Date.now() + 10_000
     let sourceSnapshot, nearest
@@ -1681,19 +1708,19 @@ export async function measureMissingWindow(electron, page, { timeframe = '15m', 
         nearest = sourceSnapshot.requests.find(request => request.source === 'candles'
           && request.from <= fixture.targetEnd && request.through >= fixture.targetWindowStart)
       }
-      await page.waitForFunction(({ instId, latestEnd }) => {
+      await page.waitForFunction(({ instId, latestEnd, failedAt }) => {
         const chart = document.querySelector(`[data-acceptance-target] [data-chart-inst="${instId}"]`)
-        const alert = document.querySelector('[role="alert"]')?.textContent ?? ''
-        return Number(chart?.dataset.chartRequestedEnd) === latestEnd && /price history failed/i.test(alert)
-      }, { instId: fixture.instId, latestEnd }, { timeout: 5_000 }).catch(async error => {
+        return Number(chart?.dataset.chartRequestedEnd) === latestEnd && window.__coldWindowNotifications?.records.some(record =>
+          record.at >= failedAt && record.node.isConnected && /chart update failed|price history could not be loaded/i.test(record.text))
+      }, { instId: fixture.instId, latestEnd, failedAt: nearest.failedAt }, { timeout: 5_000 }).catch(async error => {
         throw new Error(`A failed cold source must remain a truthful chart error. State: ${JSON.stringify(await readColdWindowState(page, fixture.instId))}`, { cause: error })
       })
       const failedState = await readColdWindowState(page, fixture.instId)
       assert.equal(failedState.requestedEnd, latestEnd)
       assert.notEqual(failedState.completedEnd, latestEnd, 'A failed page must not publish the missing target as complete.')
-      assert.match(failedState.alert, /price history failed/i)
+      assert.match(failedState.alert, /chart update failed|price history could not be loaded/i)
       assert.equal(nearest.error, 'Configured cold-window source failure.', `The delayed fixture must fail for its configured reason: ${JSON.stringify(nearest)}`)
-      assert.match(failedState.alert, /Configured cold-window source failure\./)
+      assert.doesNotMatch(failedState.alert, /Configured cold-window source failure\./, 'The UI must not expose raw provider errors.')
       assert.ok(nearest.failedAt - nearest.startedAt >= fixture.sourceDelayMS,
         `The configured failed price source must remain delayed for the full interval: ${JSON.stringify(nearest)}`)
     } else {
@@ -1741,7 +1768,6 @@ export async function measureMissingWindow(electron, page, { timeframe = '15m', 
       ['indicator readiness', () => assert.equal(finalWindow.indicatorState, observedFieldOracle?.expectedIndicatorState,
         'Indicator readiness must describe the available SQLite prefix, including its real warmup boundary.')],
       ['historical read lanes', () => assert.ok(requests.maxHistoricalActive <= 2, 'Cold acquisition exceeded the two historical read lanes.')],
-      ['legacy window calls', () => assert.equal(requests.legacyWindowCalls, 0)],
       ['source request budget', () => assert.ok(sourceSnapshot.requests.length <= 8, 'A single cold viewport admitted too many source requests.')],
       ['duplicate source pages', () => assert.ok(duplicatePages <= (failSource ? 1 : 0), 'The same cold source page was requested repeatedly.')],
       ...(!offscreen ? [
@@ -1783,6 +1809,7 @@ export async function measureMissingWindow(electron, page, { timeframe = '15m', 
     throw error
   } finally {
     const cleanupErrors = []
+    if (failSource) try { await page.evaluate(() => { window.__coldWindowNotifications?.observer.disconnect(); delete window.__coldWindowNotifications }) } catch (error) { cleanupErrors.push(error) }
     if (paintStarted) try { await finishPaintProbe(page) } catch (error) { cleanupErrors.push(error) }
     if (probeInstalled) {
       try { await releaseRequestProbe(electron) } catch (error) { cleanupErrors.push(error) }
@@ -1806,7 +1833,7 @@ async function readColdWindowState(page, instId) {
       statisticsState: chart.dataset.chartStatisticsState, oiState: chart.dataset.chartOiState,
       takerState: chart.dataset.chartTakerState,
       indicatorState: chart.dataset.chartIndicatorState ?? null,
-      alert: document.querySelector('[role="alert"]')?.textContent ?? '' }
+      alert: document.querySelector(`[data-chart-shared-status-item="${CSS.escape(document.documentElement.dataset.acceptanceTimeframe ?? '')}"]`)?.textContent ?? '' }
   })
 }
 

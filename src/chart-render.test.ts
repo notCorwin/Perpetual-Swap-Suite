@@ -60,7 +60,6 @@ test('indicator replay retains continuous curves while current prices, statistic
   assert.deepEqual(retained.window!.bars.map(bar => bar.bollUpper), frame.bars.map(bar => bar.bollUpper))
   assert.equal(retainedPlot.geometry.bollBands.length, initial.geometry.bollBands.length)
   assert.ok(Math.abs((retainedPlot.geometry.priceY(104) - retainedPlot.geometry.priceY(98)) - (initial.geometry.priceY(104) - initial.geometry.priceY(98))) < 1e-8, 'The fixed scale preserves retained band shape while following the current price.')
-  assert.equal(retainedPlot.geometry.lines.rsi6, initial.geometry.lines.rsi6)
   assert.equal(present(loading), retained, 'Repeated renders reuse the same presentation projection.')
   const partial = { ...loading, bars: loading.bars.map((bar, index) => index < 40 ? { ...bar, bollUpper: 105, indicatorsObserved: true } : bar) }
   assert.deepEqual(present(partial).window!.bars.map(bar => bar.bollUpper), frame.bars.map(bar => bar.bollUpper), 'Chunked replay cannot repeatedly reshape the cached curves.')
@@ -181,7 +180,7 @@ test('pinch projects continuous spans from cached indicators without changing ca
   const cache = createChartPlotCache(text => text.length * 6), frame = window(), size = { width: 960, height: 700 }
   const canonical = cache(frame, size)!
   const viewport = { count: 42.5, offset: -0.25 }
-  const plot = cache(frame, size, {}, undefined, false, viewport)!
+  const plot = cache(frame, size, {}, undefined, viewport)!
   assert.equal(plot.geometry.endHour, 94.75 * step)
   assert.equal(plot.geometry.firstHour, 53.25 * step)
   assert.equal(plot.bars[0], frame.bars[54], 'Reuse the already calculated bar and its indicators.')
@@ -190,7 +189,7 @@ test('pinch projects continuous spans from cached indicators without changing ca
   assert.equal(plot.after, frame.bars[95])
   assert.ok(plot.geometry.barPitch > canonical.geometry.barPitch)
   assert.ok(plot.geometry.x.every(x => x >= plot.geometry.layout.left && x <= plot.geometry.layout.right))
-  assert.equal(cache(frame, size, {}, undefined, false, viewport), plot, 'Unchanged zoom reuses immutable paths.')
+  assert.equal(cache(frame, size, {}, undefined, viewport), plot, 'Unchanged zoom reuses immutable paths.')
   assert.equal(cache(frame, size), canonical, 'Pinching cannot change canonical candidate windows.')
   assert.equal(frame.bars.length, 96)
 })
@@ -199,7 +198,7 @@ test('pinch projects continuous spans from cached indicators without changing ca
 test('a forming price outside the zoom viewport cannot distort the visible price axis', () => {
   const cache = createChartPlotCache(text => text.length * 6), frame = window(), size = { width: 960, height: 700 }
   const live = { ...frame, liveBar: { ...frame.bars.at(-1)!, hour: 96 * step, close: 1_000_000 } }
-  const plot = cache(live, size, {}, undefined, false, { count: 42.5, offset: -2.25 })!
+  const plot = cache(live, size, {}, undefined, { count: 42.5, offset: -2.25 })!
   assert.ok(plot.geometry.priceAxis.max < 1000)
   assert.equal(plot.geometry.liveClose, 102)
 })
@@ -209,19 +208,19 @@ test('fractional historical viewport centers on its rightmost visible candle, no
   const frame = { ...source, bars: source.bars.map((bar, index) => index === 95 ? { ...bar, open: 900, high: 1000, low: 900, close: 1000 } : bar) }
   for (const offset of [-0.75, -2.25]) {
     const viewport = { spacing: 9.6, offset }
-    const plot = cache(frame, size, {}, undefined, true, viewport)!
+    const plot = cache(frame, size, {}, undefined, viewport)!
     const panel = plot.geometry.layout.panels.price
     assert.ok(Math.abs(plot.geometry.priceY(102) - (panel[0] + panel[1]) / 2) < 1e-8, `Offscreen future price changed center at offset ${offset}`)
-    assert.equal(cache(frame, size, {}, undefined, true, viewport), plot, 'An unchanged viewport must reuse the geometry.')
+    assert.equal(cache(frame, size, {}, undefined, viewport), plot, 'An unchanged viewport must reuse the geometry.')
   }
   const edgeFrame = { ...source, bars: source.bars.map((bar, index) => index === 93 ? { ...bar, close: 1000 } : bar) }
   const viewport = { spacing: 9.6, offset: -2.25 }
-  const nearEdge = cache(edgeFrame, size, {}, undefined, true, viewport, 0)!
-  const shifted = cache(edgeFrame, size, {}, undefined, true, viewport, 0.9)!
+  const nearEdge = cache(edgeFrame, size, {}, undefined, viewport, 0)!
+  const shifted = cache(edgeFrame, size, {}, undefined, viewport, 0.9)!
   const center = (plot: typeof nearEdge) => (plot.geometry.layout.panels.price[0] + plot.geometry.layout.panels.price[1]) / 2
   assert.ok(Math.abs(nearEdge.geometry.priceY(1000) - center(nearEdge)) < 1e-8, 'A partially visible right-edge candle determines the center.')
   assert.ok(Math.abs(shifted.geometry.priceY(102) - center(shifted)) < 1e-8, 'The center follows the newly visible rightmost candle during fractional scrolling.')
-  assert.equal(cache(edgeFrame, size, {}, undefined, true, viewport, 0.9), shifted)
+  assert.equal(cache(edgeFrame, size, {}, undefined, viewport, 0.9), shifted)
 })
 
 test('fixed spacing survives resize and changing label gutters while axes use only visible prices', () => {
@@ -232,14 +231,14 @@ test('fixed spacing survives resize and changing label gutters while axes use on
   for (const spacing of [4, 9.6, 25]) {
     let previousCount = 0
     for (const width of [840, 841, 1290, 2180, 3000]) {
-      const plot = cache(frame, { width, height: 700 }, {}, undefined, false, { spacing, offset: -0.25 })!
+      const plot = cache(frame, { width, height: 700 }, {}, undefined, { spacing, offset: -0.25 })!
       assert.equal(plot.geometry.barPitch, spacing)
       assert.equal(plot.geometry.barWidth, spacing * 0.68)
       assert.ok(Math.abs(plot.geometry.x[1] - plot.geometry.x[0] - spacing) < 1e-9)
       assert.ok(plot.geometry.windowBars! > previousCount)
       assert.equal(plot.geometry.endHour, 1534.75 * step)
       assert.ok(plot.geometry.priceAxis.max < 1000, 'Hidden cache prices cannot affect vertical scaling.')
-      assert.equal(cache(frame, { width, height: 700 }, {}, undefined, false, { spacing, offset: -0.25 }), plot)
+      assert.equal(cache(frame, { width, height: 700 }, {}, undefined, { spacing, offset: -0.25 }), plot)
       previousCount = plot.geometry.windowBars!
     }
   }
@@ -248,10 +247,10 @@ test('fixed spacing survives resize and changing label gutters while axes use on
 test('visible new highs can widen the price gutter without stretching candle spacing', () => {
   const cache = createChartPlotCache(text => text.length * 6), base = window(), size = { width: 960, height: 700 }
   const viewport = { spacing: 9.6, offset: 0 }
-  const normal = cache(base, size, {}, undefined, true, viewport)!
+  const normal = cache(base, size, {}, undefined, viewport)!
   const changed = { ...base, bars: base.bars.map((bar, index) => index === base.bars.length - 1
     ? { ...bar, high: 9_999_999, close: 9_999_999 } : bar) }
-  const expanded = cache(changed, size, {}, undefined, true, viewport)!
+  const expanded = cache(changed, size, {}, undefined, viewport)!
   assert.notEqual(expanded.geometry.gutter, normal.geometry.gutter)
   assert.equal(expanded.geometry.barPitch, normal.geometry.barPitch)
   assert.equal(expanded.geometry.barWidth, normal.geometry.barWidth)
@@ -267,7 +266,7 @@ test('fixed percentage scale follows the visible reference during fractional scr
   for (const fixedGutter of [undefined, 70]) {
   const viewport = { spacing: 20, offset: 0, fixedGutter }
   const results = [-0.9, -0.4, 0, 0.4, 0.9].map(wheelFraction => {
-    const plot = plots(frame, size, {}, null, true, viewport, wheelFraction)!
+    const plot = plots(frame, size, {}, null, viewport, wheelFraction)!
     const offset = chartWheelContentOffset(wheelFraction, plot.geometry.barPitch, Boolean(plot.before), Boolean(plot.after))
     const base = chartPricePresentation(plot.geometry, offset).base!
     assert.ok(base > 0)
@@ -278,7 +277,7 @@ test('fixed percentage scale follows the visible reference during fractional scr
     return plot.geometry
   })
   assert.ok(results.some(geometry => geometry !== results[0]))
-  const again = plots(frame, size, {}, null, true, viewport, 0.9)!
+  const again = plots(frame, size, {}, null, viewport, 0.9)!
   assert.equal(again.geometry, results.at(-1))
   }
 })

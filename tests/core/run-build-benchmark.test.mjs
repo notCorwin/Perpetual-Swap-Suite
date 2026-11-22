@@ -23,6 +23,7 @@ test('benchmark entrypoints forward the output and keep existing sandbox protect
     assert.deepEqual(calls[0].slice(0, 2), ['npm', ['run', 'build']])
     assert.equal(calls[1][0], process.execPath)
     assert.ok(calls[1][1].includes('--desktop'))
+    assert.equal(calls[1][1][calls[1][1].indexOf('--') + 1], process.execPath)
     if (target === 'okx') {
       assert.ok(calls[1][1].includes('--allow-network'))
       assert.equal(calls[1][2].OKX_LIVE_CHART_OUTPUT, '/tmp/benchmark-report')

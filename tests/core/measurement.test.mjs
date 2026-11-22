@@ -117,11 +117,11 @@ test('serializes boundary requests with stop', { timeout: 10000 }, async () => {
 
 test('keeps counter availability independent and marks both sides of group migration', () => {
   const snapshot = (end, group, user, energy) => ({ sampleStartMonotonicNsExact: String(end - 1), sampleEndMonotonicNsExact: String(end),
-    cpuEnergySupported: false, cpuCyclesSupported: true, cpuInstructionsSupported: true,
+    timebase: { numer: 1, denom: 1 }, cpuEnergySupported: false, cpuCyclesSupported: true, cpuInstructionsSupported: true,
     cpuPTimeSupported: true, cpuPEnergySupported: false, cpuPCyclesSupported: true, cpuPInstructionsSupported: true,
     processes: [{ pid: 42, birthIdentity: '42:1:0', group, counters: {
-      startMonotonicNsExact: '1', cpuUserNsExact: String(user), cpuSystemNsExact: '0',
-      cpuPUserNsExact: '0', cpuPSystemNsExact: '0', cpuEnergyNjExact: String(energy), cpuPEnergyNjExact: String(energy / 2),
+      startMonotonicNsExact: '1', cpuUserTicksExact: String(user), cpuSystemTicksExact: '0',
+      cpuPUserTicksExact: '0', cpuPSystemTicksExact: '0', cpuEnergyNjExact: String(energy), cpuPEnergyNjExact: String(energy / 2),
       cpuCyclesExact: String(energy), cpuPCyclesExact: String(energy / 2), cpuInstructionsExact: String(energy), cpuPInstructionsExact: String(energy / 2),
     } }] })
   const old = snapshot(100, 'runtime', 10, 10), current = snapshot(200, 'runtime', 8, 20)
@@ -184,7 +184,7 @@ test('validates Mach ticks before conversion and records the rounding remainder'
 })
 
 test('rejects offsetting user and system P-core counter errors while retaining totals', () => {
-  for (const ticks of [true, false]) {
+  for (const ticks of [true]) {
     const snapshot = (end, total, pcore) => {
       const suffix = ticks ? 'TicksExact' : 'NsExact'
       return { sampleStartMonotonicNsExact: String(end - 1), sampleEndMonotonicNsExact: String(end),
@@ -205,7 +205,7 @@ test('rejects offsetting user and system P-core counter errors while retaining t
     ]) {
       const result = intervalFor(snapshot(100, beforeTotal, beforeP), snapshot(200, afterTotal, afterP)).runtime
       const cpu = result.breakdown.cpuTimeNs
-      assert.equal(cpu.source, ticks ? 'mach-ticks' : 'legacy-nanoseconds')
+      assert.equal(cpu.source, 'mach-ticks')
       assert.equal(cpu.complete, false)
       assert.equal(cpu.totalComplete, true)
       assert.equal(cpu.totalExact, String(afterTotal[0] + afterTotal[1] - beforeTotal[0] - beforeTotal[1]))
@@ -219,4 +219,17 @@ test('rejects offsetting user and system P-core counter errors while retaining t
     assert.equal(zero.pCoreExact, '0')
     assert.equal(zero.eCoreExact, '110')
   }
+})
+
+test('reports CPU time unavailable when tick timebases do not match', () => {
+  const snapshot = (end, numer) => ({ sampleStartMonotonicNsExact: String(end - 1), sampleEndMonotonicNsExact: String(end),
+    timebase: { numer, denom: 1 }, cpuPTimeSupported: true,
+    processes: [{ pid: 42, birthIdentity: '42:1:0', group: 'runtime', counters: {
+      startMonotonicNsExact: '1', cpuUserTicksExact: String(end), cpuSystemTicksExact: '0', cpuPUserTicksExact: '0', cpuPSystemTicksExact: '0',
+      cpuUserNsExact: String(end), cpuSystemNsExact: '0', cpuPUserNsExact: '0', cpuPSystemNsExact: '0',
+    } }] })
+  const cpu = intervalFor(snapshot(100, 1), snapshot(200, 2)).runtime.breakdown.cpuTimeNs
+  assert.equal(cpu.source, 'unavailable')
+  assert.equal(cpu.totalComplete, false)
+  assert.equal(cpu.totalExact, null)
 })

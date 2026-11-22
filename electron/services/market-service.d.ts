@@ -23,15 +23,12 @@ export class MarketService {
   /** Pure projection of the canonical list, including its bounded exit buffer. */
   listRowsFor(now?: number): RankedMarketRow[]
   prepareChartWindow(instId: string, timeframe: '5m' | '15m' | '1H', end?: number, historyBars?: number): Promise<PreparedChartWindow | null>
-  getPreparedCharts(): Promise<{ frames: PreparedChartWindow[] }>
   subscribePreparedCharts(listener: (frame: PreparedChartWindow) => void): () => void
   subscribeMarket(listener: () => void): () => void
   /** Pause display-only work while preserving collection and current focus. */
   setPresentationActive(active: boolean): void
   /** Hydrate invalidated resident frames from local storage before a resume snapshot. */
   preparePresentationResume(): Promise<void>
-  localChartWindow(instId: string, timeframe: '5m' | '15m' | '1H'): Promise<PreparedChartWindow | null>
-  localChartHistory(instId: string, timeframe: '5m' | '15m' | '1H', end?: number): Promise<PreparedChartWindow | null>
   dispose(): Promise<void>
   /** Observational IPC read: never starts provider requests or maintenance. */
   snapshot(): Promise<MarketServiceSnapshot>

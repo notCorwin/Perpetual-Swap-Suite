@@ -42,7 +42,7 @@ for (const volume of [5, 8]) test(`late forming REST cannot replace a newer nati
   try {
     await service.ready
     service.installInstruments(new Map([[instId, { instId, instType: 'SWAP', instCategory: '1', settleCcy: 'USDT', ctType: 'linear', state: 'live', ctVal: '0.01', ctMult: '1', ctValCcy: 'BTC', ruleType: 'normal' }]]))
-    await service.localChartWindow(instId, timeframe)
+    await service.preparedCharts.local(instId, timeframe)
     service.subscribePreparedCharts(frame => {
       published.push(frame)
       if (frame.instId === instId && frame.timeframe === timeframe && frame.liveBar?.close === 200) nativePublished.resolve()
@@ -89,7 +89,7 @@ test('a latest read admitted before the first native tick cannot revive its sour
   try {
     await service.ready
     service.installInstruments(new Map([[instId, instrument]]))
-    await service.localChartWindow(instId, timeframe)
+    await service.preparedCharts.local(instId, timeframe)
     pending = service.history.latest(instId, timeframe)
     await requested.promise
     assert.equal(service.liveCandles.size, 0, 'No native price has established this source yet.')

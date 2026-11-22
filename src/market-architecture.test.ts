@@ -102,7 +102,7 @@ test('current quote and forming candle publish while independent OI and Taker re
   await store.appendCandles(Array.from({ length: 300 }, (_, index) => candle(end - (299 - index) * interval, frame)))
   // Preparing the selected 5m viewport is explicit; no native 15m source is needed.
   service.preparedCharts.setFocus({ instId, timeframe: frame })
-  const initial = await service.localChartWindow(instId, frame)
+  const initial = await service.preparedCharts.local(instId, frame)
   assert.ok(initial?.bars.length)
   const observations = { ticker: { value: ticker(), observedAt: Date.now(), expiresAt: Date.now() + 90000 } }
   service.observations.set(instId, observations)
@@ -113,7 +113,7 @@ test('current quote and forming candle publish while independent OI and Taker re
     await waitFor(() => started.size === 2)
     service.receivePublicObservation(instId, 'ticker', ticker(220), { receivedAt: Date.now(), acknowledged: false })
     await service.setLive(instId, frame, { ...candle(formingAt, frame, 220), confirmed: false })
-    const snapshot = await service.snapshot(), chart = await service.localChartWindow(instId, frame)
+    const snapshot = await service.snapshot(), chart = await service.preparedCharts.local(instId, frame)
     assert.equal(snapshot.rows[0].lastPrice, 220)
     assert.equal(chart?.liveBar?.close, 220)
     assert.equal(chart?.priceState, 'ready')

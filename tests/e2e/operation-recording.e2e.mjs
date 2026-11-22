@@ -27,7 +27,8 @@ test('Electron persists actual renderer, graphics and database work across worke
   const candles = Array.from({ length: 250 }, (_, index) => ({ instrument: 'BTC-USDT-SWAP', timeframe: '5m',
     timestamp: through - (249 - index) * step, open: 100, high: 102, low: 99, close: 101, volume: 10, baseVolume: 1, quoteVolume: 1000, confirmed: true }))
   await request({ e2e: { action: 'seedCandles', candles } })
-  await request({ chartWindow: { instId: 'BTC-USDT-SWAP', timeframe: '5m', historyBars: 96 } })
+  await request({ chartFocus: { id: 'recording-focus', target: { instId: 'BTC-USDT-SWAP', timeframe: '5m', endHour: through } } })
+  await request({ chartHistory: { instId: 'BTC-USDT-SWAP', timeframe: '5m', endHour: through, focusId: 'recording-focus' } })
   const fixture = await request({ e2e: { action: 'seedCachedListProjection' } })
   await page.locator(`[aria-label="View ${fixture.instId} chart"]`).click()
   await page.locator(`svg[data-rendered-inst="${fixture.instId}"][data-rendered-timeframe="1H"]`).waitFor()
@@ -67,7 +68,7 @@ test('Electron persists actual renderer, graphics and database work across worke
     return parent && parent.executionId !== record.executionId && parent.traceId === record.traceId
   }), 'Renderer/main/worker operations must preserve a real causal trace across execution boundaries.')
   for (const [childName, parentName, resource] of [
-    ['desktop.request.execute', 'desktop.request', 'chartWindow'],
+    ['desktop.request.execute', 'desktop.request', 'chartHistory'],
     ['desktop.notification.receive', 'desktop.notification.send', 'radar:chart-prepared'],
   ]) {
     assert.ok([...completed.values()].some(record => {

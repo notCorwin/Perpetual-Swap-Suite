@@ -11,7 +11,7 @@ const manifestName = 'session.retention.json', statusName = 'retention.json', lo
 const previousAuditName = 'retention-deletions.1.ndjson', auditLimit = 256 * 1024
 const uuid = '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}'
 const execution = new RegExp(`^(?:[1-9]\\d*-\\d+-${uuid}|renderer-${uuid})$`)
-const sessionName = new RegExp(`^session-(\\d{13})-([1-9]\\d*)-${uuid}$`), legacyName = /^(\d{13})-([1-9]\d*)$/
+const sessionName = new RegExp(`^session-(\\d{13})-([1-9]\\d*)-${uuid}$`)
 const quarantineName = new RegExp(`^\\.pruning-(${uuid})$`)
 const participantName = new RegExp(`^(${uuid})\\.participant\\.json$`)
 const graphicsName = new RegExp(`^chromium-[1-9]\\d*-${uuid}\\.(?:status|trace)\\.json$`)
@@ -54,7 +54,7 @@ async function atomicJSON(path, value) {
   } finally { await file?.close(); await unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error }) }
 }
 const validManifest = (value, id) => value?.schemaVersion === 1 && value.kind === kind && value.id === id
-  && (sessionName.test(id) || legacyName.test(id)) && typeof value.token === 'string' && new RegExp(`^${uuid}$`).test(value.token)
+  && sessionName.test(id) && typeof value.token === 'string' && new RegExp(`^${uuid}$`).test(value.token)
   && validPID(value.pid) && number(value.createdAt) && number(value.updatedAt) && ['active', 'closed', 'interrupted'].includes(value.state)
   && (value.state !== 'closed' || timestamp(value.closedAt))
 
@@ -62,7 +62,7 @@ async function inspectSession(root, name, isProcessAlive) {
   const path = join(root, name), info = await lstat(path)
   const result = { id: name, name, path, info, bytes: info.isFile() || info.isSymbolicLink() ? info.size : 0, state: 'unsafe', reason: 'unknown-session', files: [], sizeIncomplete: false }
   if (!info.isDirectory() || info.isSymbolicLink()) return result
-  const parsed = sessionName.exec(name) ?? legacyName.exec(name), quarantined = quarantineName.exec(name)
+  const parsed = sessionName.exec(name), quarantined = quarantineName.exec(name)
   // Unknown directories are measured without descending through symlinks, but
   // never become deletion candidates based on their apparent age alone.
   const entries = await readdir(path, { withFileTypes: true })
@@ -82,16 +82,16 @@ async function inspectSession(root, name, isProcessAlive) {
     try { manifest = await readJSON(manifestFile.path) } catch { unsafe = true }
   }
   const id = quarantined ? manifest?.id : name
-  if (manifestFile && !validManifest(manifest, id) || quarantined && (!manifest?.prune || manifest.prune.token !== quarantined[1]) || !manifestFile && !legacyName.test(name)) unsafe = true
+  if (manifestFile && !validManifest(manifest, id) || quarantined && (!manifest?.prune || manifest.prune.token !== quarantined[1]) || !manifestFile) unsafe = true
   result.id = id ?? name; result.manifest = manifest
-  const ownerPID = manifest?.pid ?? Number(parsed?.[2]), pids = new Set(validPID(ownerPID) ? [ownerPID] : [])
+  const ownerPID = manifest?.pid, pids = new Set(validPID(ownerPID) ? [ownerPID] : [])
   const health = new Map(), participants = new Map()
   let healthy = true
   for (const file of result.files) {
     try {
       if (file.kind === 'health') {
         const value = await readJSON(file.path), id = file.name.slice(0, -12)
-        if (value.executionId !== id || ![undefined, 1, 2].includes(value.schemaVersion)) healthy = false
+        if (value.executionId !== id || value.schemaVersion !== 2) healthy = false
         health.set(id, value)
         const pid = Number(id.split('-')[0]); if (validPID(pid)) pids.add(pid)
         if (value.closed !== true || !number(value.recorded) || value.recorded !== value.persisted || value.failed !== 0 || value.pending !== 0
@@ -124,11 +124,10 @@ async function inspectSession(root, name, isProcessAlive) {
   result.pids = [...pids]
   result.healthy = healthy && !unsafe
   if (unsafe) result.reason = 'unsafe-contents-or-manifest'
-  else if (legacyName.test(result.id) && running) { result.state = 'active'; result.reason = 'live-owner' }
   else if (manifest?.state === 'closed' && manifest.prune && quarantined) { result.state = 'closed'; result.reason = 'resuming-prune' }
-  else if (manifest?.state === 'active' || !manifest && running) { result.state = running ? 'active' : 'interrupted'; result.reason = running ? 'live-owner' : 'owner-exited-without-close' }
+  else if (manifest?.state === 'active') { result.state = running ? 'active' : 'interrupted'; result.reason = running ? 'live-owner' : 'owner-exited-without-close' }
   else if (manifest?.state === 'interrupted' || !healthy) { result.state = 'interrupted'; result.reason = 'recorder-not-closed-or-incomplete' }
-  else if (manifest?.state === 'closed' || !running) { result.state = 'closed'; result.reason = 'completed' }
+  else if (manifest?.state === 'closed') { result.state = 'closed'; result.reason = 'completed' }
   else { result.state = 'active'; result.reason = 'live-owner' }
   return result
 }
@@ -249,8 +248,7 @@ async function pruneSession(root, session, reason, now, isProcessAlive) {
   if (fresh.info.ino !== session.info.ino || fresh.info.dev !== session.info.dev || fresh.state !== 'closed') throw new Error('Operation session is no longer eligible for cleanup.')
   session = fresh
   const token = session.manifest?.prune?.token ?? randomUUID()
-  const manifest = session.manifest ?? { schemaVersion: 1, kind, id: session.id, token: randomUUID(), pid: Number(legacyName.exec(session.id)[2]),
-    createdAt: Number(legacyName.exec(session.id)[1]), updatedAt: now, state: 'closed', closedAt: session.closedAt }
+  const manifest = session.manifest
   const intent = { ...manifest, prune: { token, reason, requestedAt: now } }
   await atomicJSON(join(session.path, manifestName), intent)
   await audit(root, { phase: 'scheduled', id: session.id, token, reason, bytes: session.bytes, at: now })

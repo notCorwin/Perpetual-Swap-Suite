@@ -371,7 +371,7 @@ function App() {
   }, [statusKey])
 
   const renderChart = (frame: '1H' | '15m' | '5m', navigation = false) => <div key={frame} data-timeframe-panel={frame} className="min-h-0 min-w-0 flex-1 overflow-hidden rounded-lg border bg-background">
-    {selectedID ? <MarketChart controller={multiChartControllers[frame]} priceOnly showBollingerPriceLabels={preferences.showBollingerPriceLabels} onStatus={updateChartStatus} navigation={navigation} instId={selectedID} tickSz={selectedRow?.tickSz} timeframe={frame} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={selectFromChart} /> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}
+    {selectedID ? <MarketChart controller={multiChartControllers[frame]} showBollingerPriceLabels={preferences.showBollingerPriceLabels} onStatus={updateChartStatus} navigation={navigation} instId={selectedID} tickSz={selectedRow?.tickSz} timeframe={frame} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={selectFromChart} /> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}
   </div>
 
   return <WorkspaceViewport>

@@ -56,7 +56,6 @@ try {
       if (value.chartFocus) return { ok: true }
       if (value.chartLocal) return encodeChartWire(prepared(value.chartLocal))
       if (value.chartHistory) return encodeChartWire(prepared(value.chartHistory))
-      if (value.chartWindow) return encodeChartWire(prepared(value.chartWindow))
       if (value.dataAudit) return { phase: 'idle', progress: { completed: 0, total: 0 }, issues: [], error: '' }
       throw new Error(`Unsupported visual fixture operation: ${Object.keys(value).join(', ')}`)
     })

@@ -114,9 +114,6 @@ before(async () => {
         const query = value.chartLocal ?? value.chartHistory
         return state.coldTimeframes.includes(query.timeframe) ? null : prepared(query)
       }
-      if (value.chartWindow) return state.coldTimeframes.includes(value.chartWindow.timeframe)
-        ? { ...prepared(value.chartWindow), bars: [], priceState: 'loading', indicatorState: 'loading', oiState: 'loading', takerState: 'loading' }
-        : prepared(value.chartWindow)
       if (value.screenshot) {
         if (state.holdCapture) { state.holdCapture = false; await new Promise(resolve => { state.releaseCapture = resolve }); state.releaseCapture = null }
         if (state.failScreenshot) { state.failScreenshot = false; throw new Error('clipboard unavailable') }
@@ -169,7 +166,7 @@ before(async () => {
     await globalThis.__presentationTest.setActive(true)
     ipcMain.handle('radar:request', async (event, value) => {
       const result = await state.request(event, value)
-      return value.chartUniverse || value.chartLocal || value.chartHistory || value.chartWindow ? encodeChartWire(result) : result
+      return value.chartUniverse || value.chartLocal || value.chartHistory ? encodeChartWire(result) : result
     })
   })
   await page.setViewportSize({ width: Number(process.env.PERPETUAL_SWAP_UI_INITIAL_WIDTH ?? 800), height: Number(process.env.PERPETUAL_SWAP_UI_INITIAL_HEIGHT ?? 572) })
@@ -464,9 +461,9 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
   await selectTimeframe(page, '15m')
   const chart = page.locator('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]')
   await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]')?.dataset.chartLoading === 'false')
-  const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length)
+  const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartLocal || value.chartHistory).length)
   await new Promise(resolve => setTimeout(resolve, 2_250))
-  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), before, 'A successfully prepared chart must not poll local or provider windows.')
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartLocal || value.chartHistory).length), before, 'A successfully prepared chart must not poll local or provider windows.')
   await electron.evaluate(async ({ ipcMain, BrowserWindow }) => {
     const state = globalThis.__workspaceFixture
     state.chartGeneration += 1
@@ -482,14 +479,14 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
   assert.equal(await priceLabel.locator('[data-chart-price-label-background]').getAttribute('fill'), 'var(--chart-annotation)')
   assert.equal(await priceLabel.locator('[data-chart-price-label-value]').getAttribute('fill'), 'white')
   await assertCompleteChartViewport(page, 'BETA-USDT-SWAP', { fullSlots: null })
-  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), before + 1, 'Only the fixture read may be added; the pushed candle must not trigger another renderer read.')
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartLocal || value.chartHistory).length), before + 1, 'Only the fixture read may be added; the pushed candle must not trigger another renderer read.')
   const liveUpdate = await page.evaluate(() => {
     const snapshot = document.querySelector('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]').__chartSnapshot
     globalThis.__completedSubscriptionBars = snapshot.bars
     return { type: 'live', instId: snapshot.instId, timeframe: snapshot.timeframe, generation: snapshot.generation, revision: snapshot.generation + 1,
       endHour: snapshot.endHour, liveBar: { ...snapshot.liveBar, high: 136, close: 135 } }
   })
-  const reads = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length)
+  const reads = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartLocal || value.chartHistory).length)
   assert.equal('bars' in liveUpdate, false, 'A forming update must not transfer completed candles.')
   await electron.evaluate(({ BrowserWindow }, update) => globalThis.__workspaceFixture.sendChart(update), liveUpdate)
   await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.liveBar?.close === 135)
@@ -514,7 +511,7 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
   assert.ok(ticks.length > 0 && ticks.every(tick => tick.y === tick.lineY && tick.x === tick.priceX), 'Price ticks stay on their grid lines and the normal axis.')
   assert.ok(ticks.some(tick => tick.overlaps), 'A tick beneath the price tag remains in its normal axis position.')
   assert.equal(await page.evaluate(() => document.querySelector('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]').__chartSnapshot.bars === globalThis.__completedSubscriptionBars), true)
-  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), reads, 'Live-only subscriptions must reuse the completed frame without a follow-up read.')
+  assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartLocal || value.chartHistory).length), reads, 'Live-only subscriptions must reuse the completed frame without a follow-up read.')
   await electron.evaluate(({ BrowserWindow }, update) => globalThis.__workspaceFixture.sendChart({ ...update, revision: update.revision + 1, liveBar: { ...update.liveBar, close: 132 } }), liveUpdate)
   await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-price-label]')?.getAttribute('data-chart-price-direction') === 'down')
   assert.equal(await priceLabel.locator('[data-chart-price-label-background]').getAttribute('fill'), 'var(--negative)')
@@ -579,7 +576,7 @@ test('contract precision updates pad current quotes while preserving historical 
       globalThis.__precisionLive = chart.__chartSnapshot.liveBar
       return chart.querySelector('[data-chart-price-label-background]').getBoundingClientRect().width
     })
-    const reads = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length)
+    const reads = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartLocal || value.chartHistory).length)
     await electron.evaluate(() => {
       const state = globalThis.__workspaceFixture
       state.rows = state.rows.map(row => row.instId === 'BETA-USDT-SWAP' ? { ...row, tickSz: '1e-8' } : row)
@@ -599,7 +596,7 @@ test('contract precision updates pad current quotes while preserving historical 
     assert.equal(layout.sameInputs, true, 'A precision-only update must reuse source bars and calculated values.')
     assert.equal(layout.historicalClose, 100.123456789)
     assert.equal(layout.bollUpper, 100.123456789)
-    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), reads, 'Precision updates must not request chart data again.')
+    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartLocal || value.chartHistory).length), reads, 'Precision updates must not request chart data again.')
     const target = await candleTarget('previous', frame)
     await page.mouse.move(target.x, target.y)
     await page.mouse.down()
@@ -1308,7 +1305,7 @@ test('constant Bollinger bands stay finite and negative lower bands retain the r
     await electron.evaluate((_electron, mode) => { const state = globalThis.__workspaceFixture; state.bollMode = mode; state.chartGeneration += 1 }, mode)
     await page.evaluate(async () => {
       const svg = document.querySelector('svg[data-rendered-inst]')
-      const frame = await window.radarDesktop.request({ chartWindow: { instId: svg.dataset.renderedInst, timeframe: svg.dataset.renderedTimeframe } })
+      const frame = await window.radarDesktop.request({ chartLocal: { instId: svg.dataset.renderedInst, timeframe: svg.dataset.renderedTimeframe } })
       window.dispatchEvent(new CustomEvent('radar-chart-prepared', { detail: frame }))
     })
   }

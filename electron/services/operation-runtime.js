@@ -65,7 +65,10 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
   // synchronously, or a complete batch is written synchronously, without loss.
   const batchLimit = 256 * 1024, memoryLimit = 1024 * 1024, recordLimit = 4096, jobLimit = 4, jobBytesLimit = 1024 * 1024
   let nextSequence = 1, maximumSequence = 0, pendingBytes = 0, memoryBytes = 0, position = prefix.length, inFlightBytes = 0
-  let timer, accepting = true, closed = false, exiting = false, closing, closeFinished = false, lastHealthState, journalFailure = false
+  let timer, cancelScheduledTimer, accepting = true, closed = false, exiting = false, closing, closeFinished = false, lastHealthState, journalFailure = false
+  // Timers can be installed by a test clock and cancelled after that clock is
+  // replaced. Always cancel with the implementation that created the handle.
+  const cancelTimer = () => { if (timer) cancelScheduledTimer(timer); timer = undefined }
   let activeFlush, pendingFlush
   let serializing = 0, building = false, draining = 0, serializationBarrier, finishSerialization
   let healthGeneration = 0, healthCommitting = false, healthRepair = false
@@ -249,7 +252,7 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
   }
   const queued = () => queue.size + spillCount
   const take = () => {
-    clearTimeout(timer); timer = undefined
+    cancelTimer()
     if (serializing || building) return undefined
     building = true
     try {
@@ -326,7 +329,7 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
     if (serializing || building || draining || !queued() || closed || exiting || journalFailure) return
     try {
       while (!journalFailure && pendingBytes >= batchLimit && get(nextSequence)) startWrite()
-      if (queued() && !timer && get(nextSequence)) { timer = setTimeout(() => { timer = undefined; startWrite(); scheduleWrite() }, 250); timer.unref() }
+      if (queued() && !timer && get(nextSequence)) { cancelScheduledTimer = clearTimeout; timer = setTimeout(() => { timer = undefined; startWrite(); scheduleWrite() }, 250); timer.unref() }
     } catch (error) { journalFailure = true; failed(error) }
   }
   const performFlush = ({ target, targetSequence, durable }) => suppress(async () => {
@@ -403,7 +406,7 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
   }
   const exit = () => suppress(() => {
     if (exiting) return
-    accepting = false; exiting = true; clearTimeout(timer); clearInterval(checkpointTimer)
+    accepting = false; exiting = true; cancelTimer(); cancelCheckpointTimer(checkpointTimer)
     // In-flight native writes may finish after this handler starts. Rewriting the
     // immutable whole buffer to its disjoint reserved offset is idempotent; the
     // callback observes completed and cannot count it twice or submit a suffix.
@@ -447,7 +450,7 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
   const closeWriter = () => {
     if (!closing) {
       accepting = false
-      clearTimeout(timer); clearInterval(checkpointTimer)
+      cancelTimer(); cancelCheckpointTimer(checkpointTimer)
       closing = (async () => {
         const failures = []
         try { await flush() } catch (error) { failures.push(error) }
@@ -469,6 +472,7 @@ function journalWriter(directory, sessionId, executionId, participant, hooks, ca
     }
     return closing
   }
+  const cancelCheckpointTimer = clearInterval
   const checkpointTimer = setInterval(() => { if (accepting) void flush().catch(() => {}) }, 5000)
   checkpointTimer.unref()
   writeHealthSync()

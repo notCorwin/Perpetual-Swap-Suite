@@ -1,3 +1,4 @@
+import type { PreparedChartBar } from '../electron/services/market-service.js'
 import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
 import { mkdtemp, rm } from 'node:fs/promises'
@@ -370,7 +371,7 @@ test('all candidates collect 5m while unselected contracts avoid chart preparati
     assert.equal(f.service.preparedCharts.liveStates.get(`${other}:5m`).live.close, 123, 'An unselected contract retains only its lightweight current candle.')
     assert.equal(f.service.preparedCharts.series.has(`${other}:5m`), false, 'Collector membership cannot initialize a full historical chart.')
     assert.equal(f.service.preparedCharts.liveSeeds.has(`${other}:5m`), false)
-    await f.service.getPreparedCharts()
+    await f.service.preparedCharts.residentFrames()
     assert.deepEqual([...f.service.preparedCharts.realtimeKeys].sort(), prepared, 'Focusing a qualified chart cannot remove any candidate period key.')
   } finally { await f.close() }
 })
@@ -453,7 +454,7 @@ test('backend listed membership owns chart preparation and prepared reads never 
     f.service.publishStreamRecords([{ ...f.service.catalog.get(instId), ticker: { ...ticker, last: '120' } }])
     assert.deepEqual(universes, [[instId]], 'Renewals and price changes preserve the backend preparation universe.')
     for (let index = 0; index < 3; index++) {
-      assert.deepEqual(await f.service.getPreparedCharts(), { frames: [] })
+      assert.deepEqual(await f.service.preparedCharts.residentFrames(), { frames: [] })
     }
     assert.deepEqual(universes, [[instId]], 'Renderer reads cannot modify preparation.')
     localCatalog(f.service, [instId, 'ETH-USDT-SWAP'])
@@ -936,8 +937,8 @@ test('SQLite catalogue restore enforces config key and expiry while historical c
     restored.touchList()
     assert.equal(restored.validCatalogEntry(restored.catalog.get(instId)), false)
     assert.equal((await restored.snapshot()).rows.length, 1, 'A runtime expiry is buffered after configuration is reconfigured.')
-    const chart = await restored.localChartHistory(instId, '5m', first + 299 * fiveMinutes)
-    assert.equal(chart!.bars.filter(bar => bar.hour >= chart!.endHour! - 95 * fiveMinutes).length, 96)
+    const chart = await restored.preparedCharts.localHistory(instId, '5m', first + 299 * fiveMinutes)
+    assert.equal(chart!.bars.filter((bar: PreparedChartBar) => bar.hour >= chart!.endHour! - 95 * fiveMinutes).length, 96)
     f.preferences.liquidity.spread.maxPercent *= 2
     assert.equal(await restored.restoreCatalog(), false)
   } finally { await restored?.dispose(); await f.close() }
@@ -1552,7 +1553,7 @@ test('native forming admission and derived prices advance while background proje
   const pipeline = f.service.preparedCharts, schedule = pipeline.scheduleLivePublications
   try {
     await f.service.persistCandles(instId, Array.from({ length: 300 }, (_, index) => rawCandle(asOf - (300 - index) * fiveMinutes)))
-    await f.service.localChartWindow(instId, '5m')
+    await f.service.preparedCharts.local(instId, '5m')
     pipeline.queueCandidate = () => {}; pipeline.scheduleCandidates = () => {}; pipeline.scheduleRefresh = () => {}
     pipeline.scheduleLivePublications = () => {}
     f.service.realtime.setSubscriptions([{ instId, timeframe: '5m' }])
@@ -1584,7 +1585,7 @@ test('live integration stays in memory and close drains accepted confirmation wh
   try {
     const candles = Array.from({ length: 300 }, (_, index) => ({ ...rawCandle(asOf - (301 - index) * fiveMinutes), statisticsVersion: 11, oi: 100, buy: 20, sell: 10 }))
     await f.service.persistCandles(instId, candles)
-    await f.service.localChartWindow(instId, '5m')
+    await f.service.preparedCharts.local(instId, '5m')
     const originalAppend = f.store.appendCandlesWithReceipt.bind(f.store)
     let writes = 0
     f.store.appendCandlesWithReceipt = async (...args) => { writes += 1; return originalAppend(...args) }
@@ -1736,11 +1737,11 @@ test('an explicit REST confirmed revision invalidates the prepared generation an
   })
   try {
     await f.store.appendCandles(Array.from({ length: 300 }, (_, index) => ({ ...rawCandle(timestamp - (299 - index) * fiveMinutes), oi: 10, buy: 20, sell: 30, statisticsVersion: 11 })))
-    const before = await f.service.localChartWindow(instId, '5m')
+    const before = await f.service.preparedCharts.local(instId, '5m')
     await f.service.history.latest(instId, '5m')
-    const after = await f.service.localChartWindow(instId, '5m')
+    const after = await f.service.preparedCharts.local(instId, '5m')
     assert.ok(after!.generation > before!.generation)
-    const bar = after!.bars.find(bar => bar.hour === timestamp)!
+    const bar = after!.bars.find((bar: PreparedChartBar) => bar.hour === timestamp)!
     assert.deepEqual([bar.close, bar.oi, bar.buy, bar.sell], [200, 10, 20, 30])
   } finally { await f.close() }
 })

@@ -15,6 +15,9 @@ test('shared spacing resolves calc lengths in the hidden renderer without changi
     const page = await electron.firstWindow()
     await page.waitForLoadState('domcontentloaded')
     const font = await page.evaluate(async () => {
+      // Request both faces explicitly: font-display: swap does not load a face
+      // until the current document actually uses that weight.
+      await Promise.all([document.fonts.load('400 12px "Ubuntu Mono"'), document.fonts.load('700 12px "Ubuntu Mono"')])
       await document.fonts.ready
       return {
         family: getComputedStyle(document.body).fontFamily,
@@ -22,8 +25,8 @@ test('shared spacing resolves calc lengths in the hidden renderer without changi
       }
     })
     assert.match(font.family, /Ubuntu Mono/)
-    assert.ok(font.faces.some(face => face.weight === '400' && face.status === 'loaded'), 'Regular font must be loaded before rendering.')
-    assert.ok(font.faces.some(face => face.weight === '500 900' && face.status === 'loaded'), 'Bold font must be loaded before rendering.')
+    assert.ok(font.faces.some(face => face.weight === '400 500' && face.status === 'loaded'), 'Regular font must be loaded before rendering.')
+    assert.ok(font.faces.some(face => face.weight === '600 900' && face.status === 'loaded'), 'Bold font must be loaded before rendering.')
     const result = await page.evaluate(async reader => {
       await document.fonts.ready
       const read = (0, eval)(`(${reader})`)

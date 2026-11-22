@@ -233,7 +233,7 @@ test('leaving a renderer submits cancelled requests before an earlier durable AC
   const stop = await initializeOperationTelemetry({ ...harness.host, recordOperations })
   try {
     for (let index = 0; index < 63; index++) measureOperation({ category: 'cpu', name: 'fixture.compute' }, () => index)
-    const history = harness.hooks().beginRequest('chartWindow')
+    const history = harness.hooks().beginRequest('chartHistory')
     const universe = harness.hooks().beginRequest('chartUniverse')
     assert.equal(harness.attempts.length, 1)
     await Promise.resolve()
@@ -242,7 +242,7 @@ test('leaving a renderer submits cancelled requests before an earlier durable AC
     const finalAttempts = harness.attempts.slice(1)
     assert.deepEqual(finalAttempts[0], harness.attempts[0], 'The in-flight batch can be replayed during final handoff.')
     assert.deepEqual(ended(finalAttempts).filter(event => event.name === 'desktop.request').map(event => [event.resource, event.status, event.attributes!.reason]), [
-      ['chartWindow', 'cancelled', 'renderer-detached'], ['chartUniverse', 'cancelled', 'renderer-detached'],
+      ['chartHistory', 'cancelled', 'renderer-detached'], ['chartUniverse', 'cancelled', 'renderer-detached'],
     ], 'All cancellation records must be submitted synchronously, while the first durable ACK is still blocked.')
     assert.equal(persisted.size, 0)
     assert.equal(acknowledged, false)
@@ -303,7 +303,7 @@ test('renderer final handoff replays the active batch and submits ordered batche
 
 test('a failed terminal handoff retries the retained immutable cancellation records', async () => {
   const harness = telemetryHost(), stop = await initializeOperationTelemetry(harness.host)
-  harness.hooks().beginRequest('chartWindow')
+  harness.hooks().beginRequest('chartHistory')
   harness.failNext()
   await assert.rejects(harness.detach(), /Transient IPC failure/)
   const failedBatch = harness.attempts.at(-1)!

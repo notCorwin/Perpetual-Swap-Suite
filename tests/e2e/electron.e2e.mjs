@@ -45,7 +45,7 @@ const installPreparedTransform = async options => electron.evaluate(async ({ ipc
   const original = ipcMain._invokeHandlers.get('radar:request')
   const contents = BrowserWindow.getAllWindows()[0].webContents
   const originalSend = contents.send
-  const probe = { original, contents, originalSend, calls: 0, confirmed: new Map() }
+  const probe = { original, contents, originalSend, confirmed: new Map() }
   const transform = response => {
     if (response?.instId !== options.instId || options.timeframe && response.timeframe !== options.timeframe) return response
     if (options.mode === 'partial' && Array.isArray(response.bars)) return {
@@ -79,9 +79,8 @@ const installPreparedTransform = async options => electron.evaluate(async ({ ipc
   }
   ipcMain.removeHandler('radar:request')
   ipcMain.handle('radar:request', async (event, value, context) => {
-    if (value.chartWindow?.instId === options.instId) probe.calls += 1
     const wire = await original(event, value, context)
-    if (!(value.chartUniverse || value.chartLocal || value.chartHistory || value.chartWindow)) return wire
+    if (!(value.chartUniverse || value.chartLocal || value.chartHistory)) return wire
     const response = decodeChartWire(wire)
     const result = value.chartUniverse ? { ...response, frames: response.frames.map(transform) } : transform(response)
     return result === response ? wire : encodeChartWire(result)
@@ -104,13 +103,7 @@ const removePreparedTransform = async () => electron.evaluate(({ ipcMain }) => {
   delete globalThis.__preparedTransform
 })
 
-before(async () => {
-  await writeFile(join(userData, 'settings.json'), JSON.stringify({ chartDisplayMode: 'indicators',
-    notificationsEnabled: true, backgroundMonitoringEnabled: true, monitoringPaused: true,
-    filterLibraryPreferencesJSON: '{"favorites":["emaTrend"]}',
-  }))
-  await launchElectron()
-})
+before(async () => { await launchElectron() })
 after(async () => { await electron?.close(); await rm(userData, { recursive: true, force: true }) })
 
 test('window position and size survive an immediate restart', async () => {
@@ -159,8 +152,9 @@ test('native traffic lights align with the renderer toolbar after window resizin
       await page.waitForFunction(width => innerWidth === width, actualWidth)
       await assertWorkspaceLayout(page)
       const native = await measureNativeWindowControls(electron)
-      const row = await page.locator('[data-layout=market-workspace] > div > [data-window-drag-region]').boundingBox()
-      const title = await page.locator('[data-chart-title]').boundingBox().catch(() => null)
+      const row = await page.locator('[data-layout=market-workspace] [data-chart-toolbar][data-window-drag-region]').boundingBox()
+      const titleLocator = page.locator('[data-chart-title]')
+      const title = await titleLocator.count() ? await titleLocator.boundingBox() : null
       for (const [name, button] of Object.entries(native.buttons)) {
         assert.ok(button && !button.hidden && !button.hiddenOrHasHiddenAncestor, `${name} must be an enabled native control.`)
         assert.ok(Math.abs(button.y + button.height / 2 - (row.y + row.height / 2)) <= .5, `${name} must actually align with the toolbar: ${JSON.stringify({ native, row })}`)
@@ -383,7 +377,11 @@ test('prepared native chart pages preserve canonical indicator values across eve
     for (const timeframe of fixture.timeframes) {
       const focusId = `canonical-oracle:${timeframe}`
       await request({ chartFocus: { id: focusId, target: { instId: fixture.instId, timeframe, endHour: fixture.end } } })
-      const prepared = await request({ chartWindow: { instId: fixture.instId, timeframe, endHour: fixture.end, focusId } })
+      await page.waitForFunction(async ({ instId, timeframe, endHour, focusId }) => {
+        const frame = await window.radarDesktop.request({ chartHistory: { instId, timeframe, endHour, focusId } })
+        return frame && frame.indicatorState !== 'loading' && frame.bars.length >= 96
+      }, { instId: fixture.instId, timeframe, endHour: fixture.end, focusId }, { timeout: 20_000 })
+      const prepared = await request({ chartHistory: { instId: fixture.instId, timeframe, endHour: fixture.end, focusId } })
       assert.notEqual(prepared.indicatorState, 'loading', 'The matching focus owns and completes canonical preparation.')
       const expected = new Map(fixture.series[timeframe].bars.map(bar => [bar.hour, bar]))
       const visible = prepared.bars.filter(bar => bar.hour >= fixture.end - 95 * fixture.series[timeframe].intervalMS && bar.hour <= fixture.end)
@@ -964,7 +962,6 @@ test('a held old history read leaves backend demand and the latest wheel target 
     assert.equal(held.heldSettled, false, 'The new target must finish while the old disk response remains held.')
     assert.ok(held.maxHistoricalActive <= 2, 'Wheel input must keep history reads inside the two available lanes.')
     assert.ok(held.maxLocalActive <= 2)
-    assert.equal(held.legacyWindowCalls, 0, 'The renderer must express demand separately from pure chart reads.')
     assert.equal(held.focusCalls.findLast(call => call.target)?.target.endHour, expectedEnd, 'Held disk delivery cannot block or replace backend viewport demand.')
     assert.ok(held.calls.filter(call => call.kind === 'history').length <= 2 * (forward.length + 3), 'Wheel bursts must coalesce rather than create one read per raw event.')
     const beforeRelease = await page.evaluate(() => window.__chartPaintProbe.commits.length)

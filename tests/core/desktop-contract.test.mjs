@@ -17,12 +17,8 @@ test('desktop requests accept each supported operation and preserve the public p
     { preferences: { action: 'update', values: { liquidity: { slippage: { notionalUSDT: 200_000 } } } } },
     ...['start', 'cancel', 'status', 'repair'].map(action => ({ dataAudit: { action } })),
     ...['start', 'cancel', 'status'].map(action => ({ historyDownload: { action } })),
-    { chartWindow: { instId, timeframe: '5m', endHour: 1_729_080_000_000 } },
-    { chartWindow: { instId, timeframe: '5m', endHour: 1_729_080_000_000, historyBars: 4_096 } },
-    { chartWindow: { instId, timeframe: '1H', historyBars: 96 } },
     { chartFocus: { id: 'focus-1', target: { instId, timeframe: '15m', endHour: 1_729_080_000_000 } } },
     { chartFocus: { id: 'hidden-2', target: null } },
-    { chartWindow: { instId, timeframe: '15m', focusId: 'focus-1', historyBars: 1280 } },
     { chartLocal: { instId, timeframe: '15m' } },
     { chartHistory: { instId, timeframe: '5m' } },
     { chartHistory: { instId, timeframe: '1H', endHour: 1_729_080_000_000 } },
@@ -49,7 +45,6 @@ test('mixed commands and unknown top-level or nested fields are rejected before 
     { preferences: { action: 'update', values: { liquidity: { spread: { maxPercent: .1, ignored: true } } } } },
     { dataAudit: { action: 'start', range: 'all' } },
     { historyDownload: { action: 'start', range: 'all' } },
-    { chartWindow: { instId, timeframe: '5m', extra: true } },
     { chartLocal: { instId, timeframe: '5m', endHour: 1 } },
     { chartHistory: { instId, timeframe: '5m', extra: true } },
     { chartFocus: { id: 'focus-1', target: { instId, timeframe: '5m', focusId: 'other' } } },
@@ -88,6 +83,7 @@ test('read requests reject retired timeframe, universe, and unrelated focus dema
 test('retired protocol operations and appearance preferences have no accepted compatibility path', () => {
   for (const request of [
     { rocPeriod: 9, marocPeriod: 9, timeframe: '5m' },
+    { chartWindow: { instId, timeframe: '5m' } },
     { webkit: {} }, { windowTint: [0, 0, 0] }, { windowTintRGB: [0, 0, 0] }, { previewWindowBlur: 10 },
     { hourlyVolumeStabilityEnabled: true },
     { preferences: { action: 'update', values: { windowBlurRadius: 10 } } },
@@ -113,13 +109,10 @@ test('required fields, action-specific fields, types, and numeric boundaries are
     { preferences: { action: 'update', values: { liquidity: { volumeStability: { maxRatio: 1 } } } } },
     { dataAudit: { action: 'delete' } },
     { historyDownload: {} }, { historyDownload: { action: 'repair' } },
-    { chartWindow: { instId: '', timeframe: '5m' } },
-    { chartWindow: { instId, timeframe: '5m', endHour: 1.5 } },
     { chartFocus: { id: '', target: null } },
     { chartFocus: { id: 'focus-1', target: { instId, timeframe: 'invalid' } } },
     { chartFocus: { id: 'focus-1' } },
     { chartLocal: { instId, timeframe: '5m', focusId: 1 } },
-    ...[95, 4_097, 100.5, NaN, Infinity, '512', null].map(historyBars => ({ chartWindow: { instId, timeframe: '5m', historyBars } })),
     { chartHistory: { instId, timeframe: '5m', endHour: -1 } },
     { chartHistory: { instId, timeframe: '5m', endHour: 1.5 } },
     { chartUniverse: null }, { chartUniverse: [] },
@@ -164,7 +157,6 @@ test('validated requests are detached data and cannot invoke accessors or inheri
   const parsedPartial = parseDesktopRequest(partial)
   partial.preferences.values.liquidity.depth.enabled = true
   assert.equal(parsedPartial.preferences.values.liquidity.depth.enabled, false)
-  assert.deepEqual(parseDesktopRequest({ chartWindow: { instId, timeframe: '5m', endHour: undefined } }), { chartWindow: { instId, timeframe: '5m' } })
   assert.deepEqual(parseDesktopRequest({ snapshot: { sinceRevision: undefined, serviceSession: undefined } }), { snapshot: {} })
 })
 
@@ -202,7 +194,6 @@ test('viewport size crosses the production parser only on focus targets and hist
       { chartHistory: { instId, timeframe: '15m', focusId: 'wide-focus', windowBars } },
     ]) assert.deepEqual(parseDesktopRequest(request), request)
     reject({ chartLocal: { instId, timeframe: '15m', windowBars } })
-    reject({ chartWindow: { instId, timeframe: '15m', windowBars } })
   }
   for (const windowBars of [0, 95, 97, 143, 145, 289, 1537, 1584, 4_096, 144.5, NaN, Infinity, '192', null, true]) {
     reject({ chartFocus: { id: 'wide-focus', target: { instId, timeframe: '15m', windowBars } } })

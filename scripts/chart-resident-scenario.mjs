@@ -57,7 +57,6 @@ export async function measureResidentScroll(electron, page, fixture, { phases, r
       const scrollingSourceRequests = requests.sourceRequests.slice(before.sourceCalls)
       const sources = separateSourceMaintenance(scrollingSourceRequests, fixture)
       assert.ok(historicalRequests.every(call => call.kind === 'history'), 'Resident navigation may issue only observational history reads.')
-      assert.equal(requests.legacyWindowCalls, 0)
       assert.deepEqual(sources.historical, [], `Warm scrolling must not download fixture history: ${JSON.stringify(sources.historical)}`)
       assert.ok(requests.maxHistoricalActive <= 2, 'Resident targets must stay independent of the held disk deliveries lane.')
       assert.ok(requests.transferredHistoryBars >= residentHistoryBars, 'The fixture must exercise a bulk durable-history transfer.')

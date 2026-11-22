@@ -2005,19 +2005,7 @@ export class MarketService {
     return task.finally(() => this.barTasks.delete(task))
   }
 
-  async getPreparedCharts() {
-    await this.ready
-    return this.preparedCharts.residentFrames()
-  }
-
   subscribePreparedCharts(listener) { return this.preparedCharts.subscribe(listener) }
-  async localChartWindow(instId, timeframe) { await this.ready; return this.preparedCharts.local(instId, timeframe) }
-  localChartHistory(instId, timeframe, end) {
-    if (this.closing || this.disposed) return Promise.reject(new Error('Market service is closed.'))
-    const task = this.ready.then(() => this.preparedCharts.localHistory(instId, timeframe, end))
-    this.barTasks.add(task)
-    return task.finally(() => this.barTasks.delete(task))
-  }
 
   observationExpiry(observation, key, instId) {
     if (key === 'ticker' && observation?.source === 'websocket') {

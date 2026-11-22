@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { after, before, test } from 'node:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -37,7 +37,6 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
   }
 
   before(async () => {
-    await writeFile(join(await userData, 'settings.json'), JSON.stringify({ chartDisplayMode: 'indicators' }))
     await launch()
     await installNavigationProbe(electron, { omitUniverseInstId: 'BTC-USDT-SWAP' })
     fixture = await page.evaluate(() => window.radarDesktop.request({ e2e: { action: 'seedInstrumentNavigationBenchmark' } }))
@@ -102,7 +101,7 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
       && request.at >= startup.inputEpoch - 1 && request.at <= startup.commitEpoch + 1)
     context.diagnostic(`Cold process restart: ${JSON.stringify({ ...startup, selectionIPC: selectedRequests.length,
       native: presentationState?.native, environment: presentationState?.environment, idleFrameCadence: presentationState?.idleFrameCadence })}`)
-    assert.ok(selectedRequests.length <= 2, 'A prepared startup selection uses only bounded local reads.')
+    assert.ok(selectedRequests.length <= 6, 'A prepared startup selection uses only bounded local reads across three charts.')
     assert.ok(startup.rendererFrameWaitMS >= 0, 'List availability and canonical renderer frame arrival must be timed separately.')
     assert.ok(startup.rendererFramesBeforeInput.includes(`${startup.timeframe}:${startup.instId}`), 'Startup selection must wait until the renderer receives its canonical full frame.')
     assert.deepEqual(startup.violations, [], 'Every startup SVG must retain the exact persisted prices and canonical indicators.')
@@ -151,31 +150,26 @@ export function registerInstrumentNavigationTests({ presentation, prepareWindow 
     'A correctness failure must retain capture and deferred validation cost diagnostics.')
   })
 
-  test('a market selected in the same task as a timeframe switch immediately uses the requested period', async context => {
+  test('a market selection immediately updates all three periods', async context => {
     context.diagnostic(`Presentation: ${JSON.stringify({ native: presentationState?.native, environment: presentationState?.environment, idleFrameCadence: presentationState?.idleFrameCadence })}`)
-    const current = await page.locator('svg[data-rendered-inst]').evaluate(svg => ({ instId: svg.dataset.renderedInst, timeframe: svg.dataset.renderedTimeframe }))
-    const timeframe = fixture.timeframes.find(value => value !== current.timeframe)
-    const instId = fixture.instIds.find(value => value !== current.instId)
-    const activeSVG = await page.locator('svg[data-rendered-inst]').elementHandle()
+    const current = await page.locator('svg[data-rendered-inst]').first().getAttribute('data-rendered-inst')
+    const instId = fixture.instIds.find(value => value !== current)
+    const activeSVG = await page.locator('svg[data-rendered-inst]').first().elementHandle()
     await startNavigationFrameProbe(page, fixture)
     try {
-      const result = await measureNavigation(page, () => page.evaluate(({ instId, timeframe }) => {
-        const button = [...document.querySelectorAll('[aria-label="Chart timeframe"] button')].find(button => button.textContent.trim() === timeframe)
+      const result = await measureNavigation(page, () => page.evaluate(({ instId }) => {
         const row = document.querySelector(`[aria-label="View ${instId} chart"]`)
-        if (!button || !row) throw new Error('The prepared interleaving targets must be mounted.')
-        button.click()
+        if (!row) throw new Error('The prepared market must be mounted.')
         row.click()
-      }, { instId, timeframe }), { expectedInstId: instId, timeframe })
+      }, { instId }), { expectedInstId: instId, timeframe: '1H' })
       assert.ok(result.framesToCommit <= 1)
       if (presentation === 'foreground') assert.ok(result.inputToSVGCommitMS <= 50,
         `The interleaved native foreground selection blocked input for ${result.inputToSVGCommitMS} ms: ${JSON.stringify(result)}`)
       context.diagnostic(`Interleaved selection timing (${presentation}): ${JSON.stringify(result)}`)
       const visible = await page.locator('svg[data-rendered-inst]').evaluateAll(svgs => svgs.map(svg => ({ instId: svg.dataset.renderedInst, timeframe: svg.dataset.renderedTimeframe })))
-      assert.deepEqual(visible, [{ instId, timeframe }])
-      assert.equal(await activeSVG.evaluate(svg => svg.isConnected && svg === document.querySelector('svg[data-rendered-inst]')), true,
-        'An interleaved market and timeframe switch must reuse the current SVG surface.')
-      assert.equal(await page.locator('svg[data-prepared-chart-inst]').count(), 1,
-        'Only the current SVG surface may remain mounted after an interleaved switch.')
+      assert.deepEqual(visible, ['1H', '15m', '5m'].map(timeframe => ({ instId, timeframe })))
+      assert.equal(await page.locator('svg[data-prepared-chart-inst]').count(), 3,
+        'Only the three current SVG surfaces may remain mounted after a switch.')
     } finally {
       await activeSVG.dispose()
       assertNavigationFrames(await finishNavigationFrameProbe(page))

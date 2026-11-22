@@ -10,14 +10,17 @@ import { encodeOperationJournal, operationJournalSuffix } from '../../electron/s
 
 const now = 1_800_000_000_000, day = 86_400_000
 const dead = () => false
-async function fixture(directory, { pid = 765432, schema = 2, health = {}, bytes = 1024, at = now } = {}) {
+const sessionId = (at, pid) => `session-${at}-${pid}-${randomUUID()}`
+async function fixture(directory, { pid = 765432, health = {}, bytes = 1024, at = now } = {}) {
   await mkdir(directory, { recursive: true })
+  const name = directory.split('/').at(-1), match = /^session-(\d{13})-([1-9]\d*)-/.exec(name)
+  if (match) await writeFile(join(directory, 'session.retention.json'), JSON.stringify({ schemaVersion: 1, kind: 'perpetual-swap-operation-session', id: name, token: randomUUID(), pid: Number(match[2]), createdAt: Number(match[1]), updatedAt: Math.floor(at), state: 'closed', closedAt: at }), { flag: 'wx' }).catch(error => { if (error.code !== 'EEXIST') throw error })
   const executionId = `${pid}-0-${randomUUID()}`, participantId = randomUUID()
   await writeFile(join(directory, `${executionId}.jsonl`), Buffer.alloc(bytes, 10))
-  const value = { ...(schema === 2 ? { schemaVersion: 2, participantId, role: 'fixture', sourceFailures: 0, omittedRecords: 0, activeOperations: 0 } : {}),
+  const value = { schemaVersion: 2, participantId, role: 'fixture', sourceFailures: 0, omittedRecords: 0, activeOperations: 0,
     recorded: 2, persisted: 2, failed: 0, pending: 0, closed: true, executionId, ...health }
   await writeFile(join(directory, `${executionId}.health.json`), JSON.stringify(value))
-  if (schema === 2) await writeFile(join(directory, `${participantId}.participant.json`), JSON.stringify({ schemaVersion: 2, id: participantId, status: 'ready', role: 'fixture', executionId }))
+  await writeFile(join(directory, `${participantId}.participant.json`), JSON.stringify({ schemaVersion: 2, id: participantId, status: 'ready', role: 'fixture', executionId }))
   for (const name of await readdir(directory)) if (name !== 'session.retention.json') await utimes(join(directory, name), at / 1000, at / 1000)
   return { executionId, participantId }
 }
@@ -28,9 +31,9 @@ async function temporary(t) {
 }
 const exists = path => stat(path).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error })
 
-test('retention expires closed legacy sessions whole by age then capacity, retaining an explicit deletion audit', async t => {
-  const root = await temporary(t), old = `${now - 10 * day}-765432`, recent = `${now - day}-765433`
-  await fixture(join(root, old), { schema: 1, at: now - 9 * day })
+test('retention expires closed sessions whole by age then capacity, retaining an explicit deletion audit', async t => {
+  const root = await temporary(t), old = sessionId(now - 10 * day, 765432), recent = sessionId(now - day, 765433)
+  await fixture(join(root, old), { at: now - 9 * day })
   await fixture(join(root, recent), { at: now - day })
   const aged = await enforceOperationRetention(root, { now: () => now, maxBytes: Number.MAX_SAFE_INTEGER, isProcessAlive: dead })
   assert.deepEqual(aged.pruned.map(value => [value.id, value.reason]), [[old, 'age']])
@@ -53,7 +56,7 @@ test('whole-session retention recognizes closed current journals and both legacy
   const root = await temporary(t), ids = []
   const formats = [['.jsonl', value => value], ['.jsonl.gz', gzipSync], [operationJournalSuffix, encodeOperationJournal]]
   for (const [index, [suffix, encode]] of formats.entries()) {
-    const id = `${now - day}-${765432 + index}`, directory = join(root, id)
+    const id = sessionId(now - day, 765432 + index), directory = join(root, id)
     const { executionId } = await fixture(directory, { pid: 765432 + index, health: { durableRecords: 2 }, at: now - day })
     const plain = join(directory, `${executionId}.jsonl`), file = join(directory, `${executionId}${suffix}`)
     const stored = encode(await readFile(plain))
@@ -85,14 +88,14 @@ test('leases preserve active and crashed sessions and surface protected over-bud
   assert.deepEqual(await readFile(join(active.directory, (await readdir(active.directory)).find(name => name.endsWith('.jsonl')))), before)
 })
 
-test('fractional filesystem times remain valid across interrupted legacy cleanup and retry', async t => {
-  const root = await temporary(t), id = `${now - day}-765432`, token = randomUUID()
-  await fixture(join(root, id), { schema: 1, at: now - day + 0.625 })
+test('fractional filesystem times remain valid across interrupted cleanup and retry', async t => {
+  const root = await temporary(t), id = sessionId(now - day, 765432), token = randomUUID()
+  await fixture(join(root, id), { at: now - day + 0.625 })
   const initial = await enforceOperationRetention(root, { now: () => now, maxBytes: 0, isProcessAlive: dead })
   assert.deepEqual(initial.pruned.map(value => value.id), [id], 'Actual filesystem mtimes may contain fractional milliseconds.')
   assert.deepEqual(initial.failures, [])
   const quarantine = join(root, `.pruning-${token}`)
-  await fixture(quarantine, { schema: 1, at: now - day + 0.625 })
+  await fixture(quarantine, { at: now - day + 0.625 })
   await writeFile(join(quarantine, 'session.retention.json'), JSON.stringify({ schemaVersion: 1,
     kind: 'perpetual-swap-operation-session', id, token: randomUUID(), pid: 765432,
     createdAt: now - day, updatedAt: now, state: 'closed', closedAt: now - day + 0.625,
@@ -121,9 +124,11 @@ test('session heartbeat and close serialize atomically and completion requires e
   assert.equal(await exists(incomplete.directory), true)
 })
 
-test('legacy migration protects live child PIDs, inconsistent counts and unclaimed participants', async t => {
-  const root = await temporary(t), live = `${now - day}-765432`, damaged = `${now - day}-765434`, unclaimed = `${now - day}-765435`
-  await fixture(join(root, live), { schema: 1, pid: 765433 })
+test('retention protects active sessions, inconsistent counts and unclaimed participants', async t => {
+  const root = await temporary(t), live = sessionId(now - day, 765432), damaged = sessionId(now - day, 765434), unclaimed = sessionId(now - day, 765435)
+  await fixture(join(root, live), { pid: 765433 })
+  const liveManifest = JSON.parse(await readFile(join(root, live, 'session.retention.json'), 'utf8'))
+  await writeFile(join(root, live, 'session.retention.json'), JSON.stringify({ ...liveManifest, state: 'active' }))
   await fixture(join(root, damaged), { health: { recorded: 3 } })
   await fixture(join(root, unclaimed))
   const id = randomUUID()
@@ -136,8 +141,17 @@ test('legacy migration protects live child PIDs, inconsistent counts and unclaim
   assert.equal(await exists(join(root, live)), true)
 })
 
+test('unrecognized old session directories remain protected', async t => {
+  const root = await temporary(t), id = `${now - day}-765432`
+  await fixture(join(root, id))
+  const status = await enforceOperationRetention(root, { now: () => now, maxBytes: 0, isProcessAlive: dead })
+  assert.equal(status.pruned.length, 0)
+  assert.equal(status.sessions.find(value => value.id === id).state, 'unsafe')
+  assert.equal(await exists(join(root, id)), true)
+})
+
 test('retention never follows symlinks or deletes unknown user files and reports unmeasured nested data', async t => {
-  const root = await temporary(t), outside = await temporary(t), name = `${now - day}-765432`
+  const root = await temporary(t), outside = await temporary(t), name = sessionId(now - day, 765432)
   await fixture(join(root, name))
   const secret = join(outside, 'user.txt'); await writeFile(secret, 'must survive')
   await symlink(secret, join(root, name, 'unrelated.txt'))
@@ -156,7 +170,7 @@ test('retention never follows symlinks or deletes unknown user files and reports
 })
 
 test('deletion audits rotate within two bounded segments and refuse foreign or symlinked audit files', async t => {
-  const root = await temporary(t), name = `${now - day}-765432`
+  const root = await temporary(t), name = sessionId(now - day, 765432)
   await fixture(join(root, name))
   const header = `${JSON.stringify({ schemaVersion: 1, kind: 'perpetual-swap-operation-retention' })}\n`
   const padding = JSON.stringify({ schemaVersion: 1, kind: 'perpetual-swap-operation-retention', padding: 'x'.repeat(500) }) + '\n'
@@ -168,7 +182,7 @@ test('deletion audits rotate within two bounded segments and refuse foreign or s
   assert.equal(status.pruned.length, 1)
   assert.ok((await stat(join(root, 'retention-deletions.ndjson'))).size <= 256 * 1024)
   assert.ok((await stat(join(root, 'retention-deletions.1.ndjson'))).size <= 256 * 1024)
-  const other = await temporary(t), otherName = `${now - day}-765433`, outside = join(other, 'user.txt')
+  const other = await temporary(t), otherName = sessionId(now - day, 765433), outside = join(other, 'user.txt')
   await fixture(join(other, otherName)); await writeFile(outside, 'private user content')
   await symlink(outside, join(other, 'retention-deletions.ndjson'))
   await assert.rejects(enforceOperationRetention(other, { now: () => now, maxBytes: 0, isProcessAlive: dead }), /Unsafe operation retention metadata/)
@@ -177,7 +191,7 @@ test('deletion audits rotate within two bounded segments and refuse foreign or s
 })
 
 test('a live cleanup lock blocks another sweeper without mutating sessions or claiming measured bytes', async t => {
-  const root = await temporary(t), name = `${now - day}-765432`
+  const root = await temporary(t), name = sessionId(now - day, 765432)
   await fixture(join(root, name))
   await writeFile(join(root, 'retention.lock'), JSON.stringify({ schemaVersion: 1, kind: 'perpetual-swap-operation-retention', pid: process.pid }))
   const busy = await enforceOperationRetention(root, { now: () => now, maxBytes: 0, isProcessAlive: () => true })
@@ -190,7 +204,7 @@ test('a live cleanup lock blocks another sweeper without mutating sessions or cl
 
 
 test('retention validates portable graphics paths and preserves incomplete native captures', async t => {
-  const root = await temporary(t), ids = [`${now - day}-765432`, `${now - day}-765433`]
+  const root = await temporary(t), ids = [sessionId(now - day, 765432), sessionId(now - day, 765433)]
   for (const [index, id] of ids.entries()) {
     const directory = join(root, id), prefix = `chromium-765432-${randomUUID()}`
     await fixture(directory)

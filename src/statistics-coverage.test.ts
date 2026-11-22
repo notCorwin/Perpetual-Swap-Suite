@@ -3,7 +3,6 @@ import { strict as assert } from 'node:assert'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
 import { MarketStore } from '../electron/services/market-store.js'
 import { STATISTICS_ABSENCE_POLICY, statisticsAbsenceExpiryAt } from '../electron/services/statistics-coverage.js'
 
@@ -132,55 +131,4 @@ test('default observation times and explicit fixture expiry overrides do not adm
     assert.ok((await f.store.statistics(page)).every(row => row.statisticsOIExpiresAt === null))
     assert.deepEqual(await f.store.statisticsMissingRanges(page), [{ from: base, through: base + step }])
   } finally { await f.close() }
-})
-
-test('SQLite v1 migration retains numeric history and expires unversioned imported null proof', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'perp-statistics-v1-'))
-  let store: MarketStore | undefined
-  try {
-    const future = Date.now() + day, database = new DatabaseSync(join(root, 'market.sqlite'))
-    try {
-      database.exec(`CREATE TABLE series (
-        id INTEGER PRIMARY KEY, instrument TEXT NOT NULL, timeframe TEXT NOT NULL,
-        revision INTEGER NOT NULL DEFAULT 0, price_revision INTEGER NOT NULL DEFAULT 0,
-        candle_count INTEGER NOT NULL DEFAULT 0, first_ts INTEGER, last_ts INTEGER, UNIQUE(instrument,timeframe));
-        CREATE TABLE statistics (
-          series_id INTEGER NOT NULL, source INTEGER NOT NULL, timestamp INTEGER NOT NULL,
-          value1 REAL, value2 REAL, expires_at INTEGER, written_at INTEGER NOT NULL,
-          origin INTEGER NOT NULL, import_version INTEGER NOT NULL DEFAULT 0,
-          PRIMARY KEY(series_id,source,timestamp)) WITHOUT ROWID;
-        INSERT INTO series(id,instrument,timeframe) VALUES(1,'BTC-USDT-SWAP','5m');
-        PRAGMA user_version=1;`)
-      const insert = database.prepare('INSERT INTO statistics VALUES(1,?,?,?,?,?,?,?,0)')
-      insert.run(1, base, 1_000, null, 1, 100, 1)
-      insert.run(2, base, 20, 10, 1, 100, 0)
-      insert.run(1, base + step, null, null, future, 200, 1)
-      insert.run(2, base + step, null, null, future, 200, 0)
-      insert.run(1, base + 2 * step, null, null, null, 200, 0)
-    } finally { database.close() }
-    const range = { ...query, through: base + 2 * step }
-    store = await MarketStore.open(root)
-    const rows = await store.statistics(range)
-    assert.deepEqual([rows[0].oi, rows[0].sell, rows[0].buy], [1_000, 20, 10])
-    assert.equal(rows[0].statisticsOIAbsenceAttempts, 0)
-    assert.equal(rows[0].statisticsTakerAbsenceAttempts, 0)
-    assert.equal(rows[1].statisticsOIExpiresAt, future)
-    assert.equal(rows[1].statisticsOIObservedAt, 200)
-    assert.equal(rows[1].statisticsOIAbsenceAttempts, 1)
-    assert.equal(rows[1].statisticsTakerExpiresAt, null)
-    assert.equal(rows[1].statisticsTakerObservedAt, 200)
-    assert.equal(rows[1].statisticsTakerAbsenceAttempts, 0)
-    assert.equal(rows[2].statisticsOIExpiresAt, null)
-    assert.deepEqual(await store.statisticsMissingRanges({ ...range, source: 'oi' }), [{ from: base + 2 * step, through: base + 2 * step }])
-    assert.deepEqual(await store.statisticsMissingRanges({ ...range, source: 'taker' }), [{ from: base + step, through: base + 2 * step }])
-    await store.appendStatistics({ ...range, from: base + step, through: base + step, source: 'taker', values: [], observedAt: Date.now() })
-    const [renewed] = await store.statistics({ ...range, from: base + step, through: base + step })
-    assert.equal(renewed.statisticsTakerAbsenceAttempts, 1)
-    await store.close(); store = await MarketStore.open(root)
-    assert.deepEqual(await store.statistics({ ...range, from: base + step, through: base + step }), [renewed])
-    await store.close()
-    const migrated = new DatabaseSync(join(root, 'market.sqlite'))
-    try { assert.equal(migrated.prepare('PRAGMA user_version').get()!.user_version, 4) }
-    finally { migrated.close() }
-  } finally { await store?.close(); await rm(root, { recursive: true, force: true }) }
 })

@@ -131,7 +131,7 @@ async function handleRequest(event, payload, context) {
   const request = parseDesktopRequest(payload, { allowE2E: testMode })
   if (security.isTrustedSender(event, settingsWindow) && !request.preferences && !request.dataAudit && !request.historyDownload) throw new Error('This request is unavailable in settings.')
   if (shuttingDown) throw new Error('The application is closing.')
-  const displayRead = Boolean(request.snapshot || request.chartWindow || request.chartLocal || request.chartHistory || request.chartUniverse)
+  const displayRead = Boolean(request.snapshot || request.chartLocal || request.chartHistory || request.chartUniverse)
   const epoch = presentation.getState().epoch
   const assertPresentation = () => {
     if (displayRead && (!presentation.getState().active || epoch !== presentation.getState().epoch)) {
@@ -170,7 +170,7 @@ async function handleRequest(event, payload, context) {
     const build = await readFile(join(process.resourcesPath, 'build-revision.json'), 'utf8').then(JSON.parse).catch(() => null)
     return { ...response, revision: build?.revision ?? null }
   }
-  return request.chartWindow || request.chartLocal || request.chartHistory || request.chartUniverse ? encodeChartWire(response) : response
+  return request.chartLocal || request.chartHistory || request.chartUniverse ? encodeChartWire(response) : response
   }
   const task = operationRecording
     ? runWithOperationContext(context, () => measureOperation({ category: 'ipc', name: 'desktop.request.execute', resource: Object.keys(request)[0] }, execute))

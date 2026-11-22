@@ -95,7 +95,7 @@ export function recordedDatabase(database, resource) {
       if (!hasOperationRecording()) return Reflect.apply(target.prepare, target, [sql])
       // Only identifiers from a fixed schema are recorded. SQL text and literals
       // may contain paths or secrets and must never enter the journal.
-      const tables = ['settings', 'analysis_settings', 'migrations', 'audits', 'catalog', 'series', 'candles', 'statistics', 'indicator_checkpoints']
+      const tables = ['settings', 'analysis_settings', 'audits', 'catalog', 'series', 'candles', 'statistics', 'indicator_checkpoints']
       const table = sql.match(/\b(?:FROM|INTO|UPDATE|TABLE)\s+([a-z_]+)/i)?.[1]?.toLowerCase()
       const statement = invoke('prepare', target.prepare.bind(target), [sql])
       return statementProxy(statement, tables.includes(table) ? table : undefined)

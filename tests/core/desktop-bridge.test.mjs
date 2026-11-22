@@ -35,7 +35,7 @@ function harness(enabled, state = Promise.resolve({ epoch: 0, active: true, star
       }
       if (args[0] === 'radar:request') {
         if (args[1].copyText === 'fail') throw new Error('Request failed')
-        return args[1].chartWindow ? wire : { ok: true }
+        return args[1].chartLocal ? wire : { ok: true }
       }
       throw new Error(`Unexpected IPC: ${args[0]}`)
     },
@@ -81,7 +81,7 @@ test('recording off skips telemetry while requests and buffered or live notifica
       ['radar-market-changed', { revision: 2 }], ['radar-chart-prepared', chart],
     ])
     assert.throws(() => h.notify('radar:chart-prepared', 'bad wire'), /Invalid chart wire|Unexpected token/)
-    assert.deepEqual(await desktop.request({ chartWindow: { instId: chart.instId, timeframe: '15m' } }), chart)
+    assert.deepEqual(await desktop.request({ chartLocal: { instId: chart.instId, timeframe: '15m' } }), chart)
     assert.deepEqual(await desktop.request({ copyText: 'ok' }), { ok: true })
     await assert.rejects(desktop.request({ copyText: 'fail' }), /Request failed/)
     assert.throws(() => desktop.initializeOperations({}), /disabled/)
@@ -146,7 +146,7 @@ test('recording on retains request and notification spans and drains acknowledge
     assert.equal(desktop.operationRecording, true)
     stop = await initializeOperationTelemetry()
     assert.equal(h.nonceCalls(), 1)
-    assert.deepEqual(await desktop.request({ chartWindow: { instId: chart.instId, timeframe: '15m' } }), chart)
+    assert.deepEqual(await desktop.request({ chartLocal: { instId: chart.instId, timeframe: '15m' } }), chart)
     await assert.rejects(desktop.request({ copyText: 'fail' }), /Request failed/)
     h.notify('radar:chart-prepared', wire, { traceId: 'market-trace', parentId: 'market-send' })
     assert.deepEqual(h.delivered.at(-1).detail, chart)

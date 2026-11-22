@@ -29,7 +29,7 @@ test('qualified rows stay stable while three timeframe surfaces load and resize'
         const response = await original(event, value, context)
         if (!gate.held) return response
         if (value.chartUniverse) { gate.suppressedReads += 1; return encodeChartWire({ ...decodeChartWire(response), frames: [] }) }
-        if (value.chartLocal || value.chartHistory || value.chartWindow) { gate.suppressedReads += 1; return encodeChartWire(null) }
+        if (value.chartLocal || value.chartHistory) { gate.suppressedReads += 1; return encodeChartWire(null) }
         return response
       })
       contents.send = function (channel, ...args) {

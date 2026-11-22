@@ -69,7 +69,7 @@ export async function runBuildBenchmark(target, args, environment = process.env,
   const flags = target === 'okx' ? ['--allow-network', '--scenario', 'okx-live-chart',
     ...['network', 'database', 'cpu', 'io', 'ipc'].flatMap(value => ['--require-category', value]),
     ...['electron-main', 'renderer', 'market-backend', 'market-reader', 'market-writer', 'prepared-chart'].flatMap(value => ['--require-role', value])] : []
-  await execute(process.execPath, ['scripts/test-sandbox.mjs', 'command', '--desktop', ...flags, '--', config.script, ...forwarded], testEnv)
+  await execute(process.execPath, ['scripts/test-sandbox.mjs', 'command', '--desktop', ...flags, '--', process.execPath, config.script, ...forwarded], testEnv)
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
