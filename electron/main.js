@@ -146,6 +146,11 @@ async function handleRequest(event, payload, context) {
     const image = nativeImage.createFromDataURL(request.copyImage)
     await copyImage(image); return { ok: true }
   }
+  if (request.screenshot) {
+    const image = await measureOperation({ category: 'gpu', name: 'window.capture', attributes: { measurement: 'submission-wall' } }, () => event.sender.capturePage())
+    await copyImage(image)
+    return { ok: true }
+  }
   if (request.captureChart) {
     const { x, y, width, height, output } = request.captureChart
     const image = await measureOperation({ category: 'gpu', name: 'chart.capture', attributes: { measurement: 'submission-wall', width, height } }, () => event.sender.capturePage({ x: Math.floor(x), y: Math.floor(y), width: Math.ceil(x + width) - Math.floor(x), height: Math.ceil(y + height) - Math.floor(y) }))

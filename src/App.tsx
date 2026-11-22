@@ -1,7 +1,6 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState, type Dispatch, type SetStateAction } from 'react'
 import { Camera } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { captureStableChart, chartCaptureBounds, eraseCapturedAction } from '@/chart-capture'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
 import { ChartTimeSyncProvider, MarketChart, type SharedChartStatusValue } from '@/MarketChart'
@@ -259,66 +258,34 @@ function App() {
   const connectionFailure = ['reconnecting', 'disconnected', 'unavailable'].includes(realtime.toLowerCase())
   const listOrder = candidateIds
   useEffect(() => { if (ready) void chartCoordinator.setUniverse(retainedChart && selectedID ? [...candidateIds, selectedID] : candidateIds, timeframe) }, [ready, candidateIds, timeframe, retainedChart, selectedID])
-  const marketOverlayRef = useRef<HTMLDivElement>(null)
-  const chartsRef = useRef<HTMLDivElement>(null)
-  const copyButtonRef = useRef<HTMLButtonElement>(null)
-  const copyOwner = useRef<object | null>(null)
-  const [copyState, setCopyState] = useState<{ status: 'idle' | 'copying' | 'copied' | 'failed'; error: string }>({ status: 'idle', error: '' })
-  useLayoutEffect(() => {
-    copyOwner.current = null
-    setCopyState({ status: 'idle', error: '' })
-    return () => { copyOwner.current = null }
-  }, [selectedID])
+  const screenshotOwner = useRef<object | null>(null)
+  const screenshotPending = useRef(false)
+  const [copyState, setCopyState] = useState<{ status: 'idle' | 'copied' | 'failed'; error: string; revision: number }>({ status: 'idle', error: '', revision: 0 })
+  useEffect(() => () => { screenshotOwner.current = null; screenshotPending.current = false }, [])
   useEffect(() => {
     if (copyState.status !== 'copied') return
-    const timer = window.setTimeout(() => setCopyState({ status: 'idle', error: '' }), 2000)
+    const timer = window.setTimeout(() => setCopyState(current => ({ ...current, status: 'idle', error: '' })), 2000)
     return () => window.clearTimeout(timer)
-  }, [copyState.status])
-  const copyChart = async () => {
-    const element = chartsRef.current
-    if (!element) return
+  }, [copyState.status, copyState.revision])
+  const screenshot = async () => {
+    if (screenshotOwner.current) { screenshotPending.current = true; return }
     const owner = {}
-    copyOwner.current = owner
-    setCopyState({ status: 'copying', error: '' })
+    screenshotOwner.current = owner
     try {
-      await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
-      if (copyOwner.current !== owner || chartsRef.current !== element) return
-      const button = copyButtonRef.current
-      if (!button) throw new Error('Copy action is unavailable.')
-      const charts = Array.from(element.querySelectorAll<HTMLElement>('[data-chart-inst]'))
-      if (charts.length !== 3 || charts.some(chart => chart.dataset.chartLoading !== 'false' || !(Number(chart.dataset.chartRenderedBars) > 0) || chart.dataset.chartInst !== selectedID)) throw new Error('Charts are still loading. Try again when all three are ready.')
-      const bounds = chartCaptureBounds(element)
-      const buttonBounds = button.getBoundingClientRect()
-      const content = charts.map(chart => chart.innerHTML)
-      const overlay = marketOverlayRef.current
-      if (!overlay) throw new Error('Contract list is unavailable.')
-      const overlayBounds = overlay.getBoundingClientRect()
-      const current = () => {
-        if (copyOwner.current !== owner || chartsRef.current !== element || copyButtonRef.current !== button || charts.some((chart, index) => chart.innerHTML !== content[index]) || marketOverlayRef.current !== overlay) return false
-        const overlayRect = overlay.getBoundingClientRect()
-        if (overlayRect.x !== overlayBounds.x || overlayRect.y !== overlayBounds.y || overlayRect.width !== overlayBounds.width || overlayRect.height !== overlayBounds.height) return false
-        const rect = element.getBoundingClientRect()
-        const action = button.getBoundingClientRect()
-        return rect.x === bounds.x && rect.y === bounds.y && rect.width === bounds.width && rect.height === bounds.height
-          && action.x === buttonBounds.x && action.y === buttonBounds.y && action.width === buttonBounds.width && action.height === buttonBounds.height
+      const result = await window.radarDesktop.request({ screenshot: {} })
+      if (!result.ok) throw new Error('Screenshot failed.')
+      if (screenshotOwner.current === owner) setCopyState(current => ({ status: 'copied', error: '', revision: current.revision + 1 }))
+    } catch {
+      if (screenshotOwner.current === owner) {
+        const detail = 'Could not copy the screenshot. Check the clipboard and try again.'
+        const issue = { id: 'copy', label: 'Screenshot', detail, severity: 'error', instance: ++toastSequence.current }
+        setCopyState(current => ({ status: 'failed', error: detail, revision: current.revision + 1 }))
+        setToast(shown => [...shown.slice(0, 3), ...[...shown.slice(3), issue].sort((a, b) => Number(b.severity === 'error') - Number(a.severity === 'error'))].slice(0, 32))
       }
-      const image = await captureStableChart(() => window.radarDesktop.request({ captureChart: { ...bounds, output: 'png' } }), current)
-      if (copyOwner.current !== owner) return
-      if (!current()) throw new Error('Chart changed during capture. Start again.')
-      const background = getComputedStyle(document.documentElement).getPropertyValue('--background')
-      const dataURL = await eraseCapturedAction(image.imageDataURL, bounds, [buttonBounds], background, overlayBounds)
-      if (copyOwner.current !== owner) return
-      if (!current()) throw new Error('Chart changed during capture. Start again.')
-      const result = await window.radarDesktop.request({ copyImage: dataURL })
-      if (!result.ok) throw new Error('Could not copy chart.')
-      if (copyOwner.current === owner) setCopyState({ status: 'copied', error: '' })
-    } catch (cause) {
-      if (copyOwner.current === owner) {
-        const detail = cause instanceof Error ? cause.message : ''
-        const error = detail === 'Charts are still loading. Try again when all three are ready.' ? detail
-          : detail === 'Chart changed before capture. Start again.' || detail === 'Chart changed during capture. Start again.' ? 'Charts changed during capture. Try again.'
-          : 'Could not copy the chart. Try again.'
-        setCopyState({ status: 'failed', error })
+    } finally {
+      if (screenshotOwner.current === owner) {
+        screenshotOwner.current = null
+        if (screenshotPending.current) { screenshotPending.current = false; void screenshot() }
       }
     }
   }
@@ -329,7 +296,7 @@ function App() {
   if (error) issues.push({ id: 'market-error', label: 'Market', detail: 'Market data is unavailable. Check the connection and data service.', severity: 'error' })
   if (connectionProblem) issues.push({ id: 'connection', label: 'Market', detail: `${connectionFailure ? 'Market connection interrupted' : 'Waiting for a live market connection'}. Check the connection for current prices.`, severity: 'warning' })
   if (status !== 'Live' && status !== 'Connecting') issues.push({ id: 'catalog', label: 'Contracts', detail: status === 'Cached' ? 'Cached contract data. Check the connection for current contracts.' : status === 'Unavailable' ? 'Contract verification is unavailable. Check the connection and data service.' : status, severity: status === 'Incomplete' || status === 'Unavailable' || status === 'Cached' ? 'warning' : 'info' })
-  if (copyState.error) issues.push({ id: 'copy', label: 'Copy chart', detail: copyState.error, severity: 'error' })
+  if (copyState.error) issues.push({ id: 'copy', label: 'Screenshot', detail: copyState.error, severity: 'error' })
   if (auditStatusUnavailable) issues.push({ id: 'data-audit-status', label: 'Data audit', detail: 'Audit status unavailable. Check the data service in Data settings.', severity: 'warning' })
   if (downloadStatusUnavailable) issues.push({ id: 'history-download-status', label: 'History download', detail: 'Download status unavailable. Check the data service in Data settings.', severity: 'warning' })
   if (globalAudit) {
@@ -349,7 +316,7 @@ function App() {
     if (value) issues.push({ id: frame, label: timeframeLabel(frame), ...value, frame })
   }
   const rankedIssues = [...issues].sort((a, b) => ({ error: 0, warning: 1, info: 2 }[a.severity] - { error: 0, warning: 1, info: 2 }[b.severity]))
-  const toastIssues = rankedIssues.filter(issue => (issue.id !== 'catalog' || status === 'Unavailable' || status === 'Cached') && issue.severity !== 'info' && (issue.id !== 'connection' || connectionFailure))
+  const toastIssues = rankedIssues.filter(issue => issue.id !== 'copy' && (issue.id !== 'catalog' || status === 'Unavailable' || status === 'Cached') && issue.severity !== 'info' && (issue.id !== 'connection' || connectionFailure))
   const toastKey = JSON.stringify(toastIssues.map(({ id, label, detail, severity }) => ({ id, label, detail, severity })))
   const previousToastIssues = useRef(new Map<string, string>())
   const toastSequence = useRef(0)
@@ -393,7 +360,7 @@ function App() {
   }, [statusKey])
 
   const renderChart = (frame: '1H' | '15m' | '5m', navigation = false) => <div key={frame} data-timeframe-panel={frame} className="min-h-0 min-w-0 flex-1 overflow-hidden rounded-lg border bg-background">
-    {selectedID ? <MarketChart controller={multiChartControllers[frame]} priceOnly onStatus={updateChartStatus} navigation={navigation} instId={selectedID} tickSz={selectedRow?.tickSz} timeframe={frame} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={selectFromChart} /> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}
+    {selectedID ? <MarketChart controller={multiChartControllers[frame]} priceOnly showBollingerPriceLabels={preferences.showBollingerPriceLabels} onStatus={updateChartStatus} navigation={navigation} instId={selectedID} tickSz={selectedRow?.tickSz} timeframe={frame} listOrder={listOrder} turnoverOrder={turnoverOrder} onSelect={selectFromChart} /> : <div className="flex h-full items-center justify-center"><Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{verifying || verificationUnavailable ? emptyDescription : 'Enable different liquidity conditions to view a chart.'}</EmptyDescription></EmptyHeader></Empty></div>}
   </div>
 
   return <WorkspaceViewport>
@@ -404,19 +371,19 @@ function App() {
       <div className="flex h-full min-w-0 flex-1">
         <section data-chart-panel className="h-full min-w-0 flex-1" aria-label="Market chart workspace">
           <div data-chart-display-mode="multi" className="flex h-full min-h-0 flex-col">
-            <span role="status" className="sr-only">{copyState.status === 'copying' ? 'Copying chart' : copyState.status === 'copied' ? 'Chart copied to clipboard' : ''}</span>
-            <div ref={chartsRef} data-chart-capture className="flex min-h-0 flex-1 flex-col">
+            <span role="status" className="sr-only">{copyState.status === 'copied' ? 'Screenshot copied to clipboard' : ''}</span>
+            <div className="flex min-h-0 flex-1 flex-col">
               <header data-chart-toolbar data-window-toolbar data-window-drag-region className="flex shrink-0 items-center gap-3 px-4">
                 <div className="flex min-w-0 flex-1 items-center gap-4">
                   <h1 className="sr-only">Perpetual Swap Suite</h1>
                   {selectedID && <h2 data-chart-title data-shared-chart-title className="max-w-32 truncate" title={selectedID}>{selectedID.replace(/-SWAP$/, '')}</h2>}
                   {sharedPriceText !== undefined && <><span className="sr-only">Market price</span><span data-shared-chart-price className="max-w-32 truncate" title={sharedPriceText}>{sharedPriceText}</span></>}
                 </div>
-                {selectedID && <Button ref={copyButtonRef} data-window-no-drag variant="outline" size="sm" disabled={copyState.status === 'copying'} onClick={() => { void copyChart() }}><Camera data-icon="inline-start" aria-hidden="true" />{copyState.status === 'copying' ? 'Copying…' : copyState.status === 'copied' ? 'Copied' : 'Copy chart'}</Button>}
+                <Button data-window-no-drag aria-label="Screenshot" variant="outline" size="sm" onClick={() => { void screenshot() }}><Camera data-icon="inline-start" aria-hidden="true" />{copyState.status === 'copied' ? 'Copied' : 'Screenshot'}</Button>
               </header>
               <ChartTimeSyncProvider key={selectedID}><div className="grid min-h-0 flex-1 grid-rows-2 gap-2 p-2 pt-0" data-multi-timeframe-charts>
                 <div className="flex min-h-0 min-w-0 gap-2">
-                <div ref={marketOverlayRef} data-market-panel className="flex min-h-0 w-[max(var(--market-list-min-width),var(--market-list-share))] min-w-0 shrink-0 flex-col overflow-hidden rounded-lg border bg-background">
+                <div data-market-panel className="flex min-h-0 w-[max(var(--market-list-min-width),var(--market-list-share))] min-w-0 shrink-0 flex-col overflow-hidden rounded-lg border bg-background">
                   <aside data-market-list className="flex min-h-0 flex-1 flex-col" aria-label="Contract list">
       <section data-market-scroll className="min-h-0 flex-1 overflow-y-auto [&>[data-slot=table-container]]:overflow-visible" aria-label="Perpetual swap markets">
         <Table className="table-fixed [&_tr:not([data-virtual-spacer])>:first-child]:pl-4 [&_tr:not([data-virtual-spacer])>:last-child]:pr-4" data-market-count={visible.length} data-total-market-count={rows.length} aria-rowcount={visible.length + 1}>

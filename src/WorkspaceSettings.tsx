@@ -305,6 +305,10 @@ export function WorkspaceSettings({ section, active, preferences, loaded, loadEr
         <FieldSet disabled={preferenceDisabled} aria-labelledby="settings-section-title">
           <FieldGroup>
             {numericField('rankingLookback', 'Ranking lookback (minutes)', 'Completed 5m closes.')}
+            <Field orientation="horizontal" data-disabled={preferenceDisabled} className="justify-between gap-6">
+              <FieldContent className="self-center"><FieldLabel htmlFor="show-bollinger-price-labels">Bollinger price labels</FieldLabel></FieldContent>
+              <Switch id="show-bollinger-price-labels" className="self-center" checked={draft.showBollingerPriceLabels} disabled={preferenceDisabled} onCheckedChange={checked => { setDraft(current => ({ ...current, showBollingerPriceLabels: checked })); setSavedMessage('') }} />
+            </Field>
           </FieldGroup>
         </FieldSet>
               </div>

@@ -10,7 +10,7 @@ import { createNativeExchange } from '../helpers/native-exchange.mjs'
 
 const frames = ['1H', '15m', '5m'], btc = 'BTC-USDT-SWAP', eth = 'ETH-USDT-SWAP'
 
-test('multi-timeframe charts synchronize navigation and copy all three charts', { timeout: 120_000 }, async () => {
+test('multi-timeframe charts synchronize navigation and screenshot the visible workspace', { timeout: 120_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'perp-multiframe-'))
   const exchange = await createNativeExchange()
   let electron
@@ -285,7 +285,7 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
     console.log('multiframe: ETH ready')
     await live(eth, 142.75, 40)
     await assertFormingCandlesFit()
-    // Observe the real capture while intercepting the final clipboard write so
+    // Exercise a real renderer capture while intercepting clipboard writes so
     // this background test never alters the user's clipboard.
     await page.addInitScript(() => {
       const define = Object.defineProperty
@@ -294,14 +294,18 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
           Object.defineProperty = define
           const original = descriptor.value
           descriptor.value = Object.freeze({ ...original, request: (...args) => {
-            if (args[0]?.captureChart) {
-              window.__captureBounds = args[0].captureChart
+            if (args[0]?.screenshot) {
+              const bounds = { x: 0, y: 0, width: innerWidth, height: innerHeight }
+              window.__captureBounds = bounds
               const button = document.querySelector('[data-chart-toolbar] button')
               const buttonRect = button.getBoundingClientRect()
               window.__captureButton = { x: buttonRect.x, y: buttonRect.y, width: buttonRect.width, height: buttonRect.height, opacity: getComputedStyle(button).opacity }
               window.__captureTitle = document.querySelector('[data-shared-chart-title]')?.textContent
+              return original.request({ captureChart: { ...bounds, output: 'png' } }).then(image => {
+                window.__copiedImage = image.imageDataURL
+                return { ok: true }
+              })
             }
-            if (args[0]?.copyImage) { window.__copiedImage = args[0].copyImage; return Promise.resolve({ ok: true }) }
             return original.request(...args)
           } })
         }
@@ -314,16 +318,16 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
     await page.waitForFunction(() => [...document.querySelectorAll('[data-chart-inst]')].length === 3
       && [...document.querySelectorAll('[data-chart-inst]')].every(chart => chart.dataset.chartLoading === 'false' && Number(chart.dataset.chartRenderedBars) > 0))
     const assertCapture = async () => {
-      const bounds = await page.locator('[data-chart-capture]').boundingBox()
+      const bounds = await page.evaluate(() => ({ x: 0, y: 0, width: innerWidth, height: innerHeight }))
       await page.evaluate(() => { window.__copiedImage = null })
-      await page.getByRole('button', { name: /^(Copy chart|Copied)$/ }).click()
+      await page.getByRole('button', { name: 'Screenshot', exact: true }).click()
       await page.waitForFunction(() => window.__copiedImage !== null || document.querySelector('[data-chart-panel] [role="alert"]'))
       const error = await page.locator('[data-chart-panel] [role="alert"]').allTextContents()
       assert.deepEqual(error, [], `Capture must succeed: ${error.join(' ')}`)
       const captured = await page.evaluate(() => ({ bounds: window.__captureBounds, image: window.__copiedImage, button: window.__captureButton, title: window.__captureTitle }))
-      for (const key of ['x', 'y', 'width', 'height']) assert.ok(Math.abs(captured.bounds[key] - bounds[key]) < 1, `Capture ${key} must cover the entire multi-timeframe capture container.`)
+      for (const key of ['x', 'y', 'width', 'height']) assert.ok(Math.abs(captured.bounds[key] - bounds[key]) < 1, `Capture ${key} must cover the entire rendered viewport.`)
       assert.match(captured.image, /^data:image\/png;base64,/)
-      assert.ok(Number(captured.button.opacity) > 0, 'Copy progress remains visible during capture.')
+      assert.ok(Number(captured.button.opacity) > 0, 'The Screenshot button remains visible during capture.')
       const masked = await page.evaluate(async ({ bounds, button, image }) => {
       const bitmap = new Image()
       bitmap.src = image
@@ -339,8 +343,8 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
       const pixels = context.getImageData(x, y, right - x, bottom - y).data
       return { blank: pixels.every((value, index) => value === background[index % 4]), background: [...background] }
       }, captured)
-      assert.ok(masked.blank, 'The entire button, including its border, must match the toolbar background in the copied image.')
-      assert.equal(captured.title, 'ETH-USDT', 'The copied image must identify its contract.')
+      assert.equal(masked.blank, false, 'The screenshot must retain the button and its border.')
+      assert.equal(captured.title, 'ETH-USDT', 'The screenshot must identify its contract.')
       const listBlank = await page.evaluate(async ({ bounds, image }) => {
         const rect = document.querySelector('[data-market-panel]').getBoundingClientRect()
         const bitmap = new Image(); bitmap.src = image; await bitmap.decode()
@@ -353,7 +357,7 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
         const pixels = context.getImageData(x, y, width, height).data
         return pixels.every((value, index) => value === pixels[index % 4])
       }, captured)
-      assert.ok(listBlank, 'The copied image must not include the contract list.')
+      assert.equal(listBlank, false, 'The screenshot must retain the contract list.')
       const output = await page.evaluate(async ({ bounds, image }) => {
         const bitmap = new Image(); bitmap.src = image; await bitmap.decode()
         const canvas = document.createElement('canvas'); canvas.width = bitmap.naturalWidth; canvas.height = bitmap.naturalHeight
@@ -370,7 +374,7 @@ test('multi-timeframe charts synchronize navigation and copy all three charts', 
         return { chartsHaveContent }
       }, captured)
       assert.equal(await page.getByRole('link', { name: 'Settings', exact: true }).count(), 0, 'Settings is accessed through the native application menu.')
-      assert.deepEqual(output.chartsHaveContent, [true, true, true], 'The copied image must retain all three charts.')
+      assert.deepEqual(output.chartsHaveContent, [true, true, true], 'The screenshot must retain all three charts.')
       return masked.background
     }
     await page.emulateMedia({ colorScheme: 'dark' })

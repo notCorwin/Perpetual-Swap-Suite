@@ -137,7 +137,6 @@
   --chart-line-width: 1px;
   --chart-legend-gap: calc(var(--space-annotation-small) * 2);
   --chart-price-label-padding-y: var(--space-1);
-  --chart-capture-flash: #fff;
   --radius: 0.625rem;
   --background: oklch(1 0 0);
   --foreground: oklch(0.145 0 0);
@@ -254,12 +253,6 @@
   h1, h2, h3, h4, h5, h6 {
     scroll-margin-top: var(--space-4);
   }
-}
-
-@keyframes chart-capture-flash {
-  0% { opacity: 0; }
-  15% { opacity: 1; }
-  100% { opacity: 0; }
 }
 
 

@@ -112,10 +112,11 @@ function preferences(value) {
   if (action === 'read') { record(value, path, ['action']); return { action } }
   record(value, path, ['action', 'values'], ['action', 'values'])
   const valuesPath = `${path}.values`
-  const values = record(value.values, valuesPath, ['chartDisplayMode', 'rankingLookback', 'historyDays', 'liquidity'])
+  const values = record(value.values, valuesPath, ['chartDisplayMode', 'showBollingerPriceLabels', 'rankingLookback', 'historyDays', 'liquidity'])
   if (Object.keys(values).length === 0) invalid(valuesPath, 'must contain an update')
   const result = {}
   optional(result, values, 'chartDisplayMode', input => choice(input, `${valuesPath}.chartDisplayMode`, ['multi', 'indicators']))
+  optional(result, values, 'showBollingerPriceLabels', input => boolean(input, `${valuesPath}.showBollingerPriceLabels`))
   optional(result, values, 'rankingLookback', input => {
     number(input, `${valuesPath}.rankingLookback`, 5, Number.MAX_SAFE_INTEGER, true)
     if (input % 5 !== 0) invalid(`${valuesPath}.rankingLookback`, 'must be a multiple of 5 minutes')
@@ -189,7 +190,7 @@ function candle(value, index) {
 
 /** Validate the complete request before dispatching any operation or side effect. */
 export function parseDesktopRequest(value, { allowE2E = false } = {}) {
-  const operations = ['snapshot', 'preferences', 'dataAudit', 'historyDownload', 'chartFocus', 'chartWindow', 'chartLocal', 'chartHistory', 'chartUniverse', 'captureChart', 'copyText', 'copyImage', 'statusLog', 'e2e']
+  const operations = ['snapshot', 'preferences', 'dataAudit', 'historyDownload', 'chartFocus', 'chartWindow', 'chartLocal', 'chartHistory', 'chartUniverse', 'captureChart', 'screenshot', 'copyText', 'copyImage', 'statusLog', 'e2e']
   record(value, 'request', operations)
   const keys = Object.keys(value)
   if (keys.length !== 1) invalid('request', 'must contain exactly one operation')
@@ -231,6 +232,7 @@ export function parseDesktopRequest(value, { allowE2E = false } = {}) {
       return { chartUniverse: {} }
     }
     case 'captureChart': return { captureChart: captureChart(input) }
+    case 'screenshot': record(input, operation, []); return { screenshot: {} }
     case 'copyText': return { copyText: text(input, operation, { empty: true, maximum: 16_777_216 }) }
     case 'copyImage': {
       const image = text(input, operation, { maximum: 33_554_432 })

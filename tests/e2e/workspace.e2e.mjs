@@ -20,7 +20,7 @@ before(async () => {
   // of source downloads, persistence workers, and any configured AI service.
   await electron.evaluate(async ({ ipcMain, BrowserWindow }) => {
     const { encodeChartWire } = process.getBuiltinModule('module').createRequire(`${process.cwd()}/package.json`)('./electron/chart-wire.js')
-    const preferences = { chartDisplayMode: 'multi', rankingLookback: 15, historyDays: 30, liquidity: {
+    const preferences = { chartDisplayMode: 'multi', showBollingerPriceLabels: false, rankingLookback: 15, historyDays: 30, liquidity: {
       spread: { enabled: true, maxPercent: .05 }, depth: { enabled: true, minUSDT: 100_000 },
       slippage: { enabled: true, maxPercent: .1, notionalUSDT: 100_000 }, volume24h: { enabled: true, minUSDT: 30_000_000 },
       openInterest: { enabled: true, minUSDT: 5_000_000 }, volumeStability: { enabled: false, maxRatio: 2 },
@@ -117,9 +117,10 @@ before(async () => {
       if (value.chartWindow) return state.coldTimeframes.includes(value.chartWindow.timeframe)
         ? { ...prepared(value.chartWindow), bars: [], priceState: 'loading', indicatorState: 'loading', oiState: 'loading', takerState: 'loading' }
         : prepared(value.chartWindow)
-      if (value.captureChart) {
+      if (value.screenshot) {
         if (state.holdCapture) { state.holdCapture = false; await new Promise(resolve => { state.releaseCapture = resolve }); state.releaseCapture = null }
-        return { imageDataURL: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=', width: 10, height: 10 }
+        if (state.failScreenshot) { state.failScreenshot = false; throw new Error('clipboard unavailable') }
+        return { ok: true }
       }
       if (value.copyImage) return { ok: true }
       if (value.historyDownload) {
@@ -183,7 +184,7 @@ before(async () => {
         const original = descriptor.value
         descriptor.value = Object.freeze({ ...original, request: (...args) => {
           const reply = original.request(...args)
-          if (!args[0]?.captureChart) return reply
+          if (!args[0]?.screenshot) return reply
           return reply.then(value => { window.__captureReplies++; return value }, error => { window.__captureReplies++; throw error })
         } })
       }
@@ -395,11 +396,11 @@ test('market arrow shortcuts survive contract clicks, toolbar focus and repeated
     await expectMarket('ArrowUp', 'ZETA')
     await page.locator('[data-timeframe-panel="15m"] [data-chart-plot]').focus()
     await expectMarket('ArrowRight', 'ALPHA')
-    await page.getByRole('button', { name: 'Copy chart', exact: true }).focus()
+    await page.getByRole('button', { name: 'Screenshot', exact: true }).focus()
     await expectMarket('ArrowLeft', 'BETA')
     await expectMarket('ArrowUp', 'NULL')
     await expectMarket('ArrowDown', 'BETA')
-    await page.getByRole('button', { name: 'Copy chart', exact: true }).click()
+    await page.getByRole('button', { name: 'Screenshot', exact: true }).click()
     await expectMarket('ArrowDown', 'ZETA')
     await page.evaluate(() => { window.dispatchEvent(new Event('blur')); window.dispatchEvent(new Event('focus')) })
     await expectMarket('ArrowDown', 'ALPHA')
@@ -446,7 +447,7 @@ test('the existing chart toolbar provides window dragging while its controls rem
   const toolbar = page.locator('[data-chart-panel] [data-chart-toolbar]')
   await assertWorkspaceLayout(page)
   assert.equal(await toolbar.evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'drag')
-  for (const name of ['Copy chart']) {
+  for (const name of ['Screenshot']) {
     assert.equal(await toolbar.getByRole('button', { name, exact: true }).evaluate(element => getComputedStyle(element).getPropertyValue('app-region')), 'no-drag')
   }
   assert.equal(await toolbar.getByRole('heading', { name: 'Perpetual Swap Suite', exact: true }).count(), 1)
@@ -547,6 +548,7 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
 })
 
 test('contract precision updates pad current quotes while preserving historical and indicator digits', async () => {
+  await page.evaluate(() => window.radarDesktop.request({ preferences: { action: 'update', values: { showBollingerPriceLabels: true } } }))
   await page.locator('[aria-label="View BETA-USDT-SWAP chart"]').click()
   await selectTimeframe(page, '15m')
   const chart = page.locator('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]')
@@ -605,6 +607,7 @@ test('contract precision updates pad current quotes while preserving historical 
     await page.mouse.up()
     await waitForLabel('+0.02%')
   } finally {
+    await page.evaluate(() => window.radarDesktop.request({ preferences: { action: 'update', values: { showBollingerPriceLabels: false } } }))
     await page.mouse.up()
     const generation = await electron.evaluate(async () => {
       const state = globalThis.__workspaceFixture
@@ -829,27 +832,32 @@ test('market notifications wait while hidden and refresh immediately when the wo
   }
 })
 
-test('a delayed chart capture cannot copy pixels after the selected contract changes', async () => {
+test('screenshot preserves the current interface and remains responsive during capture', async () => {
   await electron.evaluate(() => { globalThis.__workspaceFixture.holdCapture = true })
-  const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.copyImage).length)
-  const replies = await page.evaluate(() => window.__captureReplies)
+  const before = await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.screenshot).length)
   try {
-    await page.waitForFunction(() => [...document.querySelectorAll('[data-chart-inst]')].length === 3 && [...document.querySelectorAll('[data-chart-inst]')].every(chart => chart.dataset.chartLoading === 'false' && Number(chart.dataset.chartRenderedBars) > 0))
-    await page.getByRole('button', { name: 'Copy chart', exact: true }).click()
-    // Copying precedes the two animation frames that dispatch capture.
+    await page.getByRole('button', { name: 'Screenshot', exact: true }).click()
     await waitForAuditFixture(() => typeof globalThis.__workspaceFixture.releaseCapture === 'function')
+    assert.equal(await page.getByRole('button', { name: 'Screenshot', exact: true }).isVisible(), true)
+    assert.equal(await page.getByRole('button', { name: 'Screenshot', exact: true }).textContent(), 'Screenshot', 'Starting capture must not change the visible interface.')
+    assert.equal(await page.locator('[data-market-list]').isVisible(), true)
+    for (let index = 0; index < 4; index++) await page.getByRole('button', { name: 'Screenshot', exact: true }).click()
+    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.screenshot).length), before + 1, 'Repeated requests wait for the first capture.')
     await page.getByRole('row', { name: 'View ZETA-USDT-SWAP chart', exact: true }).click()
-    await page.waitForFunction(() => [...document.querySelectorAll('[data-chart-inst]')].every(chart => chart.dataset.chartInst === 'ZETA-USDT-SWAP'))
     await electron.evaluate(() => globalThis.__workspaceFixture.releaseCapture())
-    await page.waitForFunction(previous => window.__captureReplies > previous, replies)
-    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)))
-    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.copyImage).length), before)
-    assert.equal(await page.getByRole('alert').filter({ hasText: 'Chart changed during capture' }).count(), 0,
-      'An obsolete capture cannot publish an error into the new chart session.')
-    await page.waitForFunction(() => [...document.querySelectorAll('[data-chart-inst]')].length === 3 && [...document.querySelectorAll('[data-chart-inst]')].every(chart => chart.dataset.chartLoading === 'false' && Number(chart.dataset.chartRenderedBars) > 0))
-    await page.getByRole('button', { name: 'Copy chart', exact: true }).click()
-    await page.waitForFunction(() => [...document.querySelectorAll('[role=status]')].some(node => node.textContent.includes('Chart copied to clipboard')))
-    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.copyImage).length), before + 1)
+    await page.waitForFunction(() => [...document.querySelectorAll('[role=status]')].some(node => node.textContent.includes('Screenshot copied to clipboard')))
+    await electron.evaluate((_electron, target) => { globalThis.__workspaceFixture.captureTarget = target }, before + 2)
+    await waitForAuditFixture(() => globalThis.__workspaceFixture.requests.filter(value => value.screenshot).length === globalThis.__workspaceFixture.captureTarget)
+    await electron.evaluate(() => new Promise(resolve => setTimeout(resolve, 100)))
+    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.screenshot).length), before + 2, 'Repeated requests coalesce to one pending capture.')
+    await page.waitForFunction(() => document.querySelector('[aria-label="Screenshot"]')?.textContent.includes('Copied'))
+    await electron.evaluate(() => { globalThis.__workspaceFixture.failScreenshot = true })
+    await page.getByRole('button', { name: 'Screenshot', exact: true }).click()
+    const failures = page.locator('[data-market-status] p').filter({ hasText: 'Could not copy the screenshot' })
+    await failures.first().waitFor()
+    await electron.evaluate(() => { globalThis.__workspaceFixture.failScreenshot = true })
+    await page.getByRole('button', { name: 'Screenshot', exact: true }).click()
+    await page.waitForFunction(() => [...document.querySelectorAll('[data-market-status] p')].filter(node => node.textContent.includes('Could not copy the screenshot')).length === 2)
   } finally {
     await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.holdCapture = false; state.releaseCapture?.() })
     await page.getByRole('row', { name: 'View BETA-USDT-SWAP chart', exact: true }).click()
@@ -879,12 +887,11 @@ test('selection persists while six width/DPR combinations share page, pointer, a
       assert.equal(Number(hoveredClose), target.close, 'Screen-space pointer input must inspect the candle drawn beneath it at every UI scale and DPR.')
       await page.mouse.up()
       await page.waitForFunction(() => !document.querySelector('[data-acceptance-target] [data-chart-inst] [aria-live="off"] p')?.textContent.includes('Selected'))
-      const captureBounds = await page.locator('[data-chart-capture]').boundingBox()
       assert.equal(await page.locator('[data-shared-chart-title]').textContent(), fixture.instId.replace(/-SWAP$/, ''), 'Copied chart bounds must include the contract and displayed timeframe.')
-      await page.getByRole('button', { name: 'Copy chart', exact: true }).click()
-      await page.getByRole('status').filter({ hasText: 'Chart copied to clipboard' }).waitFor()
-      const request = await electron.evaluate(() => globalThis.__workspaceFixture.requests.findLast(value => value.captureChart).captureChart)
-      for (const key of ['x', 'y', 'width', 'height']) assert.ok(Math.abs(request[key] - captureBounds[key]) < 1, `Capture ${key} must use the drawn CSS-pixel bounds, independent of DPR.`)
+      await page.getByRole('button', { name: 'Screenshot', exact: true }).click()
+      await page.getByRole('status').filter({ hasText: 'Screenshot copied to clipboard' }).waitFor()
+      const request = await electron.evaluate(() => globalThis.__workspaceFixture.requests.findLast(value => value.screenshot))
+      assert.deepEqual(request, { screenshot: {} }, 'Screenshot captures the entire renderer without a crop, independent of DPR.')
       if (process.env.PERPETUAL_SWAP_UI_SCREENSHOTS) await page.screenshot({ path: join(process.env.PERPETUAL_SWAP_UI_SCREENSHOTS, `workspace-${width}-dpr${deviceScaleFactor}.png`) })
       const settings = await openSettings()
       const ranking = settings.getByRole('spinbutton', { name: 'Ranking lookback (minutes)' })
@@ -939,6 +946,35 @@ test('retired chart timeframe and price scale controls are absent from settings'
   assert.equal(await settings.getByRole('combobox', { name: 'Price scale' }).count(), 0)
   assert.equal(await settings.getByRole('spinbutton', { name: 'Fixed height per 1% (px)' }).count(), 0)
   await backToMarkets()
+})
+
+test('Bollinger price labels are off by default and update all charts when saved', async () => {
+  const settings = await openSettings()
+  const toggle = settings.getByRole('switch', { name: 'Bollinger price labels', exact: true })
+  assert.equal(await toggle.getAttribute('aria-checked'), 'false')
+  assert.equal(await page.locator('svg[data-rendered-inst] [data-chart-boll-label]').count(), 0)
+  const lineCount = await page.locator('svg[data-rendered-inst] [data-chart-indicator="bollUpper"]').count()
+  const priceCount = await page.locator('svg[data-rendered-inst] [data-chart-price-label]').count()
+  assert.equal(lineCount, 3)
+  assert.ok(priceCount > 0)
+  try {
+    await clickByRect(toggle)
+    await settings.getByRole('button', { name: 'Save settings', exact: true }).click()
+    await settingsWindow.getByRole('status').filter({ hasText: 'Settings saved.' }).waitFor()
+    await page.waitForFunction(() => [...document.querySelectorAll('svg[data-rendered-inst]')].length === 3 && [...document.querySelectorAll('svg[data-rendered-inst]')].every(svg => svg.querySelectorAll('[data-chart-boll-label]').length > 0))
+    assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.preferences.showBollingerPriceLabels), true)
+    assert.equal(await page.locator('svg[data-rendered-inst] [data-chart-indicator="bollUpper"]').count(), lineCount)
+    assert.equal(await page.locator('svg[data-rendered-inst] [data-chart-price-label]').count(), priceCount)
+    await backToMarkets()
+    const reopened = await openSettings()
+    assert.equal(await reopened.getByRole('switch', { name: 'Bollinger price labels', exact: true }).getAttribute('aria-checked'), 'true')
+    await clickByRect(reopened.getByRole('switch', { name: 'Bollinger price labels', exact: true }))
+    await reopened.getByRole('button', { name: 'Save settings', exact: true }).click()
+    await page.waitForFunction(() => document.querySelectorAll('svg[data-rendered-inst] [data-chart-boll-label]').length === 0)
+  } finally {
+    await page.evaluate(() => window.radarDesktop.request({ preferences: { action: 'update', values: { showBollingerPriceLabels: false } } }))
+    if (settingsWindow && !settingsWindow.isClosed()) await backToMarkets()
+  }
 })
 
 test('preference drafts survive category changes and validation returns to the first invalid group', async () => {
@@ -1250,6 +1286,7 @@ test('ranking changes keep the chosen chart while long lists retain keyboard acc
 })
 
 test('constant Bollinger bands stay finite and negative lower bands retain the relative price scale', async () => {
+  await page.evaluate(() => window.radarDesktop.request({ preferences: { action: 'update', values: { showBollingerPriceLabels: true } } }))
   const publishMode = async mode => {
     await electron.evaluate((_electron, mode) => { const state = globalThis.__workspaceFixture; state.bollMode = mode; state.chartGeneration += 1 }, mode)
     await page.evaluate(async () => {
@@ -1283,7 +1320,7 @@ test('constant Bollinger bands stay finite and negative lower bands retain the r
     const paths = await page.locator('svg[data-rendered-inst] path[d]').evaluateAll(paths => paths.map(path => path.getAttribute('d')))
     assert.doesNotMatch(paths.join(' '), /NaN|Infinity|undefined/)
     assert.equal(await page.locator('svg[data-rendered-inst] [data-chart-boll-band]').first().evaluate(path => path.getAttribute('d').length > 0), true)
-  } finally { await publishMode('standard') }
+  } finally { await publishMode('standard'); await page.evaluate(() => window.radarDesktop.request({ preferences: { action: 'update', values: { showBollingerPriceLabels: false } } })) }
 })
 
 test('list and three rounded chart panels occupy their requested positions', async () => {
@@ -1935,7 +1972,7 @@ test('compact workspaces preserve complete market prices and keep overflowing ch
       assert.equal(await price.getAttribute('title'), '0.0000012345')
       assert.equal(await price.textContent(), '0.0000012345')
       assert.equal(await price.evaluate(element => getComputedStyle(element).textOverflow), 'ellipsis')
-      assert.equal(await page.getByRole('button', { name: 'Copy chart', exact: true }).isVisible(), true)
+      assert.equal(await page.getByRole('button', { name: 'Screenshot', exact: true }).isVisible(), true)
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), true)
     }
   } finally {

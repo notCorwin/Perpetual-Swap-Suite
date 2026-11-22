@@ -62,6 +62,7 @@ export type DesktopCommands = {
   copyText: { input: string; output: { ok: boolean } }
   copyImage: { input: string; output: { ok: boolean } }
   captureChart: { input: ChartCaptureBounds & { output?: 'png' }; output: { ok: boolean } }
+  screenshot: { input: Record<string, never>; output: { ok: boolean } }
   chartFocus: { input: { id: string; slot?: 'primary' | RadarTimeframe; target: { instId: string; timeframe: RadarTimeframe; endHour?: number; windowBars?: number } | null }; output: { ok: boolean } }
   chartWindow: { input: { instId: string; timeframe: RadarTimeframe; endHour?: number; historyBars?: number; focusId?: string }; output: PreparedChartResponse | null }
   chartLocal: { input: { instId: string; timeframe: RadarTimeframe }; output: PreparedChartResponse | null }
@@ -90,6 +91,7 @@ export interface RadarDesktop {
   request(value: { copyImage: DesktopCommands['copyImage']['input'] }): Promise<DesktopCommands['copyImage']['output']>
   request(value: { captureChart: ChartCaptureBounds & { output: 'png' } }): Promise<ChartImage>
   request(value: { captureChart: DesktopCommands['captureChart']['input'] }): Promise<DesktopCommands['captureChart']['output']>
+  request(value: { screenshot: DesktopCommands['screenshot']['input'] }): Promise<DesktopCommands['screenshot']['output']>
   request(value: { chartWindow: DesktopCommands['chartWindow']['input'] }): Promise<DesktopCommands['chartWindow']['output']>
   request(value: { chartFocus: DesktopCommands['chartFocus']['input'] }): Promise<DesktopCommands['chartFocus']['output']>
   request(value: { chartLocal: DesktopCommands['chartLocal']['input'] }): Promise<DesktopCommands['chartLocal']['output']>

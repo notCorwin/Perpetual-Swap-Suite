@@ -122,6 +122,18 @@ test('an untrusted renderer cannot use the real IPC channel even when supplied w
   assert.deepEqual(await request({ preferences: { action: 'read' } }), previous)
 })
 
+test('settings window cannot request a screenshot', async () => {
+  const opened = electron.waitForEvent('window')
+  await electron.evaluate(({ Menu }) => Menu.getApplicationMenu().getMenuItemById('open-settings').click())
+  const settings = await opened
+  try {
+    await settings.waitForLoadState('domcontentloaded')
+    await assert.rejects(() => settings.evaluate(() => window.radarDesktop.request({ screenshot: {} })), /unavailable in settings/i)
+  } finally {
+    await settings.evaluate(() => window.radarDesktop.closeSettingsWindow())
+  }
+})
+
 test('fixture operations are rejected by a separately launched production-mode app', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'perp-production-security-'))
   let production

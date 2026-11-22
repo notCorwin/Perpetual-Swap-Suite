@@ -286,6 +286,41 @@ test('clipboard requests commit text and PNG pixels before acknowledging success
   }
 })
 
+test('Screenshot captures the rendered window including visible overlays without changing the clipboard', async () => {
+  await electron.evaluate(({ clipboard }) => {
+    globalThis.__screenshotOriginalWrite = clipboard.write
+    clipboard.write = async items => { globalThis.__screenshotItems = items }
+  })
+  try {
+    const viewport = await page.evaluate(() => {
+      const marker = document.createElement('div')
+      marker.id = 'screenshot-overlay-test'
+      Object.assign(marker.style, { position: 'fixed', left: '20px', bottom: '20px', width: '40px', height: '40px', background: 'rgb(17, 45, 201)', zIndex: '2147483647', pointerEvents: 'none' })
+      document.body.append(marker)
+      return { width: innerWidth, height: innerHeight }
+    })
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+    await page.getByRole('button', { name: 'Screenshot', exact: true }).click()
+    await page.waitForFunction(() => [...document.querySelectorAll('[role=status]')].some(node => node.textContent.includes('Screenshot copied to clipboard')))
+    const captured = await electron.evaluate(async ({ nativeImage }) => {
+      const item = globalThis.__screenshotItems?.find(value => value.types.includes('image/png'))
+      if (!item) return null
+      const image = nativeImage.createFromBuffer(Buffer.from(await (await item.getType('image/png')).arrayBuffer()))
+      const { width, height } = image.getSize()
+      return { width, height, pixels: image.toBitmap().toString('base64') }
+    })
+    assert.ok(captured, 'Native screenshot must write a PNG image.')
+    const scaleX = captured.width / viewport.width, scaleY = captured.height / viewport.height
+    assert.ok(scaleX > 0 && Math.abs(scaleX - scaleY) < .05, 'Screenshot must cover the full renderer at its actual pixel density.')
+    const pixels = Buffer.from(captured.pixels, 'base64')
+    const offset = (Math.floor((viewport.height - 40) * scaleY) * captured.width + Math.floor(40 * scaleX)) * 4
+    assert.deepEqual([...pixels.subarray(offset, offset + 4)], [201, 45, 17, 255], 'Visible overlay must be retained in the captured pixels.')
+  } finally {
+    await page.evaluate(() => document.querySelector('#screenshot-overlay-test')?.remove())
+    await electron.evaluate(({ clipboard }) => { clipboard.write = globalThis.__screenshotOriginalWrite; delete globalThis.__screenshotOriginalWrite; delete globalThis.__screenshotItems })
+  }
+})
+
 test('canonical catalog rows show contract, live price, and ranking independently of chart preparation', async () => {
   const fixture = await request({ e2e: { action: 'seedCachedListProjection' } })
   assert.equal(fixture.timeframe, '1H')

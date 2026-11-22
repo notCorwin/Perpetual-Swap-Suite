@@ -67,7 +67,7 @@ test('preference schema owns immutable snapshots, reuses proven values and valid
   const input = structuredClone(DEFAULT_PREFERENCES)
   const preferences = validatePreferences(input)
   assert.deepEqual(preferences, {
-    chartDisplayMode: 'multi', rankingLookback: 15, historyDays: 30,
+    chartDisplayMode: 'multi', showBollingerPriceLabels: false, rankingLookback: 15, historyDays: 30,
     liquidity: {
       spread: { enabled: true, maxPercent: 0.05 }, depth: { enabled: true, minUSDT: 100_000 },
       slippage: { enabled: true, maxPercent: 0.1, notionalUSDT: 100_000 }, volume24h: { enabled: true, minUSDT: 30_000_000 },
@@ -88,6 +88,7 @@ test('preference schema owns immutable snapshots, reuses proven values and valid
   for (const invalid of [
     { ...DEFAULT_PREFERENCES, rankingLookback: 7 }, { ...DEFAULT_PREFERENCES, rankingLookback: 0 }, { ...DEFAULT_PREFERENCES, rankingLookback: 9_007_199_254_740_990 },
     { ...DEFAULT_PREFERENCES, historyDays: 0 }, { ...DEFAULT_PREFERENCES, historyDays: 1.5 }, { ...DEFAULT_PREFERENCES, historyDays: 3651 },
+    { ...DEFAULT_PREFERENCES, showBollingerPriceLabels: 1 },
     { ...DEFAULT_PREFERENCES, frostedBackgroundEnabled: true },
     { ...DEFAULT_PREFERENCES, liquidity: { ...DEFAULT_PREFERENCES.liquidity, spread: { enabled: true, maxPercent: Infinity } } },
     { ...DEFAULT_PREFERENCES, liquidity: { ...DEFAULT_PREFERENCES.liquidity, depth: { enabled: 1, minUSDT: 100 } } },
@@ -312,18 +313,21 @@ test('existing SQLite preferences gain the multi default and preserve a saved in
       const row = database.prepare('SELECT preferences FROM settings WHERE id=1').get()!
       const old = JSON.parse(row.preferences as string)
       delete old.chartDisplayMode
+      delete old.showBollingerPriceLabels
       Object.assign(old, { chartTimeframe: '5m', priceScaleMode: 'auto', priceScalePixelsPerPercent: 99 })
       database.prepare('UPDATE settings SET preferences=? WHERE id=1').run(JSON.stringify(old))
     } finally { database.close() }
     store = await MetadataStore.open(root)
     assert.equal(store.getSettings().preferences.chartDisplayMode, 'multi')
+    assert.equal(store.getSettings().preferences.showBollingerPriceLabels, false)
     assert.equal('chartTimeframe' in store.getSettings().preferences, false)
     assert.equal('priceScaleMode' in store.getSettings().preferences, false)
     assert.equal('priceScalePixelsPerPercent' in store.getSettings().preferences, false)
     assert.equal(store.getSettings().preferences.historyDays, 45)
-    store.updateSettings({ chartDisplayMode: 'indicators' })
+    store.updateSettings({ chartDisplayMode: 'indicators', showBollingerPriceLabels: true })
     store.close(); store = await MetadataStore.open(root)
     assert.equal(store.getSettings().preferences.chartDisplayMode, 'indicators')
+    assert.equal(store.getSettings().preferences.showBollingerPriceLabels, true)
     assert.throws(() => store.updateSettings({ chartDisplayMode: 'unknown' } as any), /chartDisplayMode/)
   } finally { store.close(); await rm(root, { recursive: true, force: true }) }
 })

@@ -9,6 +9,7 @@ function freeze(value) {
 
 export const DEFAULT_PREFERENCES = freeze({
   chartDisplayMode: 'multi',
+  showBollingerPriceLabels: false,
   rankingLookback: 15,
   historyDays: 30,
   liquidity: {
@@ -45,6 +46,8 @@ export function validatePreferenceFields(value, partial = false) {
     if (partial && !Object.hasOwn(value, key)) continue
     if (key === 'chartDisplayMode') {
       if (!['multi', 'indicators'].includes(value[key])) throw new TypeError('chartDisplayMode must be multi or indicators.')
+    } else if (key === 'showBollingerPriceLabels') {
+      if (typeof value[key] !== 'boolean') throw new TypeError('showBollingerPriceLabels must be a boolean.')
     } else if (key === 'rankingLookback') {
       integer(value[key], key)
       if (value[key] < 5 || value[key] % 5 !== 0 || !Number.isSafeInteger(value[key] * 60_000)) throw new TypeError('rankingLookback must be a positive multiple of 5 minutes within the timestamp range.')

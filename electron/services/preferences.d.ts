@@ -1,5 +1,6 @@
 export type Preferences = {
   chartDisplayMode: 'multi' | 'indicators'
+  showBollingerPriceLabels: boolean
   rankingLookback: number
   /** Whole days, from 1 through 3650 inclusive. */
   historyDays: number
@@ -14,6 +15,7 @@ export type Preferences = {
 }
 export type PreferencesPatch = {
   chartDisplayMode?: 'multi' | 'indicators'
+  showBollingerPriceLabels?: boolean
   rankingLookback?: number
   historyDays?: number
   liquidity?: { [Rule in keyof Preferences['liquidity']]?: Partial<Preferences['liquidity'][Rule]> }

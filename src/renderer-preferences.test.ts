@@ -5,9 +5,12 @@ import { DEFAULT_PREFERENCES, preferencesDraft, validatePreferencesDraft } from 
 test('default screening settings round trip and can be changed independently', () => {
   const draft = preferencesDraft(DEFAULT_PREFERENCES)
   assert.deepEqual(validatePreferencesDraft(draft), { values: DEFAULT_PREFERENCES, errors: {} })
+  assert.equal(draft.showBollingerPriceLabels, false)
+  draft.showBollingerPriceLabels = true
   draft.liquidity.spread.enabled = false
   const result = validatePreferencesDraft(draft).values!
   assert.equal(result.rankingLookback, 15)
+  assert.equal(result.showBollingerPriceLabels, true)
   assert.equal(result.liquidity.spread.enabled, false)
   assert.equal(result.liquidity.volumeStability.enabled, false)
   assert.equal(result.liquidity.slippage.notionalUSDT, 100_000)
