@@ -13,7 +13,7 @@ const btc = 'BTC-USDT-SWAP', eth = 'ETH-USDT-SWAP'
 // Initial completed history is seeded; all subsequent quotes, candles, repairs
 // and reconnect acknowledgments traverse native loopback HTTP/WebSocket.
 export async function runNativeMarketAcceptance({ directory, launch, close = electron => electron?.close(), onDiagnostic = () => {}, timeoutMS = 90_000 }) {
-  const exchange = await createNativeExchange()
+  const exchange = await createNativeExchange({ holdMissingBase: true })
   let electron, page, expired = false, timer, closingElectron, closeTask
   const stopApp = () => {
     if (!electron) return Promise.resolve()
@@ -152,6 +152,10 @@ export async function runNativeMarketAcceptance({ directory, launch, close = ele
       assert.equal(repairedParent[0].volume, 300, 'Native 15m fallback volume must equal the sum of its three 5m source candles.')
       assert.equal(repairedParent[0].baseVolume, 300)
       assert.equal(repairedParent[0].quoteVolume, 30_000)
+      // Prove the durable parent was supplied by the 15m fallback before the
+      // concurrently requested 5m child can repair and re-derive that parent.
+      assert.deepEqual(await readCandles({ instId: btc, timeframe: '5m', from: exchange.missingBaseEnd, through: exchange.missingBaseEnd }), [])
+      await exchange.releaseBaseHistory()
       const missingBase = await readCandles({ instId: btc, timeframe: '5m', from: exchange.missingBaseEnd, through: exchange.missingBaseEnd })
       if (missingBase.length) {
         assert.equal(missingBase.length, 1)
@@ -242,6 +246,7 @@ export async function runNativeMarketAcceptance({ directory, launch, close = ele
       throw error
     } finally {
       await exchange.releaseHistory().catch(() => {})
+      await exchange.releaseBaseHistory().catch(() => {})
       try { await stopApp() } finally { await exchange.close() }
     }
   })()

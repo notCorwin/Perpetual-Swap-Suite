@@ -27,7 +27,7 @@ const rawCandle = row => [row.timestamp, row.open, row.high, row.low, row.close,
 
 /** Only the exchange is synthetic: clients use native HTTP/WebSocket transport,
  * protocol acknowledgments, production parsing and the ordinary market pipeline. */
-export async function createNativeExchange({ asOf = Date.now(), now = () => Date.now() } = {}) {
+export async function createNativeExchange({ asOf = Date.now(), now = () => Date.now(), holdMissingBase = false } = {}) {
   assert.equal(typeof now, 'function', 'The native fixture clock must be a function.')
   const identities = ['BTC-USDT-SWAP', 'ETH-USDT-SWAP']
   const basePrice = instId => instId.startsWith('BTC') ? 100 : 500
@@ -62,8 +62,8 @@ export async function createNativeExchange({ asOf = Date.now(), now = () => Date
   const seededBase = rows.filter(row => row.timeframe === '5m')
   const closedCandles = seededBase.filter(row => row.instrument !== 'BTC-USDT-SWAP' || row.timestamp !== missingBaseEnd)
   const seededBaseFrom = seededBase[0].timestamp, seededBaseThrough = Math.max(...seededBase.map(row => row.timestamp))
-  const clients = new Set(), requests = [], errors = [], held = [], latestQuotes = new Map(identities.map(id => [id, basePrice(id)])), lastCandles = new Map()
-  let holdHistory = true, holdBusinessAcknowledgments = false
+  const clients = new Set(), requests = [], errors = [], held = [], heldBase = [], latestQuotes = new Map(identities.map(id => [id, basePrice(id)])), lastCandles = new Map()
+  let holdHistory = true, holdBaseHistory = holdMissingBase, holdBusinessAcknowledgments = false
   const heldAcknowledgments = []
   const ticker = instId => {
     const price = latestQuotes.get(instId) ?? basePrice(instId)
@@ -95,6 +95,15 @@ export async function createNativeExchange({ asOf = Date.now(), now = () => Date
       if (path === '/market/history-candles' && holdHistory && missingCoarseParent) {
         record.held = true
         held.push({ response, record, data: values })
+        return
+      }
+      // The 5m panel is loaded concurrently with the 15m panel. Hold the
+      // missing child as well, otherwise its repair can win the race and make
+      // the 15m fallback unnecessary before the scenario has observed it.
+      if (path === '/market/history-candles' && holdBaseHistory && instId === 'BTC-USDT-SWAP' && timeframe === '5m'
+        && values.some(value => Number(value[0]) === missingBaseEnd)) {
+        record.held = true
+        heldBase.push({ response, record, data: values })
         return
       }
       const current = lastCandles.get(`${instId}:${timeframe}:${Math.floor(now() / step) * step}`)
@@ -255,6 +264,11 @@ export async function createNativeExchange({ asOf = Date.now(), now = () => Date
       await waitFor(() => held.every(value => value.response.destroyed || value.record.respondedAt !== null), 'deferred missing-candle HTTP response completion')
       return held.filter(value => value.record.respondedAt !== null).length
     },
+    async releaseBaseHistory() {
+      holdBaseHistory = false
+      for (const value of heldBase) sendJSON(value.response, value.data)
+      await waitFor(() => heldBase.every(value => value.response.destroyed || value.record.respondedAt !== null), 'deferred missing-child HTTP response completion')
+    },
     closeElapsedCandles,
     sendCandle(instId, timeframe, { close, volume, timestamp = Math.floor(now() / nativeIntervals[timeframe]) * nativeIntervals[timeframe], confirmed = false }) {
       assert.equal(timeframe, '5m', 'The native fixture sends canonical 5m candles only.')
@@ -276,7 +290,9 @@ export async function createNativeExchange({ asOf = Date.now(), now = () => Date
     },
     async close() {
       holdHistory = false
+      holdBaseHistory = false
       for (const value of held) value.response.destroy()
+      for (const value of heldBase) value.response.destroy()
       await ownedServer.close()
     },
   }

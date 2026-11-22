@@ -5,6 +5,7 @@ import { createConnection } from 'node:net'
 import { once } from 'node:events'
 import { ownFixtureServer } from '../helpers/fixture-server.mjs'
 import { createNativeExchange } from '../helpers/native-exchange.mjs'
+import { waitForAsyncCondition } from '../../scripts/async-readiness.mjs'
 
 test('fixture shutdown owns accepted sockets before HTTP headers and after upgrade', { timeout: 2000 }, async () => {
   const server = createServer(), owner = ownFixtureServer(server), clients = []
@@ -54,4 +55,22 @@ test('native exchange shutdown rejects an upgrade admitted before shutdown but c
     await closing
     assert.doesNotMatch(received, /101 Switching Protocols/)
   } finally { socket.destroy(); await exchange.close() }
+})
+
+test('native exchange can hold a competing missing child until the fallback is released', { timeout: 5000 }, async () => {
+  const exchange = await createNativeExchange({ holdMissingBase: true })
+  try {
+    const url = new URL('/api/v5/market/history-candles', exchange.environment.PERPETUAL_SWAP_E2E_HTTP_ORIGIN)
+    url.search = new URLSearchParams({ instId: 'BTC-USDT-SWAP', bar: '5m', after: String(exchange.missingBaseEnd + 300_000), limit: '1' })
+    const response = fetch(url)
+    await waitForAsyncCondition(() => exchange.requests.some(request => request.held && request.parameters.bar === '5m'),
+      { description: 'the missing child response to be held', timeoutMS: 2000 })
+    assert.equal(exchange.requests.find(request => request.parameters.bar === '5m').respondedAt, null)
+    await exchange.releaseHistory()
+    assert.equal(exchange.requests.find(request => request.parameters.bar === '5m').respondedAt, null,
+      'Releasing the coarse fallback must not release the competing child.')
+    await exchange.releaseBaseHistory()
+    const body = await (await response).json()
+    assert.equal(Number(body.data[0][0]), exchange.missingBaseEnd)
+  } finally { await exchange.close() }
 })
