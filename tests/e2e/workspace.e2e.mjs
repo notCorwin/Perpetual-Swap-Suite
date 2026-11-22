@@ -478,7 +478,7 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
   await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.liveBar?.close === 133)
   const priceLabel = chart.locator('[data-chart-price-label]')
   await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-price-label]')?.getAttribute('data-chart-price-direction') === 'flat')
-  assert.equal(await priceLabel.locator('[data-chart-price-label-background]').getAttribute('fill'), 'rgb(89 89 89)')
+  assert.equal(await priceLabel.locator('[data-chart-price-label-background]').getAttribute('fill'), 'var(--chart-annotation)')
   assert.equal(await priceLabel.locator('[data-chart-price-label-value]').getAttribute('fill'), 'white')
   await assertCompleteChartViewport(page, 'BETA-USDT-SWAP', { fullSlots: null })
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), before + 1, 'Only the fixture read may be added; the pushed candle must not trigger another renderer read.')
@@ -495,31 +495,31 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
   assert.match(await chart.locator('[aria-live="off"]').textContent(), /Close\s+135/)
   assert.match(await chart.locator('svg[data-rendered-inst] [data-chart-price-label-value]').textContent(), /^\+1\.50%$/)
   assert.equal(await priceLabel.getAttribute('data-chart-price-direction'), 'up')
-  assert.equal(await priceLabel.locator('[data-chart-price-label-background]').getAttribute('fill'), 'color-mix(in srgb, var(--positive) 75%, black)')
+  assert.equal(await priceLabel.locator('[data-chart-price-label-background]').getAttribute('fill'), 'var(--positive)')
   assert.equal(await priceLabel.locator('[data-chart-price-label-value]').getAttribute('fill'), 'white')
   assert.equal(await priceLabel.locator('[data-chart-countdown]').getAttribute('fill'), 'white')
   const ticks = await chart.evaluate(chart => {
     const background = chart.querySelector('[data-chart-price-label-background]').getBoundingClientRect()
+    const priceX = chart.querySelector('[data-chart-price-label-value]').getAttribute('x')
     return [...chart.querySelectorAll('[data-chart-price-tick]')].map(tick => {
       const line = tick.querySelector('line')
       const text = tick.querySelector('text')
       if (!text) return null
       const rect = text.getBoundingClientRect()
-      return { y: Number(text.getAttribute('y')), lineY: Number(line.getAttribute('y1')),
+      return { y: Number(text.getAttribute('y')), lineY: Number(line.getAttribute('y1')), x: text.getAttribute('x'), priceX,
         overlaps: rect.left < background.right && rect.right > background.left && rect.top < background.bottom && rect.bottom > background.top }
     }).filter(Boolean)
   })
-  assert.ok(ticks.length > 0 && ticks.every(tick => tick.y === tick.lineY && !tick.overlaps), 'Every visible price tick stays on its grid line and clear of the price tag.')
-  assert.ok(await chart.locator('[data-chart-price-tick-inset]').count() > 0, 'Ticks near the price tag remain visible on the plot side.')
+  assert.ok(ticks.length > 0 && ticks.every(tick => tick.y === tick.lineY && tick.x === tick.priceX), 'Price ticks stay on their grid lines and the normal axis.')
+  assert.ok(ticks.some(tick => tick.overlaps), 'A tick beneath the price tag remains in its normal axis position.')
   assert.equal(await page.evaluate(() => document.querySelector('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]').__chartSnapshot.bars === globalThis.__completedSubscriptionBars), true)
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartWindow || value.chartLocal || value.chartHistory).length), reads, 'Live-only subscriptions must reuse the completed frame without a follow-up read.')
   await electron.evaluate(({ BrowserWindow }, update) => globalThis.__workspaceFixture.sendChart({ ...update, revision: update.revision + 1, liveBar: { ...update.liveBar, close: 132 } }), liveUpdate)
   await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-price-label]')?.getAttribute('data-chart-price-direction') === 'down')
-  assert.equal(await priceLabel.locator('[data-chart-price-label-background]').getAttribute('fill'), 'color-mix(in srgb, var(--negative) 75%, black)')
+  assert.equal(await priceLabel.locator('[data-chart-price-label-background]').getAttribute('fill'), 'var(--negative)')
   assert.match(await priceLabel.locator('title').textContent(), /down/)
   // Put the live line exactly on a displayed tick, rather than relying on a
-  // coincidental overlap. The inset tick's background must paint after the
-  // line so the dash can never run through its text.
+  // coincidental overlap. The price tag should naturally cover the axis tick.
   const alignedClose = await chart.evaluate(chart => {
     const line = chart.querySelector('[data-chart-live-price]')
     const lineY = Number(line.getAttribute('y1'))
@@ -538,12 +538,12 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
   await page.waitForFunction(close => Math.abs(document.querySelector('[data-acceptance-target] [data-chart-inst="BETA-USDT-SWAP"]')?.__chartSnapshot.liveBar?.close - close) < 1e-7, alignedClose)
   const aligned = await chart.evaluate(chart => {
     const line = chart.querySelector('[data-chart-live-price]')
-    const tick = [...chart.querySelectorAll('[data-chart-price-tick-inset]')].find(text =>
+    const tick = [...chart.querySelectorAll('[data-chart-price-tick-label]')].find(text =>
       Math.abs(Number(text.getAttribute('y')) - Number(line.getAttribute('y1'))) < .1)
-    const background = tick?.parentElement.querySelector('rect')
-    return { exists: Boolean(tick && background), lineBeforeBackground: Boolean(background && (line.compareDocumentPosition(background) & Node.DOCUMENT_POSITION_FOLLOWING)) }
+    const background = chart.querySelector('[data-chart-price-label-background]')
+    return { exists: Boolean(tick && background), tickBeforeBackground: Boolean(tick && background && (tick.compareDocumentPosition(background) & Node.DOCUMENT_POSITION_FOLLOWING)) }
   })
-  assert.ok(aligned.exists && aligned.lineBeforeBackground, 'A coincident live price line must paint behind the visible tick background and text.')
+  assert.ok(aligned.exists && aligned.tickBeforeBackground, 'The price tag must paint over a coincident tick without moving or hiding it.')
 })
 
 test('contract precision updates pad current quotes while preserving historical and indicator digits', async () => {

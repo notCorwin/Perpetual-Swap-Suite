@@ -216,12 +216,9 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
   const latestColor = tag.rising ? "var(--positive)" : "var(--negative)"
   const latestPrice = formatCandleChange(liveBar.open, tag.price)
   const priceDirection = candleChangeDirection(liveBar.open, tag.price)
-  // Darken just the label background so white text remains legible without
-  // changing the prescribed candle and price-line colors.
-  const priceLabelBackground = priceDirection === 'up' ? 'color-mix(in srgb, var(--positive) 75%, black)' : priceDirection === 'down' ? 'color-mix(in srgb, var(--negative) 75%, black)' : 'rgb(89 89 89)'
+  const priceLabelBackground = priceDirection === 'up' ? 'var(--positive)' : priceDirection === 'down' ? 'var(--negative)' : 'var(--chart-annotation)'
   const priceLabelForeground = 'white'
   const priceLabel = chartPriceLabelLayout(latestY, panels.price, chartTokens.textSize, chartTokens.priceLabelPaddingY, liveOverlay)
-  const tickHalfHeight = chartTokens.textSize / 2
   const inspectionX = x[0] + (active.hour - bars[0].hour) / intervalMS * geometry.barPitch
   const inspectedTime = inspecting ? time(active.hour) : null
   const inspectedTimeWidth = inspectedTime ? chartTextWidth(inspectedTime) + chartTokens.annotationPadding : 0
@@ -319,12 +316,6 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     <g clipPath={`url(#${areaClipId}-time-axis)`}>
       {timeLabels.map(tick => <text data-chart-time-label key={tick.hour} x={tick.x} y={height - 6} textAnchor={tick.anchor} fill={tick.major ? 'var(--foreground)' : 'var(--muted-foreground)'} fontWeight={tick.major ? 700 : 400}>{tick.label}</text>)}
     </g>
-    {priceInViewport && <g data-chart-price-label data-chart-price-direction={priceDirection}>
-      <title>{`Change from candle open ${latestPrice} · ${priceDirection === 'flat' ? 'unchanged' : priceDirection} · ${liveOverlay ? 'Forming candle' : 'Candle'}`}</title>
-      <rect data-chart-price-label-background x={right} y={priceLabel.top} width={gutter} height={priceLabel.bottom - priceLabel.top} fill={priceLabelBackground} />
-      <text data-chart-price-label-value x={axisStarts.price} y={priceLabel.labelY} dominantBaseline="middle" fill={priceLabelForeground}>{latestPrice}</text>
-      {priceLabel.countdownY !== null && <PriceCountdown hour={liveBar.hour} intervalMS={intervalMS} x={axisStarts.price} y={priceLabel.countdownY} fill={priceLabelForeground} />}
-    </g>}
     {statistics && <>
     {legend("price", priceOverlays.map(({ label, value, color, dash }) => [label, value(active), color, dash]))}
     {legend("roc", [["ROC(9)", formatPercent(active.roc), "var(--chart-1)"], ["MAROC(9)", formatPercent(active.maroc), "var(--chart-2)", "7 4"]])}
@@ -343,14 +334,16 @@ export const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = 
     {presentation.ticks.map(({ y, label }, index) => {
       const value = Number.parseFloat(label.replaceAll(',', ''))
       const major = Number.isFinite(value) && Math.abs(value / 10 - Math.round(value / 10)) < 1e-8
-      const overlapsPriceLabel = priceInViewport && y + tickHalfHeight >= priceLabel.top && y - tickHalfHeight <= priceLabel.bottom
-      const inset = chartTokens.annotationXs
-      const labelWidth = overlapsPriceLabel ? chartTextWidth(label, chartTokens.textSize, major ? 700 : 400) : 0
-      return <g key={index} data-chart-price-tick><line x1={columns.price[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.35" />{y >= chartTokens.textSize && y <= height - chartTokens.textSize && <>
-        {overlapsPriceLabel && <rect x={right - inset - labelWidth - inset} y={y - tickHalfHeight - 1} width={labelWidth + inset * 2} height={chartTokens.textSize + 2} fill="var(--background)" />}
-        <text data-chart-price-tick-label data-chart-price-tick-inset={overlapsPriceLabel || undefined} x={overlapsPriceLabel ? right - inset : axisStarts.price} y={y} textAnchor={overlapsPriceLabel ? 'end' : 'start'} dominantBaseline="middle" fill={major ? 'var(--foreground)' : 'var(--muted-foreground)'} fontWeight={major ? 700 : 400}>{label}</text>
-      </>}</g>
+      return <g key={index} data-chart-price-tick><line x1={columns.price[0]} x2={right} y1={y} y2={y} stroke="var(--border)" strokeOpacity="0.35" />{y >= chartTokens.textSize && y <= height - chartTokens.textSize &&
+        <text data-chart-price-tick-label x={axisStarts.price} y={y} textAnchor="start" dominantBaseline="middle" fill={major ? 'var(--foreground)' : 'var(--muted-foreground)'} fontWeight={major ? 700 : 400}>{label}</text>
+      }</g>
     })}
+    {priceInViewport && <g data-chart-price-label data-chart-price-direction={priceDirection}>
+      <title>{`Change from candle open ${latestPrice} · ${priceDirection === 'flat' ? 'unchanged' : priceDirection} · ${liveOverlay ? 'Forming candle' : 'Candle'}`}</title>
+      <rect data-chart-price-label-background x={right} y={priceLabel.top} width={gutter} height={priceLabel.bottom - priceLabel.top} fill={priceLabelBackground} />
+      <text data-chart-price-label-value x={axisStarts.price} y={priceLabel.labelY} dominantBaseline="middle" fill={priceLabelForeground}>{latestPrice}</text>
+      {priceLabel.countdownY !== null && <PriceCountdown hour={liveBar.hour} intervalMS={intervalMS} x={axisStarts.price} y={priceLabel.countdownY} fill={priceLabelForeground} />}
+    </g>}
     <line x1={right} x2={right} y1={panels.price[0]} y2={geometry.priceOnly ? panels.price[1] : panels.taker[1]} stroke="var(--border)" opacity="0.8" />
   </>
   })
