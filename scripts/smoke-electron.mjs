@@ -192,9 +192,21 @@ export async function smokeElectron({ app, revision, report: reportPath, operati
     assert.equal(await page.locator('[data-shared-chart-legend]').count(), 0)
     assert.equal(await page.locator('[data-chart-title]').count(), 1)
     assert.equal(await page.locator('[data-chart-indicator="ema"], [data-chart-legend="EMA(200)"]').count(), 0)
-    for (const field of ['vwap', 'bollUpper', 'bollMiddle', 'bollLower']) assert.equal(await page.locator(`[data-chart-indicator="${field}"]`).count(), 0)
-    assert.ok(await page.locator('[data-chart-boll-band]').count() >= 3, 'Every chart retains its BOLL background.')
-    report.checks.push('default 1h / 15min / 5min price-only SVGs with BOLL backgrounds')
+    assert.equal(await page.locator('[data-chart-indicator="vwap"]').count(), 0)
+    await page.waitForFunction(() => ['bollUpper', 'bollMiddle', 'bollLower'].every(field => {
+      const lines = [...document.querySelectorAll(`[data-chart-indicator="${field}"]`)]
+      return lines.length === 3 && lines.every(line => Boolean(line.getAttribute('d')))
+    }) && document.querySelectorAll('[data-chart-boll-band]').length >= 3, null, { timeout: 20_000 })
+    for (const [field, color] of [['bollUpper', 'rgb(223, 72, 76)'], ['bollMiddle', 'rgb(56, 97, 246)'], ['bollLower', 'rgb(68, 151, 130)']]) {
+      const lines = await page.locator(`[data-chart-indicator="${field}"]`).evaluateAll(paths => paths.map(path => ({
+        stroke: getComputedStyle(path).stroke, width: getComputedStyle(path).strokeWidth,
+      })))
+      assert.equal(lines.length, 3, `${field} must appear on each chart.`)
+      assert.ok(lines.every(line => line.stroke === color && line.width === '1px'), `${field} must use its specified 1px stroke.`)
+    }
+    const fills = await page.locator('[data-chart-boll-band]').evaluateAll(paths => paths.map(path => getComputedStyle(path).fillOpacity))
+    assert.ok(fills.every(opacity => opacity === '0.05'), 'Bollinger backgrounds must use 5% opacity.')
+    report.checks.push('default 1h / 15min / 5min charts with BOLL bands and specified 1px tracks')
     const prepared = await request({ chartHistory: { instId: fixture.instId, timeframe: fixture.timeframe, endHour: fixture.end } })
     assert.ok(prepared.bars.length >= 96, 'The packaged worker must prepare a complete chart.')
     const latest = prepared.bars.find(bar => bar.hour === fixture.end)
