@@ -58,7 +58,10 @@ function chartAxes(bars: readonly Bar[], options: ChartGeometryOptions, measureT
   // Panel heights do not depend on the label gutter, so each axis is computed
   // once and shared by both the gutter measurement and the final plot.
   const { panels } = chartLayout(0, height, 64, options.priceOnly, options.layoutDensity)
-  const priceLabels = axisLabelLimit(panels.price, 9)
+  // Price-only charts can be much taller than the original indicator panels.
+  // Keep labels spaced by their available pixel height instead of imposing a
+  // fixed label count that leaves tall price axes mostly empty.
+  const priceLabels = axisLabelLimit(panels.price, Infinity)
   const base = options.priceScaleBase === undefined ? bars.flatMap(bar => [bar.open, bar.high, bar.low, bar.close]).find(value => finite(value) && value > 0) ?? null : options.priceScaleBase
   if (!Number.isFinite(priceMin) || !Number.isFinite(priceMax)) { priceMin = base ?? 0; priceMax = base ?? 1 }
   const relative = (value: number) => (value / base! - 1) * 100

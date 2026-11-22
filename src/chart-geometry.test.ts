@@ -352,3 +352,16 @@ test('fixed price scale maps one percent of its reference to the requested CSS p
   assert.notEqual(fixed, automatic)
   assert.notEqual(fixed.priceAxis.max - fixed.priceAxis.min, automatic.priceAxis.max - automatic.priceAxis.min)
 })
+
+test('price axis density follows panel height while preserving readable spacing and scale', () => {
+  const bars = rows(), get = createChartGeometryCache(text => text.length * 6)
+  for (const mode of ['fixed', 'auto'] as const) for (const height of [240, 560, 1000]) {
+    const geometry = get(bars, { ...viewport, height, priceOnly: true, priceScaleMode: mode, priceScalePixelsPerPercent: 20, priceScaleBase: 100 })
+    for (let i = 1; i < geometry.priceTicks.length; i++) {
+      assert.ok(Math.abs(geometry.priceTicks[i].y - geometry.priceTicks[i - 1].y) >= 32 - 1e-8, 'Price labels have at least 32 CSS pixels of vertical separation.')
+    }
+    if (mode === 'fixed') close(geometry.priceY(100) - geometry.priceY(101), 20)
+  }
+  const tall = get(bars, { ...viewport, height: 560, priceOnly: true, priceScaleMode: 'fixed', priceScalePixelsPerPercent: 20, priceScaleBase: 100 })
+  assert.ok(tall.priceTicks.length > 9, 'A tall price-only panel is not limited to nine labels.')
+})
