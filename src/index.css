@@ -94,6 +94,8 @@
   --space-annotation-label: calc(var(--space-annotation-symbol) + var(--space-annotation-small));
   --settings-control-width: calc(var(--space-unit) * 52);
   --settings-switch-width: 32px;
+  --settings-control-height: calc(var(--space-unit) * 10);
+  --settings-section-size: calc(var(--space-unit) * 6);
   --ui-font-size: 12px;
   --ui-font-meta: 11px;
   --ui-font-heading: 13px;
@@ -355,6 +357,23 @@ html[data-presentation-idle] *, html[data-presentation-idle] *::before, html[dat
   }
 }
 [data-chart-inspection-readout][hidden] { display: none; }
+
+/* Settings share the workspace's reading scale while retaining compact metadata. */
+[data-layout="settings-workspace"] { font-size: var(--market-font-size); line-height: var(--ui-line-height); }
+[data-layout="settings-workspace"] [data-settings-title] { font-size: var(--workspace-title-size); }
+[data-layout="settings-workspace"] #settings-section-title { font-size: var(--settings-section-size); line-height: calc(var(--space-unit) * 7); }
+[data-layout="settings-workspace"] nav a,
+[data-layout="settings-workspace"] [data-slot="field-label"],
+[data-layout="settings-workspace"] [data-slot="field-legend"],
+[data-layout="settings-workspace"] [data-slot="button"],
+[data-layout="settings-workspace"] [data-slot="input"],
+[data-layout="settings-workspace"] [data-slot="input-group-control"],
+[data-layout="settings-workspace"] [data-slot="input-group-addon"] { font-size: var(--market-font-size); }
+[data-layout="settings-workspace"] [data-slot="field-description"],
+[data-layout="settings-workspace"] [data-slot="field-error"] { font-size: var(--market-heading-size); line-height: calc(var(--space-unit) * 6); }
+[data-layout="settings-workspace"] :is([data-slot="input"], [data-slot="input-group"], [data-slot="button"]) { min-height: var(--settings-control-height); }
+[data-layout="settings-workspace"] nav a { min-height: calc(var(--space-unit) * 11); }
+[data-layout="settings-workspace"] nav a svg { width: var(--ui-line-height); height: var(--ui-line-height); }
 
 /* Fieldset owns legend separation: the native legend is outside its flex flow. */
 [data-slot="field-set"] > [data-slot="field-legend"] { padding-block-end: var(--space-2); }

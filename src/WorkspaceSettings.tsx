@@ -285,12 +285,12 @@ export function WorkspaceSettings({ section, active, preferences, loaded, loadEr
   const currentSection = SETTINGS_SECTIONS.find(value => value.id === section)!
   return <main aria-label="Settings" data-layout="settings-workspace" className="flex h-full min-w-0 flex-1 flex-col bg-background">
     <header data-window-toolbar data-window-drag-region className="flex border-b">
-      <div data-native-window-controls-row className="flex h-full w-64 shrink-0 items-center border-r px-4">
-        <h1 className="text-sm font-medium">Settings</h1>
+      <div data-native-window-controls-row className="flex h-full w-72 shrink-0 items-center border-r px-4">
+        <h1 data-settings-title className="font-medium">Settings</h1>
       </div>
     </header>
     <div className="flex min-h-0 flex-1">
-      <nav aria-label="Settings categories" className="flex w-64 shrink-0 flex-col gap-2 overflow-y-auto border-r p-6">
+      <nav aria-label="Settings categories" className="flex w-72 shrink-0 flex-col gap-2 overflow-y-auto border-r p-6">
         {SETTINGS_SECTIONS.map(item => {
           const Icon = sectionIcons[item.id]
           return <a key={item.id} href={settingsHref(item.id)} aria-current={item.id === section ? 'page' : undefined} className={buttonVariants({ variant: item.id === section ? 'secondary' : 'ghost', className: 'min-h-10 justify-start gap-3 px-3' })}><Icon aria-hidden="true" data-icon="inline-start" />{item.label}{item.id === section && <ChevronRight aria-hidden="true" data-icon="inline-end" className="ml-auto" />}</a>
@@ -299,7 +299,7 @@ export function WorkspaceSettings({ section, active, preferences, loaded, loadEr
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <div ref={scroll} onScroll={event => scrollPositions.current.set(section, event.currentTarget.scrollTop)} className="min-h-0 flex-1 overflow-y-auto px-12 py-8 [scrollbar-gutter:stable]">
           <div className="mx-auto flex w-full max-w-3xl flex-col gap-8">
-            <h2 ref={heading} id="settings-section-title" tabIndex={-1} className="text-xl font-semibold">{currentSection.label}</h2>
+            <h2 ref={heading} id="settings-section-title" tabIndex={-1} className="font-medium">{currentSection.label}</h2>
             <form id="workspace-settings-form" noValidate onSubmit={event => { event.preventDefault(); void save() }}>
               <div hidden={section !== 'workspace'} className="flex flex-col gap-8">
         <FieldSet disabled={preferenceDisabled} aria-labelledby="settings-section-title">
