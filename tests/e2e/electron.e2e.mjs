@@ -311,7 +311,7 @@ test('canonical catalog rows show contract, live price, and ranking independentl
   assert.equal((await cells.nth(0).textContent())?.trim(), fixture.instId.replace(/-USDT-SWAP$/, ''))
   assert.equal(await cells.nth(0).getAttribute('title'), fixture.instId)
   assert.doesNotMatch((await cells.nth(1).textContent()) ?? '', /—/)
-  assert.match((await cells.nth(2).textContent()) ?? '', /[↑↓→▲▼↔+−-].*%|—/)
+  assert.match((await cells.nth(2).textContent())?.trim() ?? '', /^(?:[+-]?\d+\.\d{2}%|—)$/)
   assert.deepEqual(await page.locator('[data-market-list] th').allTextContents(), ['Contract', 'Price', '15m change'])
   await page.locator('[data-chart-panel]').waitFor({ state: 'visible' })
   await page.locator(`[data-chart-inst="${fixture.instId}"]`).first().waitFor({ state: 'visible' })
@@ -965,6 +965,11 @@ test('the live price overlay follows its actual price without changing the compl
         bars: snapshot.bars.length, allConfirmed: snapshot.bars.every(bar => bar.confirmed),
         liveConfirmed: snapshot.liveBar?.confirmed, liveHour: snapshot.liveBar?.hour,
         lineY: Number(line?.getAttribute('y1')),
+        lineCount: svg.querySelectorAll('[data-chart-live-price]').length,
+        outlineCount: svg.querySelectorAll('[data-chart-live-price-outline]').length,
+        lineDash: line?.getAttribute('stroke-dasharray'),
+        lineStroke: line?.getAttribute('stroke'),
+        expectedStroke: snapshot.liveBar.close >= snapshot.liveBar.open ? 'var(--positive)' : 'var(--negative)',
         expectedY: (() => { const a = ticks[0], b = ticks.at(-1); const av = parseFloat(a.textContent.replaceAll(',', '')), bv = parseFloat(b.textContent.replaceAll(',', '')); const right = Number(svg.dataset.chartPlotRight), width = Number(svg.dataset.chartBarWidth), end = Number(svg.dataset.chartDomainEnd), pitch = Number(chart.dataset.chartBarSpacing), offset = Number(svg.querySelector('[data-chart-wheel-content]')?.dataset.chartWheelOffset ?? 0); const base = snapshot.bars.find(bar => right - width / 2 + (bar.hour - end) / snapshot.intervalMS * pitch + offset + width / 2 > 0).open; const value = (snapshot.liveBar.close / base - 1) * 100; return Number(a.getAttribute('y')) + (value - av) / (bv - av) * (Number(b.getAttribute('y')) - Number(a.getAttribute('y'))) })(),
         countdown: countdown?.textContent,
         labelX: Number(label.getAttribute('x')), tickX: Number(tick.getAttribute('x')),
@@ -983,6 +988,10 @@ test('the live price overlay follows its actual price without changing the compl
     assert.equal(overlay.allConfirmed, true)
     assert.equal(overlay.liveConfirmed, false)
     assert.equal(overlay.liveHour, fixture.end + fixture.intervalMS)
+    assert.equal(overlay.lineCount, 1, 'The latest price uses one line.')
+    assert.equal(overlay.outlineCount, 0, 'The price line must not have a contrasting solid line behind it.')
+    assert.equal(overlay.lineDash, '4 5')
+    assert.equal(overlay.lineStroke, overlay.expectedStroke, 'The price line uses the candle direction color.')
     assert.ok(Math.abs(overlay.lineY - overlay.expectedY) < 2, `The live price line must use its relative price coordinate: ${JSON.stringify(overlay)}`)
     assert.match(overlay.countdown ?? '', /^\d{2}:\d{2}$/)
     assert.equal(overlay.labelX, overlay.tickX, 'The price value must share the axis tick alignment.')

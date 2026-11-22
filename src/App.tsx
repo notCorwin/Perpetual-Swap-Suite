@@ -15,6 +15,7 @@ import type { DataAudit, HistoryDownload, MarketSnapshot, RankedMarketRow, Uncha
 import type { PreparedChartNotification } from '@/chart-data'
 import { cn } from '@/lib/utils'
 import { formatCurrentPrice } from '@/price-format'
+import { formatPercent } from '@/market-percent'
 import { getPresentation, subscribePresentationTransition, usePresentation } from '@/presentation-store'
 import { timeframeLabel, type RadarTimeframe } from '@/timeframe'
 
@@ -33,6 +34,8 @@ const message = (cause: unknown) => cause instanceof Error ? cause.message : 'Th
 
 const MarketRowView = memo(function MarketRowView({ row, index, selected, lookback, onSelect }: { row: RankedMarketRow; index: number; selected: boolean; lookback: number; onSelect: (id: string) => void }) {
   const change = Number.isFinite(row.rankingChange) ? row.rankingChange : null
+  const changeDirection = change === null ? 'unavailable' : change > 0 ? 'up' : change < 0 ? 'down' : 'flat'
+  const changeText = formatPercent(change)
   const price = formatCurrentPrice(row.lastPrice, row.tickSz)
   return <TableRow data-market-index={index} aria-rowindex={index + 2} aria-selected={selected} data-state={selected ? 'selected' : undefined} tabIndex={0} aria-label={`View ${row.instId} chart`} onClick={() => onSelect(row.instId)} onKeyDown={event => {
     if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelect(row.instId) }
@@ -40,7 +43,7 @@ const MarketRowView = memo(function MarketRowView({ row, index, selected, lookba
     <TableCell className="font-medium" title={row.instId}><span className="block truncate">{row.instId.replace(/-USDT-SWAP$/, '')}</span></TableCell>
     <TableCell className="text-right"><span className="block truncate" title={price}>{price}</span></TableCell>
     <TableCell className="text-right" title={row.rankingAsOf ? `${lookback}-minute signed relative change · completed candle as of ${new Date(row.rankingAsOf).toLocaleString('en-US')}` : 'Completed candle ranking is not available'}>
-      <span className="inline-flex max-w-full items-center justify-end gap-1 overflow-hidden"><span aria-hidden="true" className={cn(change === null ? 'text-muted-foreground' : change > 0 ? 'text-positive' : change < 0 ? 'text-negative' : 'text-muted-foreground')}>{change === null ? '' : change > 0 ? '↑' : change < 0 ? '↓' : '→'}</span><span className="truncate">{change === null ? '—' : `${change > 0 ? '+' : ''}${change.toFixed(2)}%`}</span></span>
+      <span data-market-change={changeDirection} aria-label={`${lookback}-minute change: ${changeText}, ${changeDirection === 'up' ? 'up' : changeDirection === 'down' ? 'down' : changeDirection === 'flat' ? 'unchanged' : 'unavailable'}`} className={cn('inline-block max-w-full truncate rounded-sm px-1 align-middle', changeDirection === 'up' ? 'bg-positive text-[color:var(--change-label-foreground)]' : changeDirection === 'down' ? 'bg-negative text-[color:var(--change-label-foreground)]' : changeDirection === 'flat' ? 'bg-muted text-foreground' : 'bg-muted text-muted-foreground')}>{changeText}</span>
     </TableCell>
   </TableRow>
 })

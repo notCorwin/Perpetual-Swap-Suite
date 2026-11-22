@@ -142,8 +142,7 @@ try {
       const actual = paintedColor(element, property), paintRatio = contrast(actual, bg), boundaries = []
       const addBoundary = (target, source) => {
         const boundaryStyle = getComputedStyle(target), color = paintedColor(target, 'stroke')
-        boundaries.push({ source, element: target.hasAttribute('data-chart-live-price-outline') ? '[data-chart-live-price-outline]'
-          : target.hasAttribute('data-chart-legend-outline') ? `[data-chart-legend-outline="${target.dataset.chartLegendOutline}"]` : selector(target),
+        boundaries.push({ source, element: target.hasAttribute('data-chart-legend-outline') ? `[data-chart-legend-outline="${target.dataset.chartLegendOutline}"]` : selector(target),
         geometryMatches: true, color: color.slice(0, 3), strokeWidth: boundaryStyle.strokeWidth, strokeDasharray: boundaryStyle.strokeDasharray,
         contrastAgainstSurface: contrast(color, bg), contrastAgainstPaint: contrast(color, actual) })
       }

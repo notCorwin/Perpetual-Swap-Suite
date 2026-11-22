@@ -326,10 +326,53 @@ test('default selection uses absolute completed-candle change with nulls last an
   assert.equal(await selected().getAttribute('aria-label'), 'View BETA-USDT-SWAP chart')
   assert.deepEqual(await page.locator('[data-chart-inst="BETA-USDT-SWAP"]').evaluateAll(charts => charts.map(chart => chart.querySelector('svg[data-rendered-timeframe]')?.dataset.renderedTimeframe)), ['1H', '15m', '5m'])
   const changes = await page.locator('[data-market-index] td:last-child').allTextContents()
-  assert.match(changes[0], /↓.*-3\.00%/)
-  assert.match(changes[1], /↑.*\+3\.00%/)
+  assert.equal(changes[0].trim(), '-3.00%')
+  assert.equal(changes[1].trim(), '+3.00%')
   assert.equal(changes[3].trim(), '—')
+  const changesRendered = await page.locator('[data-market-change]').evaluateAll(labels => labels.map(label => ({
+    direction: label.dataset.marketChange, background: getComputedStyle(label).backgroundColor,
+    foreground: getComputedStyle(label).color, accessible: label.getAttribute('aria-label'),
+    fits: label.scrollWidth <= label.clientWidth,
+  })))
+  assert.deepEqual(changesRendered.map(label => label.direction), ['down', 'up', 'up', 'unavailable'])
+  assert.equal(changesRendered[0].background, 'rgb(223, 72, 76)')
+  assert.equal(changesRendered[1].background, 'rgb(68, 151, 130)')
+  assert.equal(changesRendered[0].foreground, 'rgb(0, 0, 0)')
+  assert.equal(changesRendered[1].foreground, 'rgb(0, 0, 0)')
+  assert.match(changesRendered[0].accessible, /down/)
+  assert.match(changesRendered[1].accessible, /up/)
+  assert.match(changesRendered[3].accessible, /unavailable/)
+  assert.ok(changesRendered.every(label => label.fits), 'Change values must fit their badges.')
   await assertWorkspaceLayout(page)
+})
+
+test('market change backgrounds preserve direction and fit at minimum window width', async () => {
+  const publish = rows => electron.evaluate((_electron, rows) => {
+    const state = globalThis.__workspaceFixture
+    state.rows = rows; state.revision += 1; state.notify()
+  }, rows)
+  const initialRows = await electron.evaluate(() => globalThis.__workspaceFixture.initialRows)
+  const originalSize = page.viewportSize()
+  try {
+    await page.setViewportSize({ width: 1200, height: 640 })
+    await publish(initialRows.map(row => ({ ...row, rankingChange: row.instId.startsWith('BETA-') ? -.001 : row.instId.startsWith('ZETA-') ? .001 : row.instId.startsWith('ALPHA-') ? 0 : null })))
+    const beta = page.locator('[aria-label="View BETA-USDT-SWAP chart"] [data-market-change]')
+    const zeta = page.locator('[aria-label="View ZETA-USDT-SWAP chart"] [data-market-change]')
+    const alpha = page.locator('[aria-label="View ALPHA-USDT-SWAP chart"] [data-market-change]')
+    const missing = page.locator('[aria-label="View NULL-USDT-SWAP chart"] [data-market-change]')
+    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] [data-market-change]')?.textContent === '-0.00%')
+    assert.equal(await beta.textContent(), '-0.00%')
+    assert.equal(await zeta.textContent(), '+0.00%')
+    assert.equal(await alpha.textContent(), '0.00%')
+    assert.equal(await alpha.getAttribute('data-market-change'), 'flat')
+    assert.equal(await missing.getAttribute('data-market-change'), 'unavailable')
+    assert.equal(await page.locator('[aria-label="View BETA-USDT-SWAP chart"]').getAttribute('aria-selected'), 'true')
+    assert.ok(await page.locator('[data-market-change]').evaluateAll(labels => labels.every(label => label.scrollWidth <= label.clientWidth)))
+  } finally {
+    await publish(initialRows)
+    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] [data-market-change]')?.textContent === '-3.00%')
+    if (originalSize) await page.setViewportSize(originalSize)
+  }
 })
 
 test('market arrow shortcuts survive contract clicks, toolbar focus and repeated chart switches', async () => {
