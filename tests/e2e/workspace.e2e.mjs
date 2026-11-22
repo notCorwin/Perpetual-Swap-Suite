@@ -332,7 +332,10 @@ test('default selection uses absolute completed-candle change with nulls last an
   const changesRendered = await page.locator('[data-market-change]').evaluateAll(labels => labels.map(label => ({
     direction: label.dataset.marketChange, background: getComputedStyle(label).backgroundColor,
     foreground: getComputedStyle(label).color, accessible: label.getAttribute('aria-label'),
-    fits: label.scrollWidth <= label.clientWidth,
+    fits: label.scrollWidth <= label.clientWidth, tag: label.tagName,
+    radius: getComputedStyle(label).borderRadius,
+    paddingLeft: parseFloat(getComputedStyle(label).paddingLeft),
+    paddingRight: parseFloat(getComputedStyle(label).paddingRight),
   })))
   assert.deepEqual(changesRendered.map(label => label.direction), ['down', 'up', 'up', 'unavailable'])
   assert.equal(changesRendered[0].background, 'rgb(223, 72, 76)')
@@ -342,7 +345,9 @@ test('default selection uses absolute completed-candle change with nulls last an
   assert.match(changesRendered[0].accessible, /down/)
   assert.match(changesRendered[1].accessible, /up/)
   assert.match(changesRendered[3].accessible, /unavailable/)
-  assert.ok(changesRendered.every(label => label.fits), 'Change values must fit their badges.')
+  assert.ok(changesRendered.every(label => label.fits), 'Change values must fit their cells.')
+  assert.ok(changesRendered.every(label => label.tag === 'TD' && label.radius === '0px' && label.paddingLeft > 0 && label.paddingRight > 0),
+    'The colored background must fill the rectangular cell, including its padding.')
   await assertWorkspaceLayout(page)
 })
 

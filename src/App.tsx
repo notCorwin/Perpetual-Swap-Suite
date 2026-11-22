@@ -42,8 +42,8 @@ const MarketRowView = memo(function MarketRowView({ row, index, selected, lookba
   }} className="cursor-pointer focus-visible:outline-2 focus-visible:outline-ring focus-visible:-outline-offset-2">
     <TableCell className="font-medium" title={row.instId}><span className="block truncate">{row.instId.replace(/-USDT-SWAP$/, '')}</span></TableCell>
     <TableCell className="text-right"><span className="block truncate" title={price}>{price}</span></TableCell>
-    <TableCell className="text-right" title={row.rankingAsOf ? `${lookback}-minute signed relative change · completed candle as of ${new Date(row.rankingAsOf).toLocaleString('en-US')}` : 'Completed candle ranking is not available'}>
-      <span data-market-change={changeDirection} aria-label={`${lookback}-minute change: ${changeText}, ${changeDirection === 'up' ? 'up' : changeDirection === 'down' ? 'down' : changeDirection === 'flat' ? 'unchanged' : 'unavailable'}`} className={cn('inline-block max-w-full truncate rounded-sm px-1 align-middle', changeDirection === 'up' ? 'bg-positive text-[color:var(--change-label-foreground)]' : changeDirection === 'down' ? 'bg-negative text-[color:var(--change-label-foreground)]' : changeDirection === 'flat' ? 'bg-muted text-foreground' : 'bg-muted text-muted-foreground')}>{changeText}</span>
+    <TableCell data-market-change={changeDirection} aria-label={`${lookback}-minute change: ${changeText}, ${changeDirection === 'up' ? 'up' : changeDirection === 'down' ? 'down' : changeDirection === 'flat' ? 'unchanged' : 'unavailable'}`} className={cn('text-right', changeDirection === 'up' ? 'bg-positive text-[color:var(--change-label-foreground)]' : changeDirection === 'down' ? 'bg-negative text-[color:var(--change-label-foreground)]' : changeDirection === 'flat' ? 'bg-muted text-foreground' : 'bg-muted text-muted-foreground')} title={row.rankingAsOf ? `${lookback}-minute signed relative change · completed candle as of ${new Date(row.rankingAsOf).toLocaleString('en-US')}` : 'Completed candle ranking is not available'}>
+      <span className="block truncate">{changeText}</span>
     </TableCell>
   </TableRow>
 })
