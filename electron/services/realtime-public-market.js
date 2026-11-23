@@ -1,4 +1,5 @@
 import { hookOperationMethods } from './operations.js'
+import { diagnosticReason } from './realtime-diagnostics.js'
 // Native OKX public streams cover the entire eligible universe independently of
 // chart selection. https://www.okx.com/docs-v5/en/#order-book-trading-market-data
 import { recordedWebSocketFactory } from './network-operations.js'
@@ -80,6 +81,7 @@ class PublicMarketConnection {
     this.hasOpened = false
     this.attempt = 0
     this.connection = null
+    this.nextConnectionId = 0
     this.retryTimer = null
     this.closePromise = null
     this.recoveryTail = Promise.resolve()
@@ -151,12 +153,30 @@ class PublicMarketConnection {
   setState(patch) {
     const next = { ...this.state, ...patch }
     if (Object.keys(next).every(key => Object.is(next[key], this.state[key]))) return
+    const previousStatus = this.state.status
     this.state = next
+    if (previousStatus !== next.status) {
+      if (next.status === 'reconnecting' && this.diagnosticInterruptedAt == null) this.diagnosticInterruptedAt = this.now()
+      this.diagnostic('state', { status: next.status, previousStatus, ...(next.status === 'live' && this.diagnosticInterruptedAt != null ? { recoveryMs: Math.max(0, this.now() - this.diagnosticInterruptedAt) } : {}) })
+      if (next.status === 'live' || next.status === 'disconnected') this.diagnosticInterruptedAt = null
+    }
     if (!this.options.onState) return
     try {
       const result = this.options.onState(copy(next))
       if (result?.then) this.track(Promise.resolve(result).catch(error => this.report('Connection state callback failed.', error, false)))
     } catch (error) { this.report('Connection state callback failed.', error, false) }
+  }
+
+  diagnostic(event, details = {}, connection = this.connection) {
+    if (typeof this.options.onDiagnostic !== 'function') return
+    try { this.options.onDiagnostic({ event, at: this.now(),
+      stream: 'public', shard: this.options.diagnosticShard, instruments: [...this.instruments],
+      subscriptions: this.subscriptions.size, pendingAcks: connection?.pending.size ?? 0,
+      pendingSubscriptions: connection ? [...connection.pending.keys()].slice(0, 12) : [],
+      connectionId: connection?.diagnosticId ?? null,
+      pendingMessages: connection?.pendingMessages ?? 0,
+      pendingCallbacks: [...this.backlogs.values()].reduce((total, backlog) => total + backlog.pending, 0),
+      ...details }) } catch { /* Diagnostics must never interfere with market delivery. */ }
   }
 
   report(message, error, notify = true) {
@@ -184,8 +204,9 @@ class PublicMarketConnection {
     if (this.closed || !this.subscriptions.size || this.connection) return
     let socket
     try { socket = this.factory(this.url) }
-    catch (error) { this.scheduleReconnect(this.report('WebSocket connection failed.', error)); return }
+    catch (error) { this.diagnostic('lost', { reason: 'connection_factory_failed' }); this.scheduleReconnect(this.report('WebSocket connection failed.', error)); return }
     const connection = { socket, sent: new Map(), sessions: new Map(), pending: new Map(), unsubscribing: new Map(), bookRecoveries: new Map(), timers: new Map(), commands: [], commandId: 0, ingress: 0, controller: new AbortController(), ready: false, waitingForPong: false, retired: false, wasReconnect: this.hasOpened }
+    connection.diagnosticId = ++this.nextConnectionId
     this.connection = connection
     connection.done = new Promise(resolve => { connection.resolveDone = resolve })
     connection.listeners = {
@@ -193,7 +214,8 @@ class PublicMarketConnection {
       message: event => this.message(connection, event.data),
       error: event => { if (this.active(connection)) this.lost(connection, 'WebSocket transport failed.', event.error ?? event.message) },
       close: event => {
-        if (this.active(connection)) this.lost(connection, `WebSocket closed (${event.code ?? 1006}${event.reason ? `: ${event.reason}` : ''}).`)
+        if (this.active(connection)) this.lost(connection, `WebSocket closed (${event.code ?? 1006}${event.reason ? `: ${event.reason}` : ''}).`, undefined, event.code)
+        else if (connection.diagnosticLost && Number.isInteger(event.code)) this.diagnostic('socket_closed', { closeCode: event.code, afterRetire: true }, connection)
         this.finishSocket(connection)
       },
     }
@@ -289,6 +311,7 @@ class PublicMarketConnection {
         try {
           connection.socket.send(JSON.stringify({ id, op, args: chunk.map(([, value]) => ({ ...value })) }))
           connection.commands.push(now)
+          this.diagnostic('subscription_batch', { operation: op, count: chunk.length }, connection)
         } catch (error) { this.lost(connection, 'WebSocket subscription failed.', error); return }
       }
     }
@@ -313,6 +336,10 @@ class PublicMarketConnection {
         this.lost(connection, 'Public market subscription acknowledgement timed out.')
         return
       }
+      for (const [reason, values] of [
+        ['unsubscribe_ack_timeout', expired.filter(value => connection.unsubscribing.get(keyFor(value.subscription)) === value)],
+        ['subscription_ack_timeout', expired.filter(value => connection.pending.get(keyFor(value.subscription)) === value)],
+      ]) if (values.length) this.diagnosticRecoveries(connection, values, reason)
       for (const value of expired) {
         const { instId } = value.subscription, key = keyFor(value.subscription)
         if (connection.unsubscribing.get(key) === value) {
@@ -327,6 +354,12 @@ class PublicMarketConnection {
       }
       this.flushSubscriptions(connection)
     })
+  }
+
+  diagnosticRecoveries(connection, values, reason, exchangeCode) {
+    this.diagnostic('subscription_recovery', { reason, count: values.length,
+      affectedSubscriptions: values.slice(0, 12).map(({ subscription }) => keyFor(subscription)),
+      ...(typeof exchangeCode === 'string' && /^\d{1,10}$/.test(exchangeCode) ? { exchangeCode } : {}) }, connection)
   }
 
   deferUnsubscription(pending, message) {
@@ -379,8 +412,9 @@ class PublicMarketConnection {
     if (!this.active(connection)) return
     const live = connection.ready && !connection.pending.size && this.subscriptions.size > 0
       && [...this.subscriptions].every(([key, value]) => connection.sent.get(key) === value && connection.sessions.has(key))
-    if (live) this.attempt = 0
-    this.setState({ status: live ? 'live' : connection.wasReconnect ? 'reconnecting' : 'connecting', ...(live ? { error: '' } : {}) })
+    if (live) { this.attempt = 0; connection.hasBeenLive = true }
+    // Subscription changes on a recovered socket do not imply a new disconnect.
+    this.setState({ status: live ? 'live' : connection.wasReconnect && !connection.hasBeenLive ? 'reconnecting' : 'connecting', ...(live ? { error: '' } : {}) })
   }
 
   armHeartbeat(connection) {
@@ -438,6 +472,7 @@ class PublicMarketConnection {
           && (errorKey === null || keyFor(value.subscription) === errorKey))
         if (!pending.length) return
         if (pending.every(value => ['books', 'tickers'].includes(value.subscription.channel) || connection.unsubscribing.get(keyFor(value.subscription)) === value)) {
+          this.diagnosticRecoveries(connection, pending, 'exchange_control_error', message.code)
           for (const value of pending) {
             const { instId } = value.subscription, key = keyFor(value.subscription)
             const detail = `OKX public market control failed for ${key} (${message.code ?? 'unknown'}): ${message.msg ?? 'No details.'}`
@@ -450,7 +485,7 @@ class PublicMarketConnection {
           return
         }
       }
-      this.lost(connection, `OKX WebSocket ${message.event} (${message.code ?? 'unknown'}): ${message.msg ?? 'No details.'}`)
+      this.lost(connection, `OKX WebSocket ${message.event} (${message.code ?? 'unknown'}): ${message.msg ?? 'No details.'}`, undefined, undefined, message.code)
       return
     }
     const key = keyFor(message.arg ?? {})
@@ -644,8 +679,10 @@ class PublicMarketConnection {
     return { bids: [...book.bids.values()], asks: [...book.asks.values()], ts: raw.ts, seqId }
   }
 
-  lost(connection, message, error) {
+  lost(connection, message, error, closeCode, exchangeCode) {
     if (!this.active(connection)) return
+    connection.diagnosticLost = true
+    this.diagnostic('lost', { reason: diagnosticReason(message), ...(Number.isInteger(closeCode) ? { closeCode } : {}), ...(typeof exchangeCode === 'string' && /^\d{1,10}$/.test(exchangeCode) ? { exchangeCode } : {}) }, connection)
     const text = this.report(message, error)
     this.retire(connection)
     this.scheduleReconnect(text)
@@ -653,6 +690,8 @@ class PublicMarketConnection {
 
   overload(connection, message) {
     if (!this.active(connection)) return
+    connection.diagnosticLost = true
+    this.diagnostic('lost', { reason: diagnosticReason(message) }, connection)
     const fence = {}
     this.overloadFence = fence
     const text = this.report(message)
@@ -766,6 +805,7 @@ export class RealtimePublicMarket {
     this.closePromise = null
     this.changing = false
     this.controlShard = null
+    this.nextDiagnosticShard = 0
     if (typeof options.onInstruments === 'function') {
       this.controlShard = this.makeShard(true)
       this.controlShard.setSubscriptions([], { books: new Set(), trades: new Set(), openInterest: new Set() })
@@ -796,7 +836,7 @@ export class RealtimePublicMarket {
   }
 
   makeShard(instrumentsControl = false) {
-    const market = new PublicMarketConnection({ ...this.options, instrumentsControl, scheduleConnect: callback => this.scheduleConnect(callback), onState: () => this.publishState() })
+    const market = new PublicMarketConnection({ ...this.options, instrumentsControl, diagnosticShard: instrumentsControl ? 'control' : `public-${++this.nextDiagnosticShard}`, scheduleConnect: callback => this.scheduleConnect(callback), onState: () => this.publishState() })
     this.shards.push(market)
     return market
   }

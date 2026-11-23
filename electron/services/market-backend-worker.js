@@ -12,6 +12,10 @@ import { backgroundArchiveRows, seedMarketResources, startBackgroundArchive } fr
 
 let metadata, store, service, preferences, sourceProbe
 const backendStatusLog = createStatusLog(join(workerData.userData, 'Logs', 'market-backend.jsonl'))
+const connectionLog = createStatusLog(join(workerData.userData, 'Logs', 'market-connections.jsonl'))
+function recordConnectionDiagnostic(event) {
+  void connectionLog.write(event).catch(error => console.error('Could not write connection diagnostic:', error.name))
+}
 let backendStatusTimer, backendStatusTask = Promise.resolve(), lastBackendStatus = '', backendStatusWriting = false, backendStatusDirty = false, backendStatusRetryAt = 0, backendStatusRetryAttempts = 0, backendStatusAttempted = '', backendStatusClosing = false
 function captureBackendStatus(force = false) {
   if (!service) return Promise.resolve()
@@ -153,7 +157,7 @@ const initialize = runWorkerInitialization('market-backend', async () => {
   store = await MarketStore.open(join(workerData.userData, 'MarketData'))
   const exchange = nativeExchangeFixture()
   service = new MarketService(store, () => preferences, exchange?.fetcher ?? (workerData.testMode ? offline : fetch),
-    !workerData.testMode || Boolean(exchange), { metadata, onStatusChange: scheduleBackendStatus, ...(exchange ? { webSocketFactory: exchange.webSocketFactory } : {}) })
+    !workerData.testMode || Boolean(exchange), { metadata, onStatusChange: scheduleBackendStatus, onConnectionDiagnostic: recordConnectionDiagnostic, ...(exchange ? { webSocketFactory: exchange.webSocketFactory } : {}) })
   await service.ready
   scheduleBackendStatus()
   if (workerData.e2eLiveRefresh) void service.refresh().catch(error => console.error(error))
@@ -480,7 +484,7 @@ onOperationMessage(parentPort, 'market-backend', async ({ id, method, value }) =
       sourceProbe?.release()
       const failures = []
       for (const close of [() => coldBoundaryLifecycle(async () => { await coldBoundaryFixture?.remove(); coldBoundaryFixture = null }),
-        () => service.dispose(), async () => { await backendStatusTask; await captureBackendStatus(true) }, () => backendStatusLog.flush(), () => store.close(), () => metadata.close()]) {
+        () => service.dispose(), async () => { await backendStatusTask; await captureBackendStatus(true) }, () => backendStatusLog.flush(), () => connectionLog.flush(), () => store.close(), () => metadata.close()]) {
         try { await close() } catch (error) { failures.push(error) }
       }
       if (failures.length) throw new AggregateError(failures, `Market backend shutdown failed: ${failures.map(error => error?.message ?? String(error)).join('; ')}`)

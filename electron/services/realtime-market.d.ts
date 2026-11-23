@@ -42,6 +42,30 @@ export type MarketTrafficProbeEvent = {
   nativeHandlerEnteredAtMonotonicUS: number
 }
 export type RealtimeEventContext = { signal: AbortSignal; receivedAt: number; sourceEpoch?: number; marketTrafficEvents?: readonly MarketTrafficProbeEvent[] }
+export type ConnectionDiagnostic = {
+  event: 'state' | 'lost' | 'socket_closed' | 'subscription_batch' | 'subscription_recovery'
+  at: number
+  stream: 'business' | 'public'
+  shard: string
+  instruments?: string[]
+  subscriptions: number
+  pendingAcks: number
+  pendingSubscriptions: string[]
+  connectionId: number | null
+  pendingMessages: number
+  pendingCallbacks: number
+  pendingConfirmations?: number
+  status?: RealtimeMarketState['status']
+  previousStatus?: RealtimeMarketState['status']
+  recoveryMs?: number
+  reason?: string
+  closeCode?: number
+  exchangeCode?: string
+  affectedSubscriptions?: string[]
+  afterRetire?: boolean
+  operation?: 'subscribe' | 'unsubscribe'
+  count?: number
+}
 export type RealtimeMarketOptions<Candle extends CandleRecord = CandleRecord> = {
   sourceEpoch?: (instId: string) => number
   parseCandle: (instId: string, timeframe: RadarTimeframe, raw: string[]) => Candle | null
@@ -57,6 +81,7 @@ export type RealtimeMarketOptions<Candle extends CandleRecord = CandleRecord> = 
   onSubscribed?: (subscription: RealtimeSubscription, context: RealtimeEventContext) => void | Promise<void>
   /** Test-only observer; absent during normal operation and called for each native candle message. */
   onMarketTrafficIngress?: (events: readonly MarketTrafficProbeEvent[], probeCostMonotonicUS: number) => void
+  onDiagnostic?: (event: ConnectionDiagnostic) => void
   onState?: (state: RealtimeMarketState) => void | Promise<void>
   webSocketFactory?: WebSocketFactory
   url?: string

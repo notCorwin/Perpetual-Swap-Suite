@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
 import { setImmediate } from 'node:timers/promises'
 import { OKX_BUSINESS_WEBSOCKET_URL, RealtimeMarket } from '../electron/services/realtime-market.js'
-import type { RealtimeMarketOptions, RealtimeMarketState, RealtimeSubscription, RealtimeWebSocket } from '../electron/services/realtime-market.js'
+import type { ConnectionDiagnostic, RealtimeMarketOptions, RealtimeMarketState, RealtimeSubscription, RealtimeWebSocket } from '../electron/services/realtime-market.js'
 import type { CandleRecord } from '../electron/services/market-store.js'
 import type { RadarTimeframe } from './timeframe.ts'
 
@@ -356,6 +356,31 @@ test('subscription acknowledgements have independent deadlines and stale acknowl
   assert.match(f.market.getState().error, /acknowledgement timed out/)
 })
 
+test('subscription changes on a recovered candle socket do not report another disconnect', async t => {
+  const f = fixture({ reconnectBaseMs: 10 })
+  t.after(() => f.market.close())
+  const first = await f.open()
+  first.finishClose(1006)
+  assert.equal(f.market.getState().status, 'reconnecting')
+  await f.clock.advance(10)
+  const replacement = f.sockets.at(-1)!
+  replacement.autoAck = false
+  replacement.open()
+  await f.market.whenIdle()
+  assert.equal(f.market.getState().status, 'reconnecting', 'Initial recovery still waits for its acknowledgements.')
+  const initial = replacement.commands().at(-1)
+  for (const arg of initial.args) replacement.message({ id: initial.id, event: 'subscribe', arg })
+  await f.market.whenIdle()
+  assert.equal(f.market.getState().status, 'live')
+  f.market.setSubscriptions([btc, eth])
+  assert.equal(f.market.getState().status, 'connecting')
+  const added = replacement.commands().at(-1)
+  for (const arg of added.args) replacement.message({ id: added.id, event: 'subscribe', arg })
+  await f.market.whenIdle()
+  assert.equal(f.market.getState().status, 'live')
+  assert.equal(f.sockets.length, 2)
+})
+
 test('reconnect streams immediately during gap repair and pending old writes', async t => {
   const write = deferred(), repair = deferred(), repairs: RealtimeSubscription[][] = [], order: string[] = []
   const f = fixture({
@@ -695,4 +720,18 @@ test('candle decode overload cannot reconnect around a stalled decoder', async t
   decoded.resolve('{}'); await f.market.whenIdle(); await turn(); await f.clock.advance(1_000)
   assert.equal(f.sockets.length, 2)
   f.sockets[1].open(); await f.market.whenIdle()
+})
+
+
+test('business diagnostics record heartbeat timeouts and isolate callback failures', async t => {
+  const events: ConnectionDiagnostic[] = []
+  const f = fixture({ onDiagnostic: event => { events.push(event); if (event.event === 'subscription_batch') throw new Error('observer failure') } })
+  t.after(() => f.market.close())
+  await f.open()
+  await f.clock.advance(25_000)
+  const lost = events.findLast(event => event.event === 'lost')!
+  assert.equal(lost.stream, 'business')
+  assert.equal(lost.reason, 'pong_timeout')
+  assert.equal(lost.subscriptions, 1)
+  assert.equal(f.market.getState().status, 'reconnecting')
 })

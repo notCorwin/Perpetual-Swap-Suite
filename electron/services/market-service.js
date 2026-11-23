@@ -264,8 +264,9 @@ const priceRecord = row => Object.fromEntries(candleFields.map(field => [field, 
 
 /** Owns market observations and projections; HistorySync owns every historical source task. */
 export class MarketService {
-  constructor(store, preferences = () => DEFAULT_PREFERENCES, fetcher = fetch, autoRefresh = true, { metadata, requestTimeout = REQUEST_TIMEOUT, webSocketFactory, onStatusChange } = {}) {
+  constructor(store, preferences = () => DEFAULT_PREFERENCES, fetcher = fetch, autoRefresh = true, { metadata, requestTimeout = REQUEST_TIMEOUT, webSocketFactory, onStatusChange, onConnectionDiagnostic } = {}) {
     this.onStatusChange = onStatusChange
+    this.onConnectionDiagnostic = onConnectionDiagnostic
     if (typeof preferences !== 'function') throw new TypeError('A full Preferences callback is required.')
     this.store = store
     this.preferences = preferences
@@ -489,6 +490,7 @@ export class MarketService {
     if (audits.length) this.publishAudit(this.auditSnapshot(audits[0]))
     this.readCatalog()
     this.realtime = new RealtimeMarket({
+      onDiagnostic: this.onConnectionDiagnostic,
       parseCandle: candle,
       onState: state => {
         this.scheduleCandleWaitCheck()
@@ -518,6 +520,7 @@ export class MarketService {
     })
     this.realtimeStatus = this.realtime.getState().status
     this.publicRealtime = new RealtimePublicMarket({
+      onDiagnostic: this.onConnectionDiagnostic,
       ...(this.webSocketFactory ? { webSocketFactory: this.webSocketFactory } : {}),
       ...(this.autoRefresh ? {
         onInstruments: (records, context) => this.receiveInstruments(records, context),

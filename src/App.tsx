@@ -198,7 +198,7 @@ function App() {
         applyMarket(snapshot)
       } catch (cause) {
         if (stopped || !visible() || epoch !== getPresentation().epoch) return
-        setError(message(cause)); setStatus('Unavailable'); setRealtime('Disconnected')
+        setError(message(cause)); setStatus('Unavailable'); setRealtime('Unavailable')
         setCatalog(current => ({ ...current, loading: false }))
       } finally {
         working = false
@@ -302,7 +302,13 @@ function App() {
   if (presentation.error) issues.push({ id: 'presentation', label: 'Application', detail: 'The data service could not restore the workspace. Check the data service and reload the window to retry.', severity: 'error' })
   if (preferencesError) issues.push({ id: 'preferences', label: 'Settings', detail: 'Settings could not be loaded. Check the local data service.', severity: 'error' })
   if (error) issues.push({ id: 'market-error', label: 'Market', detail: 'Market data is unavailable. Check the connection and data service.', severity: 'error' })
-  if (connectionProblem) issues.push({ id: 'connection', label: 'Market', detail: `${connectionFailure ? 'Market connection interrupted' : 'Waiting for a live market connection'}. Check the connection for current prices.`, severity: 'warning' })
+  if (connectionProblem) issues.push({ id: 'connection', label: 'Market', detail: realtime.toLowerCase() === 'reconnecting'
+    ? 'Market data is reconnecting. Some prices may be delayed. Check the connection if this continues.'
+    : realtime.toLowerCase() === 'disconnected'
+      ? 'Some live market data is disconnected. Prices may be delayed. Check the connection and data service.'
+      : realtime.toLowerCase() === 'unavailable'
+        ? 'Live market status is unavailable. Check the local data service.'
+        : 'Connecting or synchronizing market subscriptions. Some prices may be delayed.', severity: 'warning' })
   if (status !== 'Live' && status !== 'Connecting') issues.push({ id: 'catalog', label: 'Contracts', detail: status === 'Cached' ? 'Cached contract data. Check the connection for current contracts.' : status === 'Unavailable' ? 'Contract verification is unavailable. Check the connection and data service.' : status, severity: status === 'Incomplete' || status === 'Unavailable' || status === 'Cached' ? 'warning' : 'info' })
   if (copyState.error) issues.push({ id: 'copy', label: 'Screenshot', detail: copyState.error, severity: 'error' })
   if (auditStatusUnavailable) issues.push({ id: 'data-audit-status', label: 'Data audit', detail: 'Audit status unavailable. Check the data service in Data settings.', severity: 'warning' })
@@ -335,8 +341,11 @@ function App() {
     const added = current.filter(issue => previousToastIssues.current.get(issue.id) !== signature(issue))
     previousToastIssues.current = new Map(current.map(issue => [issue.id, signature(issue)]))
     const instances = added.map(issue => ({ ...issue, instance: ++toastSequence.current }))
-    if (instances.length) setToast(shown => {
-      const remaining = shown.filter(issue => !instances.some(next => next.id === issue.id))
+    setToast(shown => {
+      // A connection warning describes current price freshness. Do not show it
+      // after recovery, especially if it was waiting behind other panels.
+      const remaining = shown.filter(issue => !(issue.id === 'connection' && !current.some(next => next.id === 'connection')) && !instances.some(next => next.id === issue.id))
+      if (!instances.length && remaining.length === shown.length) return shown
       const visible = remaining.slice(0, 3)
       const pending = [...remaining.slice(3), ...instances].sort((a, b) => Number(b.severity === 'error') - Number(a.severity === 'error'))
       return [...visible, ...pending].slice(0, 32)

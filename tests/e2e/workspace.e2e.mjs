@@ -1512,16 +1512,66 @@ test('queued notification panels appear after the visible panels expire', async 
       const state = globalThis.__workspaceFixture
       state.realtimeState = 'disconnected'; state.revision += 1; state.notify()
     })
-    await waitForAuditFixture(() => globalThis.__workspaceFixture.requests.some(value => value.statusLog?.issues?.some(issue => issue.includes('Market connection interrupted'))))
-    assert.equal(await toast.getByText(/Market:.*Market connection interrupted/).count(), 0, 'The fourth issue waits for a free panel.')
+    await waitForAuditFixture(() => globalThis.__workspaceFixture.requests.some(value => value.statusLog?.issues?.some(issue => issue.includes('Some live market data is disconnected'))))
+    assert.equal(await toast.getByText(/Market:.*Some live market data is disconnected/).count(), 0, 'The fourth issue waits for a free panel.')
     await page.clock.fastForward(3_100)
-    await toast.getByText(/Market:.*Market connection interrupted/).waitFor({ state: 'visible' })
+    await toast.getByText(/Market:.*Some live market data is disconnected/).waitFor({ state: 'visible' })
     await page.clock.fastForward(7_100)
     await toast.waitFor({ state: 'hidden' })
   } finally {
     await electron.evaluate(() => {
       const state = globalThis.__workspaceFixture
       Object.assign(state, { error: '', realtimeState: 'live' }); state.revision += 1; state.notify()
+      state.publishAudit({ phase: 'idle', error: '', progress: { completed: 0, total: 0 }, issues: [] })
+      state.publishDownload({ phase: 'idle', error: '', progress: { checked: 0, total: 0, available: 0, empty: 0, unavailable: 0, failed: 0, reused: 0, pending: 0 } })
+    })
+    await page.clock.fastForward(7_100)
+  }
+})
+
+test('recovered market connections clear queued and visible notifications', async () => {
+  const toast = page.locator('[data-market-status]')
+  const connection = toast.getByText(/Market:.*Some live market data is disconnected/)
+  try {
+    await page.clock.fastForward(7_100)
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      Object.assign(state, { error: 'market diagnostic', realtimeState: 'live' }); state.revision++; state.notify()
+      state.publishAudit({ phase: 'failed', error: 'audit diagnostic' })
+      state.publishDownload({ phase: 'failed', error: 'download diagnostic' })
+    })
+    await toast.getByText(/History download:.*Download failed/).waitFor({ state: 'visible' })
+    const start = await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      const count = state.requests.length
+      state.realtimeState = 'disconnected'; state.revision++; state.notify()
+      return count
+    })
+    await waitForAuditFixture(count => globalThis.__workspaceFixture.requests.slice(count).some(value => value.statusLog?.realtime === 'disconnected'), start)
+    assert.equal(await connection.count(), 0)
+    const recovery = await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      const count = state.requests.length
+      state.realtimeState = 'live'; state.revision++; state.notify()
+      return count
+    })
+    await waitForAuditFixture(count => globalThis.__workspaceFixture.requests.slice(count).some(value => value.statusLog?.realtime === 'live'), recovery)
+    await page.clock.fastForward(7_100)
+    assert.equal(await connection.count(), 0, 'A recovered connection must not surface after the queue advances.')
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      state.realtimeState = 'disconnected'; state.revision++; state.notify()
+    })
+    await connection.waitFor({ state: 'visible' })
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      state.realtimeState = 'live'; state.revision++; state.notify()
+    })
+    await connection.waitFor({ state: 'hidden' })
+  } finally {
+    await electron.evaluate(() => {
+      const state = globalThis.__workspaceFixture
+      Object.assign(state, { error: '', realtimeState: 'live' }); state.revision++; state.notify()
       state.publishAudit({ phase: 'idle', error: '', progress: { completed: 0, total: 0 }, issues: [] })
       state.publishDownload({ phase: 'idle', error: '', progress: { checked: 0, total: 0, available: 0, empty: 0, unavailable: 0, failed: 0, reused: 0, pending: 0 } })
     })

@@ -1,6 +1,6 @@
 import type { MarketStore } from './market-store.js'
 import type { MetadataStore, Preferences } from './metadata-store.js'
-import type { WebSocketFactory } from './realtime-market.js'
+import type { ConnectionDiagnostic, WebSocketFactory } from './realtime-market.js'
 import type { CatalogProgress, DataAudit, HistoryDownload, RankedMarketRow } from '../../src/desktop-contract.ts'
 export type { RankedMarketRow } from '../../src/desktop-contract.ts'
 import type { PreparedChartResponse } from '../../src/chart-data.ts'
@@ -9,7 +9,7 @@ export type PreparedChartWindow = PreparedChartResponse
 export type DataAuditSnapshot = DataAudit
 export type MarketServiceSnapshot = { rows: RankedMarketRow[]; turnoverOrder: string[]; revision: number; serviceSession: string; error: string; loading: boolean; updatedAt: number | null; realtimeState: 'connecting' | 'live' | 'reconnecting' | 'disconnected'; catalogSource: 'none' | 'cache' | 'live'; catalogProgress: CatalogProgress }
 export class MarketService {
-  constructor(store: MarketStore, preferences?: () => Readonly<Preferences>, fetcher?: typeof fetch, autoRefresh?: boolean, options?: { metadata?: MetadataStore; requestTimeout?: number; webSocketFactory?: WebSocketFactory })
+  constructor(store: MarketStore, preferences?: () => Readonly<Preferences>, fetcher?: typeof fetch, autoRefresh?: boolean, options?: { metadata?: MetadataStore; requestTimeout?: number; webSocketFactory?: WebSocketFactory; onConnectionDiagnostic?: (event: ConnectionDiagnostic) => void })
   [key: string]: any
   readonly ready: Promise<MarketService>
   reconfigure(previousPreferences: Preferences): Promise<void>

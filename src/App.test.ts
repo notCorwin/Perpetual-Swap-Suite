@@ -17,6 +17,7 @@ type View = {
   globalAudit: DataAudit | null; globalDownload: HistoryDownload | null
   auditStatusUnavailable: boolean; downloadStatusUnavailable: boolean
   issues: { id: string; detail: string }[]
+  toast: { id: string; detail: string }[]
   receiveAudit(value: DataAudit): void
 }
 type Slot = { value?: unknown; dependencies?: unknown[]; cleanup?: void | (() => void) }
@@ -34,7 +35,7 @@ const declarations = ast.program.body.filter(node => node.type === 'VariableDecl
 const logic = stripTypeScriptTypes([
   ...declarations.map(node => source.slice(node.start!, node.end!)),
   source.slice(component.start!, renderChart.start!),
-  'return { preferences, rows, turnoverOrder, ready, status, error, selectedID, globalAudit, globalDownload, auditStatusUnavailable, downloadStatusUnavailable, issues, receiveAudit } }',
+  'return { preferences, rows, turnoverOrder, ready, status, error, selectedID, globalAudit, globalDownload, auditStatusUnavailable, downloadStatusUnavailable, issues, toast, receiveAudit } }',
 ].join('\n'))
 
 function fixture(snapshotFailure = false) {
@@ -154,6 +155,30 @@ function fixture(snapshotFailure = false) {
     close() { for (const current of slots) if (current.cleanup) current.cleanup() },
   }
 }
+
+test('connection warnings describe current state and are removed on recovery even when queued', async context => {
+  const app = fixture(); context.after(() => app.close())
+  app.state.metadata.error = 'market diagnostic'
+  app.state.audit = { ...app.state.audit, phase: 'failed', error: 'audit diagnostic' }
+  app.state.download = { ...app.state.download, phase: 'failed', error: 'download diagnostic' }
+  await app.flush()
+  app.state.metadata.realtimeState = 'reconnecting'; app.state.revision++; app.notify()
+  await app.flush()
+  assert.ok(app.view.toast.findIndex(issue => issue.id === 'connection') >= 3)
+  assert.match(app.view.toast.find(issue => issue.id === 'connection')!.detail, /Some prices may be delayed/)
+  app.state.metadata.realtimeState = 'live'; app.state.revision++; app.notify()
+  await app.flush()
+  assert.equal(app.view.toast.some(issue => issue.id === 'connection'), false)
+  app.state.metadata.realtimeState = 'disconnected'; app.state.revision++; app.notify()
+  await app.flush()
+  assert.match(app.view.toast.find(issue => issue.id === 'connection')!.detail, /disconnected/)
+})
+
+test('snapshot request failure identifies the unavailable local market status', async context => {
+  const app = fixture(true); context.after(() => app.close())
+  await app.flush()
+  assert.match(app.view.issues.find(issue => issue.id === 'connection')!.detail, /status is unavailable.*local data service/)
+})
 
 test('initial job status reads reuse newer pushed snapshots and never poll', async context => {
   const app = fixture(); context.after(() => app.close())

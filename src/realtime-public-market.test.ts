@@ -4,7 +4,7 @@ import { setImmediate } from 'node:timers/promises'
 import { attachOperationSink, configureOperationContext, type OperationEvent } from '../electron/services/operations.js'
 import { OKX_PUBLIC_WEBSOCKET_URL, RealtimePublicMarket } from '../electron/services/realtime-public-market.js'
 import type { PublicMarketBook, RealtimePublicMarketOptions } from '../electron/services/realtime-public-market.js'
-import type { RealtimeWebSocket } from '../electron/services/realtime-market.js'
+import type { ConnectionDiagnostic, RealtimeWebSocket } from '../electron/services/realtime-market.js'
 
 const turn = () => setImmediate()
 const deferred = <T = void>() => {
@@ -809,7 +809,8 @@ test('an old socket finishing malformed book decoding cannot cancel its live rep
 })
 
 test('book acknowledgement timeouts retry only that channel with ACK fencing and backoff', async t => {
-  const f = fixture({ subscriptionTimeoutMs: 50, reconnectBaseMs: 10, reconnectMaxMs: 40 })
+  const diagnostics: ConnectionDiagnostic[] = []
+  const f = fixture({ subscriptionTimeoutMs: 50, reconnectBaseMs: 10, reconnectMaxMs: 40, onDiagnostic: event => diagnostics.push(event) })
   t.after(() => f.market.close())
   f.market.setSubscriptions([btc, eth])
   f.market.start()
@@ -821,6 +822,10 @@ test('book acknowledgement timeouts retry only that channel with ACK fencing and
   for (const arg of initial.args) if (arg.instId !== btc || arg.channel !== 'books') socket.message({ id: initial.id, event: 'subscribe', arg })
   await f.market.whenIdle()
   await f.clock.advance(50)
+  const timeout = diagnostics.find(event => event.reason === 'subscription_ack_timeout')!
+  assert.deepEqual(timeout.affectedSubscriptions, [`books:${btc}`])
+  assert.equal(timeout.count, 1)
+  assert.equal(timeout.connectionId, 1)
   const unsubscribe = socket.commands().at(-1)!
   assert.equal(unsubscribe.op, 'unsubscribe')
   assert.deepEqual(unsubscribe.args, [{ instId: btc, channel: 'books' }])
@@ -947,7 +952,8 @@ test('a removed contract missing an unsubscribe ACK never reconnects healthy nei
 })
 
 test('an instrument-scoped book error in a mixed subscribe request leaves healthy channels connected', async t => {
-  const f = fixture({ reconnectBaseMs: 10 })
+  const diagnostics: ConnectionDiagnostic[] = []
+  const f = fixture({ reconnectBaseMs: 10, onDiagnostic: event => diagnostics.push(event) })
   t.after(() => f.market.close())
   f.market.setSubscriptions([btc, eth])
   f.market.start()
@@ -959,6 +965,10 @@ test('an instrument-scoped book error in a mixed subscribe request leaves health
   socket.message({ id: initial.id, event: 'error', arg: failed, code: '60012', msg: 'Book subscription rejected.' })
   for (const arg of initial.args) if (arg.instId !== btc || arg.channel !== 'books') socket.message({ id: initial.id, event: 'subscribe', arg })
   await f.market.whenIdle()
+  const failure = diagnostics.find(event => event.reason === 'exchange_control_error')!
+  assert.deepEqual(failure.affectedSubscriptions, [`books:${btc}`])
+  assert.equal(failure.exchangeCode, '60012')
+  assert.equal(JSON.stringify(failure).includes('Book subscription rejected.'), false)
   const unsubscribe = socket.commands().at(-1)!
   assert.deepEqual(unsubscribe.args, [failed])
   socket.message({ id: initial.id, event: 'error', arg: failed, code: '60012', msg: 'Obsolete duplicate.' })
@@ -1031,6 +1041,31 @@ test('heartbeat and acknowledgement deadlines reconnect stalled transports', asy
   await f.market.whenIdle()
   await f.clock.advance(15_000)
   assert.match(f.market.getState().error, /acknowledgement timed out/)
+})
+
+test('subscription changes on a recovered public socket do not report another disconnect', async t => {
+  const f = fixture({ reconnectBaseMs: 10 })
+  t.after(() => f.market.close())
+  const first = await f.open()
+  first.finishClose(1006)
+  assert.equal(f.market.getState().status, 'reconnecting')
+  await f.clock.advance(500)
+  const replacement = f.sockets.at(-1)!
+  replacement.autoAck = false
+  replacement.open()
+  await f.market.whenIdle()
+  assert.equal(f.market.getState().status, 'reconnecting', 'Initial recovery still waits for its acknowledgements.')
+  const initial = replacement.commands().at(-1)!
+  for (const arg of initial.args) replacement.message({ id: initial.id, event: 'subscribe', arg })
+  await f.market.whenIdle()
+  assert.equal(f.market.getState().status, 'live')
+  f.market.setSubscriptions([btc, eth])
+  assert.equal(f.market.getState().status, 'connecting')
+  const added = replacement.commands().at(-1)!
+  for (const arg of added.args) replacement.message({ id: added.id, event: 'subscribe', arg })
+  await f.market.whenIdle()
+  assert.equal(f.market.getState().status, 'live')
+  assert.equal(f.sockets.length, 2)
 })
 
 test('reconnect waits for recovery, while independent streams can continue past a slow consumer', async t => {
@@ -1344,4 +1379,25 @@ test('public decode overload cannot reconnect around a stalled decoder', async t
   decoded.resolve('{}'); await f.market.whenIdle(); await turn(); await f.clock.advance(1_000)
   assert.equal(f.sockets.length, 2)
   f.sockets[1].open(); await f.market.whenIdle()
+})
+
+
+test('connection diagnostics identify a failed shard without recording server text', async t => {
+  const events: ConnectionDiagnostic[] = []
+  const f = fixture({ onDiagnostic: event => events.push(event) })
+  t.after(() => f.market.close())
+  const ids = Array.from({ length: 26 }, (_, index) => `TEST${index}-USDT-SWAP`)
+  await f.open(ids)
+  f.sockets[1].finishClose(1006, 'private server detail')
+  const lost = events.findLast(event => event.event === 'lost')!
+  assert.equal(lost.stream, 'public')
+  assert.equal(lost.shard, 'public-2')
+  assert.equal(lost.reason, 'socket_closed')
+  assert.equal(lost.closeCode, 1006)
+  assert.deepEqual(lost.instruments, [ids[25]])
+  assert.equal(JSON.stringify(events).includes('private server detail'), false)
+  await f.clock.advance(1000)
+  f.sockets[2].open()
+  await f.market.whenIdle()
+  assert.equal(events.findLast(event => event.shard === 'public-2' && event.status === 'live')?.recoveryMs, 1000)
 })
