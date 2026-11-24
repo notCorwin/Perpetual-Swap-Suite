@@ -209,3 +209,13 @@ test('observations older than three hours expire without reviving retired subscr
   statistics.trades(instId, [trade('2', now)])
   assert.deepEqual(values(statistics.enrich(candle(now))), [null, null, null])
 })
+
+test('non-numeric trade replay eviction invalidates only older timestamps and newer periods recover', () => {
+  const statistics = new LiveStatistics()
+  statistics.start(instId, 0)
+  const overflow = Array.from({ length: 2_050 }, (_, index) => trade(`tx-${index}`, 100 + index, 'buy', '1'))
+  statistics.trades(instId, overflow, 3_000)
+  const nextPeriod = fiveMinutes
+  statistics.trades(instId, [trade('tx-new', nextPeriod + 100, 'buy', '5')], nextPeriod + 100)
+  assert.deepEqual(values(statistics.enrich(candle(nextPeriod, '5m', false, 5), nextPeriod + 100)), [null, 5, 0])
+})

@@ -1,8 +1,8 @@
 # Perpetual Swap Suite
 
-[![Verify and Publish macOS](https://github.com/notCorwin/Perpetual-Swap-Suite/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/notCorwin/Perpetual-Swap-Suite/actions/workflows/release.yml)
+[![Verify Electron macOS](https://github.com/notCorwin/Perpetual-Swap-Suite/actions/workflows/verify.yml/badge.svg?branch=main)](https://github.com/notCorwin/Perpetual-Swap-Suite/actions/workflows/verify.yml)
 
-An Electron desktop app that rebuilds OKX perpetual market data locally. Screen USDT perpetual contracts, rank completed price changes, and review candlestick charts with reproducible indicators. Public market data needs no OKX API key. The interface and optional AI analysis use English.
+An Electron desktop app that rebuilds OKX perpetual market data locally. Screen USDT perpetual contracts, rank live hourly candle changes by magnitude, and review synchronized multi-timeframe candlestick charts (`1H`, `15m`, and `5m`) with reproducible indicators. Public market data needs no OKX API key. The interface uses English.
 
 ## Get started
 
@@ -27,7 +27,7 @@ For development, run `npm run dev` to start Vite and Electron together. Opening 
 
 The contract list stays on the left and the selected contract's chart stays on the right. The whole workspace, including dialogs, scales from a 1,600-pixel design width so both columns retain their proportions. Shared shadcn/ui components use Base UI and CSS design tokens, with system light/dark themes, tabular figures, and signed values and direction symbols alongside price colors.
 
-The list shows only contracts that meet every enabled liquidity condition and the USDT perpetual/no-scheduled-closure requirements. Search narrows the visible results. Contracts are ordered by the **absolute signed price change**, largest first; the sign still shows whether the price rose or fell.
+The list shows only contracts that meet every enabled liquidity condition and the USDT perpetual/no-scheduled-closure requirements. Contracts are ordered by the **absolute signed 1-hour candle change**, largest first; the sign still shows whether the price rose or fell. To prevent contracts oscillating near liquidity thresholds from flickering in and out of the list, removals intentionally use a **30-second hysteresis buffer** (`LIST_REMOVAL_DELAY_MS`) while eligibility is revoked immediately in the underlying catalog.
 
 Changing liquidity thresholds immediately reevaluates fresh observations in memory. Source updates and missing history continue in the background; contracts with missing or expired required observations stay unqualified. Completed volume windows are reused until their next candle boundary or a durable source correction. Historical-source recovery validates its own saved window independently of other criteria: a spread rejection cannot turn complete turnover data into a missing-data error.
 
@@ -58,17 +58,16 @@ The contract list loads once and then follows desktop change notifications. Heal
 
 ## Charts and indicators
 
-Select a contract and choose **5m**, **15m**, or **1h**. The default chart timeframe is **15m**. The main chart contains candlesticks, EMA(200), BOLL(20, 2), and VWAP(14). Separate panels show ROC(9) + MAROC(9), RSI(6/12/24), ATR%(14) + BBW(20, 2), Open Interest in contracts, and Taker Buy/Sell in contracts.
+Select a contract to view synchronized **1H**, **15m**, and **5m** candlestick charts with BOLL(20, 2) overlays and optional Bollinger Y-axis price labels. Rising candles use hollow 1 px outlines and falling candles use solid fills, with distinct Bollinger dash patterns and high-contrast axis labels for color-vision accessibility.
 
 | Control | Action |
 | --- | --- |
 | Primary mouse button, then drag | Inspect candles; release to return to the window end |
-| Scroll | Review history; return to the newest range to follow live updates |
+| Scroll / pinch | Review history or zoom across synchronized timeframes; return to the newest range to follow live updates |
 | Up / Down | Previous / next contract in the visible list, wrapping at either end |
 | Left | First contract in the visible ranking |
-| Right | Highest-turnover eligible contract, independent of search |
-| Copy chart | Copy the chart with an opaque theme background |
-| Analyze Long / Analyze Short | Analyze a captured chart snapshot |
+| Right | Highest-turnover eligible contract |
+| Screenshot | Copy a window screenshot to the clipboard |
 
 A normal viewport shows 96 candles, but any available prices can render immediately, including a new listing with fewer observations. OHLC, forming prices, OI, Taker, and recursive indicators have independent readiness. Missing or expired statistics leave gaps in their own panels; they do not hide prices, block history, or force the chart back to an older complete window. Stored data is labeled stale until current source observations and stream continuity establish freshness.
 
@@ -118,38 +117,25 @@ In **Settings → Data integrity**:
 
 Audit progress and findings are pushed after each durable checkpoint. Settings reads the current report when opened and then follows ordered updates without periodic status requests. Reopening resynchronizes any updates received while Settings was closed.
 
-## Optional AI chart analysis
-
-Open **Settings → Optional AI analysis → Configure analysis**, enter a Vercel AI Gateway key, and select a model with image input support. The default model is `openai/gpt-6.1-sol`. Market collection and charts work without AI credentials.
-
-**Analyze Long** and **Analyze Short** capture the chart as an opaque PNG and send it through the main process to Gateway. Responses stream in English. Follow-up questions reuse that snapshot and model; **New analysis** captures the current chart. Conversations and drafts stay in memory until exit. **Stop**, changing contracts, or closing the panel cancels generation. Failed requests retry while the panel remains open.
-
-The model and API key are stored in a private analysis record inside `metadata.sqlite`. The database has mode `0600`; the key is plaintext on disk and available only to the main process. Public settings responses report whether a key exists without returning it. Chart images and conversations are sent to Gateway when analysis is requested.
-
 ## Local storage
 
 Paths are relative to `~/Library/Application Support/perp-radar/`:
 
 | Path | Contents |
 | --- | --- |
-| `MarketData/market.sqlite` | Authoritative completed native candles, independent OI/Taker observations, per-series versions, indicator checkpoints, and migration/audit evidence |
+| `MarketData/market.sqlite` | Authoritative completed native candles, independent OI/Taker observations, per-series versions, and indicator checkpoints |
 | `MarketData/market.sqlite-wal`, `market.sqlite-shm` | SQLite WAL coordination files while connections are open |
-| `MarketData/candles/` | Previous Parquet data retained as a read-only migration/recovery source; new observations are not written here |
-| `metadata.sqlite` | Transactional preferences, qualification catalog, manual download checkpoints, audit reports, and private analysis settings |
+| `metadata.sqlite` | Transactional preferences, qualification catalog, manual download checkpoints, and audit reports |
 
-Existing Parquet is imported once in a separate Node child process, with durable per-partition progress. Its native DuckDB lifetime is isolated from the app and SQLite workers. First access prioritizes the required series/range, and bounded latest queries import recent partitions first. The importer honors the newest base and later deltas, resolves source revisions, validates observations, and never overwrites newer SQLite facts with old imported data. Original files remain unchanged. Corrupt or incompatible partitions become explicit repairable audit findings. After the import cutover, the importer exits and retained Parquet is no longer consulted; there is no permanent dual authority.
-
-Market writes update keyed rows rather than republishing a day's files. Price corrections invalidate affected later indicator checkpoints atomically; statistics updates have their own revisions and do not invalidate price calculations. Checkpoints retain exact recursive state, formula version, and a source revision. Derived renderer and chart projections are bounded memory caches; they can be rebuilt from SQLite. A cached projection alone does not establish that a price is live.
+Market writes update keyed rows in SQLite WAL. Price corrections invalidate affected later indicator checkpoints atomically; statistics updates have their own revisions and do not invalidate price calculations. Checkpoints retain exact recursive state, formula version, and a source revision. Derived renderer and chart projections are bounded memory caches; they can be rebuilt from SQLite. A cached projection alone does not establish that a price is live.
 
 The audit lookback does not delete downloaded facts. Listing dates, actual provider availability, available disk space, and download time limit obtainable history. Large archives use bounded reads and calculations.
 
-On the first migration, recognized values from an existing `settings.json` are imported once into SQLite. Retired glass and blur preferences are not part of the new settings schema.
-
-The renderer uses a single isolated `window.radarDesktop` bridge. The main process validates the caller and complete command before executing an operation; Node APIs and credentials stay outside the page context.
+The renderer uses a single isolated `window.radarDesktop` bridge with a strict Content Security Policy on production pages. The main process validates the caller and complete command before executing an operation; Node APIs stay outside the page context.
 
 ## Development and checks
 
-Install the locked dependencies with `npm ci`. The shadcn CLI is a development dependency; `@shadcn/react` remains a runtime dependency for the analysis message scroller. Base components, styles, and tokens live in [src/components/ui](src/components/ui), [src/index.css](src/index.css), and [components.json](components.json).
+Install the locked dependencies with `npm ci`. The shadcn CLI is a development dependency. Base components, styles, and tokens live in [src/components/ui](src/components/ui), [src/index.css](src/index.css), and [components.json](components.json).
 
 | Command | Purpose |
 | --- | --- |
@@ -181,7 +167,7 @@ Install the locked dependencies with `npm ci`. The shadcn CLI is a development d
 
 Local tests, benchmarks, and installation validation keep native Electron windows invisible and cannot raise, pin, activate, or focus desktop windows. `npm test` and `npm run test:e2e` still use the real Electron host, preload, IPC, and workers. Foreground paint-performance acceptance runs only on GitHub-hosted macOS GitHub Actions runners; local foreground requests are rejected before building or launching Electron. Minimizing a window changes visibility and frame scheduling, so it cannot represent foreground timing. The CI workflow builds the renderer before its foreground benchmarks, which reuse that build.
 
-[GitHub Actions](.github/workflows/release.yml) checks pull requests with lint, desktop syntax checks, types, sandboxed core tests, functional Electron E2E, a separate required foreground chart-paint suite, and the full-market foreground benchmark. Every test and benchmark run retains its operation journal, command logs, manifest, and summary in the CI `artifacts/` upload, including failed runs. On `main`, successful validation is followed by packaging, executable smoke, and publication of the `autobuild` app and digest metadata. [Live OKX integration](.github/workflows/okx-live.yml) separately checks history, statistics, all-contract WebSocket subscriptions, and the real native chart on a schedule or manual dispatch. Each check keeps its exit status and evidence. A demonstrated chart defect takes precedence over unrelated endpoint probe failures; a smoke failure without sufficient source evidence remains an unclassified integration failure. Background benchmarks can be run locally as needed.
+[GitHub Actions](.github/workflows/verify.yml) checks pull requests with lint, desktop syntax checks, types, sandboxed core tests, functional Electron E2E, a separate required foreground chart-paint suite, and the full-market foreground benchmark. Every test and benchmark run retains its operation journal, command logs, manifest, and summary in the CI `artifacts/` upload, including failed runs. [Live OKX integration](.github/workflows/okx-live.yml) separately checks history, statistics, all-contract WebSocket subscriptions, and the real native chart on a schedule or manual dispatch. Each check keeps its exit status and evidence. A demonstrated chart defect takes precedence over unrelated endpoint probe failures; a smoke failure without sufficient source evidence remains an unclassified integration failure. Background benchmarks can be run locally as needed.
 
 The live chart check starts with an empty isolated profile and uses no seeded market values. A bounded relay witnesses original upstream BTC/ETH candles before forwarding unchanged prices to the app. It verifies exact selected-SVG price/OHLC, instrument/timeframe identity, current native period, advancing observation time and the Live badge across cold selection, a later update, a contract switch and warm return. The source price may repeat. Subscription commands, original acknowledgments, clock probes, source digests, expected/actual values and closed recorder health remain in artifacts. The only market-universe transformation restricts actual instrument-discovery rows to BTC/ETH. External checks have hard time/traffic limits and stay separate from deterministic offline tests.
 

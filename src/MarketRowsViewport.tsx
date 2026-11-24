@@ -5,10 +5,16 @@ import { TableBody, TableCell, TableRow } from "@/components/ui/table"
 // for scrolling, then convert spacer heights back into the original design size.
 export const MarketRowsViewport = memo(function MarketRowsViewport({ ids, children }: { ids: string[]; children: (index: number) => ReactNode }) {
   const body = useRef<HTMLTableSectionElement>(null)
-  const geometry = useRef({ top: 0, rowSize: 56, scroller: null as HTMLElement | null })
+  const idsRef = useRef(ids)
+  const geometry = useRef({ top: 0, rowSize: 28, scroller: null as HTMLElement | null })
   const focusRequest = useRef<number | null>(null)
   const [pinned, setPinned] = useState<string | null>(null)
-  const [range, setRange] = useState({ first: 0, end: Math.min(ids.length, 20), size: 56 })
+  const [range, setRange] = useState({ first: 0, end: Math.min(ids.length, 20), size: 28 })
+
+  useLayoutEffect(() => {
+    idsRef.current = ids
+    if (focusRequest.current !== null && focusRequest.current >= ids.length) focusRequest.current = null
+  }, [ids])
 
   useLayoutEffect(() => {
     const element = body.current
@@ -18,22 +24,24 @@ export const MarketRowsViewport = memo(function MarketRowsViewport({ ids, childr
     const overscan = 8
     const measure = () => {
       frame = null
+      const currentIds = idsRef.current
       const rect = element.getBoundingClientRect(), scale = rect.width / element.offsetWidth || 1
       const row = element.querySelector<HTMLTableRowElement>("tr[data-market-index]")
       const size = row ? row.getBoundingClientRect().height / scale : geometry.current.rowSize
       if (!(size > 0)) return
       const viewport = scroller.getBoundingClientRect(), pixels = size * scale
       geometry.current = { top: (rect.top - viewport.top) / scale + scroller.scrollTop, rowSize: size, scroller }
-      const first = Math.min(Math.max(0, ids.length - 1), Math.max(0, Math.floor((viewport.top - rect.top) / pixels) - overscan))
-      const end = Math.min(ids.length, Math.max(first + 1, Math.ceil((viewport.bottom - rect.top) / pixels) + overscan))
+      const first = Math.min(Math.max(0, currentIds.length - 1), Math.max(0, Math.floor((viewport.top - rect.top) / pixels) - overscan))
+      const end = Math.min(currentIds.length, Math.max(first + 1, Math.ceil((viewport.bottom - rect.top) / pixels) + overscan))
       setRange(current => current.first === first && current.end === end && Math.abs(current.size - size) < 0.1 ? current : { first, end, size })
     }
     const schedule = () => { if (frame === null) frame = requestAnimationFrame(measure) }
     const focus = (event: FocusEvent) => {
-      const target = event.target as HTMLElement
+      const target = event.target
+      if (!(target instanceof Element)) return
       const row = target.closest<HTMLTableRowElement>("tr[data-market-index]")
-      if (row && element.contains(row)) setPinned(ids[Number(row.dataset.marketIndex)])
-      else if (!target.closest("[data-slot=select-content], [role=dialog]")) setPinned(null)
+      if (row && element.contains(row)) setPinned(idsRef.current[Number(row.dataset.marketIndex)] ?? null)
+      else if (!target.closest("[role=dialog]")) setPinned(null)
     }
     const observer = new ResizeObserver(schedule)
     observer.observe(element)
@@ -41,18 +49,19 @@ export const MarketRowsViewport = memo(function MarketRowsViewport({ ids, childr
     scroller.addEventListener("scroll", schedule, { passive: true })
     window.addEventListener("resize", schedule)
     document.addEventListener("focusin", focus)
-    measure()
+    schedule()
     return () => {
       observer.disconnect(); scroller.removeEventListener("scroll", schedule); window.removeEventListener("resize", schedule); document.removeEventListener("focusin", focus)
       if (frame !== null) cancelAnimationFrame(frame)
     }
-  }, [ids])
+  }, [])
 
   useLayoutEffect(() => {
     if (focusRequest.current === null) return
+    if (focusRequest.current >= ids.length) { focusRequest.current = null; return }
     const row = body.current?.querySelector<HTMLTableRowElement>(`tr[data-market-index="${focusRequest.current}"]`)
     if (row) { focusRequest.current = null; row.focus() }
-  }, [range])
+  }, [range.first, range.end, ids.length])
 
   const first = Math.min(range.first, Math.max(0, ids.length - 1))
   const end = Math.min(ids.length, Math.max(first + 1, range.end))

@@ -3906,3 +3906,35 @@ test('maximum selected viewport has bounded complete history reserves through re
     assert.throws(() => pipeline.setFocus({ instId, timeframe: '15m', windowBars: 1584 }), /Invalid chart window/)
   } finally { await pipeline.dispose() }
 })
+
+for (const windowBars of [240, 288] as const) test(`rightward historical navigation at windowBars=${windowBars} settles without looping`, { timeout: 10000 }, async () => {
+  const { pipeline, store } = fixture(source(3000))
+  try {
+    const target = end() - 1200 * interval
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: target, windowBars }, `w${windowBars}-a`)
+    await pipeline.focus.task
+    await finishSeed(pipeline)
+    const queriesBefore = store.queries.length
+    pipeline.setFocus({ instId, timeframe: '15m', endHour: target + interval, windowBars }, `w${windowBars}-b`)
+    await pipeline.focus.task
+    assert.ok(store.queries.length - queriesBefore <= 3, `windowBars=${windowBars} rightward step must not loop SQLite reads.`)
+  } finally { await pipeline.dispose() }
+})
+
+test('non-contiguous confirmed observe does not wipe recursive indicator state', { timeout: 10000 }, async () => {
+  const rows = source(300)
+  const { pipeline, store } = fixture(rows)
+  try {
+    pipeline.setFocus({ instId, timeframe: '15m' }, 'non-contiguous')
+    await pipeline.focus.task
+    await finishSeed(pipeline)
+    const state = pipeline.series.get(`${instId}:15m`)
+    assert.ok(state?.indicatorState?.ema !== null)
+    const savedLastTimestamp = state.indicatorState.lastTimestamp
+    const skippedBar = { ...rows.at(-1)!, timestamp: savedLastTimestamp + 2 * interval, close: 150, open: 149, high: 151, low: 148 }
+    pipeline.observe([skippedBar], new Map())
+    assert.equal(state.indicatorState.lastTimestamp, savedLastTimestamp, 'Non-contiguous observe must not advance or wipe recursive indicatorState.')
+    assert.equal(state.indicators.has(skippedBar.timestamp), false)
+    assert.ok(store.queries.length >= 1)
+  } finally { await pipeline.dispose() }
+})

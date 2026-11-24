@@ -95,9 +95,12 @@ function recordWebSocket(socket, url, suppliedAttributes, pendingConnect) {
         removeObservers()
       },
     }
-    for (const [type, listener] of Object.entries(listeners)) socket.addEventListener(type, listener)
-    if (socket.readyState === 1) listeners.open()
-    else if (socket.readyState === 3) finishConnect('error')
+    if (socket.readyState === 3) {
+      finishConnect('error')
+    } else {
+      for (const [type, listener] of Object.entries(listeners)) socket.addEventListener(type, listener)
+      if (socket.readyState === 1) listeners.open()
+    }
 
     const nativeSend = socket.send, nativeClose = socket.close
     let recorded = socket
@@ -123,8 +126,8 @@ function recordWebSocket(socket, url, suppliedAttributes, pendingConnect) {
     } catch {
       // Injected immutable transports expose only the supported contract.
       recorded = { get readyState() { return socket.readyState }, ...methods,
-        addEventListener(type, listener) { socket.addEventListener(type, listener) },
-        removeEventListener(type, listener) { socket.removeEventListener(type, listener) } }
+        addEventListener(...args) { socket.addEventListener(...args) },
+        removeEventListener(...args) { socket.removeEventListener(...args) } }
     }
     recordedSockets.set(socket, recorded)
     recordedSockets.set(recorded, recorded)

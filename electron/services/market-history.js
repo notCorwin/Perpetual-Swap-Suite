@@ -134,9 +134,9 @@ export class MarketHistory {
     if (coverage) {
       gaps.push(...coverage.gaps)
       for (const entry of coverage.expiries) {
-        if (!(entry.expiresAt > observedAt)) {
-          if ((entry.from - query.from) % query.intervalMS === 0) gaps.push({ from: entry.from, through: entry.through })
-        } else if (Number.isSafeInteger(entry.expiresAt)) leases.push(entry)
+        if ((entry.from - query.from) % query.intervalMS !== 0 || (entry.through - query.from) % query.intervalMS !== 0) continue
+        if (!(entry.expiresAt > observedAt)) gaps.push({ from: entry.from, through: entry.through })
+        else if (Number.isSafeInteger(entry.expiresAt)) leases.push(entry)
       }
     }
     if (query.source === 'candles') {

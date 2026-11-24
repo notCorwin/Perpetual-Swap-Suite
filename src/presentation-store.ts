@@ -1,4 +1,4 @@
-import { useMemo, useSyncExternalStore } from 'react'
+import { useCallback, useRef, useSyncExternalStore } from 'react'
 import { flushSync } from 'react-dom'
 import type { PresentationUpdate } from './desktop-contract.ts'
 
@@ -30,13 +30,16 @@ window.radarDesktop.subscribePresentation(update => {
   }
   // Commit the barrier as one React update before a later activation message
   // can suspend the renderer again or an incremental notification can arrive.
-  flushSync(() => {
-    for (const transition of transitions) transition(update)
-    for (const listener of listeners) listener()
-  })
-  if (update.active) {
-    for (const waiter of waiters) waiter()
-    waiters.clear()
+  try {
+    flushSync(() => {
+      for (const transition of transitions) transition(update)
+      for (const listener of listeners) listener()
+    })
+  } finally {
+    if (update.active) {
+      for (const waiter of waiters) waiter()
+      waiters.clear()
+    }
   }
 })
 
@@ -54,19 +57,17 @@ export const waitForPresentation = () => current.active ? Promise.resolve() : ne
 
 /** Keep background stores running, but expose their last presented value while idle. */
 export function usePresentedStore<T>(subscribe: (listener: () => void) => () => void, get: () => T): T {
-  const adapter = useMemo(() => {
-    let value = get()
-    return {
-      get: () => {
-        if (current.active) value = get()
-        return value
-      },
-      subscribe: (notify: () => void) => {
-        const stopSource = subscribe(() => { if (current.active) notify() })
-        const stopPresentation = subscribePresentation(() => { if (current.active) notify() })
-        return () => { stopSource(); stopPresentation() }
-      },
+  const presented = useRef<{ initialized: boolean; value: T }>({ initialized: false, value: undefined as T })
+  const getSnapshot = useCallback(() => {
+    if (!presented.current.initialized || current.active) {
+      presented.current = { initialized: true, value: get() }
     }
-  }, [subscribe, get])
-  return useSyncExternalStore(adapter.subscribe, adapter.get)
+    return presented.current.value
+  }, [get])
+  const subscribeSnapshot = useCallback((notify: () => void) => {
+    const stopSource = subscribe(() => { if (current.active) notify() })
+    const stopPresentation = subscribePresentation(() => { if (current.active) notify() })
+    return () => { stopSource(); stopPresentation() }
+  }, [subscribe])
+  return useSyncExternalStore(subscribeSnapshot, getSnapshot)
 }

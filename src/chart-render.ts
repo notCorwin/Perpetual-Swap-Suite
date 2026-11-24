@@ -83,11 +83,11 @@ export function createChartPlotCache(measureText: (text: string) => number, layo
       // A changed reference can widen labels and reveal a different edge candle.
       // Keep the gutter monotonic until geometry and displayed reference agree.
       let gutter = viewport?.fixedGutter ?? projected.gutter
-      for (;;) {
+      for (let pass = 0; pass < 8; pass += 1) {
         const offset = chartWheelContentOffset(wheelFraction, projected.barPitch, Boolean(projected.before), Boolean(projected.after))
         const { base, centerPrice } = chartPricePresentation(projected, offset, false)
-        if (viewport?.fixedGutter === undefined) gutter = Math.max(gutter, projected.measuredGutter)
-        if (projected.priceAxis.base === base && projected.priceAxis.centerPrice === centerPrice && projected.gutter === gutter) break
+        if (viewport?.fixedGutter === undefined && Number.isFinite(projected.measuredGutter)) gutter = Math.max(gutter, projected.measuredGutter)
+        if (!Number.isFinite(gutter) || projected.priceAxis.base === base && projected.priceAxis.centerPrice === centerPrice && projected.gutter === gutter) break
         projected = geometry(bars, { ...options, fixedGutter: gutter, priceScaleBase: base, priceScaleCenter: centerPrice }, { before, after })
       }
     }

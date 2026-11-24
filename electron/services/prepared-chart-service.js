@@ -90,8 +90,8 @@ const bar = (row, calculated, oiFresh = sourceFresh(row, 1), takerFresh = source
   statisticsSources: statisticsMask(row), statisticsObserved: oiFresh && takerFresh,
   oiObserved: oiFresh, takerObserved: takerFresh,
   indicatorsObserved: Boolean(calculated),
-  oiUnavailableReason: oiFresh && !numeric(row.oi) ? 'not-published' : undefined,
-  takerUnavailableReason: takerFresh && (!numeric(row.buy) || !numeric(row.sell)) ? 'not-published' : undefined,
+  ...(oiFresh && !numeric(row.oi) ? { oiUnavailableReason: 'not-published' } : {}),
+  ...(takerFresh && (!numeric(row.buy) || !numeric(row.sell)) ? { takerUnavailableReason: 'not-published' } : {}),
 })
 
 // A confirmed seed is shared by the latest tail and a resident history view.
@@ -186,7 +186,7 @@ export class PreparedChartPipeline {
     this.priceJournal = new Map()
     this.unsubscribeStore = store.subscribe?.(change => {
       const key = seriesKey(change.instrument, change.timeframe)
-      if (!this.series.has(key) || change.priceFrom === null || !Number.isSafeInteger(change.priceRevision)) return
+      if (!this.series.has(key) && !this.liveStates.has(key) || change.priceFrom === null || !Number.isSafeInteger(change.priceRevision)) return
       const journal = this.priceJournal.get(key) ?? []
       journal.push({ revision: change.priceRevision, from: change.priceFrom })
       if (journal.length > 256) journal.shift()
@@ -267,8 +267,13 @@ export class PreparedChartPipeline {
     for (const [key, state] of this.series) {
       if (this.series.size <= this.maxSeries && bytes <= this.maxBytes) break
       if (state.active || this.focusFor(key)) continue
-      this.series.delete(key); this.priceJournal.delete(key); bytes -= state.byteSize ?? 0
+      this.series.delete(key); if (!this.liveStates.has(key)) this.priceJournal.delete(key); bytes -= state.byteSize ?? 0
       for (const [attemptKey, attempt] of this.sourceAttempts) if (attempt.seriesKey === key && !this.universe.has(key)) this.sourceAttempts.delete(attemptKey)
+    }
+    for (const [attemptKey, attempt] of this.sourceAttempts) {
+      if (!this.series.has(attempt.seriesKey) && !this.universe.has(attempt.seriesKey) && !this.focusFor(attempt.seriesKey)) {
+        this.sourceAttempts.delete(attemptKey)
+      }
     }
     for (const [key] of this.snapshots) if (!this.universe.has(key) && !this.series.has(key)) this.snapshots.delete(key)
     const snapshotBytes = value => {
@@ -285,7 +290,12 @@ export class PreparedChartPipeline {
       projected -= snapshotBytes(value); this.snapshots.delete(key)
     }
     for (const [key, state] of this.liveStates) {
-      if (projected <= this.maxProjectionBytes) break
+      if (!this.realtimeKeys.has(key) && !this.universe.has(key) && !this.series.has(key) && !this.focusFor(key) && !state.active) {
+        projected -= (state.byteSize ?? 0) + 4096
+        this.liveStates.delete(key); this.priceJournal.delete(key)
+        continue
+      }
+      if (projected <= this.maxProjectionBytes) continue
       if (this.focusFor(key) || this.universe.has(key) || state.active || this.series.get(key)?.active) continue
       projected -= state.byteSize ?? 0
       state.rows.clear(); this.sourceRowsChanged(state); state.indicators.clear(); state.barCaches?.clear(); state.projectedBars?.clear(); state.historyBarsCache = null; state.liveProjection = null; state.byteSize = 0
@@ -1052,8 +1062,7 @@ export class PreparedChartPipeline {
     if (historical && focus && limit === this.historyResidentBars(state.key)) {
       ahead = HISTORY_BALANCE
       if (focus.direction > 0) {
-        ahead = limit - HISTORY_BALANCE
-        if (this.visibleBars(state.key) > HISTORY_BASE_VISIBLE) ahead = Math.min(ahead, limit - this.visibleBars(state.key) - HISTORY_RUNWAY)
+        ahead = Math.min(limit - HISTORY_BALANCE, Math.max(0, limit - this.visibleBars(state.key) - HISTORY_RUNWAY))
       }
     }
     const first = anchor - (limit - ahead - 1) * state.intervalMS, last = anchor + ahead * state.intervalMS
@@ -1079,11 +1088,12 @@ export class PreparedChartPipeline {
   pruneSourceAttempts(state) {
     // The latest tail cannot retire errors owned by a resident historical
     // reserve of the same series. Both share one bounded source lifetime.
-    if (this.series.get(state.key) !== state) return
+    if (this.series.has(state.key) && this.series.get(state.key) !== state) return
     const attempts = []
     for (const entry of this.sourceAttempts) if (entry[1].seriesKey === state.key) attempts.push(entry)
     if (!attempts.length) return
-    const hours = [...state.rows.keys(), ...(this.liveStates.get(state.key)?.rows.keys() ?? [])].sort((left, right) => left - right)
+    const resident = this.series.get(state.key)
+    const hours = [...(resident?.rows.keys() ?? []), ...(this.liveStates.get(state.key)?.rows.keys() ?? [])].sort((left, right) => left - right)
     const selected = this.focusFor(state.key) ? this.focusFor(state.key).end ?? state.latestHour ?? Math.floor(Date.now() / state.intervalMS) * state.intervalMS - state.intervalMS : null
     const from = selected === null ? null : selected - (this.visibleBars(state.key) - 1) * state.intervalMS
     for (const [key, attempt] of attempts) {
@@ -1115,8 +1125,10 @@ export class PreparedChartPipeline {
       state.generation = live.generation
       state.indicators.clear(); state.indicatorState = null; state.indicatorFailures?.clear()
     }
+    const latestHour = state.latestHour === null ? live.latestHour : live.latestHour === null ? state.latestHour : Math.max(live.latestHour, state.latestHour)
     // Historical reserves cannot replace the separately retained latest tail.
-    for (const [hour, row] of state.rows) if (hour >= state.latestHour - (this.tailBars(state.key) - 1) * state.intervalMS) {
+    const cutoff = latestHour === null ? -Infinity : latestHour - (this.tailBars(state.key) - 1) * state.intervalMS
+    for (const [hour, row] of state.rows) if (hour >= cutoff) {
       const previous = live.rows.get(hour)
       if (previous && !samePrice(previous, row)) live.indicators.delete(hour)
       if (previous !== row) this.sourceRowsChanged(live, hour)
@@ -1125,13 +1137,13 @@ export class PreparedChartPipeline {
       const failure = state.indicatorFailures?.get(hour)
       if (failure) { live.indicatorFailures ??= new Map(); live.indicatorFailures.set(hour, failure) }
     }
-    for (const hour of live.rows.keys()) if (hour < state.latestHour - (this.tailBars(state.key) - 1) * state.intervalMS) {
+    if (latestHour !== null) for (const hour of live.rows.keys()) if (hour < cutoff) {
       live.rows.delete(hour); live.indicators.delete(hour); live.projectedBars?.delete(hour)
       this.sourceRowsChanged(live, hour)
     }
     for (const hour of live.indicatorFailures?.keys() ?? []) if (!live.rows.has(hour)) live.indicatorFailures.delete(hour)
     if (state.indicatorState && (!live.indicatorState || state.indicatorState.lastTimestamp > live.indicatorState.lastTimestamp)) live.indicatorState = sharedIndicatorState(state.indicatorState)
-    live.latestHour = state.latestHour; live.floor = state.floor; live.generation = state.generation
+    live.latestHour = latestHour; live.floor = state.floor; live.generation = state.generation
     live.loaded ||= state.loaded
     for (const field of ['sourceVersion', 'priceVersion', 'oiVersion', 'takerVersion', 'indicatorVersion']) live[field] = Math.max(live[field] ?? 0, state[field] ?? 0)
     live.bollExpansion = live.indicatorState?.bollExpansion ?? null
@@ -1235,7 +1247,10 @@ export class PreparedChartPipeline {
       this.focusWaits.set(task, group)
       const finish = (succeeded, error) => {
         if (this.focusWaits.get(task) === group) this.focusWaits.delete(task)
-        for (const waiter of group.waiters.values()) succeeded ? waiter.resolve(true) : waiter.reject(error)
+        for (const waiter of group.waiters.values()) {
+          if (succeeded) waiter.resolve(true)
+          else waiter.reject(error)
+        }
         group.waiters.clear()
       }
       task.then(() => finish(true), error => finish(false, error))
@@ -1315,7 +1330,10 @@ export class PreparedChartPipeline {
         value = succeeded ? cleanup : new AggregateError([value, cleanup], `${value?.message ?? value}\n${cleanup.message}`, { cause: value })
         succeeded = false
       }
-      for (const waiter of entry.waiters.values()) succeeded ? waiter.resolve(value) : waiter.reject(value)
+      for (const waiter of entry.waiters.values()) {
+        if (succeeded) waiter.resolve(value)
+        else waiter.reject(value)
+      }
       entry.waiters.clear(); entry.resolveDone()
       const next = this.pendingFocusRead
       if (next) {
@@ -1446,7 +1464,8 @@ export class PreparedChartPipeline {
         let visible = Boolean(admitted && firstVisible >= admitted.from && targetEnd <= admitted.through && admitted.revision === revision)
         for (let hour = firstVisible; visible && hour <= targetEnd; hour += step) visible = completePriceCandle(resident.rows.get(hour))
         const firstReserve = Math.max(0, targetEnd - ((focus.windowBars ?? VISIBLE) + HISTORY_RUNWAY - 1) * step, resident.floor ?? 0)
-        const lastReserve = Math.min(targetEnd + HISTORY_RUNWAY * step, resident.latestHour ?? targetEnd)
+        const ceiling = Math.floor(Date.now() / step) * step - step
+        const lastReserve = Math.min(targetEnd + HISTORY_RUNWAY * step, resident.latestHour ?? targetEnd, ceiling)
         const read = resident.historyReadRange
         const valid = read && read.revision === revision && read.priceVersion === resident.priceVersion
         const older = !valid || read.from > firstReserve, newer = !valid || read.through < lastReserve
@@ -1454,16 +1473,19 @@ export class PreparedChartPipeline {
         return newer && (!older || focus.direction > 0) ? 'newer' : 'older'
       }
       let side
-      while (current() && (side = needsReserveRead())) {
+      for (let pass = 0; pass < 2 && current() && (side = needsReserveRead()); pass += 1) {
         // An admitted reserve read belongs to the series, not the transient
         // cursor that happened to request it. New cursors share it, and a
         // distant missing viewport can still take its independent read lane.
         let ahead = HISTORY_AHEAD
         if (side === 'newer') {
           ahead = HISTORY - HISTORY_AHEAD - 1
-          if ((focus.windowBars ?? VISIBLE) > HISTORY_BASE_VISIBLE) ahead = Math.min(ahead, this.historyReadBars(focus.key) - focus.windowBars - HISTORY_RUNWAY)
+          if ((focus.windowBars ?? VISIBLE) > HISTORY_BALANCE - HISTORY_RUNWAY) ahead = Math.min(ahead, Math.max(0, this.historyReadBars(focus.key) - (focus.windowBars ?? VISIBLE) - HISTORY_RUNWAY))
         }
-        await this.focusHistoryRead(resident, focus, ahead)
+        const before = resident.historyReadRange
+        const progressed = await this.focusHistoryRead(resident, focus, ahead)
+        const after = resident.historyReadRange
+        if (progressed === false || before && after && before.from === after.from && before.through === after.through && before.revision === after.revision && before.priceVersion === after.priceVersion) break
       }
       if (!current()) return null
     }
@@ -1789,7 +1811,7 @@ export class PreparedChartPipeline {
     }
     const task = Promise.resolve().then(async () => {
       try {
-        if (priority === 'chartWarm') await abortable(() => new Promise(resolve => {
+        if (job.priority === 'chartWarm') await abortable(() => new Promise(resolve => {
           job.admit = resolve; this.warmSourceQueue.push(job); this.drainWarmSources()
         }), signal)
         const result = await abortable(() => operation(signal, job), signal)
@@ -2093,11 +2115,15 @@ export class PreparedChartPipeline {
       let changedFrom = Infinity
       for (const current of consumers) {
         for (const row of ordered) {
-          const changed = !samePrice(previous.get(row.timestamp), row)
+          const priorRow = previous.get(`${key}:${row.timestamp}`) ?? (() => {
+            const candidate = previous.get(row.timestamp)
+            return candidate && (candidate.instrument === undefined || candidate.instrument === row.instrument) && (candidate.timeframe === undefined || candidate.timeframe === row.timeframe) ? candidate : undefined
+          })()
+          const changed = !samePrice(priorRow, row)
           if (changed) {
             current.priceVersion += 1
-            if (row.timestamp <= (current.latestHour ?? -Infinity)) changedFrom = Math.min(changedFrom, row.timestamp)
-            else if (current.indicatorState) {
+            if (row.timestamp <= (current.latestHour ?? -Infinity) || current.indicatorState && row.timestamp <= current.indicatorState.lastTimestamp) changedFrom = Math.min(changedFrom, row.timestamp)
+            else if (current.indicatorState && current.indicatorState.lastTimestamp + current.intervalMS === row.timestamp) {
               const previous = current.indicatorState
               let appended = confirmedAppends.get(previous)
               if (!appended || appended.row !== row) {
@@ -2107,11 +2133,14 @@ export class PreparedChartPipeline {
               const { state: successor, value } = appended
               current.indicatorState = successor
               current.bollExpansion = current.indicatorState.bollExpansion
-              if (value) current.indicators.set(value.hour, value)
+              if (value) {
+                current.indicators.set(value.hour, value)
+                current.indicatorVersion = (current.indicatorVersion ?? 0) + 1
+              }
             }
           }
-          if (changedSource(previous.get(row.timestamp), row, 1)) current.oiVersion = (current.oiVersion ?? 0) + 1
-          if (changedSource(previous.get(row.timestamp), row, 2)) current.takerVersion = (current.takerVersion ?? 0) + 1
+          if (changedSource(priorRow, row, 1)) current.oiVersion = (current.oiVersion ?? 0) + 1
+          if (changedSource(priorRow, row, 2)) current.takerVersion = (current.takerVersion ?? 0) + 1
           const prior = current.rows.get(row.timestamp), value = mergeStatistics(prior, this.normalize(row))
           if (!sameRecord(prior, value)) { current.rows.set(row.timestamp, immutableRecord(value)); current.sourceVersion += 1; this.sourceRowsChanged(current, row.timestamp) }
           current.latestHour = Math.max(current.latestHour ?? -Infinity, row.timestamp)
@@ -2145,7 +2174,9 @@ export class PreparedChartPipeline {
     const hours = admitted.flatMap(value => [...value.rows.keys()])
     // Acquisition already returns its committed projection. Both chart and live
     // residency reuse those same rows, or share one bounded SQLite read.
-    const rows = inputRows ?? await this.store.candles({ instrument: instId, timeframe, from: Math.min(...hours), through: Math.max(...hours), limit: HISTORY, order: 'asc' }, priority)
+    const minHour = Math.min(...hours), maxHour = Math.max(...hours), intervalMS = intervalFor(timeframe)
+    const span = Math.max(HISTORY, Math.floor((maxHour - minHour) / intervalMS) + 1)
+    const rows = inputRows ?? await this.store.candles({ instrument: instId, timeframe, from: minHour, through: maxHour, limit: span, order: 'asc' }, priority)
     let changed = false
     for (const { current, rows: prior } of admitted) {
       let observationsChanged = false
@@ -2178,8 +2209,9 @@ export class PreparedChartPipeline {
       current.publishedHistoryFrame = null
     }
     if (this.presentationActive) this.snapshots.delete(key)
-    const focus = this.focusFor(key)
-    if (focus) this.replaceFocus({ instId, timeframe, endHour: focus.end, windowBars: focus.windowBars }, focus.id, focus.slot)
+    for (const focus of [...this.focuses.values()]) if (focus.key === key) {
+      this.replaceFocus({ instId, timeframe, endHour: focus.end, windowBars: focus.windowBars }, focus.id, focus.slot)
+    }
     const demand = this.universe.get(key)
     if (demand) this.queueCandidate(demand, true)
   }
@@ -2260,7 +2292,9 @@ export class PreparedChartPipeline {
         if (!this.workers.includes(slot)) return
         const pending = this.calculations.get(slot.busy)
         if (pending) { this.calculations.delete(slot.busy); pending.reject(Object.assign(error, { code: 'PREPARED_CHART_WORKER_UNAVAILABLE' })) }
-        this.workers = this.workers.filter(value => value !== slot); this.drainCalculations()
+        this.workers = this.workers.filter(value => value !== slot)
+        void slot.worker.terminate().catch(() => {})
+        this.drainCalculations()
       }
       slot.worker.on('error', failed)
       slot.worker.on('exit', code => failed(new Error(`Prepared chart worker exited (${code}).`)))

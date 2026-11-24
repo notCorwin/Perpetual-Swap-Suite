@@ -480,8 +480,11 @@ export class HistorySync {
       }
     } finally {
       this.draining = false
-      const retries = [...this.tasks.values()].filter(task => task.status === 'retry').map(task => task.nextAttemptAt)
-      if (!this.active.size && retries.length && !this.closed) this.timer = setTimeout(() => this.kick(), Math.min(2147483647, Math.max(1, Math.min(...retries) - this.now())))
+      clearTimeout(this.timer); this.timer = null
+      const retries = [...this.tasks.values()]
+        .filter(task => task.status === 'retry' && !this.active.has(seriesKey(task)))
+        .map(task => task.nextAttemptAt)
+      if (retries.length && !this.closed) this.timer = setTimeout(() => this.kick(), Math.min(2147483647, Math.max(1, Math.min(...retries) - this.now())))
       this.settleIdle()
     }
   }

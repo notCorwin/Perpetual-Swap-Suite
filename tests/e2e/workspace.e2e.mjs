@@ -477,7 +477,7 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
   const priceLabel = chart.locator('[data-chart-price-label]')
   await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-price-label]')?.getAttribute('data-chart-price-direction') === 'flat')
   assert.equal(await priceLabel.locator('[data-chart-price-label-background]').getAttribute('fill'), 'var(--chart-annotation)')
-  assert.equal(await priceLabel.locator('[data-chart-price-label-value]').getAttribute('fill'), 'white')
+  assert.equal(await priceLabel.locator('[data-chart-price-label-value]').getAttribute('fill'), 'var(--foreground)')
   await assertCompleteChartViewport(page, 'BETA-USDT-SWAP', { fullSlots: null })
   assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.chartLocal || value.chartHistory).length), before + 1, 'Only the fixture read may be added; the pushed candle must not trigger another renderer read.')
   const liveUpdate = await page.evaluate(() => {
@@ -494,8 +494,8 @@ test('a prepared idle chart makes no periodic window requests and accepts a push
   assert.match(await chart.locator('svg[data-rendered-inst] [data-chart-price-label-value]').textContent(), /^\+1\.50%$/)
   assert.equal(await priceLabel.getAttribute('data-chart-price-direction'), 'up')
   assert.equal(await priceLabel.locator('[data-chart-price-label-background]').getAttribute('fill'), 'var(--positive)')
-  assert.equal(await priceLabel.locator('[data-chart-price-label-value]').getAttribute('fill'), 'white')
-  assert.equal(await priceLabel.locator('[data-chart-countdown]').getAttribute('fill'), 'white')
+  assert.equal(await priceLabel.locator('[data-chart-price-label-value]').getAttribute('fill'), 'var(--change-label-foreground)')
+  assert.equal(await priceLabel.locator('[data-chart-countdown]').getAttribute('fill'), 'var(--change-label-foreground)')
   const ticks = await chart.evaluate(chart => {
     const background = chart.querySelector('[data-chart-price-label-background]').getBoundingClientRect()
     const priceX = chart.querySelector('[data-chart-price-label-value]').getAttribute('x')

@@ -240,7 +240,7 @@ export class HistoryDownload {
             this.held.delete(pending.id); this.adjustHeld(item.task, -1); this.active.set(pending.id, item)
             this.update(); this.publish()
           }
-          if (!pending.settled && readyForSource(state, bounds)) {
+          if (!job.cancelled && !pending.settled && readyForSource(state, bounds)) {
             try { this.sync.release(pending.id) }
             catch (error) {
               releaseError = error
@@ -316,6 +316,7 @@ export class HistoryDownload {
     for (const state of states) if (state.pending) {
       const pending = state.pending, item = this.held.get(pending.id)
       if (item) { this.held.delete(pending.id); this.adjustHeld(item.task, -1); this.active.set(pending.id, item) }
+      if (job.cancelled && !pending.settled) await this.sync.cancel(pending.id).catch(() => undefined)
       state.running = true; await runPage(state)
     }
     this.update()

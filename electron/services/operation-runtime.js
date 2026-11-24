@@ -29,6 +29,7 @@ const validID = value => typeof value === 'string' && /^[\w.:-]{1,256}$/.test(va
 const jsonWrite = (path, value, encoded) => suppress(() => {
   const temporary = join(dirname(path), `.tmp-${randomUUID()}-${basename(path)}`)
   let descriptor
+  let primaryError, cleanupError
   try {
     writeFileSync(temporary, `${encoded ?? JSON.stringify(value)}\n`, { mode: 0o600, flag: 'wx' })
     descriptor = openSync(temporary, 'r')
@@ -36,10 +37,14 @@ const jsonWrite = (path, value, encoded) => suppress(() => {
     const closing = descriptor; descriptor = undefined
     closeSync(closing)
     renameSync(temporary, path)
+  } catch (error) {
+    primaryError = error
   } finally {
-    try { if (descriptor !== undefined) closeSync(descriptor) }
-    finally { try { unlinkSync(temporary) } catch (error) { if (error.code !== 'ENOENT') throw error } }
+    try { if (descriptor !== undefined) closeSync(descriptor) } catch (error) { cleanupError = error }
+    try { unlinkSync(temporary) } catch (error) { if (error.code !== 'ENOENT') cleanupError ??= error }
   }
+  if (primaryError) throw primaryError
+  if (cleanupError) throw cleanupError
 })
 
 function journalWriter(directory, sessionId, executionId, participant, hooks, capabilities = () => []) {

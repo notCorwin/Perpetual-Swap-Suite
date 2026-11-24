@@ -29,8 +29,14 @@ test('renderer and canonical settings agree on strict thresholds and supported r
   for (const [key, value] of [['depth', '0'], ['volume24h', '0'], ['volumeStability', '1']]) {
     const draft = preferencesDraft(DEFAULT_PREFERENCES)
     draft.liquidity[key as keyof typeof draft.liquidity].threshold = value
-    assert.equal(validatePreferencesDraft(draft).values, undefined)
+    const checked = validatePreferencesDraft(draft)
+    assert.equal(checked.values, undefined)
+    assert.doesNotMatch(checked.errors[key], /5e-324/)
+    assert.equal(checked.errors[key], key === 'volumeStability' ? 'Enter a ratio greater than 1.' : 'Enter a number greater than 0.')
   }
+  const blankStability = preferencesDraft(DEFAULT_PREFERENCES)
+  blankStability.liquidity.volumeStability.threshold = ''
+  assert.equal(validatePreferencesDraft(blankStability).errors.volumeStability, 'Enter a ratio greater than 1.')
   const draft = preferencesDraft(DEFAULT_PREFERENCES)
   draft.historyDays = '3651'
   assert.equal(validatePreferencesDraft(draft).values, undefined)

@@ -70,7 +70,10 @@ const mutate = (changes, series, timestamp, price = false, statistic = null) => 
 }
 const transaction = (operation, validate) => {
   database.exec('BEGIN IMMEDIATE')
-  try { const value = operation(); validate?.(); database.exec('COMMIT'); return value } catch (error) { database.exec('ROLLBACK'); throw error }
+  try { const value = operation(); validate?.(); database.exec('COMMIT'); return value } catch (error) {
+    try { database.exec('ROLLBACK') } catch { /* SQLite may have already rolled back on I/O or full disk errors. */ }
+    throw error
+  }
 }
 const finishMutations = (changes) => {
   for (const [id, change] of changes) {
@@ -456,13 +459,14 @@ function missingRanges(query, source = 'candles', verify = false) {
   const condition = source === 'candles' ? '' : ` AND source=?${staleDerived} AND ((value1 IS NOT NULL${source === 'taker' ? ' AND value2 IS NOT NULL' : ''}${contradicted}) OR expires_at>?)`
   const table = source === 'candles' ? 'candles' : 'statistics'
   const now = Date.now()
-  const values = all(`WITH present AS (SELECT timestamp,LAG(timestamp,1,?) OVER(ORDER BY timestamp) AS previous FROM ${table}
-    WHERE series_id=? AND timestamp>=? AND timestamp<=?${condition}) SELECT previous+? AS "from",timestamp-? AS through FROM present WHERE timestamp-previous>?`,
-    from - step, series.id, from, through, ...(source === 'candles' ? [] : [sourceBit, now]), step, step, step)
-  const last = get(`SELECT MAX(timestamp) AS timestamp FROM ${table} WHERE series_id=? AND timestamp>=? AND timestamp<=?${condition}`, series.id, from, through, ...(source === 'candles' ? [] : [sourceBit, now]))?.timestamp
-  if (last == null) return [{ from, through }]
-  if (last < through) values.push({ from: last + step, through })
-  return values
+  return all(`WITH present(timestamp) AS (
+      SELECT timestamp FROM ${table}
+      WHERE series_id=? AND timestamp>=? AND timestamp<=? AND typeof(timestamp)='integer' AND timestamp%?=0${condition}
+      UNION ALL SELECT ?+?
+    ), spans AS (
+      SELECT timestamp,LAG(timestamp,1,?) OVER(ORDER BY timestamp) AS previous FROM present
+    ) SELECT previous+? AS "from",timestamp-? AS through FROM spans WHERE timestamp-previous>? ORDER BY "from"`,
+  series.id, from, through, step, ...(source === 'candles' ? [] : [sourceBit, now]), through, step, from - step, step, step, step)
 }
 
 function missingCompletePriceRanges(query) {
@@ -502,35 +506,46 @@ const commands = {
   checkpointWrite: query => {
     validateQuery(query)
     if (!Number.isSafeInteger(query.timestamp) || query.timestamp < 0 || query.timestamp % CANDLE_INTERVALS[query.timeframe] || typeof query.formulaVersion !== 'string' || !query.state) throw new TypeError('Invalid indicator checkpoint.')
-    const series = ensureSeries(query), watermark = `sqlite:${series.id}:${series.price_revision}`
+    const existing = identity(query)
+    if (!existing && query.sourceRevision !== 'sqlite:0:0' && query.sourceRevision !== 0) return { result: false }
+    const series = existing ?? ensureSeries(query), watermark = `sqlite:${series.id}:${series.price_revision}`
     if (query.sourceRevision !== watermark && query.sourceRevision !== series.price_revision) return { result: false }
     const value = { timestamp: query.timestamp, state: query.state, formulaVersion: query.formulaVersion, sourceRevision: query.sourceRevision, ...(query.bollExpansion !== undefined ? { bollExpansion: query.bollExpansion } : {}) }
     const encoded = JSON.stringify(value, (_key, child) => { if (typeof child === 'number' && !Number.isFinite(child)) throw new TypeError('Indicator checkpoints require finite numbers.'); return child })
-    run('INSERT OR REPLACE INTO indicator_checkpoints(series_id,formula,timestamp,value) VALUES(?,?,?,?)', series.id, query.formulaVersion, query.timestamp, encoded)
+    transaction(() => {
+      run('DELETE FROM indicator_checkpoints WHERE series_id=? AND formula!=?', series.id, query.formulaVersion)
+      run('INSERT OR REPLACE INTO indicator_checkpoints(series_id,formula,timestamp,value) VALUES(?,?,?,?)', series.id, query.formulaVersion, query.timestamp, encoded)
+    })
     return { result: true }
   },
   inspect: query => {
-    const valid = validateQuery(query), series = identity(valid), gaps = missingRanges(valid, 'candles', true), issues = []
-    let checkedRows = 0
-    const rows = series ? statement(`SELECT timestamp,open,high,low,close,volume,base_volume AS baseVolume,quote_volume AS quoteVolume FROM candles
-      WHERE series_id=? AND timestamp>=? AND timestamp<=? ORDER BY timestamp ${valid.order === 'desc' ? 'DESC' : 'ASC'}${valid.limit ? ' LIMIT ?' : ''}`)
-      .iterate(series.id, valid.from, valid.through, ...(valid.limit ? [valid.limit] : [])) : []
-    for (const row of rows) {
-      checkedRows++
-      const first = Math.floor(row.timestamp / CANDLE_INTERVALS[query.timeframe]) * CANDLE_INTERVALS[query.timeframe]
-      const issue = reason => issues.push({ instrument: query.instrument, timeframe: query.timeframe, source: 'candles', from: first, through: first, reason, repairable: true })
-      if (row.baseVolume == null) issue('missing-base-volume')
-      if (row.quoteVolume == null) issue('missing-quote-volume')
-      if (row.timestamp !== first) issue('invalid-grid')
-      if (['open','high','low','close'].some(field => !Number.isFinite(row[field]) || row[field] <= 0)
-        || row.high < Math.max(row.open,row.close,row.low) || row.low > Math.min(row.open,row.close,row.high)) issue('invalid-ohlc')
-      if (['volume','baseVolume','quoteVolume'].some(field => row[field] !== null && (!Number.isFinite(row[field]) || row[field] < 0))) issue('negative-volume')
+    const valid = validateQuery(query)
+    database.exec('BEGIN DEFERRED')
+    try {
+      const series = identity(valid), gaps = missingRanges(valid, 'candles', true), issues = []
+      let checkedRows = 0
+      const rows = series ? statement(`SELECT timestamp,open,high,low,close,volume,base_volume AS baseVolume,quote_volume AS quoteVolume FROM candles
+        WHERE series_id=? AND timestamp>=? AND timestamp<=? ORDER BY timestamp ${valid.order === 'desc' ? 'DESC' : 'ASC'}${valid.limit ? ' LIMIT ?' : ''}`)
+        .iterate(series.id, valid.from, valid.through, ...(valid.limit ? [valid.limit] : [])) : []
+      for (const row of rows) {
+        checkedRows++
+        const first = Math.floor(row.timestamp / CANDLE_INTERVALS[query.timeframe]) * CANDLE_INTERVALS[query.timeframe]
+        const issue = reason => issues.push({ instrument: query.instrument, timeframe: query.timeframe, source: 'candles', from: first, through: first, reason, repairable: true })
+        if (row.baseVolume == null) issue('missing-base-volume')
+        if (row.quoteVolume == null) issue('missing-quote-volume')
+        if (row.timestamp !== first) issue('invalid-grid')
+        if (['open','high','low','close'].some(field => !Number.isFinite(row[field]) || row[field] <= 0)
+          || row.high < Math.max(row.open,row.close,row.low) || row.low > Math.min(row.open,row.close,row.high)) issue('invalid-ohlc')
+        if (['volume','baseVolume','quoteVolume'].some(field => row[field] !== null && (!Number.isFinite(row[field]) || row[field] < 0))) issue('negative-volume')
+      }
+      for (const gap of gaps) issues.push({ instrument: query.instrument, timeframe: query.timeframe, source: 'candles', ...gap, reason: 'gap', repairable: true })
+      return { result: { issues, checkedRows, files: 1, missingRanges: gaps } }
+    } finally {
+      try { database.exec('COMMIT') } catch { /* Read snapshot cleanup */ }
     }
-    for (const gap of gaps) issues.push({ instrument: query.instrument, timeframe: query.timeframe, source: 'candles', ...gap, reason: 'gap', repairable: true })
-    return { result: { issues, checkedRows, files: 1, missingRanges: gaps } }
   },
   integrity: () => ({ result: all('PRAGMA quick_check').map(row => row.quick_check) }),
-  close: () => { if (!workerData.reader) database.exec('PRAGMA wal_checkpoint(PASSIVE)'); database.close(); return { result: undefined } },
+  close: () => { if (!workerData.reader) database.exec('PRAGMA wal_checkpoint(TRUNCATE)'); database.close(); return { result: undefined } },
 }
 
 onOperationMessage(parentPort, workerData.reader ? 'market-reader' : 'market-writer', ({ id, command, args }) => {

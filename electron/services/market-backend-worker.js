@@ -7,8 +7,10 @@ import { MarketService } from './market-service.js'
 import { drainCallbackProbeObserverCostMonotonicUS, monotonicMicroseconds, validateMarketTrafficDrainWindow, wrapAcceptedCallback } from './market-traffic-callback-probe.js'
 import { ChartNotificationEncoder } from './chart-notifications.js'
 import { createStatusLog } from './status-log.js'
-import { createChartAcquisitionFixture, createChartColdBoundaryFixture, seedCachedListProjection, seedChartScrollBenchmark, seedHistoricalStatisticsBoundary, seedInstrumentNavigationBenchmark } from '../e2e-fixtures.js'
-import { backgroundArchiveRows, seedMarketResources, startBackgroundArchive } from '../market-resource-fixtures.js'
+
+let e2eFixturesModule, resourceFixturesModule
+const loadE2EFixtures = () => e2eFixturesModule ??= import('../e2e-fixtures.js')
+const loadResourceFixtures = () => resourceFixturesModule ??= import('../market-resource-fixtures.js')
 
 let metadata, store, service, preferences, sourceProbe
 const backendStatusLog = createStatusLog(join(workerData.userData, 'Logs', 'market-backend.jsonl'))
@@ -197,10 +199,10 @@ async function request(value) {
       case 'seedCandles': return { written: await store.appendCandles(input.candles) }
       case 'readCandles': return store.candles(input)
       case 'readStatistics': return store.statistics(input)
-      case 'seedCachedListProjection': return seedCachedListProjection(store, service)
-      case 'seedChartScrollBenchmark': return seedChartScrollBenchmark(store, service)
-      case 'seedHistoricalStatisticsBoundary': return seedHistoricalStatisticsBoundary(store, service)
-      case 'seedInstrumentNavigationBenchmark': return seedInstrumentNavigationBenchmark(store, service)
+      case 'seedCachedListProjection': return (await loadE2EFixtures()).seedCachedListProjection(store, service)
+      case 'seedChartScrollBenchmark': return (await loadE2EFixtures()).seedChartScrollBenchmark(store, service)
+      case 'seedHistoricalStatisticsBoundary': return (await loadE2EFixtures()).seedHistoricalStatisticsBoundary(store, service)
+      case 'seedInstrumentNavigationBenchmark': return (await loadE2EFixtures()).seedInstrumentNavigationBenchmark(store, service)
       case 'settings': return preferences
     }
   }
@@ -224,11 +226,11 @@ async function probe(input) {
       series: [...pipeline.universe.keys()].map(key => ({ key, compact: state(pipeline.liveStates.get(key)), history: state(pipeline.series.get(key)),
         cached: pipeline.cached(key)?.indicatorState, cachedGeneration: pipeline.cached(key)?.generation })) }
   }
-  if (input.action === 'seedChartScrollBenchmark') return seedChartScrollBenchmark(store, service, { instId: input.instId, stablePriceLabels: input.stablePriceLabels })
+  if (input.action === 'seedChartScrollBenchmark') return (await loadE2EFixtures()).seedChartScrollBenchmark(store, service, { instId: input.instId, stablePriceLabels: input.stablePriceLabels })
   if (input.action === 'coldBoundaryInstall') return coldBoundaryLifecycle(async () => {
     await coldBoundaryFixture?.remove()
     coldBoundaryFixture = null
-    coldBoundaryFixture = await createChartColdBoundaryFixture(store, service, input)
+    coldBoundaryFixture = await (await loadE2EFixtures()).createChartColdBoundaryFixture(store, service, input)
     return coldBoundaryFixture.fixture
   })
   if (input.action === 'coldBoundaryRead') return coldBoundaryFixture?.read() ?? null
@@ -240,7 +242,7 @@ async function probe(input) {
     return { ok: true, disposed: previous?.read() ?? null }
   })
   if (input.action === 'acquisitionInstall') {
-    acquisitionFixture = await createChartAcquisitionFixture(store, service, input)
+    acquisitionFixture = await (await loadE2EFixtures()).createChartAcquisitionFixture(store, service, input)
     return acquisitionFixture.fixture
   }
   if (input.action === 'acquisitionStep') {
@@ -251,7 +253,7 @@ async function probe(input) {
     const previous = preferences
     preferences = metadata.updateSettings({ liquidity: Object.fromEntries(Object.entries(preferences.liquidity).map(([key, value]) => [key, { ...value, enabled: false }])) }).preferences
     await service.reconfigure(previous)
-    resourceFixture = await seedMarketResources(store, service, input)
+    resourceFixture = await (await loadResourceFixtures()).seedMarketResources(store, service, input)
     return { ...resourceFixture.fixture, backendThreadId: threadId, diagnostics: store.getDiagnostics() }
   }
   if (input.action === 'scaleLoadStart') { if (!resourceFixture) throw new Error('Resource benchmark is not seeded.'); return resourceFixture.startLoad(input) }
@@ -454,12 +456,12 @@ async function probe(input) {
   if (input.action === 'diagnostics') return { backendThreadId: threadId, tasks: service.history.sync.listTasks(),
     activeHistory: [...service.history.sync.active.values()].map(({ group }) => ({ instrument: group.instrument, timeframe: group.timeframe, source: group.source })),
     writeMetrics: store.getWriteMetrics() }
-  if (input.action === 'backgroundStart') return startBackgroundArchive(store, service)
+  if (input.action === 'backgroundStart') return (await loadResourceFixtures()).startBackgroundArchive(store, service)
   if (input.action === 'backgroundStatus') {
     const audit = await service.dataAuditRequest({ action: 'status' }), tasks = service.history.sync.listTasks()
     const result = { source: 'offline synthetic source; worker backend, HistorySync and SQLite WAL',
       audit: { phase: audit.phase, progress: audit.progress }, tasks: tasks.length,
-      writtenRecords: tasks.reduce((sum, task) => sum + (task.writtenRecords ?? 0), 0), archiveRows: await backgroundArchiveRows(store), writeMetrics: store.getWriteMetrics() }
+      writtenRecords: tasks.reduce((sum, task) => sum + (task.writtenRecords ?? 0), 0), archiveRows: await (await loadResourceFixtures()).backgroundArchiveRows(store), writeMetrics: store.getWriteMetrics() }
     await service.dataAuditRequest({ action: 'cancel' })
     return result
   }

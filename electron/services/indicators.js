@@ -74,7 +74,7 @@ export function appendIndicatorCandle(state, candle) {
       if (state.atrCount === ATR_PERIOD - 1) state.atr = state.atrSeedSum / ATR_PERIOD
     } else state.atr = (state.atr * (ATR_PERIOD - 1) + range) / ATR_PERIOD
     state.atrCount += 1
-    if (state.atr !== null && price > 0) atrPercent = state.atr / price * 100
+    if (state.atr !== null && price > 0) atrPercent = finite(state.atr / price * 100)
   } else { state.atrCount = 0; state.atrSeedSum = 0; state.atr = null }
 
   state.closes.push(price)
@@ -85,7 +85,8 @@ export function appendIndicatorCandle(state, candle) {
     // cumulative sum of squares (which loses precision for nearly flat prices).
     const middle = state.closes.reduce((sum, value) => sum + value, 0) / BOLL_PERIOD
     const deviation = Math.sqrt(state.closes.reduce((sum, value) => sum + (value - middle) ** 2, 0) / BOLL_PERIOD)
-    band = { upper: middle + 2 * deviation, middle, lower: middle - 2 * deviation }
+    const upper = finite(middle + 2 * deviation), lower = finite(middle - 2 * deviation), mid = finite(middle)
+    if (upper !== null && lower !== null && mid !== null) band = { upper, middle: mid, lower }
   }
 
   state.rocs.push(currentROC)

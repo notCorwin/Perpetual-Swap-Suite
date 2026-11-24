@@ -21,40 +21,59 @@ import { isPriceFresh, watchPriceFreshness, watchPriceCountdown } from '@/price-
 import { sharedChartEnd, sharedChartGesture, sharedChartLiveEnd, sharedChartViewport, type SharedChartTime } from '@/chart-time-sync'
 
 const ChartTimeSync = createContext<{ value: SharedChartTime | null; setValue: React.Dispatch<React.SetStateAction<SharedChartTime | null>>; gutter: number; reportGutter: (frame: RadarTimeframe, epoch: object | null, width: number | null) => void } | null>(null)
-export function ChartTimeSyncProvider({ children }: { children: React.ReactNode }) {
-  const [value, setValue] = useState<SharedChartTime | null>(null)
-  const [gutter, setGutter] = useState(64)
-  const measurements = useRef(new Map<RadarTimeframe, { epoch: object; width: number }>())
+export function ChartTimeSyncProvider({ resetKey, children }: { resetKey?: string | null; children: React.ReactNode }) {
+  const [state, setState] = useState<{ key: string | null | undefined; value: SharedChartTime | null; gutter: number }>({ key: resetKey, value: null, gutter: 64 })
+  const value = state.key === resetKey ? state.value : null
+  const gutter = state.key === resetKey ? state.gutter : 64
+  const measurements = useRef<{ key: string | null | undefined; entries: Map<RadarTimeframe, { epoch: object; width: number }> }>({ key: resetKey, entries: new Map() })
+  const setValue: React.Dispatch<React.SetStateAction<SharedChartTime | null>> = useCallback(action => {
+    setState(current => {
+      const base = current.key === resetKey ? current.value : null
+      const next = typeof action === 'function' ? (action as (prev: SharedChartTime | null) => SharedChartTime | null)(base) : action
+      if (current.key === resetKey && next === current.value) return current
+      return { key: resetKey, value: next, gutter: current.key === resetKey ? current.gutter : 64 }
+    })
+  }, [resetKey])
   const reportGutter = useCallback((frame: RadarTimeframe, epoch: object | null, width: number | null) => {
-    const previous = measurements.current.get(frame)
-    if (width === null) measurements.current.delete(frame)
+    if (measurements.current.key !== resetKey) {
+      measurements.current = { key: resetKey, entries: new Map() }
+    }
+    const entries = measurements.current.entries
+    const previous = entries.get(frame)
+    if (width === null) entries.delete(frame)
     else if (epoch) {
       // Within one input epoch, changing the gutter can change which candle is
       // visible and hence its rebased labels. Grow monotonically until stable;
       // a new input epoch permits the gutter to shrink again.
       const next = previous?.epoch === epoch ? Math.max(previous.width, width) : width
       if (previous?.epoch === epoch && previous.width === next) return
-      measurements.current.set(frame, { epoch, width: next })
+      entries.set(frame, { epoch, width: next })
     }
-    const widths = [...measurements.current.values()].map(item => item.width)
-    setGutter(widths.length ? Math.max(...widths) : 64)
-  }, [])
-  const context = useMemo(() => ({ value, setValue, gutter, reportGutter }), [value, gutter, reportGutter])
+    const widths = [...entries.values()].map(item => item.width)
+    const nextGutter = widths.length ? Math.max(...widths) : 64
+    setState(current => {
+      const currentValue = current.key === resetKey ? current.value : null
+      const currentGutter = current.key === resetKey ? current.gutter : 64
+      if (current.key === resetKey && currentGutter === nextGutter) return current
+      return { key: resetKey, value: currentValue, gutter: nextGutter }
+    })
+  }, [resetKey])
+  const context = useMemo(() => ({ value, setValue, gutter, reportGutter }), [value, setValue, gutter, reportGutter])
   return <ChartTimeSync.Provider value={context}>{children}</ChartTimeSync.Provider>
 }
 
 const presentationActive = () => getPresentation().active
 const EMPTY_BARS: readonly Bar[] = []
 export type SharedChartStatusValue = { detail: string; severity: 'error' | 'warning' | 'info' }
-const SharedChartStatus = memo(function SharedChartStatus({ timeframe, summary, error, warning, loading, observedAt, realtime, active, historical, onStatus }: {
-  timeframe: RadarTimeframe; summary: string; error: string; warning: boolean; loading: boolean; observedAt?: number | null; realtime?: 'live' | 'stale'; active: boolean; historical: boolean; onStatus: (timeframe: RadarTimeframe, value: SharedChartStatusValue | null) => void
+const SharedChartStatus = memo(function SharedChartStatus({ timeframe, summary, error, warning, observedAt, realtime, active, historical, onStatus }: {
+  timeframe: RadarTimeframe; summary: string; error: string; warning: boolean; observedAt?: number | null; realtime?: 'live' | 'stale'; active: boolean; historical: boolean; onStatus: (timeframe: RadarTimeframe, value: SharedChartStatusValue | null) => void
 }) {
   const [now, setNow] = useState(Date.now)
   useEffect(() => watchPriceFreshness({ observedAt, realtime, active, displayedAt: now, isActive: presentationActive, onTime: setNow }), [active, observedAt, realtime, now])
   const cached = !historical && !isPriceFresh(observedAt, realtime, now)
   const detail = [error || summary, cached ? 'Cached price. Check the market connection for current prices.' : ''].filter(Boolean).join(' · ')
   const severity = error ? 'error' : cached || warning ? 'warning' : 'info'
-  useEffect(() => { onStatus(timeframe, detail ? { detail, severity } : null) }, [onStatus, timeframe, detail, severity, loading])
+  useEffect(() => { onStatus(timeframe, detail ? { detail, severity } : null) }, [onStatus, timeframe, detail, severity])
   useEffect(() => () => onStatus(timeframe, null), [onStatus, timeframe])
   return null
 })
@@ -135,12 +154,12 @@ const PlotPaths = memo(function PlotPaths({ bars, geometry, areaClipId, priceVis
   const lineStroke = (key: keyof Bar, d: string, color: string, dash?: string) => <path data-chart-indicator={key} d={d} fill="none" stroke={color} strokeLinecap="round" strokeLinejoin="round" strokeDasharray={dash} />
   return measureOperation({ category: 'cpu', name: 'chart.svg.paths.construct', attributes: { candles: bars.length } }, () => <>
     <g clipPath={`url(#${areaClipId}-price)`} visibility={priceVisible ? "visible" : "hidden"}>
-    {lineStroke("bollUpper", bollLines.bollUpper, "var(--chart-boll-upper)")}
-    {lineStroke("bollMiddle", bollLines.bollMiddle, "var(--chart-boll-middle)")}
-    {lineStroke("bollLower", bollLines.bollLower, "var(--chart-boll-lower)")}
+    {lineStroke("bollUpper", bollLines.bollUpper, "var(--chart-boll-upper)", "4 2")}
+    {lineStroke("bollMiddle", bollLines.bollMiddle, "var(--chart-boll-middle)", "1.5 2.5")}
+    {lineStroke("bollLower", bollLines.bollLower, "var(--chart-boll-lower)", "6 2 1.5 2")}
     <path d={upWicks} fill="none" stroke="var(--positive)" />
     <path d={downWicks} fill="none" stroke="var(--negative)" />
-    <path data-chart-candle-direction="up" data-chart-candle-fill="solid" d={upBodies} fill="var(--positive)" />
+    <path data-chart-candle-direction="up" data-chart-candle-fill="hollow" d={upBodies} fill="var(--background)" stroke="var(--positive)" />
     <path data-chart-candle-direction="down" data-chart-candle-fill="solid" d={downBodies} fill="var(--negative)" />
     </g>
   </>)
@@ -164,15 +183,15 @@ const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = false, 
   const latestPrice = formatCandleChange(liveBar.open, tag.price)
   const priceDirection = candleChangeDirection(liveBar.open, tag.price)
   const priceLabelBackground = priceDirection === 'up' ? 'var(--positive)' : priceDirection === 'down' ? 'var(--negative)' : 'var(--chart-annotation)'
-  const priceLabelForeground = 'white'
+  const priceLabelForeground = priceDirection === 'flat' ? 'var(--foreground)' : 'var(--change-label-foreground)'
   const priceLabel = chartPriceLabelLayout(latestY, panels.price, chartTokens.textSize, chartTokens.priceLabelPaddingY, liveOverlay)
   // Match the actual plotted series snapshot, including historical navigation;
   // never fill a missing value with a previous candle's indicator.
   const indicatorBar = chartVisibleLastBar(geometry, contentOffset)
   const bollLabelSpecs = [
-    { field: 'bollUpper', name: 'Upper', color: 'var(--chart-boll-upper)' },
-    { field: 'bollMiddle', name: 'Middle', color: 'var(--chart-boll-middle)' },
-    { field: 'bollLower', name: 'Lower', color: 'var(--chart-boll-lower)' },
+    { field: 'bollUpper', name: 'Upper', color: 'var(--chart-boll-upper)', foreground: 'var(--change-label-foreground)' },
+    { field: 'bollMiddle', name: 'Middle', color: 'var(--chart-boll-middle)', foreground: 'white' },
+    { field: 'bollLower', name: 'Lower', color: 'var(--chart-boll-lower)', foreground: 'var(--change-label-foreground)' },
   ] as const
   const bollCandidates = !showBollingerPriceLabels || presentation.base === null || !indicatorBar || !(indicatorBar.open > 0) ? [] : bollLabelSpecs.flatMap(spec => {
     const value = indicatorBar[spec.field]
@@ -226,9 +245,10 @@ const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = false, 
       if (!Number.isFinite(value)) return null
       const markerX = x[index], label = formatHistoricalPrice(value)
       const labelWidth = chartTextWidth(label) + 8
-      const start = index < n / 2 ? markerX + 10 : markerX - labelWidth - 10
+      const placeRight = markerX < (columns.price[0] + right) / 2
+      const start = placeRight ? markerX + 10 : markerX - labelWidth - 10
       return <g key={kind}>
-        <line x1={markerX} x2={index < n / 2 ? markerX + 10 : markerX - 10} y1={priceY(value)} y2={priceY(value)} stroke="var(--foreground)" />
+        <line x1={markerX} x2={placeRight ? markerX + 10 : markerX - 10} y1={priceY(value)} y2={priceY(value)} stroke="var(--foreground)" />
         {lineLabel(start, priceY(value), label, "var(--foreground)")}
       </g>
     })}
@@ -236,9 +256,9 @@ const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = false, 
       </g>
     </g>
     <g clipPath={`url(#${areaClipId}-time-axis)`}>
-      {timeLabels.map(tick => <text data-chart-time-label key={tick.hour} x={tick.x} y={height - 6} textAnchor={tick.anchor} fill={tick.major ? 'var(--foreground)' : 'var(--muted-foreground)'} fontWeight={tick.major ? 700 : 400}>{tick.label}</text>)}
+      {timeLabels.map(tick => <text data-chart-time-label key={tick.hour} x={tick.x} y={panels.price[1] + chartTokenNumber('--chart-bottom-axis-height') / 2} dominantBaseline="middle" textAnchor={tick.anchor} fill={tick.major ? 'var(--foreground)' : 'var(--muted-foreground)'} fontWeight={tick.major ? 700 : 400}>{tick.label}</text>)}
     </g>
-    {inspectedTime && <g data-chart-inspected-time><rect x={inspectedTimeX} y={height - chartTokenNumber('--chart-bottom-axis-height')} width={inspectedTimeWidth} height={chartTokenNumber('--chart-bottom-axis-height') - 1} rx={3} fill="var(--chart-annotation)" /><text x={inspectedTimeX + inspectedTimeWidth / 2} y={height - 6} textAnchor="middle" fill="var(--foreground)">{inspectedTime}</text></g>}
+    {inspectedTime && <g data-chart-inspected-time><rect x={inspectedTimeX} y={height - chartTokenNumber('--chart-bottom-axis-height')} width={inspectedTimeWidth} height={chartTokenNumber('--chart-bottom-axis-height') - 1} rx={3} fill="var(--chart-annotation)" /><text x={inspectedTimeX + inspectedTimeWidth / 2} y={panels.price[1] + chartTokenNumber('--chart-bottom-axis-height') / 2} dominantBaseline="middle" textAnchor="middle" fill="var(--foreground)">{inspectedTime}</text></g>}
     {priceInViewport && <line data-chart-live-price x1={columns.price[0]} x2={right} y1={latestY} y2={latestY} stroke={latestColor} strokeDasharray="4 5" />}
     <g clipPath={`url(#${areaClipId}-price-axis)`} data-chart-price-axis>
     {presentation.ticks.map(({ y, label }, index) => {
@@ -249,11 +269,11 @@ const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = false, 
       </g>
     })}
     </g>
-    {bollLabels.map(({ field, name, color, y, labelY, top, bottom, value, label }) => <g key={field} data-chart-boll-label={field} data-chart-boll-price={value} data-chart-boll-hour={indicatorBar?.hour}>
+    {bollLabels.map(({ field, name, color, foreground, y, labelY, top, bottom, value, label }) => <g key={field} data-chart-boll-label={field} data-chart-boll-price={value} data-chart-boll-hour={indicatorBar?.hour}>
       <title>{`Bollinger ${name}: ${label} from candle open`}</title>
       {Math.abs(y - labelY) > 0.5 && <path d={`M ${right - 8} ${y} L ${right} ${labelY}`} fill="none" stroke={color} />}
       <rect x={right} y={top} width={gutter} height={bottom - top} fill={color} />
-      <text x={axisStarts.price} y={labelY} dominantBaseline="middle" fill="white">{label}</text>
+      <text x={axisStarts.price} y={labelY} dominantBaseline="middle" fill={foreground}>{label}</text>
     </g>)}
     {priceInViewport && <g data-chart-price-label data-chart-price-direction={priceDirection}>
       <title>{`Change from candle open ${latestPrice} · ${priceDirection === 'flat' ? 'unchanged' : priceDirection} · ${liveOverlay ? 'Forming candle' : 'Candle'}`}</title>
@@ -330,12 +350,14 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
   const [zoom, setZoom] = useState<{ spacing: number; offset: number } | null>(null)
   const zoomRef = useRef(zoom)
   const lastSourceBar = surface?.liveBar?.hour ?? surface?.bars.at(-1)?.hour
-  const sharedEnd = sync?.value ? sharedChartEnd(sync.value, Date.now()) : null
+  const syncValue = sync?.value ?? null
+  const syncGutter = sync?.gutter
+  const sharedEnd = syncValue ? sharedChartEnd(syncValue, syncValue.observedAt) : null
   const hasSync = sync !== null
-  const viewport = useMemo(() => sync?.value && sharedEnd !== null && lastSourceBar !== undefined
-    ? { ...sharedChartViewport(sharedEnd, sync.value.spacing, intervalMS, lastSourceBar), fixedGutter: sync.gutter }
-    : hasSync ? { ...(zoom ?? { spacing: CHART_DEFAULT_SPACING, offset: 0 }), fixedGutter: sync?.gutter }
-      : zoom ?? { spacing: CHART_DEFAULT_SPACING, offset: 0 }, [hasSync, sync?.value, sync?.gutter, sharedEnd, lastSourceBar, intervalMS, zoom])
+  const viewport = useMemo(() => syncValue && sharedEnd !== null && lastSourceBar !== undefined
+    ? { ...sharedChartViewport(sharedEnd, syncValue.spacing, intervalMS, lastSourceBar), fixedGutter: syncGutter }
+    : hasSync ? { ...(zoom ?? { spacing: CHART_DEFAULT_SPACING, offset: 0 }), fixedGutter: syncGutter }
+      : zoom ?? { spacing: CHART_DEFAULT_SPACING, offset: 0 }, [hasSync, syncValue, syncGutter, sharedEnd, lastSourceBar, intervalMS, zoom])
   const [wheelFraction, setWheelFraction] = useState(0)
   const [wheelOwner, setWheelOwner] = useState<{ session: object; instId: string; timeframe: RadarTimeframe; generation: number } | null>(null)
   const wheelOwnerRef = useRef<typeof wheelOwner>(null)
@@ -361,37 +383,45 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     // Do not navigate that fresh frame into history while waiting for its live update.
     const nearNow = now >= last && now - last <= 2 * intervalMS
     const spacing = plotGeometry.barPitch
-    const end = live ? sharedChartLiveEnd(last, intervalMS, Math.max(last, Math.min(surface.priceObservedAt ?? now, last + intervalMS)), spacing)
+    const observed = Math.max(last, Math.min(surface.priceObservedAt ?? now, last + intervalMS))
+    const end = live ? sharedChartLiveEnd(last, intervalMS, observed, spacing)
       : nearNow ? now : plotGeometry.endHour + intervalMS * 0.34
-    sync.setValue(current => current ?? { end, spacing, follow: true, liveEnd: end, observedAt: now, advancing: false, oldest: 0 })
+    const liveAnchor = live ? { lastBar: last, interval: intervalMS, observed } : undefined
+    sync.setValue(current => current ?? { end, spacing, follow: true, liveEnd: end, observedAt: now, advancing: false, oldest: 0, ...(liveAnchor ? { liveAnchor } : {}) })
   }, [sync, timeframe, surface, matchesSelection, plotGeometry, intervalMS])
   useLayoutEffect(() => {
-    if (!sync?.value || !matchesSelection || !surface?.liveBar || !surface.priceObservedAt) return
+    if (!syncValue || !matchesSelection || !surface?.liveBar || !surface.priceObservedAt) return
     const last = surface.liveBar.hour
-    const observed = sharedChartLiveEnd(last, intervalMS, Math.max(last, Math.min(surface.priceObservedAt, last + intervalMS)), sync.value.spacing)
-    sync.setValue(current => !current || observed <= current.liveEnd ? current : {
-      ...current, end: current.follow ? observed : current.end, liveEnd: observed, observedAt: surface.priceObservedAt!, advancing: false,
+    const observedTime = Math.max(last, Math.min(surface.priceObservedAt, last + intervalMS))
+    const observed = sharedChartLiveEnd(last, intervalMS, observedTime, syncValue.spacing)
+    sync?.setValue(current => !current || observed <= current.liveEnd ? current : {
+      ...current,
+      end: current.follow ? observed : current.end,
+      liveEnd: observed,
+      observedAt: surface.priceObservedAt!,
+      advancing: false,
+      liveAnchor: { lastBar: last, interval: intervalMS, observed: observedTime },
     })
-  }, [sync, timeframe, matchesSelection, surface, intervalMS])
+  }, [sync, syncValue, matchesSelection, surface, intervalMS])
   useLayoutEffect(() => {
-    if (!sync?.value || !view.historyExhausted || view.oldestHour === null) return
+    if (!syncValue || !view.historyExhausted || view.oldestHour === null) return
     const oldest = view.oldestHour
-    sync.setValue(current => !current || oldest <= current.oldest ? current : {
+    sync?.setValue(current => !current || oldest <= current.oldest ? current : {
       ...current, oldest, end: Math.max(oldest, current.end),
     })
-  }, [sync, view.historyExhausted, view.oldestHour])
+  }, [sync, syncValue, view.historyExhausted, view.oldestHour])
   useLayoutEffect(() => {
-    if (!sync?.value || sharedEnd === null || !isActive) return
+    if (!syncValue || sharedEnd === null || !isActive) return
     const current = chartController.getSnapshot()
     if (!current.requested || current.latestEnd === null) return
     // Following uses each native latest cursor even if the first cached frame
     // predates the next live update. Otherwise initialization can accidentally
     // turn a stale startup frame into a permanent historical request.
-    const target = sync.value.follow ? current.latestEnd : Math.min(current.latestEnd, Math.floor(sharedEnd / intervalMS) * intervalMS)
+    const target = syncValue.follow ? current.latestEnd : Math.min(current.latestEnd, Math.floor(sharedEnd / intervalMS) * intervalMS)
     const currentEnd = current.requested.end ?? current.latestEnd
     const steps = Math.round((target - currentEnd) / intervalMS)
     if (steps) chartController.scroll(steps)
-  }, [chartController, sync?.value, sharedEnd, intervalMS, isActive, view.latestEnd, view.requested])
+  }, [chartController, syncValue, sharedEnd, intervalMS, isActive, view.latestEnd, view.requested])
   const [inspection, setInspection] = useState<{ instId: string; timeframe: RadarTimeframe; hour: number } | null>(null)
   const inspectedIndex = inspection?.instId === surface?.instId && inspection?.timeframe === surface?.timeframe ? bars.findIndex(bar => bar.hour === inspection?.hour) : -1
   const inspected = inspectedIndex >= 0 ? inspectedIndex : null
@@ -423,7 +453,9 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
   // Do not include the measured geometry or shared gutter in this epoch:
   // both change as the shared width converges. New market data, navigation,
   // fractional scrolling, and size changes invalidate the measurement.
-  const gutterEpoch = useMemo(() => ({ window: displayedIndicators.window, sync: sync?.value, fraction: activeWheelFraction, width: plotSize.width, height: plotSize.height, instId, timeframe, showBollingerPriceLabels }), [displayedIndicators.window, sync?.value, activeWheelFraction, plotSize.width, plotSize.height, instId, timeframe, showBollingerPriceLabels])
+  const plotGeometryRef = useRef(plotGeometry)
+  useLayoutEffect(() => { plotGeometryRef.current = plotGeometry }, [plotGeometry])
+  const gutterEpoch = useMemo(() => ({ window: displayedIndicators.window, sync: syncValue, fraction: activeWheelFraction, width: plotSize.width, height: plotSize.height, instId, timeframe, showBollingerPriceLabels }), [displayedIndicators.window, syncValue, activeWheelFraction, plotSize.width, plotSize.height, instId, timeframe, showBollingerPriceLabels])
   const reportGutter = sync?.reportGutter
   useLayoutEffect(() => {
     if (!reportGutter) return
@@ -546,8 +578,9 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
       wheelScheduler.schedule(() => {
         const amount = zoomPixels.current
         zoomPixels.current = 0
-        if (!getPresentation().active) return
-        sync.setValue(current => current ? sharedChartGesture(current, 'zoom', amount, plotGeometry.layout.right - plotGeometry.layout.left, intervalMS, anchor, Date.now()) : current)
+        const currentGeometry = plotGeometryRef.current
+        if (!getPresentation().active || !currentGeometry) return
+        sync.setValue(current => current ? sharedChartGesture(current, 'zoom', amount, currentGeometry.layout.right - currentGeometry.layout.left, intervalMS, anchor, Date.now()) : current)
         endInspection()
       })
       return
@@ -590,8 +623,9 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
       wheelScheduler.schedule(() => {
         const progress = wheelBatch.current.consume(0)
         const amount = progress.steps * CHART_WHEEL_PIXELS_PER_BAR + progress.remainderPixels
-        if (!getPresentation().active) return
-        sync.setValue(current => current ? sharedChartGesture(current, 'pan', amount, plotGeometry.layout.right - plotGeometry.layout.left, intervalMS, 0.5, Date.now()) : current)
+        const currentGeometry = plotGeometryRef.current
+        if (!getPresentation().active || !currentGeometry) return
+        sync.setValue(current => current ? sharedChartGesture(current, 'pan', amount, currentGeometry.layout.right - currentGeometry.layout.left, intervalMS, 0.5, Date.now()) : current)
         endInspection()
       })
       return
@@ -667,18 +701,24 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
   if (!statusMessages.length && error) statusMessages.push('Chart update failed')
   if (historical && !inspectedBar && active) statusMessages.push(`Window end ${time(active.hour)}`)
   if (priceScale === 'unavailable' && surface) statusMessages.push('Price scale unavailable')
-  const statusLoading = !error && ((pending) || priceState === 'loading' || priceState === 'partial' || priceState === 'stale')
-    || surface?.indicatorState === 'loading'
   const statusSummary = statusMessages.join(' · ')
   const sharedError = [
     error ? 'Chart update failed. Check the data service and try again.' : '',
     priceState === 'error' ? 'Price history could not be loaded. Check the market connection and data service.' : '',
     surface?.indicatorState === 'error' ? 'Indicators could not be calculated. Check the data service.' : '',
   ].filter(Boolean).join(' · ')
+  const { oiSamples, takerSamples } = useMemo(() => {
+    let oi = 0, taker = 0
+    for (const bar of bars) {
+      if (bar.oi !== null) oi += 1
+      if (bar.buy !== null && bar.sell !== null) taker += 1
+    }
+    return { oiSamples: oi, takerSamples: taker }
+  }, [bars])
   const inspectionReadout = active && <div id={readoutId} data-chart-inspection-readout hidden={inspectedBar === undefined} aria-live="off" className='pointer-events-none absolute left-0 right-0 top-0 z-10 flex flex-wrap gap-x-3 bg-background/90 px-4 text-xs'>
     <p className="min-w-0 truncate" data-chart-inspected-hour={inspectedBar?.hour}><span className="text-muted-foreground">{inspectedBar === undefined ? historical ? 'Window end' : 'Latest' : 'Selected'}</span> {time(active.hour)}</p>
     {([['Open', active.open], ['High', active.high], ['Low', active.low], ['Close', active.close]] as const).map(([label, value]) => {
-      const text = label === 'Close' && active === surface?.liveBar ? formatCurrentPrice(value, currentPriceTickSz) : formatHistoricalPrice(value)
+      const text = label === 'Close' && active.confirmed === false && active.hour === surface?.liveBar?.hour ? formatCurrentPrice(value, currentPriceTickSz) : formatHistoricalPrice(value)
       return <div key={label} data-chart-ohlc={label.toLowerCase()} className="min-w-0"><span className="text-muted-foreground">{label} </span><span title={text}>{text}</span></div>
     })}
     {inspectedBar && priceOverlays.map(({ label, value }) => <div key={label} data-chart-inspection-indicator={label}>
@@ -686,11 +726,11 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
     </div>)}
   </div>
   return <section data-chart-workspace aria-label="Market chart workspace" className="flex h-full min-h-0 w-full min-w-0 flex-col overflow-hidden overscroll-none text-sm font-normal tabular-nums">
-    {onStatus && <SharedChartStatus timeframe={timeframe} summary={sharedError ? '' : statusSummary} error={sharedError} warning={priceState === 'stale' || priceState === 'partial' || priceState === 'unavailable' || surface?.indicatorState === 'unavailable'} loading={statusLoading} observedAt={surface?.priceObservedAt} realtime={surface?.realtimeState} active={windowVisible && presentation.active} historical={historical} onStatus={onStatus} />}
+    {onStatus && <SharedChartStatus timeframe={timeframe} summary={sharedError ? '' : statusSummary} error={sharedError} warning={priceState === 'stale' || priceState === 'partial' || priceState === 'unavailable' || surface?.indicatorState === 'unavailable'} observedAt={surface?.priceObservedAt} realtime={surface?.realtimeState} active={windowVisible && presentation.active} historical={historical} onStatus={onStatus} />}
     <div className="flex min-h-0 flex-1">
-    <section ref={chartRef} data-chart-inst={displayedId} data-chart-indicator-state={surface?.indicatorState} data-chart-indicator-stale={displayedIndicators.stale} data-chart-indicator-input={surface?.indicatorStatus?.inputVersion} data-chart-time-end={plotGeometry ? plotGeometry.endHour + intervalMS * 0.34 - wheelContentOffset / plotGeometry.barPitch * intervalMS : undefined} data-chart-time-start={plotGeometry ? plotGeometry.endHour + intervalMS * 0.34 - (plotGeometry.layout.right - plotGeometry.layout.left + wheelContentOffset) / plotGeometry.barPitch * intervalMS : undefined} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={surface?.windowBars ?? 96} data-chart-visible-bars={visibleBars} data-chart-bar-spacing={viewport.spacing} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={priceState} data-chart-statistics-state={surface?.oiState === 'error' || surface?.takerState === 'error' ? 'error' : surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={bars.filter(bar => bar.oi !== null).length} data-chart-taker-samples={bars.filter(bar => bar.buy !== null && bar.sell !== null).length} data-chart-incomplete={priceState !== 'ready' || surface?.indicatorState !== 'ready' || oiState !== 'ready' || takerState !== 'ready' ? 'true' : 'false'} data-chart-loading={pending ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
+    <section ref={chartRef} data-chart-inst={displayedId} data-chart-indicator-state={surface?.indicatorState} data-chart-indicator-stale={displayedIndicators.stale} data-chart-indicator-input={surface?.indicatorStatus?.inputVersion} data-chart-time-end={plotGeometry ? plotGeometry.endHour + intervalMS * 0.34 - wheelContentOffset / plotGeometry.barPitch * intervalMS : undefined} data-chart-time-start={plotGeometry ? plotGeometry.endHour + intervalMS * 0.34 - (plotGeometry.layout.right - plotGeometry.layout.left + wheelContentOffset) / plotGeometry.barPitch * intervalMS : undefined} data-chart-start={bars[0]?.hour} data-chart-end={bars.at(-1)?.hour} data-chart-completed-end={surface?.endHour} data-chart-cache-start={view.oldestHour ?? undefined} data-chart-requested-end={requestedEnd ?? undefined} data-chart-rendered-bars={bars.length} data-chart-target-bars={surface?.windowBars ?? 96} data-chart-visible-bars={visibleBars} data-chart-bar-spacing={viewport.spacing} data-chart-visual-stale={surface && !matchesSelection ? 'true' : 'false'} data-chart-candle-state={priceState} data-chart-statistics-state={surface?.oiState === 'error' || surface?.takerState === 'error' ? 'error' : surface?.oiState === 'loading' || surface?.takerState === 'loading' ? 'loading' : surface?.oiState === 'unavailable' || surface?.takerState === 'unavailable' ? 'unavailable' : surface ? 'ready' : 'loading'} data-chart-statistics-end={surface?.endHour} data-chart-oi-state={oiState} data-chart-taker-state={takerState} data-chart-oi-samples={oiSamples} data-chart-taker-samples={takerSamples} data-chart-incomplete={priceState !== 'ready' || surface?.indicatorState !== 'ready' || oiState !== 'ready' || takerState !== 'ready' ? 'true' : 'false'} data-chart-loading={pending ? 'true' : 'false'} aria-label={`${displayedId} chart`} className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
       {inspectionReadout}
-      <div ref={plotRef} data-chart-plot tabIndex={-1} className="relative min-h-0 flex-1 overflow-hidden outline-none" onKeyDown={event => {
+      <div ref={plotRef} data-chart-plot tabIndex={-1} className="relative min-h-0 flex-1 touch-none overflow-hidden outline-none" onKeyDown={event => {
         if (event.key === 'Escape') { endInspection(); return }
       }} onPointerLeave={() => { if (!heldPointer.current) setInspection(null) }} onPointerDown={event => {
         if (event.button !== 0) return
@@ -698,10 +738,10 @@ export const MarketChart = memo(function MarketChart({ instId, tickSz, timeframe
         event.currentTarget.focus({ preventScroll: true })
         const target = (event.target as Element).closest<SVGSVGElement>('svg[data-rendered-inst]')
         if (!matchesSelection || !target || heldPointer.current) return
-        target.setPointerCapture(event.pointerId)
+        try { target.setPointerCapture(event.pointerId) } catch { /* Detached or synthetic pointer. */ }
         heldPointer.current = { pointerId: event.pointerId, target }
         inspectAt(target, event.clientX)
-      }} onPointerUp={endInspection} onPointerCancel={releaseInspection} onLostPointerCapture={releaseInspection} onPointerMove={event => {
+      }} onPointerUp={endInspection} onPointerCancel={endInspection} onLostPointerCapture={endInspection} onPointerMove={event => {
         const held = heldPointer.current
         if (!held || !matchesSelection || held.pointerId !== event.pointerId) return
         if (!(event.buttons & 1)) { endInspection(); return }

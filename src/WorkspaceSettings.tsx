@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { ChevronRight, Database, Settings2, SlidersHorizontal } from 'lucide-react'
-import { Button, buttonVariants } from '@/components/ui/button'
+import { Button } from '@/components/ui/button'
+import { buttonVariants } from '@/components/ui/button-variants'
 import { Field, FieldContent, FieldDescription, FieldError, FieldGroup, FieldLabel, FieldLegend, FieldSet } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { InputGroup, InputGroupAddon, InputGroupInput } from '@/components/ui/input-group'
@@ -64,16 +65,16 @@ function HistoryDownloadSettings({ open, onStatusChange, onJobSnapshot }: { open
   }, [accept])
   useEffect(() => {
     if (!open) return
-    lifecycle.current++
-    setReady(false)
+    const lifecycleRef = lifecycle
+    const activeLifecycle = ++lifecycleRef.current
     const published = (event: Event) => accept((event as CustomEvent<HistoryDownload>).detail)
     window.addEventListener('radar-history-download-changed', published)
     const stop = subscribePresentationTransition(update => {
       if (update.active && update.snapshot) accept(update.snapshot.download)
       else if (update.active && update.epoch > 0) void request('status')
     })
-    if (getPresentation().active && getPresentation().epoch === 0) void request('status')
-    return () => { stop(); window.removeEventListener('radar-history-download-changed', published); lifecycle.current++ }
+    if (getPresentation().active && getPresentation().epoch === 0) queueMicrotask(() => { if (lifecycleRef.current === activeLifecycle) void request('status') })
+    return () => { stop(); window.removeEventListener('radar-history-download-changed', published); lifecycleRef.current++; setReady(false) }
   }, [open, accept, request])
   const { progress, contracts, streams } = download
   const percent = progress.total ? Math.min(100, progress.checked / progress.total * 100) : 0
@@ -148,14 +149,15 @@ type WorkspaceSettingsProps = {
   preferences: Preferences
   loaded: boolean
   loadError: string
-  onSave: (values: Preferences) => Promise<void>
+  onRetryLoad?: () => void
+  onSave: (values: Preferences) => Promise<Preferences | void>
   onNavigationStateChange: (state: SettingsNavigationState) => void
   onStatusChange?: (items: SettingsStatusValue[]) => void
   onJobSnapshot?: (kind: 'audit' | 'download', value: DataAudit | HistoryDownload) => void
 }
 const sectionIcons = { workspace: Settings2, liquidity: SlidersHorizontal, data: Database }
 
-export function WorkspaceSettings({ section, active, preferences, loaded, loadError, onSave, onNavigationStateChange, onStatusChange, onJobSnapshot }: WorkspaceSettingsProps) {
+export function WorkspaceSettings({ section, active, preferences, loaded, loadError, onRetryLoad, onSave, onNavigationStateChange, onStatusChange, onJobSnapshot }: WorkspaceSettingsProps) {
   const [draft, setDraft] = useState(() => preferencesDraft(preferences))
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [saving, setSaving] = useState(false)
@@ -167,28 +169,40 @@ export function WorkspaceSettings({ section, active, preferences, loaded, loadEr
   const scrollPositions = useRef(new Map<SettingsSection, number>())
   const focusAfterValidation = useRef<string | null>(null)
   const previousPreferences = useRef(preferences)
-  const dirty = JSON.stringify(draft) !== JSON.stringify(preferencesDraft(preferences))
-  const dataMounted = visited.has('data') || section === 'data'
-  const preferenceDisabled = saving || !loaded || Boolean(loadError)
-  useEffect(() => {
-    const previous = previousPreferences.current
-    previousPreferences.current = preferences
-    setDraft(current => JSON.stringify(current) === JSON.stringify(preferencesDraft(previous)) ? preferencesDraft(preferences) : current)
-  }, [preferences])
-  useLayoutEffect(() => {
+  const [syncedPreferences, setSyncedPreferences] = useState(preferences)
+  const [wasActive, setWasActive] = useState(active)
+  if (syncedPreferences !== preferences) {
+    setSyncedPreferences(preferences)
+    if (!active || JSON.stringify(draft) === JSON.stringify(preferencesDraft(syncedPreferences))) {
+      setDraft(preferencesDraft(preferences))
+    }
+  }
+  if (wasActive !== active) {
+    setWasActive(active)
     if (!active) {
       setDraft(preferencesDraft(preferences))
       setErrors({}); setSaveError(''); setSavedMessage('')
+    } else if (!visited.has(section)) {
+      setVisited(current => new Set([...current, section]))
+    }
+  } else if (active && !visited.has(section)) {
+    setVisited(current => new Set([...current, section]))
+  }
+  const dirty = JSON.stringify(draft) !== JSON.stringify(preferencesDraft(preferences))
+  const dataMounted = visited.has('data') || section === 'data'
+  const preferenceDisabled = saving || !loaded || Boolean(loadError)
+  useLayoutEffect(() => {
+    previousPreferences.current = preferences
+    if (!active) {
       focusAfterValidation.current = null
       return
     }
-    setVisited(current => current.has(section) ? current : new Set([...current, section]))
     scroll.current?.scrollTo(0, scrollPositions.current.get(section) ?? 0)
     if (focusAfterValidation.current) {
       document.getElementById(focusAfterValidation.current)?.focus()
       focusAfterValidation.current = null
     }
-  }, [active, section])
+  }, [active, section, preferences])
   useLayoutEffect(() => { onNavigationStateChange({ dirty: active && dirty, busy: saving }) }, [active, dirty, saving, onNavigationStateChange])
   useEffect(() => () => onNavigationStateChange({ dirty: false, busy: false }), [onNavigationStateChange])
   const [audit, setAudit] = useState<DataAudit>(emptyAudit)
@@ -205,29 +219,30 @@ export function WorkspaceSettings({ section, active, preferences, loaded, loadEr
     setAudit(value); setAuditStatusError('')
     onJobSnapshot?.('audit', value)
   }, [onJobSnapshot])
+  const loadAuditStatus = useCallback(async (lifecycle = auditLifecycle.current) => {
+    const accepted = auditAccepted.current
+    const epoch = getPresentation().epoch
+    setAuditStatusError('')
+    try {
+      const value = await window.radarDesktop.request({ dataAudit: { action: 'status' } })
+      if (lifecycle === auditLifecycle.current && getPresentation().active && epoch === getPresentation().epoch && accepted === auditAccepted.current) acceptAudit(value)
+    } catch {
+      if (lifecycle === auditLifecycle.current && getPresentation().active && epoch === getPresentation().epoch && accepted === auditAccepted.current) setAuditStatusError('Audit status unavailable. Check the data service and retry.')
+    }
+  }, [acceptAudit])
   useEffect(() => {
     if (!dataMounted) return
-    const lifecycle = ++auditLifecycle.current
-    setAuditBusy(false); setAuditError(''); setAuditStatusError('')
+    const lifecycleRef = auditLifecycle
+    const lifecycle = ++lifecycleRef.current
     const published = (event: Event) => acceptAudit((event as CustomEvent<DataAudit>).detail)
     window.addEventListener('radar-audit-changed', published)
-    const status = async () => {
-      const accepted = auditAccepted.current
-      const epoch = getPresentation().epoch
-      try {
-        const value = await window.radarDesktop.request({ dataAudit: { action: 'status' } })
-        if (lifecycle === auditLifecycle.current && getPresentation().active && epoch === getPresentation().epoch && accepted === auditAccepted.current) acceptAudit(value)
-      } catch {
-        if (lifecycle === auditLifecycle.current && getPresentation().active && epoch === getPresentation().epoch && accepted === auditAccepted.current) setAuditStatusError('Audit status unavailable. Check the data service and reopen Data settings.')
-      }
-    }
     const stop = subscribePresentationTransition(update => {
       if (update.active && update.snapshot) acceptAudit(update.snapshot.audit)
-      else if (update.active && update.epoch > 0) void status()
+      else if (update.active && update.epoch > 0) void loadAuditStatus(lifecycle)
     })
-    if (getPresentation().active && getPresentation().epoch === 0) void status()
-    return () => { stop(); window.removeEventListener('radar-audit-changed', published); auditLifecycle.current++ }
-  }, [dataMounted, acceptAudit])
+    if (getPresentation().active && getPresentation().epoch === 0) void loadAuditStatus(lifecycle)
+    return () => { stop(); window.removeEventListener('radar-audit-changed', published); lifecycleRef.current++; setAuditBusy(false); setAuditError(''); setAuditStatusError('') }
+  }, [dataMounted, acceptAudit, loadAuditStatus])
   const auditAction = async (action: 'start' | 'cancel' | 'repair') => {
     const lifecycle = auditLifecycle.current
     const sequence = ++auditSequence.current
@@ -244,7 +259,9 @@ export function WorkspaceSettings({ section, active, preferences, loaded, loadEr
     setDraft(current => ({ ...current, [key]: value })); setErrors(current => ({ ...current, [key]: '' })); setSaveError(''); setSavedMessage('')
   }
   const save = async () => {
-    const checked = validatePreferencesDraft(draft)
+    let checked
+    try { checked = validatePreferencesDraft(draft) }
+    catch { setSaveError('Could not validate settings. Discard changes and try again.'); return }
     setErrors(checked.errors); setSaveError(''); setSavedMessage('')
     if (!checked.values) {
       const key = Object.keys(checked.errors)[0]
@@ -255,7 +272,11 @@ export function WorkspaceSettings({ section, active, preferences, loaded, loadEr
       return
     }
     setSaving(true)
-    try { await onSave(checked.values); setDraft(preferencesDraft(checked.values)); setSavedMessage('Settings saved.') }
+    try {
+      const saved = await onSave(checked.values)
+      setDraft(preferencesDraft(saved ?? checked.values))
+      setSavedMessage('Settings saved.')
+    }
     catch { setSaveError('Could not save settings. Check the data service and retry.') }
     finally { setSaving(false) }
   }
@@ -305,7 +326,7 @@ export function WorkspaceSettings({ section, active, preferences, loaded, loadEr
           <FieldGroup>
             <Field orientation="horizontal" data-disabled={preferenceDisabled} className="justify-between gap-6">
               <FieldContent className="self-center"><FieldLabel htmlFor="show-bollinger-price-labels">Bollinger price labels</FieldLabel></FieldContent>
-              <Switch id="show-bollinger-price-labels" className="self-center" checked={draft.showBollingerPriceLabels} disabled={preferenceDisabled} onCheckedChange={checked => { setDraft(current => ({ ...current, showBollingerPriceLabels: checked })); setSavedMessage('') }} />
+              <Switch id="show-bollinger-price-labels" className="self-center" checked={draft.showBollingerPriceLabels} disabled={preferenceDisabled} onCheckedChange={checked => { setDraft(current => ({ ...current, showBollingerPriceLabels: checked })); setSaveError(''); setSavedMessage('') }} />
             </Field>
           </FieldGroup>
         </FieldSet>
@@ -323,12 +344,12 @@ export function WorkspaceSettings({ section, active, preferences, loaded, loadEr
                 <InputGroup className="w-52 shrink-0 self-center">
                 <InputGroupInput id={`threshold-${field.key}`} name={`threshold-${field.key}`} aria-label={field.parameterLabel} autoComplete="off" type="number" inputMode="decimal" step="any" value={draft.liquidity[field.key].threshold} aria-invalid={Boolean(errors[field.key])} aria-describedby={[field.description && `description-${field.key}`, errors[field.key] && `error-${field.key}`].filter(Boolean).join(' ') || undefined} onChange={event => {
                   const threshold = event.target.value
-                  setDraft(current => ({ ...current, liquidity: { ...current.liquidity, [field.key]: { ...current.liquidity[field.key], threshold } } })); setErrors(current => ({ ...current, [field.key]: '' })); setSavedMessage('')
+                  setDraft(current => ({ ...current, liquidity: { ...current.liquidity, [field.key]: { ...current.liquidity[field.key], threshold } } })); setErrors(current => ({ ...current, [field.key]: '' })); setSaveError(''); setSavedMessage('')
                 }} />
                 <InputGroupAddon align="inline-start" aria-hidden="true">{field.parameter === 'minUSDT' ? '>' : '<'}</InputGroupAddon>
                 {field.parameter !== 'maxRatio' && <InputGroupAddon align="inline-end" aria-hidden="true">{field.parameter === 'minUSDT' ? 'USDT' : '%'}</InputGroupAddon>}
                 </InputGroup>
-                <Switch id={`condition-${field.key}`} aria-labelledby={`condition-label-${field.key}`} className="self-center" checked={draft.liquidity[field.key].enabled} onCheckedChange={enabled => setDraft(current => ({ ...current, liquidity: { ...current.liquidity, [field.key]: { ...current.liquidity[field.key], enabled } } }))} />
+                <Switch id={`condition-${field.key}`} aria-labelledby={`condition-label-${field.key}`} className="self-center" checked={draft.liquidity[field.key].enabled} onCheckedChange={enabled => { setDraft(current => ({ ...current, liquidity: { ...current.liquidity, [field.key]: { ...current.liquidity[field.key], enabled } } })); setSaveError(''); setSavedMessage('') }} />
               </Field>
               {field.key === 'slippage' && <FieldGroup>{numericField('slippageNotional', 'Slippage trade size (USDT)')}</FieldGroup>}
             </FieldGroup>)}
@@ -343,14 +364,15 @@ export function WorkspaceSettings({ section, active, preferences, loaded, loadEr
           <FieldSet disabled={preferenceDisabled} aria-label="Audit range"><FieldGroup>
             {numericField('historyDays', 'Data audit lookback (days)')}
           </FieldGroup></FieldSet>
-          {audit.phase !== 'validating' && <Progress aria-label="Data audit progress" value={audit.progress.total ? audit.progress.completed / audit.progress.total * 100 : 0} />}
+          {audit.phase !== 'validating' && <Progress aria-label="Data audit progress" value={audit.progress.total ? Math.min(100, Math.max(0, audit.progress.completed / audit.progress.total * 100)) : 0} />}
           <div className="flex flex-wrap gap-2">
             <Button type="button" variant="outline" onClick={() => void auditAction('start')} disabled={auditBusy || audit.phase === 'running' || audit.phase === 'validating'}>Start audit</Button>
             <Button type="button" variant="outline" onClick={() => void auditAction('cancel')} disabled={auditBusy || (audit.phase !== 'running' && audit.phase !== 'validating')}>Cancel audit</Button>
             <Button type="button" variant="outline" onClick={() => void auditAction('repair')} disabled={auditBusy || audit.phase === 'running' || audit.phase === 'validating' || !audit.issues.some(issue => issue.repairable)}>Repair issues</Button>
+            {auditStatusError && <Button type="button" variant="outline" onClick={() => void loadAuditStatus()} disabled={auditBusy}>Retry status</Button>}
           </div>
           {audit.issues.length > 0 && <ul className="flex max-h-48 flex-col gap-2 overflow-y-auto text-sm" aria-label="Data audit issues">{audit.issues.map((issue, index) => <li key={`${issue.instrument}-${issue.timeframe}-${issue.from}-${index}`}>
-            <strong>{issue.instrument} · {issue.timeframe}</strong><p>{new Date(issue.from).toLocaleString('en-US')} – {new Date(issue.through).toLocaleString('en-US')}</p><p>{issue.reason} · {issue.repairable ? 'Repairable' : 'Review required'}</p>
+            <strong>{issue.instrument} · {issue.timeframe}</strong><p>{downloadTime(issue.from)} – {downloadTime(issue.through)}</p><p>{issue.reason} · {issue.repairable ? 'Repairable' : 'Review required'}</p>
           </li>)}</ul>}
         </FieldSet>
               </div>
@@ -358,7 +380,7 @@ export function WorkspaceSettings({ section, active, preferences, loaded, loadEr
           </div>
         </div>
         <footer className="shrink-0 border-t px-12 py-4"><div className="mx-auto flex w-full max-w-3xl items-center justify-between gap-4">
-          <span />
+          <div>{loadError && onRetryLoad && <Button type="button" variant="outline" onClick={onRetryLoad}>Retry loading settings</Button>}</div>
           <div className="flex gap-2"><Button type="button" variant="outline" disabled={preferenceDisabled || !dirty} onClick={() => { setDraft(preferencesDraft(preferences)); setErrors({}); setSaveError(''); setSavedMessage('') }}>Discard changes</Button><Button type="submit" form="workspace-settings-form" disabled={preferenceDisabled}>{saving && <Spinner data-icon="inline-start" />}Save settings</Button></div>
         </div></footer>
       </div>

@@ -18,6 +18,7 @@ export class LiveStatistics {
   constructor(options = {}) {
     this.now = options.now ?? Date.now
     if (typeof this.now !== 'function') throw new TypeError('now must be a function.')
+    this.maxClockSkewMS = Number.isSafeInteger(options.maxClockSkewMS) && options.maxClockSkewMS >= 0 ? options.maxClockSkewMS : 0
     this.instruments = new Map()
     this.watermark = 0
   }
@@ -27,7 +28,7 @@ export class LiveStatistics {
     this.watermark = Math.max(this.watermark, receivedAt)
     let state = this.instruments.get(instId)
     if (!state && create) {
-      state = { active: null, coverage: [], trades: new Map(), interest: new Map(), replay: new Map(), retiredThrough: null, unsequencedEviction: false, prunedAt: null }
+      state = { active: null, coverage: [], trades: new Map(), interest: new Map(), replay: new Map(), retiredThrough: null, unsequencedRetiredThrough: null, prunedAt: null }
       this.instruments.set(instId, state)
     }
     if (state) this.prune(state)
@@ -83,7 +84,7 @@ export class LiveStatistics {
     for (const raw of rows) {
       const time = typeof raw?.ts === 'string' && raw.ts.trim() ? Number(raw.ts) : raw?.ts
       if (raw?.instId !== undefined && raw.instId !== instId) continue
-      if (!timestamp(time) || time > receivedAt) { this.tradeBucket(state, receivedAt).valid = false; continue }
+      if (!timestamp(time) || time > receivedAt + this.maxClockSkewMS) { this.tradeBucket(state, receivedAt).valid = false; continue }
       if (time < state.active || time < this.watermark - RETENTION_MS) continue
       const bucket = this.tradeBucket(state, time)
       if (!raw || !['buy', 'sell'].includes(raw.side) || typeof raw.tradeId !== 'string' || !raw.tradeId.trim() || !amount(raw.sz)) {
@@ -106,13 +107,13 @@ export class LiveStatistics {
       // watermark. An older unseen ID could be either a replay or a missing
       // trade; invalidate that period instead of guessing which it represents.
       if (sequence !== null && state.retiredThrough !== null && sequence <= state.retiredThrough
-        || sequence === null && state.unsequencedEviction) { bucket.valid = false; continue }
+        || sequence === null && state.unsequencedRetiredThrough !== null && time <= state.unsequencedRetiredThrough) { bucket.valid = false; continue }
       state.replay.set(raw.tradeId, { fingerprint, timestamp: time, sequence })
       if (state.replay.size > TRADE_REPLAY_LIMIT) {
         const oldest = state.replay.entries().next().value
         state.replay.delete(oldest[0])
         const retired = oldest[1].sequence
-        if (retired === null) state.unsequencedEviction = true
+        if (retired === null) state.unsequencedRetiredThrough = Math.max(state.unsequencedRetiredThrough ?? -Infinity, oldest[1].timestamp)
         else if (state.retiredThrough === null || retired > state.retiredThrough) state.retiredThrough = retired
       }
       bucket.latestTimestamp = Math.max(bucket.latestTimestamp, time)
@@ -137,7 +138,7 @@ export class LiveStatistics {
     const state = this.state(instId, receivedAt, true)
     const time = typeof raw?.ts === 'string' && raw.ts.trim() ? Number(raw.ts) : raw?.ts
     if (!state || !raw || raw.instId !== undefined && raw.instId !== instId || !timestamp(time)
-      || time > receivedAt || time < this.watermark - RETENTION_MS || !amount(raw.oi)) return
+      || time > receivedAt + this.maxClockSkewMS || time < this.watermark - RETENTION_MS || !amount(raw.oi)) return
     const key = period(time), sample = { timestamp: time, value: Number(raw.oi) }
     const previous = state.interest.get(key)
     // All chart closes are on the five-minute grid. Keep the final sample

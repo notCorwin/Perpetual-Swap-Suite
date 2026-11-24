@@ -14,7 +14,6 @@ Batch initialization and incremental updates use the same formulas. Confirmed st
 | --- | --- |
 | EMA(200) | First value is the mean of the first 200 closes of a contiguous run. Subsequent values are `close × 2/201 + previousEMA × 199/201`. |
 | BOLL(20,2) | Middle is the arithmetic mean of 20 closes. Population deviation is `sqrt(sum((close − mean)²)/20)`. Upper/lower are `mean ± 2 × deviation`. A negative lower band is a valid result; the chart uses a linear price axis when a nonpositive band cannot be plotted logarithmically. |
-| VWAP(14) | Rolling `sum(((high + low + close)/3) × baseVolume) / sum(baseVolume)` across 14 candles. Base volume is OKX candle `volCcy`, not contract count or quote amount. Missing/negative quantity or a zero total gives no value. This is a candle typical-price approximation, not tick-level execution VWAP. |
 | ROC(9) | Signed relative change of the current close from the close nine candles earlier. First valid value is the tenth candle. |
 | MAROC(9) | Arithmetic mean of nine consecutive valid ROC(9) values. First valid value is candle 18. Missing ROC cannot be treated as zero. |
 | RSI(6/12/24) | Seed mean positive/negative close changes over the period; continue with Wilder smoothing `(previous × (period−1) + current)/period`. Both means zero gives 50; only loss zero gives 100; only gain zero gives 0. First valid sample needs `period + 1` closes. |

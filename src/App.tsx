@@ -97,12 +97,17 @@ function App() {
       setReady(true)
     }
     setError(snapshot.error)
-    setCatalog(current => ({
-      loading: snapshot.loading ?? ('unchanged' in snapshot ? current.loading : false),
-      catalogSource: snapshot.catalogSource ?? current.catalogSource,
-      catalogProgress: snapshot.catalogProgress ?? ('unchanged' in snapshot ? current.catalogProgress : undefined),
-    }))
-    if (!('unchanged' in snapshot) || snapshot.catalogSource !== undefined || snapshot.catalogProgress !== undefined || snapshot.loading !== undefined) setStatus(collectorStatus(snapshot))
+    setCatalog(current => {
+      const next = {
+        loading: snapshot.loading ?? ('unchanged' in snapshot ? current.loading : false),
+        catalogSource: snapshot.catalogSource ?? current.catalogSource,
+        catalogProgress: snapshot.catalogProgress ?? ('unchanged' in snapshot ? current.catalogProgress : undefined),
+      }
+      if (!('unchanged' in snapshot) || snapshot.catalogSource !== undefined || snapshot.catalogProgress !== undefined || snapshot.loading !== undefined) {
+        setStatus(collectorStatus({ ...snapshot, ...next }))
+      }
+      return next
+    })
     if (snapshot.updatedAt !== undefined) updatedAt.current = snapshot.updatedAt
     if (snapshot.catalogProgress !== undefined) lastCatalogProgress.current = snapshot.catalogProgress
     if (snapshot.realtimeState) setRealtime(snapshot.realtimeState)
@@ -171,14 +176,15 @@ function App() {
     return () => window.removeEventListener('radar-preferences-changed', receive)
   }, [])
   useEffect(() => {
+    if (!presentation.active || preferencesLoaded) return
     let stopped = false
     const write = preferenceWrite.current
-    const epoch = getPresentation().epoch
+    const epoch = presentation.epoch
     window.radarDesktop.request({ preferences: { action: 'read' } }).then(value => {
       if (!stopped && getPresentation().active && epoch === getPresentation().epoch && write === preferenceWrite.current) { setPreferences(value); setPreferencesError('') }
     }).catch(cause => { if (!stopped && getPresentation().active && epoch === getPresentation().epoch && write === preferenceWrite.current) setPreferencesError(message(cause)) }).finally(() => { if (!stopped && getPresentation().active && epoch === getPresentation().epoch) setPreferencesLoaded(true) })
     return () => { stopped = true }
-  }, [])
+  }, [presentation.active, presentation.epoch, preferencesLoaded])
   useEffect(() => {
     if (!preferencesLoaded) return
     let stopped = false
@@ -207,9 +213,13 @@ function App() {
     }
     const changed = () => { void load() }
     window.addEventListener('radar-market-changed', changed)
+    const stopPresentation = subscribePresentationTransition(update => {
+      if (update.active && !update.snapshot && queued) void load()
+    })
     void load()
     return () => {
       stopped = true
+      stopPresentation()
       window.removeEventListener('radar-market-changed', changed)
     }
   }, [preferencesLoaded, applyMarket])
@@ -241,15 +251,20 @@ function App() {
   }, [])
   const retainedChart = Boolean(selected && !selectedRow)
   const selectedID = selected
+  const selectContract = useCallback((id: string) => {
+    retainSelection.current = false
+    setSelected(id)
+  }, [])
   const focusChartAfterSelection = useRef(false)
   const selectFromChart = useCallback((id: string) => {
+    retainSelection.current = false
     focusChartAfterSelection.current = true
     setSelected(id)
   }, [])
   useLayoutEffect(() => {
-    if (!focusChartAfterSelection.current) return
+    if (!focusChartAfterSelection.current || !selectedID) return
     focusChartAfterSelection.current = false
-    document.querySelector<SVGElement>('[data-timeframe-panel="1H"] [data-chart-plot]')?.focus({ preventScroll: true })
+    document.querySelector<HTMLElement>('[data-timeframe-panel="1H"] [data-chart-plot]')?.focus({ preventScroll: true })
   }, [selectedID])
   const connectionProblem = !['live', 'connected'].includes(realtime.toLowerCase())
   const connectionFailure = ['reconnecting', 'disconnected', 'unavailable'].includes(realtime.toLowerCase())
@@ -257,6 +272,8 @@ function App() {
   useEffect(() => { if (ready) void chartCoordinator.setUniverse(retainedChart && selectedID ? [...candidateIds, selectedID] : candidateIds, timeframe) }, [ready, candidateIds, timeframe, retainedChart, selectedID])
   const screenshotOwner = useRef<object | null>(null)
   const screenshotPending = useRef(false)
+  const toastSequence = useRef(0)
+  const [toast, setToast] = useState<ToastIssue[]>([])
   const [copyState, setCopyState] = useState<{ error: string }>({ error: '' })
   const [screenshotSuccess, setScreenshotSuccess] = useState(0)
   const [shutter, setShutter] = useState(0)
@@ -286,7 +303,7 @@ function App() {
     } catch {
       if (screenshotOwner.current === owner) {
         const detail = 'Could not copy the screenshot. Check the clipboard and try again.'
-        const issue = { id: 'copy', label: 'Screenshot', detail, severity: 'error', instance: ++toastSequence.current }
+        const issue = { id: 'copy', label: 'Screenshot', detail, severity: 'error', instance: -(++toastSequence.current) }
         setCopyState({ error: detail })
         setToast(shown => [...shown.slice(0, 3), ...[...shown.slice(3), issue].sort((a, b) => Number(b.severity === 'error') - Number(a.severity === 'error'))].slice(0, 32))
       }
@@ -332,15 +349,14 @@ function App() {
   const rankedIssues = [...issues].sort((a, b) => ({ error: 0, warning: 1, info: 2 }[a.severity] - { error: 0, warning: 1, info: 2 }[b.severity]))
   const toastIssues = rankedIssues.filter(issue => issue.id !== 'copy' && (issue.id !== 'catalog' || status === 'Unavailable' || status === 'Cached') && issue.severity !== 'info' && (issue.id !== 'connection' || connectionFailure))
   const toastKey = JSON.stringify(toastIssues.map(({ id, label, detail, severity }) => ({ id, label, detail, severity })))
-  const previousToastIssues = useRef(new Map<string, string>())
-  const toastSequence = useRef(0)
-  const [toast, setToast] = useState<ToastIssue[]>([])
-  useEffect(() => {
+  const [trackedToast, setTrackedToast] = useState<{ key: string; signatures: Record<string, string>; sequence: number }>({ key: '[]', signatures: {}, sequence: 0 })
+  if (trackedToast.key !== toastKey) {
     const current = JSON.parse(toastKey) as Omit<ToastIssue, 'instance'>[]
     const signature = (issue: Omit<ToastIssue, 'instance'>) => JSON.stringify([issue.label, issue.detail, issue.severity])
-    const added = current.filter(issue => previousToastIssues.current.get(issue.id) !== signature(issue))
-    previousToastIssues.current = new Map(current.map(issue => [issue.id, signature(issue)]))
-    const instances = added.map(issue => ({ ...issue, instance: ++toastSequence.current }))
+    const added = current.filter(issue => trackedToast.signatures[issue.id] !== signature(issue))
+    const nextSignatures = Object.fromEntries(current.map(issue => [issue.id, signature(issue)]))
+    const instances = added.map((issue, index) => ({ ...issue, instance: trackedToast.sequence + index + 1 }))
+    setTrackedToast({ key: toastKey, signatures: nextSignatures, sequence: trackedToast.sequence + instances.length })
     setToast(shown => {
       // A connection warning describes current price freshness. Do not show it
       // after recovery, especially if it was waiting behind other panels.
@@ -350,7 +366,7 @@ function App() {
       const pending = [...remaining.slice(3), ...instances].sort((a, b) => Number(b.severity === 'error') - Number(a.severity === 'error'))
       return [...visible, ...pending].slice(0, 32)
     })
-  }, [toastKey])
+  }
   const logStatus = status.startsWith('Verifying ') ? 'Verifying' : status.startsWith('Updating ') ? 'Updating' : status
   const logIssues = rankedIssues.filter(issue => issue.id !== 'catalog' && issue.severity !== 'info').map(issue => `${issue.label}: ${issue.detail}`)
   if (globalAudit && globalAudit.phase !== 'idle') logIssues.push(`Data audit phase: ${globalAudit.phase}`)
@@ -399,15 +415,15 @@ function App() {
                 </div>
                 <Button data-window-no-drag data-screenshot-button aria-label="Screenshot" variant="ghost" size="sm" className="border-0 text-muted-foreground" onClick={() => { void screenshot() }}><Camera className="size-[var(--ui-line-height)]" data-icon="inline-start" aria-hidden="true" />Screenshot</Button>
               </header>
-              <ChartTimeSyncProvider key={selectedID}><div className="grid min-h-0 flex-1 grid-rows-2 gap-2 p-2 pt-0" data-multi-timeframe-charts>
+              <ChartTimeSyncProvider resetKey={selectedID}><div className="grid min-h-0 flex-1 grid-rows-2 gap-2 p-2 pt-0" data-multi-timeframe-charts>
                 <div className="flex min-h-0 min-w-0 gap-2">
                 <div data-market-panel className="flex min-h-0 w-[max(var(--market-list-min-width),var(--market-list-share))] min-w-0 shrink-0 flex-col overflow-hidden rounded-lg border bg-background">
                   <aside data-market-list className="flex min-h-0 flex-1 flex-col" aria-label="Contract list">
       <section data-market-scroll className="min-h-0 flex-1 overflow-y-auto [&>[data-slot=table-container]]:overflow-visible" aria-label="Perpetual swap markets">
         <Table className="table-fixed [&_tr:not([data-virtual-spacer])>:first-child]:pl-4 [&_tr:not([data-virtual-spacer])>:last-child]:pr-4" data-market-count={visible.length} data-total-market-count={rows.length} aria-rowcount={visible.length + 1}>
           <colgroup><col className="w-[25%]" /><col className="w-[45%]" /><col className="w-[30%]" /></colgroup>
-          <TableHeader className="sticky top-0 bg-background [&_th]:text-xs [&_th]:text-muted-foreground"><TableRow className="hover:bg-transparent"><TableHead>Contract</TableHead><TableHead className="text-right">Price</TableHead><TableHead className="text-right" aria-sort="other" aria-label="1-hour candle change By magnitude" title="Sorted by absolute current 1-hour candle change, largest first"><span>1h Δ%</span></TableHead></TableRow></TableHeader>
-          {visible.length ? <MarketRowsViewport ids={visibleIds}>{index => <MarketRowView row={visible[index]} index={index} selected={visible[index].instId === selectedID} onSelect={setSelected} />}</MarketRowsViewport> : <TableBody><TableRow><TableCell colSpan={3}>
+          <TableHeader className="sticky top-0 bg-background [&_th]:text-xs [&_th]:text-muted-foreground"><TableRow aria-rowindex={1} className="hover:bg-transparent"><TableHead>Contract</TableHead><TableHead className="text-right">Price</TableHead><TableHead className="text-right" aria-sort="other" aria-label="1-hour candle change by magnitude" title="Sorted by absolute current 1-hour candle change, largest first"><span>1h Δ%</span></TableHead></TableRow></TableHeader>
+          {visible.length ? <MarketRowsViewport ids={visibleIds}>{index => <MarketRowView row={visible[index]} index={index} selected={visible[index].instId === selectedID} onSelect={selectContract} />}</MarketRowsViewport> : <TableBody><TableRow><TableCell colSpan={3}>
             <Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{emptyDescription}</EmptyDescription></EmptyHeader></Empty>
           </TableCell></TableRow></TableBody>}
         </Table>

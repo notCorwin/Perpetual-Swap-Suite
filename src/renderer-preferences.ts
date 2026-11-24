@@ -1,6 +1,6 @@
-import { validatePreferences } from '../electron/services/preferences.js'
+import { CHART_PRIMARY_TIMEFRAME, DEFAULT_PREFERENCES, validatePreferences } from '../electron/services/preferences.js'
 import type { Preferences } from '../electron/services/preferences.js'
-export { CHART_PRIMARY_TIMEFRAME, DEFAULT_PREFERENCES } from '../electron/services/preferences.js'
+export { CHART_PRIMARY_TIMEFRAME, DEFAULT_PREFERENCES }
 export type { Preferences }
 export type LiquidityKey = keyof Preferences['liquidity']
 export const LIQUIDITY_FIELDS: { key: LiquidityKey; label: string; description?: string; parameter: 'maxPercent' | 'minUSDT' | 'maxRatio'; parameterLabel: string }[] = [
@@ -20,10 +20,20 @@ export type PreferencesDraft = {
   slippageNotional: string
 }
 export function preferencesDraft(value: Preferences): PreferencesDraft {
+  const source = value ?? DEFAULT_PREFERENCES
+  const liquiditySource = source.liquidity ?? DEFAULT_PREFERENCES.liquidity
   return {
-    chartDisplayMode: value.chartDisplayMode, showBollingerPriceLabels: value.showBollingerPriceLabels, rankingLookback: String(value.rankingLookback), historyDays: String(value.historyDays),
-    liquidity: Object.fromEntries(LIQUIDITY_FIELDS.map(field => [field.key, { enabled: value.liquidity[field.key].enabled, threshold: String((value.liquidity[field.key] as unknown as Record<string, number>)[field.parameter]) }])) as PreferencesDraft['liquidity'],
-    slippageNotional: String(value.liquidity.slippage.notionalUSDT),
+    chartDisplayMode: source.chartDisplayMode ?? DEFAULT_PREFERENCES.chartDisplayMode,
+    showBollingerPriceLabels: Boolean(source.showBollingerPriceLabels ?? DEFAULT_PREFERENCES.showBollingerPriceLabels),
+    rankingLookback: String(source.rankingLookback ?? DEFAULT_PREFERENCES.rankingLookback),
+    historyDays: String(source.historyDays ?? DEFAULT_PREFERENCES.historyDays),
+    liquidity: Object.fromEntries(LIQUIDITY_FIELDS.map(field => {
+      const rule = liquiditySource[field.key] ?? DEFAULT_PREFERENCES.liquidity[field.key]
+      const fallback = DEFAULT_PREFERENCES.liquidity[field.key]
+      const threshold = (rule as unknown as Record<string, number>)[field.parameter] ?? (fallback as unknown as Record<string, number>)[field.parameter]
+      return [field.key, { enabled: Boolean(rule.enabled), threshold: String(threshold) }]
+    })) as PreferencesDraft['liquidity'],
+    slippageNotional: String(liquiditySource.slippage?.notionalUSDT ?? DEFAULT_PREFERENCES.liquidity.slippage.notionalUSDT),
   }
 }
 export function validatePreferencesDraft(draft: PreferencesDraft): { values?: Preferences; errors: Record<string, string> } {
@@ -43,8 +53,8 @@ export function validatePreferencesDraft(draft: PreferencesDraft): { values?: Pr
     [field.parameter]: number(field.key, draft.liquidity[field.key].threshold, Number.MIN_VALUE),
   }])) as Preferences['liquidity']
   // An inactive condition retains valid parameters so it can be enabled later.
-  for (const field of LIQUIDITY_FIELDS) if (errors[field.key] && field.parameter !== 'minUSDT') errors[field.key] = 'Enter a number greater than 0.'
-  if (liquidity.volumeStability.maxRatio <= 1) errors.volumeStability = 'Enter a ratio greater than 1.'
+  for (const field of LIQUIDITY_FIELDS) if (errors[field.key]) errors[field.key] = field.parameter === 'maxRatio' ? 'Enter a ratio greater than 1.' : 'Enter a number greater than 0.'
+  if (!Number.isFinite(liquidity.volumeStability.maxRatio) || liquidity.volumeStability.maxRatio <= 1) errors.volumeStability = 'Enter a ratio greater than 1.'
   liquidity.slippage.notionalUSDT = number('slippageNotional', draft.slippageNotional, Number.MIN_VALUE)
   if (errors.slippageNotional) errors.slippageNotional = 'Enter a trade size greater than 0.'
   return { values: Object.keys(errors).length ? undefined : validatePreferences({ chartDisplayMode: draft.chartDisplayMode, showBollingerPriceLabels: draft.showBollingerPriceLabels, rankingLookback, historyDays, liquidity }), errors }

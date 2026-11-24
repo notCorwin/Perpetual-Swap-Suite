@@ -70,7 +70,7 @@ function buildGeometry(sourceBars: readonly Bar[], options: ChartGeometryOptions
   if (barSpacing !== undefined) {
     // Reserve the measured label gutter monotonically within this layout pass.
     // Only axes are recalculated if an edge candle leaves; paths are built once.
-    for (;;) {
+    for (let pass = 0; pass < 8; pass += 1) {
       windowBars = chartPitchSpan(Math.max(0, width - 4 - gutter), barSpacing)
       const first = endHour - (windowBars - 1) * intervalMS
       const inRange = sourceBars.filter(bar => bar.hour > first - chartPitchBodyWidth(barSpacing) / barSpacing * intervalMS && bar.hour < endHour + chartPitchBodyWidth(barSpacing) / barSpacing * intervalMS)
@@ -83,8 +83,8 @@ function buildGeometry(sourceBars: readonly Bar[], options: ChartGeometryOptions
       bars = visible
       const visibleLive = liveClose !== undefined && sourceBars.at(-1)!.hour <= endHour ? liveClose : bars.at(-1)!.close
       axes = axesFor(bars, { ...options, liveClose: visibleLive })
-      const nextGutter = options.fixedGutter ?? Math.max(gutter, axes.gutter)
-      if (nextGutter === gutter) break
+      const nextGutter = options.fixedGutter ?? (Number.isFinite(axes.gutter) ? Math.max(gutter, axes.gutter) : gutter)
+      if (!Number.isFinite(nextGutter) || nextGutter === gutter) break
       gutter = nextGutter
     }
   }

@@ -206,7 +206,7 @@ try {
         const measured = await measure()
         assert.deepEqual(measured.semantics.positive, [68, 151, 130])
         assert.deepEqual(measured.semantics.negative, [223, 72, 76])
-        assert.equal(measured.semantics.upFill, 'solid')
+        assert.equal(measured.semantics.upFill, 'hollow')
         assert.equal(measured.semantics.downFill, 'solid')
         for (const expectedBackground of [measured.semantics.positive, measured.semantics.negative]) {
           const label = measured.texts.find(item => item.text.endsWith('%') && item.background.every((value, index) => value === expectedBackground[index]))

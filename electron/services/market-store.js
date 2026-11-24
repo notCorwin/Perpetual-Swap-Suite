@@ -216,7 +216,7 @@ function dequeue(bucket) {
 /** A bounded set of database connections; SQLite work never runs on Electron's event loop. */
 class DatabaseWorkers {
   constructor(workers, onMutation) {
-    this.workers = workers
+    this.workers = [...workers]
     this.onMutation = onMutation
     this.buckets = emptyPriorityBuckets()
     this.queuedCount = 0
@@ -227,39 +227,53 @@ class DatabaseWorkers {
     this.failed = null
     this.closing = false
     this.metrics = { requests: 0, completed: 0, failed: 0, maximumQueued: 0, rowsReturned: 0, durationMS: 0 }
-    for (const worker of workers) {
-      worker.busy = false
-      worker.on('message', message => {
-        if (message.ready) return
-        const job = worker.current
-        if (!job || job.id !== message.id) return
-        worker.current = null; worker.currentLifetime = null; worker.busy = false
-        if (message.error) {
-          this.metrics.failed += 1
-          const error = new Error(message.error.message); error.name = message.error.name; error.code = message.error.code
-          job.reject(error)
-        } else {
-          this.metrics.completed += 1; this.metrics.durationMS += message.durationMS ?? 0
-          if (Array.isArray(message.result)) this.metrics.rowsReturned += message.result.length
-          if (message.mutations?.length) this.onMutation?.(message.mutations, message.durationMS)
-          job.resolve(message.result)
-        }
-        this.drain()
-        if (!worker.busy) worker.unref()
-      })
-      worker.on('error', error => this.fail(error))
-      worker.on('exit', code => {
-        if (worker.currentLifetime) {
-          const fence = new Int32Array(worker.currentLifetime.buffer)
-          Atomics.store(fence, 1, 0); Atomics.notify(fence, 1)
-          worker.currentLifetime = null
-        }
-        if (!this.closing) this.fail(new Error(`Market database worker exited (${code}).`))
-      })
-      worker.unref()
+    for (const worker of this.workers) this.attachWorker(worker)
+  }
+  attachWorker(worker) {
+    worker.busy = false; worker.exited = false
+    worker.on('message', message => {
+      if (message.ready) return
+      const job = worker.current
+      if (!job || job.id !== message.id) return
+      worker.current = null; worker.currentLifetime = null; worker.busy = false
+      if (message.error) {
+        this.metrics.failed += 1
+        const error = new Error(message.error.message); error.name = message.error.name; error.code = message.error.code
+        job.reject(error)
+      } else {
+        this.metrics.completed += 1; this.metrics.durationMS += message.durationMS ?? 0
+        if (Array.isArray(message.result)) this.metrics.rowsReturned += message.result.length
+        if (message.mutations?.length) this.onMutation?.(message.mutations, message.durationMS)
+        job.resolve(message.result)
+      }
+      this.drain()
+      if (!worker.busy && !worker.exited) worker.unref()
+    })
+    const handleWorkerLoss = error => {
+      if (worker.lost) return
+      worker.lost = true
+      if (this.closing) {
+        const current = worker.current
+        worker.current = null; worker.busy = false
+        current?.reject(error)
+        return
+      }
+      this.fail(error)
     }
+    worker.on('error', error => handleWorkerLoss(error))
+    worker.on('exit', code => {
+      worker.exited = true
+      if (worker.currentLifetime) {
+        const fence = new Int32Array(worker.currentLifetime.buffer)
+        Atomics.store(fence, 1, 0); Atomics.notify(fence, 1)
+        worker.currentLifetime = null
+      }
+      handleWorkerLoss(new Error(`Market database worker exited (${code}).`))
+    })
+    worker.unref()
   }
   fail(error) {
+    if (this.failed) return
     this.failed = error
     for (const fence of this.fences.splice(0)) fence.reject(error)
     for (const worker of this.workers) { worker.current?.reject(error); worker.current = null; worker.busy = false }
@@ -328,29 +342,40 @@ class DatabaseWorkers {
         worker.currentLifetime = args[1]?.lifetime ?? null
         job.dispatch(worker, { id: job.id, command: job.command, args })
       }
-      catch (error) { worker.current = null; worker.busy = false; worker.unref(); job.reject(error); queueMicrotask(() => this.drain()) }
+      catch (error) { worker.current = null; worker.currentLifetime = null; worker.busy = false; worker.unref(); job.reject(error); queueMicrotask(() => this.drain()) }
     }
   }
   async close() {
     // The owner joins admitted work before calling this method.
     await Promise.allSettled([...this.tasks])
     this.closing = true
+    const workers = [...this.workers]
     try {
-      await Promise.all(this.workers.map(worker => new Promise((resolve, reject) => {
+      await Promise.allSettled(workers.filter(worker => !worker.exited && worker.threadId !== -1).map(worker => new Promise((resolve, reject) => {
         const id = ++this.nextID
-        const request = createWorkerRequest('market-store', 'close', resolve, reject)
+        const timer = setTimeout(() => {
+          if (worker.current?.id === id) { worker.current = null; worker.busy = false }
+          reject(new Error('Market database worker close timed out.'))
+        }, 5_000)
+        timer.unref?.()
+        const settle = fn => value => { clearTimeout(timer); fn(value) }
+        const request = createWorkerRequest('market-store', 'close', settle(resolve), settle(reject))
         worker.current = { id, ...request }; worker.busy = true; worker.ref()
-        request.dispatch(worker, { id, command: 'close', args: [] })
+        try { request.dispatch(worker, { id, command: 'close', args: [] }) }
+        catch (error) { clearTimeout(timer); worker.current = null; worker.busy = false; reject(error) }
       })))
-    } finally { await Promise.all(this.workers.map(worker => worker.terminate())) }
+    } finally { await Promise.allSettled(workers.filter(worker => !worker.exited).map(worker => worker.terminate())) }
   }
 }
 
 async function createDatabaseWorker(path, reader = false) {
   const worker = createOperationWorker(new URL('./market-store-worker.js', import.meta.url), { workerData: { path, reader } }, reader ? 'market-reader' : 'market-writer')
   await new Promise((resolve, reject) => {
-    const ready = message => { if (message.ready) { worker.off('error', reject); worker.off('message', ready); resolve() } }
-    worker.on('message', ready); worker.once('error', reject)
+    const cleanup = () => { worker.off('message', ready); worker.off('error', fail); worker.off('exit', exited) }
+    const ready = message => { if (message.ready) { cleanup(); resolve() } }
+    const fail = error => { cleanup(); reject(error) }
+    const exited = code => { cleanup(); reject(new Error(`Market database worker exited before ready (${code}).`)) }
+    worker.on('message', ready); worker.once('error', fail); worker.once('exit', exited)
   })
   return worker
 }
@@ -359,10 +384,16 @@ export class MarketStore {
   static async open(root) {
     await mkdir(root, { recursive: true })
     const path = join(root, 'market.sqlite'), writer = await createDatabaseWorker(path)
-    let readers
-    try { readers = await Promise.all([createDatabaseWorker(path, true), createDatabaseWorker(path, true)]) }
-    catch (error) { await writer.terminate(); throw error }
-    return new MarketStore(root, path, writer, readers)
+    const results = await Promise.allSettled([createDatabaseWorker(path, true), createDatabaseWorker(path, true)])
+    const failed = results.find(result => result.status === 'rejected')
+    if (failed) {
+      await Promise.allSettled([
+        writer.terminate(),
+        ...results.filter(result => result.status === 'fulfilled').map(result => result.value.terminate()),
+      ])
+      throw failed.reason
+    }
+    return new MarketStore(root, path, writer, results.map(result => result.value))
   }
 
   constructor(root, path, writer, readers) {
@@ -601,8 +632,11 @@ export class MarketStore {
     this.candleReads.clear()
     this.closeTask = (async () => {
       await Promise.allSettled([...this.operations])
-      await this.readers.close()
-      await this.writer.close()
+      const errors = []
+      try { await this.readers.close() } catch (error) { errors.push(error) }
+      try { await this.writer.close() } catch (error) { errors.push(error) }
+      if (errors.length === 1) throw errors[0]
+      if (errors.length > 1) throw new AggregateError(errors, 'MarketStore shutdown failed.')
     })()
     return this.closeTask
   }

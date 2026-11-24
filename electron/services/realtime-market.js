@@ -154,21 +154,23 @@ export class RealtimeMarket {
 
   /** A new source observation or a recovered writer resumes retained revisions. */
   retryPendingConfirmations() {
-    for (const series of this.series.values()) if (series.pendingConfirmations.size) {
+    for (const [key, series] of this.series) if (series.pendingConfirmations.size) {
       series.commitDemand++
-      this.drainConfirmations(series)
+      this.drainConfirmations(series, key)
     }
   }
 
-  drainConfirmations(series) {
+  drainConfirmations(series, key = null) {
     if (series.commitTask || !series.pendingConfirmations.size) return
+    const isCurrent = () => key === null ? [...this.series.values()].includes(series) : this.series.get(key) === series
     const task = Promise.resolve().then(async () => {
-      while (series.pendingConfirmations.size) {
+      while (series.pendingConfirmations.size && isCurrent()) {
         const [fingerprint, entry] = series.pendingConfirmations.entries().next().value
         const demand = series.commitDemand
         try {
           await this.options.onConfirmed(copy(entry.candle), entry.context)
         } catch (error) {
+          if (!isCurrent()) { this.commitFailures.delete(series); break }
           series.failedDemand = demand
           const detail = error instanceof Error ? error.message : String(error)
           this.commitFailures.set(series, `Confirmed candle persistence failed. ${detail}`)

@@ -38,6 +38,8 @@ const OBSERVATION_TTL = 90_000
 const TICKER_BOOTSTRAP_MS = 10_000
 const CANDLE_DELIVERY_MS = 10_000
 const CATALOG_RENEW_INTERVAL = 30_000
+// Intentional 30-second hysteresis buffer: prevents contracts oscillating at
+// liquidity thresholds from flickering in and out of the visible list.
 const LIST_REMOVAL_DELAY_MS = 30_000
 const REQUEST_TIMEOUT = 12_000
 const RETRY_DELAYS = [1_000]
@@ -999,6 +1001,7 @@ export class MarketService {
         // Choose at admission time so newly queued chart/qualification work
         // passes downloads that were waiting for the endpoint's rate budget.
         const request = this.nextQueuedRequest(lane, allowMaintenance)
+        if (!request) { await this.waitRequestLane(lane, 1); continue }
         request.bucket.nextAt = Date.now() + lane.interval
         lane.queue.bucketChanged(request.bucket)
         this.activeRequests.add(request)
@@ -1023,13 +1026,14 @@ export class MarketService {
   }
 
   get(path, parameters, requestSignal, priority = 'foreground', { getPriority, subscribePriority } = {}) {
-    if (this.disposed || requestSignal?.aborted) throw new Error('Market service is closed.')
+    if (this.disposed) return Promise.reject(new Error('Market service is closed.'))
+    if (requestSignal?.aborted) return Promise.reject(requestSignal.reason ?? Object.assign(new Error('The request was aborted.'), { name: 'AbortError' }))
     if (getPriority && typeof subscribePriority !== 'function') throw new TypeError('Dynamic request priorities require change notifications.')
     const lane = requestLaneFor(path)
     // Independent endpoint budgets reserve capacity for chart and Verify
     // requests. At most one download occupies a lane's concurrent slots.
     const controller = new AbortController()
-    const abort = () => controller.abort()
+    const abort = () => controller.abort(requestSignal?.aborted ? requestSignal.reason : this.shutdownController.signal.reason)
     this.shutdownController.signal.addEventListener('abort', abort, { once: true })
     requestSignal?.addEventListener('abort', abort, { once: true })
     this.abortControllers.add(controller)
@@ -1086,7 +1090,10 @@ export class MarketService {
     const result = await this.enqueueCandleMutation(instrument, async () => {
       if (this.disposed) return false
       const changed = []
-      for (const rows of Map.groupBy(confirmed, row => row.timeframe).values()) changed.push(...await this.appendChangedCandlesLocked(canWrite ? rows.filter(canWrite) : rows, priority, canWrite))
+      for (const rows of Map.groupBy(confirmed, row => row.timeframe).values()) {
+        const eligible = canWrite ? rows.filter(canWrite) : rows
+        if (eligible.length) changed.push(...await this.appendChangedCandlesLocked(eligible, priority, canWrite))
+      }
       if (!changed.length) return false
       this.invalidateLiquidityHistory(instrument, changed)
       this.markChartDataChanged(instrument)
@@ -1095,6 +1102,7 @@ export class MarketService {
       if (base.length) {
         this.candleDerivations.correct(instrument, base)
         const first = Math.min(...base.map(row => row.timestamp)), last = Math.max(...base.map(row => row.timestamp))
+        this.history?.sync?.invalidate({ instrument, timeframe: '5m', source: 'candles', from: first, through: last })
         for (const timeframe of ['15m', '1H']) {
           const step = timeframeMilliseconds(timeframe), from = Math.floor(first / step) * step
           const through = Math.min(Math.floor(last / step) * step, closedBoundary(timeframe) - step)
@@ -1322,7 +1330,7 @@ export class MarketService {
       if (this.tickerSubscriptions.get(instId)?.signal === signal) this.tickerFault(instId, new Error(`Invalid native ticker for ${instId}.`))
       return
     }
-    if (key === 'openInterest' && (number(value.oiUsd) === null || number(value.oiUsd) < 0)) return
+    if (key === 'openInterest' && (number(value?.oiUsd) === null || number(value?.oiUsd) < 0)) return
     this.#markMarketDeadlineDirty(instId)
     observations[key] = { value, source: 'websocket', sourceTimestamp, observedAt: receivedAt, expiresAt: receivedAt + OBSERVATION_TTL }
     this.observations.set(instId, observations)
@@ -1658,7 +1666,7 @@ export class MarketService {
   sampleBook(instId, sample) {
     const instrument = this.instruments.get(instId), config = this.prefs().liquidity, configKey = liquidityConfigKey(config)
     if (!instrument || !this.candidateIDs?.has(instId) || sample.configKey !== configKey) {
-      this.bookSamples.delete(instId); this.scheduleSubscriptions(); return
+      this.bookSamples.delete(instId); this.sourceError?.(`${instId}:book`, null); this.scheduleSubscriptions(); return
     }
     // Wait until retirement has completed, including transport reconciliation.
     if (this.publicRealtime?.subscriptions.has(`books:${instId}`)) {
@@ -1719,7 +1727,10 @@ export class MarketService {
       const priorSample = this.bookSamples.get(instId)
       const liveBookRecovered = priorSample && this.publicRealtime?.subscriptions.has(`books:${instId}`)
         && ['depth', 'slippage'].every(key => !config[key].enabled || record?.result?.checks?.some(check => check.key === key && check.status === 'verified'))
-      if (priorSample && (priorSample.configKey !== configKey || !possible || this.statisticsDemand(instId) || liveBookRecovered)) this.bookSamples.delete(instId)
+      if (priorSample && (priorSample.configKey !== configKey || !possible || this.statisticsDemand(instId) || liveBookRecovered)) {
+        this.bookSamples.delete(instId)
+        this.sourceError?.(`${instId}:book`, null)
+      }
       const interval = this.autoRefresh && possible && !this.statisticsDemand(instId) && !this.bookSamples.has(instId) ? this.bookSampleInterval(record, config) : null
       if (interval !== null) this.bookSamples.set(instId, { configKey, next: now + interval, pending: false })
       const sampling = this.bookSamples.has(instId)
@@ -1734,7 +1745,10 @@ export class MarketService {
       if (this.statisticsDemand(instId)) trades.add(instId)
       if (config.openInterest.enabled || this.statisticsDemand(instId)) openInterest.add(instId)
     }
-    for (const id of this.bookSamples.keys()) if (!ids.has(id) || !(config.depth.enabled || config.slippage.enabled)) this.bookSamples.delete(id)
+    for (const id of this.bookSamples.keys()) if (!ids.has(id) || !(config.depth.enabled || config.slippage.enabled)) {
+      this.bookSamples.delete(id)
+      this.sourceError?.(`${id}:book`, null)
+    }
     this.scheduleBookSamples()
     this.subscriptionDeadlines = new DeadlineIndex(proofDeadlines)
     const previous = this.publicSubscriptionDemand
@@ -2408,15 +2422,16 @@ export class MarketService {
     const validObservations = required.map(fresh)
     const complete = metadataFresh && validObservations.every(Boolean) && (!historicalPending || retained)
     const status = !metadataFresh ? 'unknown' : result.status === 'verified' && complete ? 'verified' : result.status === 'failed' ? 'failed' : 'unknown'
-    const leases = complete ? [continuousMetadata ? { ...instrumentObservation, expiresAt: Number.MAX_SAFE_INTEGER } : instrumentObservation,
+    const leases = complete ? [continuousMetadata ? { observedAt: instrumentObservation?.observedAt ?? now, expiresAt: Number.MAX_SAFE_INTEGER } : instrumentObservation,
       ...required.map((key, index) => ({ observedAt: validObservations[index].observedAt, expiresAt: this.observationExpiry(validObservations[index], key, instrument.instId) }))] : []
+    const observedAt = leases.length ? Math.min(...leases.map(value => value.observedAt)) : now
+    const expiresAt = status === 'verified' ? Math.max(observedAt, Math.min(...leases.map(value => value.expiresAt))) : Math.max(observedAt, now)
     const record = this.catalogRecord({ instrument, ...(instrumentObservation ? { instrumentObservation } : {}),
       ticker: fresh('ticker')?.value ?? {}, result: { ...result, eligible: status === 'verified' },
       status, configKey, observations: { ...assessed }, observationErrors: errors,
       preferencesRevision: this.catalogChecks.get(instrument.instId)?.preferencesRevision ?? 0,
       renewalTarget: status === 'verified' || status === 'unknown' && this.renewalTargets.has(instrument.instId),
-      observedAt: leases.length ? Math.min(...leases.map(value => value.observedAt)) : now,
-      expiresAt: status === 'verified' ? Math.min(...leases.map(value => value.expiresAt)) : now }, now)
+      observedAt, expiresAt }, now)
     this.rememberHistoricalAssessment(record, now, true)
     return record
   }
@@ -2865,13 +2880,22 @@ export class MarketService {
       for (const timeframe of CHART_TIMEFRAMES) {
         const key = `${instId}:${timeframe}`
         this.liveSourceRevisions.set(key, (this.liveSourceRevisions.get(key) ?? 0) + 1)
+        this.liveReceivedAt.delete(key)
+        this.liquidityHistoryRevisions.delete(key)
       }
       for (const recovery of this.sourceRecoveries.values()) if (recovery.instId === instId) this.cancelRequiredRecovery(recovery.key)
       this.tickerSubscriptions.delete(instId)
       this.cancelTickerRecovery(instId)
       this.clearTickerFault(instId)
+      this.sourceError(`${instId}:book`, null)
       this.#markMarketDeadlineDirty(instId)
+      this.instruments.delete(instId)
       this.observations.delete(instId)
+      this.historicalWindows.delete(instId)
+      this.nativeBookDeadlines.delete(instId)
+      this.bookGenerations.delete(instId)
+      this.dataRevisions.delete(instId)
+      this.listPrefixAttempts.delete(instId)
       this.bookRetirements.delete(instId)
       this.books.invalidate(instId)
       this.#markMarketDeadlineDirty(instId)
@@ -3164,7 +3188,10 @@ export class MarketService {
       const existing = currentID ? audit.get(currentID) : null
       if (existing && ['queued', 'running'].includes(existing.status)) return structuredClone(this.auditReport)
       const preferences = this.prefs(), targets = []
-      for (const instrument of this.instruments.values()) for (const timeframe of CHART_TIMEFRAMES) {
+      const auditInstruments = this.catalog.size > 0
+        ? [...this.catalog.values()].map(entry => this.instruments.get(entry.instrument.instId) ?? entry.instrument)
+        : [...this.instruments.values()]
+      for (const instrument of auditInstruments) for (const timeframe of CHART_TIMEFRAMES) {
         const step = timeframeMilliseconds(timeframe), through = closedBoundary(timeframe) - step
         const listedAt = Number(instrument.listTime), horizon = Math.max(0, through - preferences.historyDays * 86_400_000 + step - 200 * step)
         const from = Number.isFinite(listedAt) && listedAt > 0 ? Math.max(horizon, Math.ceil(listedAt / step) * step) : horizon
@@ -3268,7 +3295,8 @@ export class MarketService {
     this.downloadListeners.clear()
     this.qualificationQueue.clear()
     this.disposeTask = (async () => {
-      try { await this.ready } catch { if (this.ownsMetadata) this.metadata?.close(); return }
+      let readyFailed = false
+      try { await this.ready } catch { readyFailed = true }
       const failures = []
       const settle = async operations => {
         const results = await Promise.allSettled(operations.map(operation => Promise.resolve().then(operation)))
@@ -3276,7 +3304,7 @@ export class MarketService {
       }
       // A confirmed stream event resolves only after its durable write. Drain it before aborting source work.
       await settle([() => this.realtime?.close(), () => this.publicRealtime?.close()])
-      this.candleDerivations.close()
+      this.candleDerivations?.close()
       await settle([() => this.streamLiquidity?.close()])
       this.disposed = true
       this.refreshController?.abort()
@@ -3284,12 +3312,12 @@ export class MarketService {
       for (const controller of this.catalogControllers) controller.abort()
       this.shutdownController.abort()
       for (const controller of this.abortControllers) controller.abort()
-      await settle([() => this.historyDownload.close()])
-      await settle([() => this.history.close()])
-      await settle([() => this.preparedCharts.dispose()])
+      await settle([() => this.historyDownload?.close()])
+      await settle([() => this.history?.close()])
+      await settle([() => this.preparedCharts?.dispose()])
       await Promise.allSettled([this.refreshing, this.renewing, this.drainRequestQueues(), ...this.candidateTasks.values(), ...this.barTasks, ...this.backgroundTasks, ...this.candleMutations.values(), ...this.livePrefixTasks.values()].filter(Boolean))
-      if (this.ownsMetadata) await settle([() => this.metadata.close()])
-      if (failures.length) throw new AggregateError(failures, `Market service shutdown failed: ${failures.map(error => error?.message ?? String(error)).join('; ')}`)
+      if (this.ownsMetadata) await settle([() => this.metadata?.close()])
+      if (!readyFailed && failures.length) throw new AggregateError(failures, `Market service shutdown failed: ${failures.map(error => error?.message ?? String(error)).join('; ')}`)
     })()
     return this.disposeTask
   }

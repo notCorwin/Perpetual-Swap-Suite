@@ -251,6 +251,12 @@ async function createSettingsWindow() {
     }).catch(error => { closing = false; console.error('Settings operation source close failed:', error) })
   })
   target.once('closed', () => { if (settingsWindow === target) settingsWindow = undefined; settingsCloseGuard = { dirty: false, busy: false } })
+  target.webContents.on('render-process-gone', (_event, details) => {
+    console.error('Settings renderer process exited:', details.reason)
+    settingsCloseGuard = { dirty: false, busy: false }
+    rendererOperations?.markIncomplete(target.webContents.id, `settings-renderer-${details.reason}`)
+    if (!shuttingDown && !testMode && details.reason !== 'clean-exit' && !target.isDestroyed()) target.destroy()
+  })
   for (const name of ['will-navigate', 'will-redirect', 'will-frame-navigate']) target.webContents.on(name, event => { if (!security.isAllowedNavigation(event.url)) event.preventDefault() })
   target.webContents.setWindowOpenHandler(({ url }) => {
     if (security.isAllowedExternalURL(url)) void shell.openExternal(url).catch(error => console.error('Could not open external link:', error))
@@ -298,7 +304,7 @@ async function createWindow() {
       preload: join(root, 'electron', 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true },
   })
   if (!testMode && !backgroundTests && !backgroundLaunch) {
-    window.maximize()
+    if (!savedBounds) window.maximize()
     window.show()
   }
   if (backgroundLaunch) window.once('ready-to-show', () => { if (!window.isDestroyed()) window.showInactive() })
@@ -317,14 +323,30 @@ async function createWindow() {
   window.webContents.on('will-navigate', event => { if (!security.isAllowedNavigation(event.url)) event.preventDefault() })
   window.webContents.on('will-redirect', event => { if (!security.isAllowedNavigation(event.url)) event.preventDefault() })
   window.webContents.on('will-frame-navigate', event => { if (!security.isAllowedNavigation(event.url)) event.preventDefault() })
-  window.webContents.on('render-process-gone', (_event, details) => {
-    console.error('Renderer process exited:', details.reason)
-    rendererOperations?.markIncomplete(window.webContents.id, `renderer-${details.reason}`)
-    if (operationRecording) recordOperation({ category: 'cpu', name: 'renderer.interrupted', startedAt: Date.now(), durationMS: 0, status: 'error',
-      attributes: { incomplete: true, execution: 'renderer', reason: details.reason } })
-  })
+  let rendererRecoveries = 0
   let allowClose = false, closing = false
   const target = window
+  target.webContents.on('render-process-gone', (_event, details) => {
+    console.error('Renderer process exited:', details.reason)
+    rendererOperations?.markIncomplete(target.webContents.id, `renderer-${details.reason}`)
+    if (operationRecording) recordOperation({ category: 'cpu', name: 'renderer.interrupted', startedAt: Date.now(), durationMS: 0, status: 'error',
+      attributes: { incomplete: true, execution: 'renderer', reason: details.reason } })
+    if (shuttingDown || testMode || details.reason === 'clean-exit' || target.isDestroyed()) return
+    if (rendererRecoveries < 2) {
+      rendererRecoveries += 1
+      void (rendererURL ? target.loadURL(rendererURL) : target.loadFile(join(root, 'dist', 'index.html'))).catch(error => {
+        console.error('Could not reload window after renderer exit:', error)
+      })
+    } else if (!backgroundTests) {
+      void dialog.showMessageBox(target, { type: 'error', buttons: ['Reload', 'Quit'], defaultId: 0,
+        message: 'The workspace window stopped unexpectedly.', detail: 'Reload the window to restore the market view.' }).then(({ response }) => {
+        if (response === 0 && !target.isDestroyed()) {
+          rendererRecoveries = 0
+          void (rendererURL ? target.loadURL(rendererURL) : target.loadFile(join(root, 'dist', 'index.html')))
+        } else app.quit()
+      })
+    }
+  })
   target.on('close', event => {
     if (allowClose || shuttingDown) { saveWindowBounds(windowStatePath, target); return }
     event.preventDefault()
@@ -392,6 +414,10 @@ async function startDesktop() {
     if (!shuttingDown && window && !window.isDestroyed() && !window.webContents.isDestroyed()) sendNotification(window.webContents, channel, value)
   }
   backend.on('failure', error => { console.error('Market backend failed:', error); send('radar:market-changed') })
+  backend.on('recovered', () => {
+    if (presentation?.desiredActive) void presentation.setActive(true, { refresh: true })
+    send('radar:market-changed')
+  })
   ipcMain.handle('radar:request', handleRequest)
   ipcMain.handle('radar:presentation-state', event => { assertApplicationSender(event); return presentation.getState() })
   ipcMain.on('radar:settings-close-guard', (event, value) => {
@@ -419,6 +445,16 @@ async function startDesktop() {
 
 app.whenReady().then(() => {
   installApplicationMenu()
+  if (!rendererURL) {
+    session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+      if (details.resourceType === 'mainFrame' && security.isTrustedURL(details.url)) {
+        callback({ responseHeaders: { ...details.responseHeaders,
+          'Content-Security-Policy': ["default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"] } })
+        return
+      }
+      callback({ responseHeaders: details.responseHeaders })
+    })
+  }
   if (operationRecording) {
     installElectronOperationHooks({ app, net, session })
     void operationRecording.flush().catch(error => console.error('Operation hook checkpoint failed:', error.message))

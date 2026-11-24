@@ -64,3 +64,13 @@ test('pan uses the active interval and zoom preserves its anchor while sharing t
   const anotherInterval = sharedChartGesture(original, 'pan', -200, width, 300_000, 0.5, now)
   assert.equal(anotherInterval.end, now - 10 * 300_000)
 })
+
+test('zooming out and back in recomputes liveEnd from liveAnchor without permanent rightward drift', () => {
+  const hour = 3_600_000, width = 1000, start = Date.UTC(2026, 10, 20, 12), observed = start + 60_000, spacing = 20
+  const initialLiveEnd = sharedChartLiveEnd(start, hour, observed, spacing)
+  const initial = { end: initialLiveEnd, spacing, liveEnd: initialLiveEnd, observedAt: observed, follow: true, advancing: false, oldest: 0, liveAnchor: { lastBar: start, interval: hour, observed } }
+  const zoomedOut = sharedChartGesture(initial, 'zoom', 50, width, hour, 1, observed)
+  assert.ok(zoomedOut.liveEnd > initialLiveEnd)
+  const zoomedIn = sharedChartGesture(zoomedOut, 'zoom', -50, width, hour, 1, observed)
+  assert.ok(Math.abs(zoomedIn.liveEnd - initialLiveEnd) < 1, 'zooming back in should restore the original liveEnd without drift')
+})

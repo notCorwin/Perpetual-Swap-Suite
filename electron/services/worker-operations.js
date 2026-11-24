@@ -109,7 +109,8 @@ export function createWorkerRequest(role, command, resolve, reject, attributes =
     queue?.end({ status: error ? failureStatus(error) : 'ok' })
     operation?.end({ status: error ? failureStatus(error) : 'ok', attributes: { ...(queueMS === undefined ? {} : { queueMS }), ...(error ? { errorName: error.name } : {}) } })
     requests.get(target)?.delete(request)
-    error ? reject(error) : resolve(value)
+    if (error) reject(error)
+    else resolve(value)
   }
   const request = {
     context: operation?.context,

@@ -205,7 +205,7 @@ class PublicMarketConnection {
     let socket
     try { socket = this.factory(this.url) }
     catch (error) { this.diagnostic('lost', { reason: 'connection_factory_failed' }); this.scheduleReconnect(this.report('WebSocket connection failed.', error)); return }
-    const connection = { socket, sent: new Map(), sessions: new Map(), pending: new Map(), unsubscribing: new Map(), bookRecoveries: new Map(), timers: new Map(), commands: [], commandId: 0, ingress: 0, controller: new AbortController(), ready: false, waitingForPong: false, retired: false, wasReconnect: this.hasOpened }
+    const connection = { socket, sent: new Map(), sessions: new Map(), pending: new Map(), unsubscribing: new Map(), bookRecoveries: new Map(), tickerRecoveries: new Map(), timers: new Map(), commands: [], commandId: 0, ingress: 0, controller: new AbortController(), ready: false, waitingForPong: false, retired: false, wasReconnect: this.hasOpened }
     connection.diagnosticId = ++this.nextConnectionId
     this.connection = connection
     connection.done = new Promise(resolve => { connection.resolveDone = resolve })
@@ -274,7 +274,11 @@ class PublicMarketConnection {
   flushSubscriptions(connection) {
     if (!this.active(connection) || !connection.opened || connection.socket.readyState !== 1) return
     this.clearConnectionTimer(connection, 'control')
-    const due = value => value.channel !== 'books' || (connection.bookRecoveries.get(value.instId)?.retryAt ?? -Infinity) <= this.now()
+    const due = value => value.channel === 'books'
+      ? (connection.bookRecoveries.get(value.instId)?.retryAt ?? -Infinity) <= this.now()
+      : value.channel === 'tickers'
+        ? (connection.tickerRecoveries.get(value.instId)?.retryAt ?? -Infinity) <= this.now()
+        : true
     const removals = [...connection.sent].filter(([key, value]) => this.subscriptions.get(key) !== value || !connection.sessions.has(key))
     for (const [key, pending] of connection.unsubscribing) {
       if (pending.deadline === null && pending.retryAt <= this.now()) removals.push([key, pending.subscription])
@@ -319,6 +323,10 @@ class PublicMarketConnection {
       const key = `books:${instId}`
       return this.subscriptions.has(key) && !connection.sessions.has(key) && !connection.unsubscribing.has(key) && recovery.retryAt > this.now()
     }).map(([, recovery]) => recovery.retryAt)
+    for (const [instId, recovery] of connection.tickerRecoveries) {
+      const key = `tickers:${instId}`
+      if (this.subscriptions.has(key) && !connection.sessions.has(key) && !connection.unsubscribing.has(key) && recovery.retryAt > this.now()) retries.push(recovery.retryAt)
+    }
     for (const pending of connection.unsubscribing.values()) if (pending.deadline === null && pending.retryAt > this.now()) retries.push(pending.retryAt)
     if (retries.length) this.timer(connection, 'control', Math.max(1, Math.min(...retries) - this.now()), () => this.flushSubscriptions(connection))
     this.armAcknowledgement(connection)
@@ -345,10 +353,10 @@ class PublicMarketConnection {
         if (connection.unsubscribing.get(key) === value) {
           this.deferUnsubscription(value, `Public market unsubscribe acknowledgement timed out for ${key}.`)
         } else if (connection.pending.get(key) === value) {
-          if (value.subscription.channel === 'books') this.recoverBook(connection, instId, `Order book subscribe acknowledgement timed out for ${instId}.`)
+          if (value.subscription.channel === 'books') this.recoverBook(connection, instId, `Order book subscribe acknowledgement timed out for ${instId}.`, { flush: false })
           else {
-            this.report(`Ticker subscribe acknowledgement timed out for ${instId}.`)
-            this.recoverSubscription(instId, 'tickers')
+            this.deferTickerRecovery(connection, instId, `Ticker subscribe acknowledgement timed out for ${instId}.`)
+            this.recoverSubscription(instId, 'tickers', { flush: false })
           }
         }
       }
@@ -381,12 +389,21 @@ class PublicMarketConnection {
     if (session?.controller !== connection.controller) session?.controller.abort()
   }
 
-  recoverSubscription(instId, channel) {
+  recoverSubscription(instId, channel, { flush = true } = {}) {
     const connection = this.connection, subscription = this.subscriptions.get(`${channel}:${instId}`)
     if (!connection || !this.active(connection) || !subscription || !connection.sessions.has(keyFor(subscription))) return false
     this.invalidateSubscription(connection, subscription)
-    this.flushSubscriptions(connection)
+    if (flush) this.flushSubscriptions(connection)
     return true
+  }
+
+  deferTickerRecovery(connection, instId, message) {
+    const previous = connection.tickerRecoveries.get(instId)
+    const stable = previous?.healthySince != null && this.now() - previous.healthySince >= this.maxDelay
+    const attempt = !previous || stable ? 1 : previous.attempt + 1
+    const delay = Math.min(this.maxDelay, this.baseDelay * 2 ** Math.min(attempt - 1, 30))
+    connection.tickerRecoveries.set(instId, { attempt, retryAt: this.now() + delay, healthySince: null })
+    this.report(message)
   }
 
   deferBookRecovery(connection, instId, message) {
@@ -400,12 +417,12 @@ class PublicMarketConnection {
     this.report(message)
   }
 
-  recoverBook(connection, instId, message) {
+  recoverBook(connection, instId, message, { flush = true } = {}) {
     const key = `books:${instId}`, subscription = this.subscriptions.get(key)
     if (!this.active(connection) || !subscription || !connection.sessions.has(key)) return
     this.deferBookRecovery(connection, instId, message)
     this.invalidateSubscription(connection, subscription)
-    this.flushSubscriptions(connection)
+    if (flush) this.flushSubscriptions(connection)
   }
 
   maybeLive(connection) {
@@ -478,8 +495,8 @@ class PublicMarketConnection {
             const detail = `OKX public market control failed for ${key} (${message.code ?? 'unknown'}): ${message.msg ?? 'No details.'}`
             if (connection.unsubscribing.get(key) === value) {
               this.deferUnsubscription(value, detail)
-            } else if (value.subscription.channel === 'books') this.recoverBook(connection, instId, detail)
-            else { this.report(detail); this.recoverSubscription(instId, 'tickers') }
+            } else if (value.subscription.channel === 'books') this.recoverBook(connection, instId, detail, { flush: false })
+            else { this.deferTickerRecovery(connection, instId, detail); this.recoverSubscription(instId, 'tickers', { flush: false }) }
           }
           this.flushSubscriptions(connection)
           return
@@ -561,7 +578,7 @@ class PublicMarketConnection {
     const queued = backlog.coalesced
     if (queued && queued.connection === connection && queued.session === session) {
       const timestamp = snapshotTimestamp(subscription, message)
-      if (timestamp === null || queued.acknowledged !== acknowledged) {
+      if (timestamp === null || (queued.acknowledged && !acknowledged)) {
         this.overload(connection, `Public market ${subscription.channel} callback fell behind.`)
         return
       }
