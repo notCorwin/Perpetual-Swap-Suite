@@ -3,7 +3,11 @@ import test from 'node:test'
 import { reconcileMarketOrder, reconcileMarketRows } from './market-snapshot.ts'
 import type { RankedMarketRow } from './desktop-contract.ts'
 
-const row = (instId: string, lastPrice = 100): RankedMarketRow => ({ instId, tickSz: '0.01', lastPrice, turnover24hUSDT: 40_000_000, rankingChange: 1, rankingAsOf: 900_000 })
+const row = (instId: string, lastPrice = 100): RankedMarketRow => ({
+  instId, tickSz: '0.01', lastPrice, turnover24hUSDT: 40_000_000,
+  change5m: 0.25, change5mAsOf: 900_000, change15m: 0.5, change15mAsOf: 900_000,
+  rankingChange: 1, rankingAsOf: 900_000,
+})
 
 test('navigation order identity follows membership and order rather than row prices', () => {
   const previous = ['BTC-USDT-SWAP', 'ETH-USDT-SWAP']
@@ -25,6 +29,11 @@ test('snapshot reconciliation preserves unchanged row identities and backend ord
   assert.equal(precisionOnly[0].tickSz, '0.001', 'A precision change must reach the renderer even when the quote is unchanged.')
   assert.notEqual(precisionOnly[0], previous[0])
   assert.equal(precisionOnly[1], previous[1])
+  const shortTermOnly = reconcileMarketRows(previous, [{ ...previous[0], change5m: -0.75 }, { ...previous[1], change15m: 1.25 }])
+  assert.equal(shortTermOnly[0].change5m, -0.75)
+  assert.equal(shortTermOnly[1].change15m, 1.25)
+  assert.notEqual(shortTermOnly[0], previous[0])
+  assert.notEqual(shortTermOnly[1], previous[1])
 })
 
 test('snapshot reconciliation applies backend membership immediately', () => {

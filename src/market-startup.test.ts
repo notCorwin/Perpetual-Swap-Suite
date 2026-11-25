@@ -159,10 +159,14 @@ test('automatic startup gates 289 candidates on shared tickers and OI before acq
     for (const row of snapshot.rows) {
       assert.equal(row.turnover24hUSDT, 57_600_000)
       assert.equal(row.lastPrice, 100)
+      assert.equal(row.change5m, null, 'No live candle has arrived to establish a 5-minute change.')
+      assert.equal(row.change5mAsOf, null)
+      assert.equal(row.change15m, null, 'No live candle has arrived to establish a 15-minute change.')
+      assert.equal(row.change15mAsOf, null)
       assert.equal(row.rankingChange, null, 'No live candle has arrived to establish an hourly change.')
       assert.equal(row.rankingAsOf, null)
       assert.equal(market.validCatalogEntry(market.catalog.get(row.instId)), true)
-      assert.deepEqual(Object.keys(row).sort(), ['instId', 'tickSz', 'lastPrice', 'turnover24hUSDT', 'rankingChange', 'rankingAsOf'].sort())
+      assert.deepEqual(Object.keys(row).sort(), ['instId', 'tickSz', 'lastPrice', 'turnover24hUSDT', 'change5m', 'change5mAsOf', 'change15m', 'change15mAsOf', 'rankingChange', 'rankingAsOf'].sort())
     }
     const windows: CandleQuery[] = qualificationReads.mock.calls.map((call: { arguments: [CandleQuery, AbortSignal] }) => call.arguments[0])
     assert.equal(windows.length, 14, 'Only the final 14 cheap-gate survivors read qualification windows, rather than all 289 candidates.')

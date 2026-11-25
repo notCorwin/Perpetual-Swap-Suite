@@ -36,9 +36,12 @@ test('canonical snapshot and prepared frame reads never admit source or calculat
   const f = await fixture(), service = f.service
   try {
     f.admit()
-    const asOf = Date.now(), key = `${instrument.instId}:1H`
-    service.liveCandles.set(key, { open: 100, close: 102, timestamp: Math.floor(asOf / 3_600_000) * 3_600_000 })
-    service.liveReceivedAt.set(key, asOf)
+    const asOf = Date.now()
+    for (const [timeframe, interval, close] of [['5m', 300_000, 100.5], ['15m', 900_000, 101], ['1H', 3_600_000, 102]] as const) {
+      const key = `${instrument.instId}:${timeframe}`
+      service.liveCandles.set(key, { open: 100, close, timestamp: Math.floor(asOf / interval) * interval })
+      service.liveReceivedAt.set(key, asOf)
+    }
     service.priceStreaming = () => true
     const revision = service.revision, candles = structuredClone([...service.liveCandles])
     for (const method of ['refresh', 'updateSubscriptions', 'ensureListHourPrefix', 'pruneCatalog']) {
@@ -51,6 +54,10 @@ test('canonical snapshot and prepared frame reads never admit source or calculat
     service.lastRefreshAt = 0
     const first = await service.snapshot()
     assert.equal(first.rows.length, 1)
+    assert.equal(first.rows[0].change5m, 0.5)
+    assert.equal(first.rows[0].change5mAsOf, asOf)
+    assert.equal(first.rows[0].change15m, 1)
+    assert.equal(first.rows[0].change15mAsOf, asOf)
     assert.equal(first.rows[0].rankingChange, 2)
     assert.equal(first.rows[0].rankingAsOf, asOf)
     assert.deepEqual(service.listRowsFor(), first.rows)

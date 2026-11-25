@@ -47,7 +47,7 @@ function fixture(snapshotFailure = false) {
   const state = {
     preferences: structuredClone(DEFAULT_PREFERENCES), revision: 1, snapshotFailure, serviceSession: 'fixture',
     metadata: { loading: false, catalogSource: 'live', error: '', realtimeState: 'live' } as Pick<MarketSnapshot, 'loading' | 'catalogSource' | 'error' | 'catalogProgress' | 'realtimeState'>,
-    rows: [{ instId: 'BTC-USDT-SWAP', tickSz: '0.1', lastPrice: 100, rankingChange: 2, rankingAsOf: 900_000, turnover24hUSDT: 100 }] as RankedMarketRow[],
+    rows: [{ instId: 'BTC-USDT-SWAP', tickSz: '0.1', lastPrice: 100, change5m: null, change5mAsOf: null, change15m: null, change15mAsOf: null, rankingChange: 2, rankingAsOf: 900_000, turnover24hUSDT: 100 }] as RankedMarketRow[],
     afterUpdate: undefined as undefined | (() => Promise<void>),
     beforeUpdate: undefined as undefined | (() => Promise<void>),
     beforeSnapshot: undefined as undefined | (() => Promise<void>),

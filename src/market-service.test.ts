@@ -201,8 +201,16 @@ test('canonical rows contain only list facts and own both ranking and turnover o
     const snapshot = await f.service.snapshot()
     assert.deepEqual(snapshot.rows.map(row => row.instId), [ids[1], ids[0], ids[2], ids[3]])
     assert.deepEqual(snapshot.turnoverOrder, [ids[1], ids[2], ids[0], ids[3]])
-    assert.deepEqual(snapshot.rows[3], { instId: ids[3], tickSz: null, lastPrice: 100, turnover24hUSDT: null, rankingChange: null, rankingAsOf: null })
-    for (const row of snapshot.rows) assert.deepEqual(Object.keys(row).sort(), ['instId', 'tickSz', 'lastPrice', 'turnover24hUSDT', 'rankingChange', 'rankingAsOf'].sort())
+    assert.deepEqual(snapshot.rows[3], {
+      instId: ids[3], tickSz: null, lastPrice: 100, turnover24hUSDT: null,
+      change5m: null, change5mAsOf: null, change15m: null, change15mAsOf: null,
+      rankingChange: null, rankingAsOf: null,
+    })
+    for (const row of snapshot.rows) assert.deepEqual(Object.keys(row).sort(), [
+      'instId', 'tickSz', 'lastPrice', 'turnover24hUSDT',
+      'change5m', 'change5mAsOf', 'change15m', 'change15mAsOf',
+      'rankingChange', 'rankingAsOf',
+    ].sort())
     assert.equal('timeframe' in snapshot, false)
     assert.equal('listProgress' in snapshot, false)
     const unchanged = await f.service.snapshot({ sinceRevision: snapshot.revision, serviceSession: snapshot.serviceSession })
@@ -272,6 +280,67 @@ test('list uses current hourly chart open and close, expires, and refreshes even
     assert.equal(row.rankingChange, null)
     await f.service.setLive(instId, '1H', { ...candle, timestamp: boundary, open: 97, close: 98 }, { receivedAt: Date.now() })
     assert.equal(f.service.listRowsFor().find(row => row.instId === instId)?.rankingChange, 100 / 97)
+  } finally { context.mock.timers.reset(); await f.close() }
+})
+
+test('list exposes current 5m and 15m candle changes with independent rollover and staleness while keeping 1H ranking order', async context => {
+  const fifteenMinutes = 3 * fiveMinutes
+  const hourStart = Math.floor(Date.now() / hour) * hour
+  const fiveStart = hourStart + fiveMinutes
+  const now = fiveStart + fiveMinutes - 10_000
+  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now })
+  const f = await fixture()
+  try {
+    const other = 'ETH-USDT-SWAP'
+    localCatalog(f.service, [instId, other])
+    f.service.priceStreaming = () => true
+    await f.service.setLive(instId, '5m', { ...nativeCandle(fiveStart, '5m', 105), open: 100, confirmed: false }, { receivedAt: Date.now() })
+    await f.service.setLive(instId, '15m', { ...nativeCandle(hourStart, '15m', 98), open: 100, confirmed: false }, { receivedAt: Date.now() })
+    await f.service.setLive(instId, '1H', { ...nativeCandle(hourStart, '1H', 101), open: 100, confirmed: false }, { receivedAt: Date.now() })
+    await f.service.setLive(other, '5m', { ...nativeCandle(fiveStart, '5m', 100.5), open: 100, confirmed: false }, { receivedAt: Date.now() })
+    await f.service.setLive(other, '15m', { ...nativeCandle(hourStart, '15m', 100.25), open: 100, confirmed: false }, { receivedAt: Date.now() })
+    await f.service.setLive(other, '1H', { ...nativeCandle(hourStart, '1H', 96), open: 100, confirmed: false }, { receivedAt: Date.now() })
+    const initial = await f.service.snapshot()
+    assert.deepEqual(initial.rows.map(row => row.instId), [other, instId], 'Ranking order stays governed by absolute 1H change.')
+    const btcRow = initial.rows.find(row => row.instId === instId)!
+    assert.equal(btcRow.change5m, 5)
+    assert.equal(btcRow.change15m, -2)
+    assert.equal(btcRow.rankingChange, 1)
+    assert.equal(btcRow.change5mAsOf, now)
+    assert.equal(btcRow.change15mAsOf, now)
+
+    // Crossing the 5m boundary expires only 5m while 15m and 1H stay inside their current buckets.
+    context.mock.timers.tick(10_000)
+    const after5m = await f.service.snapshot({ sinceRevision: initial.revision, serviceSession: initial.serviceSession })
+    assert.equal('unchanged' in after5m, false)
+    const btcAfter5m = 'rows' in after5m ? after5m.rows.find(row => row.instId === instId)! : null
+    assert.equal(btcAfter5m?.change5m, null)
+    assert.equal(btcAfter5m?.change5mAsOf, null)
+    assert.equal(btcAfter5m?.change15m, -2)
+    assert.equal(btcAfter5m?.rankingChange, 1)
+
+    // Updating 5m and 15m refreshes the snapshot revision and schedules expiry.
+    const refreshedAt = Date.now()
+    await f.service.setLive(instId, '5m', { ...nativeCandle(fiveStart + fiveMinutes, '5m', 99), open: 100, confirmed: false }, { receivedAt: refreshedAt })
+    const afterUpdate = await f.service.snapshot({ sinceRevision: after5m.revision, serviceSession: after5m.serviceSession })
+    assert.equal('unchanged' in afterUpdate, false)
+    assert.equal('rows' in afterUpdate && afterUpdate.rows.find(row => row.instId === instId)?.change5m, -1)
+
+    // 20s more hits the 30s staleness cutoff for the original 15m/1H observations while the fresher 5m remains live.
+    context.mock.timers.tick(20_000)
+    const afterStale15m = await f.service.snapshot({ sinceRevision: afterUpdate.revision, serviceSession: afterUpdate.serviceSession })
+    assert.equal('unchanged' in afterStale15m, false)
+    const btcStale = 'rows' in afterStale15m ? afterStale15m.rows.find(row => row.instId === instId)! : null
+    assert.equal(btcStale?.change5m, -1)
+    assert.equal(btcStale?.change15m, null)
+    assert.equal(btcStale?.rankingChange, null)
+
+    // 10s more hits the 30s staleness cutoff for the refreshed 5m observation.
+    context.mock.timers.tick(10_000)
+    const afterStale5m = await f.service.snapshot({ sinceRevision: afterStale15m.revision, serviceSession: afterStale15m.serviceSession })
+    assert.equal('unchanged' in afterStale5m, false)
+    assert.equal('rows' in afterStale5m && afterStale5m.rows.find(row => row.instId === instId)?.change5m, null)
+    assert.equal(fifteenMinutes, 900_000)
   } finally { context.mock.timers.reset(); await f.close() }
 })
 

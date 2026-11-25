@@ -696,26 +696,36 @@ export class MarketService {
 
   /** Reuse one canonical projection until its market facts or freshness proof change. */
   canonicalMarketList(now = Date.now()) {
-    const lookback = 60, configKey = this.catalogCriteriaKey(), asOf = closedBoundary('1H', now)
+    const lookback = 60, configKey = this.catalogCriteriaKey()
+    const asOf5m = closedBoundary('5m', now), asOf15m = closedBoundary('15m', now), asOf1H = closedBoundary('1H', now)
     const cached = this.canonicalList
     if (cached?.revision === this.revision && cached.lookback === lookback && cached.configKey === configKey
       && now >= cached.observedAt && now < cached.expiresAt) return cached
     const entries = [...this.listedCatalogEntries(now).values()]
     let qualifiedCount = 0
     for (const entry of this.catalog.values()) if (this.validCatalogEntry(entry, now)) qualifiedCount++
-    const projected = entries.map(entry => {
-      const instId = entry.instrument.instId, key = `${instId}:1H`
+    const liveChange = (instId, timeframe, asOf) => {
+      const key = `${instId}:${timeframe}`
       const live = this.liveCandles.get(key), observedAt = this.liveReceivedAt.get(key)
       const current = live?.timestamp === asOf && Number.isFinite(observedAt) && observedAt <= now
-        && now < observedAt + 30_000 && this.priceStreaming(instId, '1H')
+        && now < observedAt + 30_000 && this.priceStreaming(instId, timeframe)
       const change = current ? signedRelativeChange(live.close, live.open) : null
+      return { change, asOf: change === null ? null : observedAt }
+    }
+    const projected = entries.map(entry => {
+      const instId = entry.instrument.instId
+      const change5m = liveChange(instId, '5m', asOf5m)
+      const change15m = liveChange(instId, '15m', asOf15m)
+      const change1H = liveChange(instId, '1H', asOf1H)
       // A metadata reassessment may have no ticker dependency. Quote display
       // still owns the last shared market observation, independently of filters.
       const ticker = this.observations.get(instId)?.ticker?.value ?? this.tickerCache?.values.get(instId)?.value ?? entry.ticker
       const instrument = this.instruments.get(instId) ?? entry.instrument
       return { instId, tickSz: typeof instrument.tickSz === 'string' ? instrument.tickSz : null,
         lastPrice: number(ticker.last), turnover24hUSDT: number(this.catalogChecks.get(instId)?.result.turnover ?? entry.result.turnover),
-        rankingChange: change, rankingAsOf: change === null ? null : observedAt }
+        change5m: change5m.change, change5mAsOf: change5m.asOf,
+        change15m: change15m.change, change15mAsOf: change15m.asOf,
+        rankingChange: change1H.change, rankingAsOf: change1H.asOf }
     })
     const previousOrder = this.canonicalOrdering, byId = new Map(projected.map(row => [row.instId, row]))
     let sameRanking = previousOrder?.keys.size === byId.size, sameTurnover = sameRanking
@@ -732,8 +742,12 @@ export class MarketService {
         .map(row => row.instId))
     this.canonicalOrdering = { keys: new Map(projected.map(row => [row.instId, { rankingChange: row.rankingChange, turnover24hUSDT: row.turnover24hUSDT }])),
       ranking: sameRanking ? previousOrder.ranking : rows.map(row => row.instId), turnover: sameTurnover ? previousOrder.turnover : turnoverOrder.slice() }
-    let expiresAt = asOf + 3_600_000
-    for (const row of projected) if (row.rankingAsOf !== null) expiresAt = Math.min(expiresAt, row.rankingAsOf + 30_000)
+    let expiresAt = asOf5m + FIVE_MINUTES
+    for (const row of projected) {
+      if (row.change5mAsOf !== null) expiresAt = Math.min(expiresAt, row.change5mAsOf + 30_000)
+      if (row.change15mAsOf !== null) expiresAt = Math.min(expiresAt, row.change15mAsOf + 30_000)
+      if (row.rankingAsOf !== null) expiresAt = Math.min(expiresAt, row.rankingAsOf + 30_000)
+    }
     for (const entry of entries) {
       const expiry = this.catalogEntryExpiry(entry, now)
       expiresAt = Math.min(expiresAt, this.listRemovals.get(entry.instrument.instId)?.removeAt ?? (expiry > now ? expiry : expiry + LIST_REMOVAL_DELAY_MS))
@@ -1262,8 +1276,10 @@ export class MarketService {
     const now = Date.now()
     let next = Infinity
     for (const instId of this.listedUniverse) {
-      const observedAt = this.liveReceivedAt.get(`${instId}:1H`)
-      if (observedAt != null && observedAt + 30_000 > now) next = Math.min(next, observedAt + 30_000)
+      for (const timeframe of CHART_TIMEFRAMES) {
+        const observedAt = this.liveReceivedAt.get(`${instId}:${timeframe}`)
+        if (observedAt != null && observedAt + 30_000 > now) next = Math.min(next, observedAt + 30_000)
+      }
     }
     if (!Number.isFinite(next)) return
     this.listQuoteTimer = setTimeout(() => {
@@ -1292,7 +1308,7 @@ export class MarketService {
       this.liveCandleSources.delete(key)
       this.liveCandles.delete(key)
     }
-    if (timeframe === '1H' && this.listedUniverse.has(instId)) {
+    if (CHART_TIMEFRAMES.includes(timeframe) && this.listedUniverse.has(instId)) {
       if (!current || !row || current.timestamp !== row.timestamp || current.open !== row.open || current.close !== row.close
         || previousReceivedAt == null || Date.now() - previousReceivedAt >= 30_000) this.touchList()
       this.scheduleListQuoteExpiry()

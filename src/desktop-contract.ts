@@ -18,6 +18,8 @@ export type ChartImage = { imageDataURL: string; width: number; height: number }
 
 export type RankedMarketRow = {
   instId: string; tickSz: string | null; lastPrice: number | null; turnover24hUSDT: number | null
+  change5m: number | null; change5mAsOf: number | null
+  change15m: number | null; change15mAsOf: number | null
   rankingChange: number | null; rankingAsOf: number | null
 }
 export type CatalogProgress = { total: number; completed: number; verified: number; failed: number; unknown: number; pending: number }

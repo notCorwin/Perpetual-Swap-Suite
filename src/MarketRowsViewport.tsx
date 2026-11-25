@@ -69,7 +69,7 @@ export const MarketRowsViewport = memo(function MarketRowsViewport({ ids, childr
   const pinnedIndex = pinned ? ids.indexOf(pinned) : -1
   if (pinnedIndex >= 0) indices.add(pinnedIndex)
   const ordered = [...indices].sort((a, b) => a - b)
-  const spacer = (count: number, key: string) => count > 0 && <TableRow key={key} aria-hidden="true" className="border-0" data-virtual-spacer><TableCell colSpan={3} className="p-0" style={{ height: count * range.size }} /></TableRow>
+  const spacer = (count: number, key: string) => count > 0 && <TableRow key={key} aria-hidden="true" className="border-0" data-virtual-spacer><TableCell colSpan={4} className="p-0" style={{ height: count * range.size }} /></TableRow>
   return <TableBody ref={body} onKeyDownCapture={event => {
     if (!(event.target instanceof HTMLTableRowElement) || !["Home", "End"].includes(event.key)) return
     const target = event.key === "Home" ? 0 : ids.length - 1

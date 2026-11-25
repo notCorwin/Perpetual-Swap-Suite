@@ -41,19 +41,23 @@ function NotificationPanel({ issue, setToast }: { issue: ToastIssue; setToast: D
   return <p data-chart-shared-status-item={['1H', '15m', '5m'].includes(issue.id) ? issue.id : undefined} className={cn('break-words rounded-md border bg-popover px-4 py-3 text-sm text-popover-foreground shadow-lg', issue.severity === 'error' && 'text-destructive')}><span className="font-medium">{issue.label}: </span>{issue.detail}</p>
 }
 
+function MarketChangeCell({ value, asOf, timeframe, period }: { value: number | null | undefined; asOf: number | null | undefined; timeframe: RadarTimeframe; period: string }) {
+  const change = typeof value === 'number' && Number.isFinite(value) ? value : null
+  const direction = change === null ? 'unavailable' : change > 0 ? 'up' : change < 0 ? 'down' : 'flat'
+  const text = change !== null && change !== 0 && Math.abs(change) < 0.005 ? `${change > 0 ? '+' : '-'}0.00%` : formatPercent(change)
+  return <TableCell data-market-change={direction} data-market-change-timeframe={timeframe} aria-label={`${period} candle change: ${text}, ${direction === 'up' ? 'up' : direction === 'down' ? 'down' : direction === 'flat' ? 'unchanged' : 'unavailable'}`} className={cn('text-right', direction === 'up' ? 'text-positive' : direction === 'down' ? 'text-negative' : direction === 'flat' ? 'text-foreground' : 'text-muted-foreground')} title={asOf ? `${period} candle change · observed ${new Date(asOf).toLocaleString('en-US')}` : `Current ${period} candle is unavailable`}>
+    <span className="block truncate">{text}</span>
+  </TableCell>
+}
+
 const MarketRowView = memo(function MarketRowView({ row, index, selected, onSelect }: { row: RankedMarketRow; index: number; selected: boolean; onSelect: (id: string) => void }) {
-  const change = Number.isFinite(row.rankingChange) ? row.rankingChange : null
-  const changeDirection = change === null ? 'unavailable' : change > 0 ? 'up' : change < 0 ? 'down' : 'flat'
-  const changeText = change !== null && change !== 0 && Math.abs(change) < 0.005 ? `${change > 0 ? '+' : '-'}0.00%` : formatPercent(change)
-  const price = formatCurrentPrice(row.lastPrice, row.tickSz)
   return <TableRow data-market-index={index} aria-rowindex={index + 2} aria-selected={selected} data-state={selected ? 'selected' : undefined} tabIndex={0} aria-label={`View ${row.instId} chart`} onClick={() => onSelect(row.instId)} onKeyDown={event => {
     if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelect(row.instId) }
   }} className="cursor-pointer focus-visible:outline-2 focus-visible:outline-ring focus-visible:-outline-offset-2">
     <TableCell className="font-medium" title={row.instId}><span className="block truncate">{row.instId.replace(/-USDT-SWAP$/, '')}</span></TableCell>
-    <TableCell className="text-right"><span className="block truncate" title={price}>{price}</span></TableCell>
-    <TableCell data-market-change={changeDirection} aria-label={`1-hour candle change: ${changeText}, ${changeDirection === 'up' ? 'up' : changeDirection === 'down' ? 'down' : changeDirection === 'flat' ? 'unchanged' : 'unavailable'}`} className={cn('text-right', changeDirection === 'up' ? 'text-positive' : changeDirection === 'down' ? 'text-negative' : changeDirection === 'flat' ? 'text-foreground' : 'text-muted-foreground')} title={row.rankingAsOf ? `1-hour candle change · observed ${new Date(row.rankingAsOf).toLocaleString('en-US')}` : 'Current 1-hour candle is unavailable'}>
-      <span className="block truncate">{changeText}</span>
-    </TableCell>
+    <MarketChangeCell value={row.change5m} asOf={row.change5mAsOf} timeframe="5m" period="5-minute" />
+    <MarketChangeCell value={row.change15m} asOf={row.change15mAsOf} timeframe="15m" period="15-minute" />
+    <MarketChangeCell value={row.rankingChange} asOf={row.rankingAsOf} timeframe="1H" period="1-hour" />
   </TableRow>
 })
 
@@ -421,9 +425,9 @@ function App() {
                   <aside data-market-list className="flex min-h-0 flex-1 flex-col" aria-label="Contract list">
       <section data-market-scroll className="min-h-0 flex-1 overflow-y-auto [&>[data-slot=table-container]]:overflow-visible" aria-label="Perpetual swap markets">
         <Table className="table-fixed [&_tr:not([data-virtual-spacer])>:first-child]:pl-4 [&_tr:not([data-virtual-spacer])>:last-child]:pr-4" data-market-count={visible.length} data-total-market-count={rows.length} aria-rowcount={visible.length + 1}>
-          <colgroup><col className="w-[25%]" /><col className="w-[45%]" /><col className="w-[30%]" /></colgroup>
-          <TableHeader className="sticky top-0 bg-background [&_th]:text-xs [&_th]:text-muted-foreground"><TableRow aria-rowindex={1} className="hover:bg-transparent"><TableHead>Contract</TableHead><TableHead className="text-right">Price</TableHead><TableHead className="text-right" aria-sort="other" aria-label="1-hour candle change by magnitude" title="Sorted by absolute current 1-hour candle change, largest first"><span>1h Δ%</span></TableHead></TableRow></TableHeader>
-          {visible.length ? <MarketRowsViewport ids={visibleIds}>{index => <MarketRowView row={visible[index]} index={index} selected={visible[index].instId === selectedID} onSelect={selectContract} />}</MarketRowsViewport> : <TableBody><TableRow><TableCell colSpan={3}>
+          <colgroup><col className="w-[26%]" /><col className="w-[24%]" /><col className="w-[24%]" /><col className="w-[26%]" /></colgroup>
+          <TableHeader className="sticky top-0 bg-background [&_th]:text-xs [&_th]:text-muted-foreground"><TableRow aria-rowindex={1} className="hover:bg-transparent"><TableHead>Contract</TableHead><TableHead className="text-right" aria-label="5-minute candle change" title="Current 5-minute candle change"><span>5m Δ%</span></TableHead><TableHead className="text-right" aria-label="15-minute candle change" title="Current 15-minute candle change"><span>15m Δ%</span></TableHead><TableHead className="text-right" aria-sort="other" aria-label="1-hour candle change by magnitude" title="Sorted by absolute current 1-hour candle change, largest first"><span>1h Δ%</span></TableHead></TableRow></TableHeader>
+          {visible.length ? <MarketRowsViewport ids={visibleIds}>{index => <MarketRowView row={visible[index]} index={index} selected={visible[index].instId === selectedID} onSelect={selectContract} />}</MarketRowsViewport> : <TableBody><TableRow><TableCell colSpan={4}>
             <Empty><EmptyHeader><EmptyTitle>{emptyTitle}</EmptyTitle><EmptyDescription>{emptyDescription}</EmptyDescription></EmptyHeader></Empty>
           </TableCell></TableRow></TableBody>}
         </Table>

@@ -28,8 +28,17 @@ try {
       slippage: { enabled: true, maxPercent: .1, notionalUSDT: 100_000 }, volume24h: { enabled: true, minUSDT: 30_000_000 },
       openInterest: { enabled: true, minUSDT: 5_000_000 }, volumeStability: { enabled: false, maxRatio: 2 },
     } }
-    const rows = [['BETA', -3], ['ZETA', 3], ['ALPHA', 1], ['NULL', null]].map(([symbol, rankingChange]) => ({
-      instId: `${symbol}-USDT-SWAP`, price: 100, lastPrice: 100, rankingChange, rankingAsOf: 1_800_000_000_000, turnover24hUSDT: 50_000_000,
+    const rows = [
+      ['BETA', -0.45, -1.2, -3],
+      ['ZETA', 0.8, 1.5, 3],
+      ['ALPHA', 0, 0.25, 1],
+      ['NULL', null, null, null],
+    ].map(([symbol, change5m, change15m, rankingChange]) => ({
+      instId: `${symbol}-USDT-SWAP`, price: 100, lastPrice: 100,
+      change5m, change5mAsOf: change5m === null ? null : 1_800_000_000_000,
+      change15m, change15mAsOf: change15m === null ? null : 1_800_000_000_000,
+      rankingChange, rankingAsOf: rankingChange === null ? null : 1_800_000_000_000,
+      turnover24hUSDT: 50_000_000,
     }))
     const prepared = ({ instId, timeframe }) => {
       const intervalMS = timeframe === '1H' ? 3_600_000 : timeframe === '15m' ? 900_000 : 300_000

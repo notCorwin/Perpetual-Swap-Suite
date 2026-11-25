@@ -117,7 +117,7 @@ export async function installReadyRecorder(page) {
         renderedTimeframe: svg?.dataset.renderedTimeframe, renderedEnd: Number(svg?.dataset.renderedEnd),
         visible: Boolean(svg?.isConnected && svg.getAttribute('aria-hidden') !== 'true' && svg.style.visibility !== 'hidden'),
         priceLabel: svg?.querySelector('[data-chart-price-label-value]')?.textContent ?? null,
-        marketPrice: row?.querySelectorAll('td')[1]?.textContent ?? null,
+        marketPrice: document.querySelector('[data-shared-chart-price]')?.textContent ?? null,
         marketCount: Number(document.querySelector('[data-total-market-count]')?.getAttribute('data-total-market-count')) })
     }
     window.addEventListener('radar-presentation-ready', handler)

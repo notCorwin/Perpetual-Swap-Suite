@@ -25,8 +25,16 @@ before(async () => {
       slippage: { enabled: true, maxPercent: .1, notionalUSDT: 100_000 }, volume24h: { enabled: true, minUSDT: 30_000_000 },
       openInterest: { enabled: true, minUSDT: 5_000_000 }, volumeStability: { enabled: false, maxRatio: 2 },
     } }
-    const rows = [['BETA', -3], ['ZETA', 3], ['ALPHA', 1], ['NULL', null]].map(([symbol, rankingChange]) => ({
-      instId: `${symbol}-USDT-SWAP`, tickSz: null, price: 100, lastPrice: 100, rankingChange, rankingAsOf: 1_800_000_000_000,
+    const rows = [
+      ['BETA', -0.5, -1.25, -3],
+      ['ZETA', 0.5, 1.25, 3],
+      ['ALPHA', 0.25, 0.5, 1],
+      ['NULL', null, null, null],
+    ].map(([symbol, change5m, change15m, rankingChange]) => ({
+      instId: `${symbol}-USDT-SWAP`, tickSz: null, price: 100, lastPrice: 100,
+      change5m, change5mAsOf: change5m === null ? null : 1_800_000_000_000,
+      change15m, change15mAsOf: change15m === null ? null : 1_800_000_000_000,
+      rankingChange, rankingAsOf: rankingChange === null ? null : 1_800_000_000_000,
       turnover24hUSDT: 50_000_000,
     }))
     const state = globalThis.__workspaceFixture = { preferences, rows, initialRows: rows, requests: [], coldTimeframes: [], revision: 1, loading: false, error: '', realtimeState: 'live', updatedAt: 1_800_000_000_000, catalogSource: 'live', catalogProgress: undefined, failNextSave: false, failSnapshots: 0, staleNextSnapshot: false, staleReplies: 0, chartGeneration: 1, bollMode: 'standard', holdNextSnapshot: false, releaseSnapshot: null, snapshotActive: 0, snapshotMaximum: 0,
@@ -317,18 +325,23 @@ const clickByRect = async locator => {
 }
 
 test('default selection uses absolute completed-candle change with nulls last and stable contract ties', async () => {
-  const rankingHeader = page.getByRole('columnheader', { name: /15m change.*By magnitude/ })
+  assert.deepEqual(await page.locator('[data-market-list] th').allTextContents(), ['Contract', '5m Δ%', '15m Δ%', '1h Δ%'])
+  const rankingHeader = page.getByRole('columnheader', { name: /1-hour candle change by magnitude/ })
   assert.equal(await rankingHeader.getAttribute('aria-sort'), 'other')
   assert.deepEqual(await page.locator('[data-market-index]').evaluateAll(rows => rows.map(row => row.getAttribute('aria-label'))), [
     'View BETA-USDT-SWAP chart', 'View ZETA-USDT-SWAP chart', 'View ALPHA-USDT-SWAP chart', 'View NULL-USDT-SWAP chart',
   ])
   assert.equal(await selected().getAttribute('aria-label'), 'View BETA-USDT-SWAP chart')
   assert.deepEqual(await page.locator('[data-chart-inst="BETA-USDT-SWAP"]').evaluateAll(charts => charts.map(chart => chart.querySelector('svg[data-rendered-timeframe]')?.dataset.renderedTimeframe)), ['1H', '15m', '5m'])
+  const changes5m = await page.locator('[data-market-index] [data-market-change-timeframe="5m"]').allTextContents()
+  const changes15m = await page.locator('[data-market-index] [data-market-change-timeframe="15m"]').allTextContents()
   const changes = await page.locator('[data-market-index] td:last-child').allTextContents()
+  assert.deepEqual(changes5m.map(value => value.trim()), ['-0.50%', '+0.50%', '+0.25%', '—'])
+  assert.deepEqual(changes15m.map(value => value.trim()), ['-1.25%', '+1.25%', '+0.50%', '—'])
   assert.equal(changes[0].trim(), '-3.00%')
   assert.equal(changes[1].trim(), '+3.00%')
   assert.equal(changes[3].trim(), '—')
-  const changesRendered = await page.locator('[data-market-change]').evaluateAll(labels => labels.map(label => ({
+  const changesRendered = await page.locator('[data-market-change-timeframe="1H"]').evaluateAll(labels => labels.map(label => ({
     direction: label.dataset.marketChange, background: getComputedStyle(label).backgroundColor,
     foreground: getComputedStyle(label).color, accessible: label.getAttribute('aria-label'),
     fits: label.scrollWidth <= label.clientWidth, tag: label.tagName,
@@ -345,6 +358,7 @@ test('default selection uses absolute completed-candle change with nulls last an
   assert.match(changesRendered[1].accessible, /up/)
   assert.match(changesRendered[3].accessible, /unavailable/)
   assert.ok(changesRendered.every(label => label.fits), 'Change values must fit their cells.')
+  assert.ok(await page.locator('[data-market-change]').evaluateAll(labels => labels.every(label => label.scrollWidth <= label.clientWidth)), 'All 5m, 15m, and 1h change values must fit their cells.')
   assert.ok(changesRendered.every(label => label.tag === 'TD' && label.radius === '0px' && label.paddingLeft > 0 && label.paddingRight > 0),
     'Change values must retain the table cell spacing.')
   await assertWorkspaceLayout(page)
@@ -359,22 +373,27 @@ test('market change values preserve direction and fit at minimum window width', 
   const originalSize = page.viewportSize()
   try {
     await page.setViewportSize({ width: 1200, height: 640 })
-    await publish(initialRows.map(row => ({ ...row, rankingChange: row.instId.startsWith('BETA-') ? -.001 : row.instId.startsWith('ZETA-') ? .001 : row.instId.startsWith('ALPHA-') ? 0 : null })))
-    const beta = page.locator('[aria-label="View BETA-USDT-SWAP chart"] [data-market-change]')
-    const zeta = page.locator('[aria-label="View ZETA-USDT-SWAP chart"] [data-market-change]')
-    const alpha = page.locator('[aria-label="View ALPHA-USDT-SWAP chart"] [data-market-change]')
-    const missing = page.locator('[aria-label="View NULL-USDT-SWAP chart"] [data-market-change]')
-    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] [data-market-change]')?.textContent === '-0.00%')
+    await publish(initialRows.map(row => {
+      const value = row.instId.startsWith('BETA-') ? -.001 : row.instId.startsWith('ZETA-') ? .001 : row.instId.startsWith('ALPHA-') ? 0 : null
+      return { ...row, change5m: value, change15m: value, rankingChange: value }
+    }))
+    const beta = page.locator('[aria-label="View BETA-USDT-SWAP chart"] [data-market-change-timeframe="1H"]')
+    const zeta = page.locator('[aria-label="View ZETA-USDT-SWAP chart"] [data-market-change-timeframe="1H"]')
+    const alpha = page.locator('[aria-label="View ALPHA-USDT-SWAP chart"] [data-market-change-timeframe="1H"]')
+    const missing = page.locator('[aria-label="View NULL-USDT-SWAP chart"] [data-market-change-timeframe="1H"]')
+    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] [data-market-change-timeframe="1H"]')?.textContent === '-0.00%')
     assert.equal(await beta.textContent(), '-0.00%')
     assert.equal(await zeta.textContent(), '+0.00%')
     assert.equal(await alpha.textContent(), '0.00%')
     assert.equal(await alpha.getAttribute('data-market-change'), 'flat')
     assert.equal(await missing.getAttribute('data-market-change'), 'unavailable')
+    assert.equal(await page.locator('[aria-label="View BETA-USDT-SWAP chart"] [data-market-change-timeframe="5m"]').textContent(), '-0.00%')
+    assert.equal(await page.locator('[aria-label="View ZETA-USDT-SWAP chart"] [data-market-change-timeframe="15m"]').textContent(), '+0.00%')
     assert.equal(await page.locator('[aria-label="View BETA-USDT-SWAP chart"]').getAttribute('aria-selected'), 'true')
     assert.ok(await page.locator('[data-market-change]').evaluateAll(labels => labels.every(label => label.scrollWidth <= label.clientWidth)))
   } finally {
     await publish(initialRows)
-    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] [data-market-change]')?.textContent === '-3.00%')
+    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] [data-market-change-timeframe="1H"]')?.textContent === '-3.00%')
     if (originalSize) await page.setViewportSize(originalSize)
   }
 })
@@ -565,7 +584,7 @@ test('contract precision updates pad current quotes while preserving historical 
       state.sendChart(frame)
       return frame
     })
-    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '100.1200')
+    await page.waitForFunction(() => document.querySelector('[data-shared-chart-price]')?.textContent === '100.1200')
     await waitForLabel('+0.02%')
     assert.equal(await close.textContent(), '100.1200')
     await page.waitForFunction(() => document.querySelector('[data-acceptance-target] [data-chart-boll-label="bollUpper"]')?.getAttribute('data-chart-boll-price') === '100.123456789')
@@ -582,7 +601,7 @@ test('contract precision updates pad current quotes while preserving historical 
       state.rows = state.rows.map(row => row.instId === 'BETA-USDT-SWAP' ? { ...row, tickSz: '1e-8' } : row)
       state.revision += 1; state.notify()
     })
-    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '100.12000000')
+    await page.waitForFunction(() => document.querySelector('[data-shared-chart-price]')?.textContent === '100.12000000')
     await waitForLabel('+0.02%')
     assert.equal(await close.textContent(), '100.12000000')
     const layout = await chart.evaluate(chart => {
@@ -744,7 +763,7 @@ test('snapshot failures wait for a new notification and resume immediately on re
     assert.deepEqual(await page.evaluate(() => globalThis.__snapshotRetryClock.delays), [])
     assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length), before + 1)
     await electron.evaluate(() => globalThis.__workspaceFixture.notify())
-    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '204')
+    await page.waitForFunction(() => document.querySelector('[data-shared-chart-price]')?.textContent === '204')
     await page.clock.fastForward(7_100)
     await error.waitFor({ state: 'hidden' })
     assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length), before + 2)
@@ -752,7 +771,7 @@ test('snapshot failures wait for a new notification and resume immediately on re
   } finally {
     await page.evaluate(() => { globalThis.__snapshotRetryClock?.restore(); delete globalThis.__snapshotRetryClock })
     await electron.evaluate(() => { const state = globalThis.__workspaceFixture; state.failSnapshots = 0; state.rows = state.initialRows; state.revision += 1; state.notify() })
-    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '100')
+    await page.waitForFunction(() => document.querySelector('[data-shared-chart-price]')?.textContent === '100')
   }
 })
 
@@ -781,7 +800,7 @@ test('market notifications refresh immediately and coalesce changes arriving dur
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
     assert.equal(await electron.evaluate(() => globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length), blockedCount, 'Notifications during a request must coalesce rather than start concurrent snapshots.')
     await electron.evaluate(() => { globalThis.__workspaceFixture.releaseSnapshot() })
-    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '202', null, { timeout: 1_000 })
+    await page.waitForFunction(() => document.querySelector('[data-shared-chart-price]')?.textContent === '202', null, { timeout: 1_000 })
     assert.deepEqual(await electron.evaluate(() => ({ maximum: globalThis.__workspaceFixture.snapshotMaximum, count: globalThis.__workspaceFixture.requests.filter(value => value.snapshot).length })), { maximum: 1, count: blockedCount + 1 }, 'Queued changes need exactly one immediate follow-up snapshot.')
   } finally {
     await electron.evaluate(({ BrowserWindow }) => {
@@ -792,7 +811,7 @@ test('market notifications refresh immediately and coalesce changes arriving dur
       state.revision += 1
       BrowserWindow.getAllWindows()[0].webContents.send('radar:market-changed')
     })
-    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '100')
+    await page.waitForFunction(() => document.querySelector('[data-shared-chart-price]')?.textContent === '100')
   }
 })
 
@@ -808,7 +827,7 @@ test('market notifications continue refreshing while the workspace is hidden', a
       state.revision += 1
       for (let index = 0; index < 20; index += 1) BrowserWindow.getAllWindows()[0].webContents.send('radar:market-changed')
     })
-    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '203', null, { timeout: 1_000 })
+    await page.waitForFunction(() => document.querySelector('[data-shared-chart-price]')?.textContent === '203', null, { timeout: 1_000 })
   } finally {
     await page.evaluate(() => { delete document.visibilityState; document.dispatchEvent(new Event('visibilitychange')) })
     await electron.evaluate(({ BrowserWindow }) => {
@@ -817,7 +836,7 @@ test('market notifications continue refreshing while the workspace is hidden', a
       state.revision += 1
       BrowserWindow.getAllWindows()[0].webContents.send('radar:market-changed')
     })
-    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '100')
+    await page.waitForFunction(() => document.querySelector('[data-shared-chart-price]')?.textContent === '100')
   }
 })
 
@@ -1809,7 +1828,7 @@ test('backend readmission updates membership without restoring a previously excl
     await page.locator('[data-market-index][aria-selected="true"][aria-label="View ZETA-USDT-SWAP chart"]').waitFor()
     assert.equal(await page.locator('[aria-label="View BETA-USDT-SWAP chart"]').count(), 0)
     await publish({ rows: await electron.evaluate(() => globalThis.__workspaceFixture.initialRows.map(row => row.instId === 'BETA-USDT-SWAP' ? { ...row, lastPrice: 147, rankingChange: -7 } : row)) })
-    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2)')?.textContent === '147')
+    await page.waitForFunction(() => document.querySelector('[aria-label="View BETA-USDT-SWAP chart"] [data-market-change-timeframe="1H"]')?.textContent === '-7.00%')
     assert.equal(await selected().getAttribute('aria-label'), 'View ZETA-USDT-SWAP chart', 'Readmission must preserve the current user selection.')
     assert.equal(await page.locator('[data-market-index="0"]').getAttribute('aria-label'), 'View BETA-USDT-SWAP chart')
     assert.equal(await page.locator('[data-total-market-count]').getAttribute('data-total-market-count'), '4')
@@ -2024,7 +2043,7 @@ test('compact workspaces preserve complete market prices and keep overflowing ch
     for (const width of [1000, 1200, 1510, 1710]) {
       await page.setViewportSize({ width, height: 900 })
       await assertWorkspaceLayout(page)
-      const price = page.locator('[aria-label="View BETA-USDT-SWAP chart"] td:nth-child(2) span')
+      const price = page.locator('[data-shared-chart-price]')
       assert.equal(await price.getAttribute('title'), '0.0000012345')
       assert.equal(await price.textContent(), '0.0000012345')
       assert.equal(await price.evaluate(element => getComputedStyle(element).textOverflow), 'ellipsis')
