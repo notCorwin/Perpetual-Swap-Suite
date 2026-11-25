@@ -1,34 +1,26 @@
 import { execFile } from 'node:child_process'
-import { parseArgs, promisify } from 'node:util'
+import { promisify } from 'node:util'
 import { mkdtemp, writeFile } from 'node:fs/promises'
 import { listPackage } from '@electron/asar'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { fingerprintInputs, inspectApp, run, trashPath, withBuildCleanup } from './electron-delivery.mjs'
-
 import { assertDesktopImports, assertPackagedEntries } from './package-layout.mjs'
-import { verifyBuildReuseManifest } from './build-artifact-reuse.mjs'
 import { buildRendererUnlocked } from './build-renderer.mjs'
 import { withBuildLock } from './build-lock.mjs'
-import { assertOutsideBuildSync } from './build-output-path.mjs'
 
 const execute = promisify(execFile)
 const root = fileURLToPath(new URL('..', import.meta.url))
-export async function preparePackagedRenderer({ root, reuseBuildManifest }, { verify = verifyBuildReuseManifest, execute = () => buildRendererUnlocked({ root }) } = {}) {
-  if (reuseBuildManifest) return verify({ root, manifestPath: reuseBuildManifest })
-  await execute()
-}
 
-export async function packageElectronUnlocked({ reuseBuildManifest } = {}) {
+export async function packageElectronUnlocked() {
   if (process.platform !== 'darwin') throw new Error('macOS is required to package the desktop app.')
   if (!['arm64', 'x64'].includes(process.arch)) throw new Error(`Unsupported macOS architecture: ${process.arch}`)
-  if (reuseBuildManifest) assertOutsideBuildSync(root, resolve(root, reuseBuildManifest), 'Build reuse manifest')
   return withBuildCleanup(root, async () => {
     const revision = (await execute('git', ['rev-parse', 'HEAD'], { cwd: root })).stdout.trim()
     const dirty = Boolean((await execute('git', ['status', '--porcelain'], { cwd: root })).stdout.trim())
     await assertDesktopImports(join(root, 'electron'))
-    await preparePackagedRenderer({ root, reuseBuildManifest })
+    await buildRendererUnlocked({ root })
     const metadata = { schemaVersion: 1, revision, dirty, builtAt: new Date().toISOString(), arch: process.arch }
     const temporary = await mkdtemp(join(tmpdir(), 'perpetual-swap-package-'))
     const metadataPath = join(temporary, 'build-revision.json')
@@ -51,11 +43,10 @@ export async function packageElectronUnlocked({ reuseBuildManifest } = {}) {
   })
 }
 
-export async function packageElectron(options = {}) {
-  return withBuildLock(root, () => packageElectronUnlocked(options))
+export async function packageElectron() {
+  return withBuildLock(root, () => packageElectronUnlocked())
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const { values } = parseArgs({ options: { 'reuse-build-manifest': { type: 'string' } } })
-  await packageElectron({ reuseBuildManifest: values['reuse-build-manifest'] })
+  await packageElectron()
 }

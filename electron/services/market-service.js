@@ -1,7 +1,5 @@
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { beginOperation, measureOperation } from './operations.js'
-import { networkResource } from './network-operations.js'
 import { PreparedChartPipeline } from './prepared-chart-service.js'
 import { MetadataStore, DEFAULT_PREFERENCES, validatePreferences } from './metadata-store.js'
 import { CHART_PRIMARY_TIMEFRAME } from './preferences.js'
@@ -735,11 +733,11 @@ export class MarketService {
       if (!key || !Object.is(key.turnover24hUSDT, row.turnover24hUSDT)) sameTurnover = false
     }
     const rows = sameRanking ? previousOrder.ranking.map(id => byId.get(id))
-      : measureOperation({ category: 'cpu', name: 'market.list.sort', attributes: { inputRows: entries.length } }, () => projected.toSorted(compareRanking))
+      : projected.toSorted(compareRanking)
     const turnoverOrder = sameTurnover ? previousOrder.turnover.slice()
-      : measureOperation({ category: 'cpu', name: 'market.list.turnover-sort', attributes: { inputRows: rows.length } }, () => [...projected]
+      : [...projected]
         .sort((left, right) => (right.turnover24hUSDT ?? -Infinity) - (left.turnover24hUSDT ?? -Infinity) || (left.instId < right.instId ? -1 : left.instId > right.instId ? 1 : 0))
-        .map(row => row.instId))
+        .map(row => row.instId)
     this.canonicalOrdering = { keys: new Map(projected.map(row => [row.instId, { rankingChange: row.rankingChange, turnover24hUSDT: row.turnover24hUSDT }])),
       ranking: sameRanking ? previousOrder.ranking : rows.map(row => row.instId), turnover: sameTurnover ? previousOrder.turnover : turnoverOrder.slice() }
     let expiresAt = asOf5m + FIVE_MINUTES
@@ -926,56 +924,37 @@ export class MarketService {
           // network call which no active viewport can consume.
           if (request.controller.signal.aborted) throw request.controller.signal.reason ?? new Error('The request was aborted.')
           const url = requestURL(request.path, request.parameters), signal = request.controller.signal
-          const operation = beginOperation({ category: 'ipc', name: 'http.request', resource: networkResource(url),
-            attributes: { transport: 'http', method: 'GET', path: request.path, lane: lane.name, priority: request.priority, queueMS: Math.max(0, Date.now() - request.enqueuedAt) } })
-          const attributes = {}
-          let finished = false
-          const finish = status => {
-            if (finished) return
-            finished = true
-            operation.end({ status, attributes })
+          const response = await this.fetcher(url, { headers: { Accept: 'application/json' }, signal })
+          if (signal.aborted) throw signal.reason ?? new Error('The request was aborted.')
+          const serverDelay = retryAfterDelay(response.headers?.get('retry-after'))
+          if (response.status === 429) {
+            // Statistics cooling belongs to this instrument's bucket;
+            // unrelated instruments retain their own published allowance.
+            request.bucket.rateLimitedUntil = Math.max(request.bucket.rateLimitedUntil, Date.now() + (serverDelay ?? RETRY_DELAYS[0]))
+            lane.queue.bucketChanged(request.bucket)
+            if (!instrumentRateLimit(lane.name)) lane.concurrency = Math.max(2, Math.floor((lane.concurrency ?? 4) / 2))
+            throw new RetryAfterError(request.path, serverDelay, lane.name)
           }
-          const abort = () => { attributes.timedOut = signal.reason instanceof RequestTimeoutError; finish(attributes.timedOut ? 'error' : 'cancelled') }
-          signal.addEventListener('abort', abort, { once: true })
-          try {
-            const response = await this.fetcher(url, { headers: { Accept: 'application/json' }, signal })
-            attributes.httpStatus = response.status
-            const contentLength = response.headers?.get('content-length')
-            if (contentLength !== null && contentLength !== undefined && /^\d+$/.test(contentLength) && Number.isSafeInteger(Number(contentLength))) attributes.declaredResponseBytes = Number(contentLength)
-            if (signal.aborted) throw signal.reason ?? new Error('The request was aborted.')
-            const serverDelay = retryAfterDelay(response.headers?.get('retry-after'))
-            if (response.status === 429) {
-              // Statistics cooling belongs to this instrument's bucket;
-              // unrelated instruments retain their own published allowance.
-              request.bucket.rateLimitedUntil = Math.max(request.bucket.rateLimitedUntil, Date.now() + (serverDelay ?? RETRY_DELAYS[0]))
+          if (!response.ok) {
+            const error = new Error(`OKX ${request.path} failed (${response.status}).`)
+            if (serverDelay !== undefined) {
+              error.retryAfter = serverDelay
+              request.bucket.rateLimitedUntil = Math.max(request.bucket.rateLimitedUntil, Date.now() + serverDelay)
               lane.queue.bucketChanged(request.bucket)
-              if (!instrumentRateLimit(lane.name)) lane.concurrency = Math.max(2, Math.floor((lane.concurrency ?? 4) / 2))
-              throw new RetryAfterError(request.path, serverDelay, lane.name)
             }
-            if (!response.ok) {
-              const error = new Error(`OKX ${request.path} failed (${response.status}).`)
-              if (serverDelay !== undefined) {
-                error.retryAfter = serverDelay
-                request.bucket.rateLimitedUntil = Math.max(request.bucket.rateLimitedUntil, Date.now() + serverDelay)
-                lane.queue.bucketChanged(request.bucket)
-              }
-              throw error
-            }
-            const payload = await response.json()
-            if (signal.aborted) throw signal.reason ?? new Error('The request was aborted.')
-            if (String(payload.code) === '50011') {
-              request.bucket.rateLimitedUntil = Math.max(request.bucket.rateLimitedUntil, Date.now() + (serverDelay ?? RETRY_DELAYS[0]))
-              lane.queue.bucketChanged(request.bucket)
-              throw new RetryAfterError(request.path, serverDelay, lane.name)
-            }
-            if (payload.code && payload.code !== '0') throw new Error(`OKX ${request.path}: ${payload.msg || payload.code}`)
-            const data = payload.data
-            if (!Array.isArray(data)) throw new TypeError(`OKX ${request.path} response needs a data array.`)
-            attributes.rows = data.length
-            finish('ok')
-            return data
-          } catch (error) { finish(signal.aborted && !(signal.reason instanceof RequestTimeoutError) ? 'cancelled' : 'error'); throw error }
-          finally { signal.removeEventListener('abort', abort) }
+            throw error
+          }
+          const payload = await response.json()
+          if (signal.aborted) throw signal.reason ?? new Error('The request was aborted.')
+          if (String(payload.code) === '50011') {
+            request.bucket.rateLimitedUntil = Math.max(request.bucket.rateLimitedUntil, Date.now() + (serverDelay ?? RETRY_DELAYS[0]))
+            lane.queue.bucketChanged(request.bucket)
+            throw new RetryAfterError(request.path, serverDelay, lane.name)
+          }
+          if (payload.code && payload.code !== '0') throw new Error(`OKX ${request.path}: ${payload.msg || payload.code}`)
+          const data = payload.data
+          if (!Array.isArray(data)) throw new TypeError(`OKX ${request.path} response needs a data array.`)
+          return data
         }), request.controller.signal)
         lane.latencyMS = lane.latencyMS === undefined ? performance.now() - startedAt : lane.latencyMS * 0.8 + (performance.now() - startedAt) * 0.2
         lane.completed = (lane.completed ?? 0) + 1

@@ -1,8 +1,7 @@
-import { createOperationWorker, createWorkerRequest } from './worker-operations.js'
+import { Worker } from 'node:worker_threads'
 import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { CANDLE_INTERVALS, completePriceCandle, validateQuery } from './market-records.js'
-import { measureOperation } from './operations.js'
 export { CANDLE_INTERVALS, validateCandle } from './market-records.js'
 
 const keyOf = (instrument, timeframe) => `${instrument}:${timeframe}`
@@ -16,36 +15,24 @@ const CANDLE_CACHE_ENTRIES = 512, CANDLE_CACHE_BYTES = 8 * 1024 * 1024
 const CANDLE_PENDING_ENTRIES = 512, CANDLE_PENDING_BYTES = 256 * 1024, CANDLE_KEY_BYTES = 8 * 1024
 
 function copyCandleRows(rows, snapshot = false) {
-  const copy = () => {
-    // A reader response is already an owned structured clone. Retain it once;
-    // only the mutable values returned to callers need another allocation.
-    if (snapshot) {
-      for (const row of rows) Object.freeze(row)
-      return Object.freeze(rows)
-    }
-    return rows.map(row => ({ ...row }))
+  if (snapshot) {
+    for (const row of rows) Object.freeze(row)
+    return Object.freeze(rows)
   }
-  // Small copies are cheaper than a trace. Record the actual bulk CPU work,
-  // independently of the database/IPC operations a cache hit eliminates.
-  return rows.length < 128 ? copy() : measureOperation({ category: 'cpu', name: snapshot ? 'market.candle-cache.snapshot' : 'market.candle-cache.copy',
-    resource: 'market-store', attributes: { rows: rows.length } }, copy)
+  return rows.map(row => ({ ...row }))
 }
 
 function candleRowBytes(rows) {
-  const count = () => {
-    let bytes = 64
-    for (const row of rows) {
-      bytes += 64
-      for (const name of Object.keys(row)) {
-        const value = row[name]
-        bytes += 48 + name.length * 2 + (typeof value === 'string' ? value.length * 2 : 8)
-      }
-      if (bytes > CANDLE_CACHE_BYTES) break
+  let bytes = 64
+  for (const row of rows) {
+    bytes += 64
+    for (const name of Object.keys(row)) {
+      const value = row[name]
+      bytes += 48 + name.length * 2 + (typeof value === 'string' ? value.length * 2 : 8)
     }
-    return bytes
+    if (bytes > CANDLE_CACHE_BYTES) break
   }
-  return rows.length < 128 ? count() : measureOperation({ category: 'cpu', name: 'market.candle-cache.size',
-    resource: 'market-store', attributes: { rows: rows.length } }, count)
+  return bytes
 }
 
 /** Private snapshots are shared only inside this store, never with callers. */
@@ -290,8 +277,7 @@ class DatabaseWorkers {
   request(command, args = [], priority = 'background', prepare) {
     if (this.failed) return Promise.reject(this.failed)
     const task = new Promise((resolve, reject) => {
-      const request = createWorkerRequest('market-store', command, resolve, reject, { priority })
-      enqueue(this.buckets, { id: ++this.nextID, command, args, priority, prepare, rank: priorityRank(priority), ...request })
+      enqueue(this.buckets, { id: ++this.nextID, command, args, priority, prepare, rank: priorityRank(priority), resolve, reject })
       this.queuedCount += 1
       this.metrics.requests += 1; this.metrics.maximumQueued = Math.max(this.metrics.maximumQueued, this.queuedCount)
       this.drain()
@@ -340,7 +326,7 @@ class DatabaseWorkers {
       try {
         const args = job.prepare ? job.prepare() : job.args
         worker.currentLifetime = args[1]?.lifetime ?? null
-        job.dispatch(worker, { id: job.id, command: job.command, args })
+        worker.postMessage({ id: job.id, command: job.command, args })
       }
       catch (error) { worker.current = null; worker.currentLifetime = null; worker.busy = false; worker.unref(); job.reject(error); queueMicrotask(() => this.drain()) }
     }
@@ -359,9 +345,8 @@ class DatabaseWorkers {
         }, 5_000)
         timer.unref?.()
         const settle = fn => value => { clearTimeout(timer); fn(value) }
-        const request = createWorkerRequest('market-store', 'close', settle(resolve), settle(reject))
-        worker.current = { id, ...request }; worker.busy = true; worker.ref()
-        try { request.dispatch(worker, { id, command: 'close', args: [] }) }
+        worker.current = { id, resolve: settle(resolve), reject: settle(reject) }; worker.busy = true; worker.ref()
+        try { worker.postMessage({ id, command: 'close', args: [] }) }
         catch (error) { clearTimeout(timer); worker.current = null; worker.busy = false; reject(error) }
       })))
     } finally { await Promise.allSettled(workers.filter(worker => !worker.exited).map(worker => worker.terminate())) }
@@ -369,7 +354,7 @@ class DatabaseWorkers {
 }
 
 async function createDatabaseWorker(path, reader = false) {
-  const worker = createOperationWorker(new URL('./market-store-worker.js', import.meta.url), { workerData: { path, reader } }, reader ? 'market-reader' : 'market-writer')
+  const worker = new Worker(new URL('./market-store-worker.js', import.meta.url), { workerData: { path, reader } })
   await new Promise((resolve, reject) => {
     const cleanup = () => { worker.off('message', ready); worker.off('error', fail); worker.off('exit', exited) }
     const ready = message => { if (message.ready) { cleanup(); resolve() } }

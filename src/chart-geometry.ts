@@ -1,7 +1,6 @@
 import { chartCandleWidth, chartHourX, chartLayout, chartPitchBodyWidth, chartPitchSpan, type ChartLayoutDensity } from './chart-layout.ts'
 import type { Bar } from './chart-data.ts'
 import { formatCandleChange } from './market-percent.ts'
-import { measureOperation } from '../electron/services/operations.js'
 
 const axisFormatters = new Map<number, Intl.NumberFormat>()
 const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value)
@@ -240,9 +239,7 @@ export function createChartGeometryCache(measureText: (text: string) => number) 
       resident.delete(value); resident.set(value, variants)
       return value
     }
-    const value = measureOperation({ category: 'cpu', name: 'chart.geometry', attributes: {
-      candles: bars.length + Number(Boolean(overscan.before)) + Number(Boolean(overscan.after)), width: options.width, height: options.height, intervalMS: options.intervalMS,
-    } }, () => buildGeometry(bars, { ...options, liveClose }, overscan, axesFor))
+    const value = buildGeometry(bars, { ...options, liveClose }, overscan, axesFor)
     const variant = { value, before: overscan.before, after: overscan.after }
     variants.push(variant)
     if (variants.length > 4) resident.delete(variants.shift()!.value)

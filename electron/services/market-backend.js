@@ -1,4 +1,4 @@
-import { createOperationWorker, createWorkerRequest } from './worker-operations.js'
+import { Worker } from 'node:worker_threads'
 import { EventEmitter } from 'node:events'
 
 const notificationEvents = new Set(['chart', 'market', 'audit', 'history-download'])
@@ -38,7 +38,7 @@ export class MarketBackend extends EventEmitter {
     this.failure = null
     this.ready = new Promise((resolve, reject) => { this.resolveReady = resolve; this.rejectReady = reject })
     this.ready.catch(() => {})
-    const worker = this.worker = createOperationWorker(new URL('./market-backend-worker.js', import.meta.url), { workerData: this.options }, 'market-backend')
+    const worker = this.worker = new Worker(new URL('./market-backend-worker.js', import.meta.url), { workerData: this.options })
     let settled = false
     const onLoss = error => {
       if (settled || this.worker !== worker) return
@@ -110,12 +110,12 @@ export class MarketBackend extends EventEmitter {
   call(method, value) {
     const id = ++this.sequence
     return new Promise((resolve, reject) => {
-      const request = createWorkerRequest('market-backend', method, resolve, reject)
+      const request = { resolve, reject }
       void this.ready.then(() => {
         if (this.failure) throw this.failure
         if (this.closed) throw new Error('Market backend is closed.')
         this.pending.set(id, request)
-        try { request.dispatch(this.worker, { id, method, value }) }
+        try { this.worker.postMessage({ id, method, value }) }
         catch (error) { this.pending.delete(id); request.reject(error) }
       }).catch(request.reject)
     })

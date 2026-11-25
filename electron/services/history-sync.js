@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto'
-import { beginOperation } from './operations.js'
 
 const intervals = { '5m': 300_000, '15m': 900_000, '1H': 3_600_000 }
 const terminal = new Set(['paused', 'cancelled', 'completed', 'unavailable'])
@@ -491,7 +490,6 @@ export class HistorySync {
 
   async callSource(operation, query) {
     const { signal } = query
-    const queuedAt = performance.now(), queued = beginOperation({ category: 'cpu', name: 'history.source.queue', resource: query.source, attributes: { priority: query.priority } })
     let result
     const admission = this.requestTail.then(async () => {
       signal.throwIfAborted()
@@ -502,11 +500,10 @@ export class HistorySync {
         signal.addEventListener('abort', abort, { once: true })
       })
       signal.throwIfAborted(); this.lastRequestAt = this.now()
-      queued.end({ attributes: { priority: query.getPriority(), queueMS: performance.now() - queuedAt } })
       result = operation()
     })
     this.requestTail = admission.catch(() => undefined)
-    try { await admission } catch (error) { queued.end({ status: signal.aborted ? 'cancelled' : 'error', attributes: { queueMS: performance.now() - queuedAt } }); throw error }
+    await admission
     return result
   }
 

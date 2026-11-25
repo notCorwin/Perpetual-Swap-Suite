@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, ClipboardItem, contentTracing, dialog, ipcMain, Menu, nativeImage, net, screen, session, shell } from 'electron'
+import { app, BrowserWindow, clipboard, ClipboardItem, dialog, ipcMain, Menu, nativeImage, screen, session, shell } from 'electron'
 import { mkdirSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -9,13 +9,6 @@ import { encodeChartWire } from './chart-wire.js'
 import { createDesktopSecurity } from './desktop-security.js'
 import { assertBackgroundTestLaunch, testPresentation, testWindowOptions } from './test-presentation.js'
 import { startTestOwnerWatchdog } from './test-owner.js'
-import { initializeOperationRecording, closeOperationRecording, closeExternalOperationSource } from './services/operation-runtime.js'
-import { graphicsRecordingRequested, startGraphicsRecording } from './services/operation-graphics.js'
-import { beginOperation, measureOperation, recordOperation, runWithOperationContext, withOperationSuppressed } from './services/operations.js'
-import { createRendererOperationReceiver } from './services/renderer-operations.js'
-import { createOperationSession, enforceOperationRetention } from './services/operation-retention.js'
-import { operationRecordingRequested } from './services/operation-policy.js'
-import { installElectronOperationHooks } from './services/operation-hooks.js'
 import { MarketBackend } from './services/market-backend.js'
 import { backgroundWindowLaunch, windowToolbarLayout } from './window-layout.js'
 import { restoreWindowBounds, saveWindowBounds } from './window-state.js'
@@ -37,27 +30,7 @@ if (process.env.PERPETUAL_SWAP_USER_DATA) {
   app.setPath('userData', userData)
   app.setPath('sessionData', sessionData)
 }
-const recordGraphics = graphicsRecordingRequested()
-const operationSessionRoot = join(app.getPath('userData'), 'Operations')
-const operationSession = operationRecordingRequested() && !process.env.PERPETUAL_SWAP_OPERATION_DIR
-  ? await withOperationSuppressed(() => createOperationSession({ root: operationSessionRoot })) : undefined
-if (operationSession) process.env.PERPETUAL_SWAP_OPERATION_DIR = operationSession.directory
-let retentionTask = Promise.resolve()
-const maintainOperationRetention = () => {
-  if (!operationSession) return retentionTask
-  retentionTask = retentionTask.catch(() => {}).then(() => withOperationSuppressed(async () => {
-    await operationSession.heartbeat()
-    return enforceOperationRetention(operationSessionRoot)
-  })).catch(error => { console.error('Operation retention failed:', error.message) })
-  return retentionTask
-}
-await maintainOperationRetention()
-const operationRecording = initializeOperationRecording({ label: 'electron-main' })
 const statusLog = createStatusLog(join(app.getPath('userData'), 'Logs', 'market-status.jsonl'))
-const retentionTimer = operationSession ? setInterval(maintainOperationRetention, 60_000) : undefined
-retentionTimer?.unref()
-const rendererOperations = operationRecording ? createRendererOperationReceiver() : undefined
-let stopGraphicsRecording
 const security = createDesktopSecurity({ rendererURL, rendererFile: join(root, 'dist', 'index.html') })
 const e2eLiveRefresh = testMode && process.env.PERPETUAL_SWAP_E2E_LIVE_REFRESH === '1'
 let window
@@ -93,40 +66,16 @@ function assertSettingsSender(event) { security.assertTrustedSender(event, setti
 function sendNotification(sender, channel, detail) {
   if (!presentation?.getState().active) return
   const epoch = presentation.getState().epoch
-  if (!operationRecording) return sender.send(channel, channel === 'radar:chart-prepared' ? encodeChartWire(detail) : detail, undefined, epoch)
-  const operation = beginOperation({ category: 'ipc', name: 'desktop.notification.send', resource: channel })
-  try { operation.run(() => sender.send(channel, channel === 'radar:chart-prepared' ? encodeChartWire(detail) : detail, operation.context, epoch)) }
-  finally { operation.end() }
-}
-
-function drainRendererOperations(target) {
-  if (!target || target.isDestroyed() || target.webContents.isDestroyed()) return Promise.resolve()
-  const sender = target.webContents
-  if (!rendererOperations?.sourcesFor(sender.id).length) return Promise.resolve()
-  return new Promise((resolve, reject) => {
-    const id = randomUUID()
-    const finish = error => {
-      clearTimeout(timer); ipcMain.off('radar:operations-drained', acknowledged)
-      if (error) { rendererOperations.markIncomplete(sender.id, error.message); reject(error) }
-      else resolve()
-    }
-    const acknowledged = (event, value) => {
-      try { security.assertTrustedSender(event, target) } catch { return }
-      if (value?.id === id) finish(value.ok ? undefined : new Error('Renderer operation drain failed.'))
-    }
-    const timer = setTimeout(() => finish(new Error('Renderer operation drain timed out.')), 5_000)
-    ipcMain.on('radar:operations-drained', acknowledged)
-    sender.send('radar:operations-drain', { id })
-  })
+  sender.send(channel, channel === 'radar:chart-prepared' ? encodeChartWire(detail) : detail, epoch)
 }
 
 async function copyImage(image) {
   if (image.isEmpty()) throw new Error('Invalid chart image.')
-  const png = measureOperation({ category: 'cpu', name: 'chart.encode-png' }, () => image.toPNG())
+  const png = image.toPNG()
   await clipboard.write([new ClipboardItem({ 'image/png': new Blob([png], { type: 'image/png' }) })])
 }
 
-async function handleRequest(event, payload, context) {
+async function handleRequest(event, payload) {
   assertApplicationSender(event)
   const request = parseDesktopRequest(payload, { allowE2E: testMode })
   if (security.isTrustedSender(event, settingsWindow) && !request.preferences && !request.dataAudit && !request.historyDownload) throw new Error('This request is unavailable in settings.')
@@ -147,14 +96,14 @@ async function handleRequest(event, payload, context) {
     await copyImage(image); return { ok: true }
   }
   if (request.screenshot) {
-    const image = await measureOperation({ category: 'gpu', name: 'window.capture', attributes: { measurement: 'submission-wall' } }, () => event.sender.capturePage())
+    const image = await event.sender.capturePage()
     await copyImage(image)
     return { ok: true }
   }
   if (request.captureChart) {
     const { x, y, width, height, output } = request.captureChart
-    const image = await measureOperation({ category: 'gpu', name: 'chart.capture', attributes: { measurement: 'submission-wall', width, height } }, () => event.sender.capturePage({ x: Math.floor(x), y: Math.floor(y), width: Math.ceil(x + width) - Math.floor(x), height: Math.ceil(y + height) - Math.floor(y) }))
-    if (output === 'png') return { imageDataURL: `data:image/png;base64,${measureOperation({ category: 'cpu', name: 'chart.encode-png' }, () => image.toPNG()).toString('base64')}`, ...image.getSize() }
+    const image = await event.sender.capturePage({ x: Math.floor(x), y: Math.floor(y), width: Math.ceil(x + width) - Math.floor(x), height: Math.ceil(y + height) - Math.floor(y) })
+    if (output === 'png') return { imageDataURL: `data:image/png;base64,${image.toPNG().toString('base64')}`, ...image.getSize() }
     await copyImage(image)
     return { ok: true }
   }
@@ -172,9 +121,7 @@ async function handleRequest(event, payload, context) {
   }
   return request.chartLocal || request.chartHistory || request.chartUniverse ? encodeChartWire(response) : response
   }
-  const task = operationRecording
-    ? runWithOperationContext(context, () => measureOperation({ category: 'ipc', name: 'desktop.request.execute', resource: Object.keys(request)[0] }, execute))
-    : execute()
+  const task = execute()
   desktopRequests.add(task)
   task.then(() => desktopRequests.delete(task), () => desktopRequests.delete(task))
   return task
@@ -231,7 +178,7 @@ async function createSettingsWindow() {
     title: 'Settings — Perpetual Swap Suite', backgroundColor: '#101114', show: false,
     ...(process.platform === 'darwin' ? { titleBarStyle: 'hidden', trafficLightPosition: windowToolbarLayout(1600, true).buttonsPosition } : {}),
     webPreferences: { ...testWindowOptions(backgroundTests).webPreferences,
-      additionalArguments: ['--perpetual-swap-settings-window', ...(operationRecording ? ['--perpetual-swap-operation-recording'] : []),
+      additionalArguments: ['--perpetual-swap-settings-window',
         ...(!presentation.getState().active ? ['--perpetual-swap-presentation-idle'] : [])],
       preload: join(root, 'electron', 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true },
   })
@@ -242,19 +189,16 @@ async function createSettingsWindow() {
     event.preventDefault()
     if (closing) return
     closing = true
-    void querySettingsCloseGuard(target).then(async () => {
+    void querySettingsCloseGuard(target).then(() => {
       if (target.isDestroyed() || !canCloseSettings()) { closing = false; return }
-      await drainRendererOperations(target).catch(error => console.error('Settings operation shutdown failed:', error))
-      for (const executionId of rendererOperations?.sourcesFor(target.webContents.id) ?? []) await closeExternalOperationSource(executionId)
       allowClose = true
       if (!target.isDestroyed()) target.close()
-    }).catch(error => { closing = false; console.error('Settings operation source close failed:', error) })
+    }).catch(error => { closing = false; console.error('Settings close check failed:', error) })
   })
   target.once('closed', () => { if (settingsWindow === target) settingsWindow = undefined; settingsCloseGuard = { dirty: false, busy: false } })
   target.webContents.on('render-process-gone', (_event, details) => {
     console.error('Settings renderer process exited:', details.reason)
     settingsCloseGuard = { dirty: false, busy: false }
-    rendererOperations?.markIncomplete(target.webContents.id, `settings-renderer-${details.reason}`)
     if (!shuttingDown && !testMode && details.reason !== 'clean-exit' && !target.isDestroyed()) target.destroy()
   })
   for (const name of ['will-navigate', 'will-redirect', 'will-frame-navigate']) target.webContents.on(name, event => { if (!security.isAllowedNavigation(event.url)) event.preventDefault() })
@@ -299,8 +243,7 @@ async function createWindow() {
     width: 1600, height: 1000, ...savedBounds, minWidth: 1200, minHeight: 640,
     title: 'Perpetual Swap Suite', backgroundColor: '#101114', show: false,
     webPreferences: { ...testWindowOptions(backgroundTests).webPreferences,
-      additionalArguments: [...(operationRecording ? ['--perpetual-swap-operation-recording'] : []),
-        ...(!presentation.getState().active ? ['--perpetual-swap-presentation-idle'] : [])],
+      additionalArguments: [...(!presentation.getState().active ? ['--perpetual-swap-presentation-idle'] : [])],
       preload: join(root, 'electron', 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true },
   })
   if (!testMode && !backgroundTests && !backgroundLaunch) {
@@ -324,13 +267,9 @@ async function createWindow() {
   window.webContents.on('will-redirect', event => { if (!security.isAllowedNavigation(event.url)) event.preventDefault() })
   window.webContents.on('will-frame-navigate', event => { if (!security.isAllowedNavigation(event.url)) event.preventDefault() })
   let rendererRecoveries = 0
-  let allowClose = false, closing = false
   const target = window
   target.webContents.on('render-process-gone', (_event, details) => {
     console.error('Renderer process exited:', details.reason)
-    rendererOperations?.markIncomplete(target.webContents.id, `renderer-${details.reason}`)
-    if (operationRecording) recordOperation({ category: 'cpu', name: 'renderer.interrupted', startedAt: Date.now(), durationMS: 0, status: 'error',
-      attributes: { incomplete: true, execution: 'renderer', reason: details.reason } })
     if (shuttingDown || testMode || details.reason === 'clean-exit' || target.isDestroyed()) return
     if (rendererRecoveries < 2) {
       rendererRecoveries += 1
@@ -347,15 +286,7 @@ async function createWindow() {
       })
     }
   })
-  target.on('close', event => {
-    if (allowClose || shuttingDown) { saveWindowBounds(windowStatePath, target); return }
-    event.preventDefault()
-    if (closing) return
-    closing = true
-    void drainRendererOperations(target).catch(error => console.error('Renderer operation shutdown failed:', error)).then(async () => {
-      for (const executionId of rendererOperations?.sourcesFor(target.webContents.id) ?? []) await closeExternalOperationSource(executionId)
-    }).catch(error => console.error('Renderer operation source close failed:', error)).finally(() => { allowClose = true; if (!target.isDestroyed()) target.close() })
-  })
+  target.on('close', () => { saveWindowBounds(windowStatePath, target) })
   window.webContents.setWindowOpenHandler(({ url }) => {
     if (security.isAllowedExternalURL(url)) void shell.openExternal(url).catch(error => console.error('Could not open external link:', error))
     return { action: 'deny' }
@@ -396,7 +327,6 @@ function subscribeWindowNotifications(target, settingsOnly = false) {
 }
 
 async function startDesktop() {
-  if (recordGraphics) stopGraphicsRecording = await startGraphicsRecording(app, contentTracing, operationRecording.directory)
   backend = new MarketBackend({ userData: app.getPath('userData'), testMode, e2eLiveRefresh })
   presentation = new PresentationLifecycle({ active: true,
     pause: epoch => { for (const entry of windowNotifications) entry.detach(); return backend.presentation(false, epoch) },
@@ -425,20 +355,6 @@ async function startDesktop() {
     if (typeof value?.dirty === 'boolean' && typeof value?.busy === 'boolean') settingsCloseGuard = { dirty: value.dirty, busy: value.busy }
   })
   ipcMain.handle('radar:settings-close', event => { assertSettingsSender(event); settingsWindow.close() })
-  if (rendererOperations) {
-  ipcMain.handle('radar:operations-initialize', (event, value) => {
-    assertApplicationSender(event)
-    return rendererOperations.initialize(event.sender.id, value?.nonce)
-  })
-  ipcMain.handle('radar:operations', (event, batch) => {
-    assertApplicationSender(event)
-    return rendererOperations.receive(event.sender.id, batch)
-  })
-  ipcMain.handle('radar:operations-failure', (event, value) => {
-    assertApplicationSender(event)
-    rendererOperations.fail(event.sender.id, value)
-  })
-  }
   // Windows and input become available while data restores in its own worker.
   await createWindow()
 }
@@ -455,11 +371,7 @@ app.whenReady().then(() => {
       callback({ responseHeaders: details.responseHeaders })
     })
   }
-  if (operationRecording) {
-    installElectronOperationHooks({ app, net, session })
-    void operationRecording.flush().catch(error => console.error('Operation hook checkpoint failed:', error.message))
-  }
-  if (testMode || process.env.PERPETUAL_SWAP_SANDBOX === '1' || process.env.PERPETUAL_SWAP_TEST_UI !== undefined) {
+  if (testMode || process.env.PERPETUAL_SWAP_TEST_UI !== undefined) {
     stopTestOwner = startTestOwnerWatchdog({ parentPID: testLaunchParentPID, onOwnerLost: () => {
       app.quit()
       testOwnerExitTimer = setTimeout(() => app.exit(1), 10_000)
@@ -478,29 +390,14 @@ function startShutdown() {
   shuttingDown = true
   ipcMain.removeHandler('radar:request')
   void (async () => {
-    let recordingComplete = false
     try {
       await startupTask.catch(error => console.error('Desktop startup did not complete:', error))
       try { await backend?.dispose() }
       catch (error) { console.error('Market backend shutdown failed:', error) }
       await Promise.allSettled([...desktopRequests])
       await statusLog.flush()
-      await Promise.all([window, settingsWindow].filter(target => target && !target.isDestroyed() && !target.webContents.isDestroyed()).map(target => drainRendererOperations(target).catch(error => console.error('Renderer operation shutdown failed:', error))))
-      await stopGraphicsRecording?.()
-      await closeOperationRecording()
-      recordingComplete = true
     } catch (error) { console.error('Desktop shutdown failed:', error) }
     finally {
-      clearInterval(retentionTimer)
-      if (operationSession) {
-        try {
-          await retentionTask
-          await withOperationSuppressed(async () => {
-            await operationSession.close({ complete: recordingComplete })
-            await enforceOperationRetention(operationSessionRoot)
-          })
-        } catch (error) { console.error('Operation session did not close cleanly:', error.message) }
-      }
       shutdownComplete = true; app.quit()
     }
   })()

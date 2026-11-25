@@ -1,8 +1,7 @@
 const { contextBridge, ipcRenderer } = require('electron')
 
-const operationRecording = process.argv.includes('--perpetual-swap-operation-recording')
 const pendingNotifications = []
-let notificationReceiver, presentationReceiver, flushOperations
+let notificationReceiver, presentationReceiver
 let pendingPreferences
 const isSettingsWindow = process.argv.includes('--perpetual-swap-settings-window')
 let settingsCloseGuard = { dirty: false, busy: false }
@@ -26,52 +25,30 @@ ipcRenderer.on('radar:presentation', (_event, value) => { presentationEvents++; 
 ipcRenderer.invoke('radar:presentation-state').then(value => {
   if (!presentationEvents) updatePresentation(value)
 }).catch(() => {})
-const receive = operationRecording
-  ? (channel, detail, context, epoch) => {
-    if (!presentation.active || typeof epoch === 'number' && epoch < presentation.epoch) return
-    if (notificationReceiver) notificationReceiver(channel, detail, context, epoch)
-    else pendingNotifications.push([channel, detail, context, epoch])
-  }
-  : (channel, detail, _context, epoch) => {
-    if (!presentation.active || typeof epoch === 'number' && epoch < presentation.epoch) return
-    if (notificationReceiver) notificationReceiver(channel, detail)
-    else pendingNotifications.push([channel, detail, undefined, epoch])
-  }
+const receive = (channel, detail, epoch) => {
+  if (!presentation.active || typeof epoch === 'number' && epoch < presentation.epoch) return
+  if (notificationReceiver) notificationReceiver(channel, detail)
+  else pendingNotifications.push([channel, detail, epoch])
+}
 for (const channel of ['radar:chart-prepared', 'radar:market-changed', 'radar:audit-changed', 'radar:history-download-changed']) {
-  ipcRenderer.on(channel, (_event, detail, context, epoch) => receive(channel, detail, context, epoch))
+  ipcRenderer.on(channel, (_event, detail, epoch) => receive(channel, detail, epoch))
 }
 ipcRenderer.on('radar:preferences-changed', (_event, detail) => {
   if (notificationReceiver) notificationReceiver('radar:preferences-changed', detail)
   else pendingPreferences = detail
 })
-if (operationRecording) {
-  ipcRenderer.on('radar:operations-drain', async (_event, { id }) => {
-    try {
-      if (!flushOperations) throw new Error('Renderer recording is not initialized.')
-      await flushOperations()
-      ipcRenderer.send('radar:operations-drained', { id, ok: true })
-    } catch { ipcRenderer.send('radar:operations-drained', { id, ok: false }) }
-  })
-  window.addEventListener('pagehide', () => { if (flushOperations) void flushOperations().catch(() => {}) })
-}
-const requireRecording = () => {
-  if (!operationRecording) throw new Error('Operation recording is disabled for this renderer.')
-}
 const transport = {
   nativeWindowControls: process.platform === 'darwin',
-  operationRecording,
   isSettingsWindow,
   setSettingsCloseGuard: value => { if (!isSettingsWindow) throw new Error('Not a settings window.'); settingsCloseGuard = { dirty: value.dirty, busy: value.busy }; ipcRenderer.send('radar:settings-close-guard', settingsCloseGuard) },
   closeSettingsWindow: () => { if (!isSettingsWindow) throw new Error('Not a settings window.'); return ipcRenderer.invoke('radar:settings-close') },
-  request: operationRecording
-    ? (value, context) => ipcRenderer.invoke('radar:request', value, context)
-    : value => ipcRenderer.invoke('radar:request', value),
+  request: value => ipcRenderer.invoke('radar:request', value),
   subscribeNotifications: receiver => {
     if (notificationReceiver || typeof receiver !== 'function') throw new Error('The notification receiver is already subscribed or invalid.')
     notificationReceiver = receiver
     if (pendingPreferences !== undefined) { receiver('radar:preferences-changed', pendingPreferences); pendingPreferences = undefined }
-    for (const notification of pendingNotifications.splice(0)) {
-      if (presentation.active && (typeof notification[3] !== 'number' || notification[3] >= presentation.epoch)) receiver(...notification)
+    for (const [channel, detail, epoch] of pendingNotifications.splice(0)) {
+      if (presentation.active && (typeof epoch !== 'number' || epoch >= presentation.epoch)) receiver(channel, detail)
     }
   },
   subscribePresentation: receiver => {
@@ -80,15 +57,6 @@ const transport = {
     try { receiver(presentation) }
     finally { const { snapshot: _snapshot, ...state } = presentation; presentation = state }
   },
-  initializeOperations: flush => {
-    requireRecording()
-    if (flushOperations || typeof flush !== 'function') throw new Error('Renderer recording is already initialized or its drain is invalid.')
-    flushOperations = flush
-    const nonce = Array.from(globalThis.crypto.getRandomValues(new Uint8Array(16)), value => value.toString(16).padStart(2, '0')).join('')
-    return ipcRenderer.invoke('radar:operations-initialize', { nonce })
-  },
-  recordOperations: batch => { requireRecording(); return ipcRenderer.invoke('radar:operations', batch) },
-  operationSourceFailure: value => { requireRecording(); return ipcRenderer.invoke('radar:operations-failure', value) },
 }
 // Hand the transport to the application once through the stable bridge API.
 // Bulk values remain strings when the resulting function proxies are called.

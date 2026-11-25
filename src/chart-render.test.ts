@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { attachOperationSink } from '../electron/services/operations.js'
 import { createChartIndicatorPresentation, createChartPlotCache } from './chart-render.ts'
 import type { ReadyChartWindow } from './chart-data.ts'
 
@@ -112,17 +111,13 @@ test('selection reuses preconstructed live paths even beyond the geometry LRU ca
     return { ...frame, liveBar: { ...frame.bars.at(-1)!, confirmed: false, hour: 96 * step } }
   })
   const plots = windows.map(frame => cache(frame, size))
-  const operations: string[] = [], stop = attachOperationSink(event => { operations.push(event.name) })
-  try {
-    for (const [index, frame] of windows.entries()) {
-      assert.equal(cache(frame, size), plots[index])
-      assert.equal(plots[index]!.bars.length, 96)
-      assert.equal(plots[index]!.bars.at(-1), frame.liveBar)
-      assert.equal(cache({ ...frame, realtimeState: 'stale', priceObservedAt: 123 }, size), plots[index],
-        'Metadata-only freshness updates reuse merged live bars and geometry.')
-    }
-    assert.ok(!operations.includes('chart.geometry'), 'Selecting any listed candidate cannot reconstruct geometry.')
-  } finally { stop() }
+  for (const [index, frame] of windows.entries()) {
+    assert.equal(cache(frame, size), plots[index])
+    assert.equal(plots[index]!.bars.length, 96)
+    assert.equal(plots[index]!.bars.at(-1), frame.liveBar)
+    assert.equal(cache({ ...frame, realtimeState: 'stale', priceObservedAt: 123 }, size), plots[index],
+      'Metadata-only freshness updates reuse merged live bars and geometry.')
+  }
   const changed = { ...windows[0], liveBar: { ...windows[0].liveBar, close: 103 } }
   assert.notEqual(cache(changed, size), plots[0], 'New prices invalidate the prior immutable plot.')
   assert.notEqual(cache(windows[0], { ...size, width: 800 }), plots[0], 'Layout changes prepare correctly sized paths.')

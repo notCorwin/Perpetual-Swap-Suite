@@ -1,5 +1,4 @@
-import { createOperationWorker, createWorkerRequest } from './worker-operations.js'
-import { stopOperationWorker } from './operation-worker.js'
+import { Worker } from 'node:worker_threads'
 
 /** Exact streaming qualification runs outside Electron's main event loop. */
 export class StreamLiquidityEvaluator {
@@ -14,7 +13,7 @@ export class StreamLiquidityEvaluator {
   }
 
   startWorker() {
-    const worker = createOperationWorker(new URL('./stream-liquidity-worker.js', import.meta.url), {}, 'stream-liquidity')
+    const worker = new Worker(new URL('./stream-liquidity-worker.js', import.meta.url))
     this.worker = worker
     worker.unref()
     worker.on('message', ({ id, result, error }) => {
@@ -46,7 +45,7 @@ export class StreamLiquidityEvaluator {
     return new Promise((resolve, reject) => {
       let worker
       const id = ++this.nextID
-      const request = createWorkerRequest('stream-liquidity', 'evaluate', resolve, reject)
+      const request = { resolve, reject }
       try {
         worker = this.worker ?? this.startWorker()
         this.pending.set(id, request)
@@ -58,7 +57,7 @@ export class StreamLiquidityEvaluator {
         const evict = snapshot && !this.books.has(instId) && this.books.size >= 512 ? this.books.keys().next().value : undefined
         // Each immutable book crosses the boundary once per worker lifetime.
         // Later ticker/OI observations reference that exact captured version.
-        request.dispatch(worker, { id, input: book ? { ...input, book: null } : input,
+        worker.postMessage({ id, input: book ? { ...input, book: null } : input,
           ...(snapshot ? { bookVersion: snapshot.version, ...(snapshot !== previous ? { bookSnapshot: book } : {}) } : {}),
           ...(evict !== undefined ? { evictBook: evict } : {}) })
         if (snapshot) {
@@ -81,7 +80,7 @@ export class StreamLiquidityEvaluator {
     this.books.clear()
     for (const request of this.pending.values()) request.reject(new Error('Streaming liquidity evaluator is closed.'))
     this.pending.clear()
-    this.closeTask = worker ? stopOperationWorker(worker, 'stream-liquidity') : Promise.resolve()
+    this.closeTask = worker ? worker.terminate().then(() => {}) : Promise.resolve()
     return this.closeTask
   }
 }

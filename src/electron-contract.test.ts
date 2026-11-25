@@ -45,7 +45,8 @@ test('backend adapters keep resident reads separate from viewport demand and for
   const universe = { frames: [frame] }
   const snapshot = { rows: [], revision: 3, serviceSession: 'collector-1' }
   const fixture = {
-    handle: null as null | ((request: unknown) => Promise<{ value: unknown; error?: unknown }>),
+    handle: null as null | ((request: unknown) => Promise<void>),
+    responses: new Map<number, { value: unknown; error?: unknown }>(),
     service: {
       ready: Promise.resolve(), barTasks: new Set(),
       snapshot: (...args: unknown[]) => { calls.push(['snapshot', ...args]); return snapshot },
@@ -62,10 +63,11 @@ test('backend adapters keep resident reads separate from viewport demand and for
   const fixtureKey = '__desktopContractBackendFixture'
   const fixtureSource = `const fixture = Reflect.get(globalThis, '${fixtureKey}');`
   const stubs = new Map([
-    ['node:worker_threads', 'export const parentPort = { postMessage() {} }, workerData = { userData: "unused", testMode: true }, threadId = 1;'],
-    ['./worker-operations.js', `${fixtureSource}
-      export const runWorkerInitialization = (_role, initialize) => Promise.resolve().then(initialize);
-      export const onOperationMessage = (_port, _role, handle) => { fixture.handle = handle; };`],
+    ['node:worker_threads', `${fixtureSource}
+      export const parentPort = {
+        on(event, handle) { if (event === 'message') fixture.handle = handle; },
+        postMessage(msg) { if (msg && typeof msg.id === 'number') fixture.responses.set(msg.id, msg); },
+      }, workerData = { userData: "unused", testMode: true }, threadId = 1;`],
     ['./metadata-store.js', 'export class MetadataStore { static async open() { return { getSettings: () => ({ preferences: {} }) }; } }'],
     ['./market-store.js', 'export class MarketStore { static async open() { return {}; } }'],
     ['./market-service.js', `${fixtureSource} export class MarketService { constructor() { return fixture.service; } }`],
@@ -81,9 +83,13 @@ test('backend adapters keep resident reads separate from viewport demand and for
   })
   try {
     await import(`${workerURL}?desktop-contract-test`)
+    let seq = 0
     const request = async (input: unknown) => {
       assert.ok(fixture.handle)
-      const result = await fixture.handle({ id: 1, method: 'request', value: parseDesktopRequest(input) })
+      const id = ++seq
+      await fixture.handle({ id, method: 'request', value: parseDesktopRequest(input) })
+      const result = fixture.responses.get(id)!
+      assert.ok(result)
       assert.equal(result.error, undefined)
       return result.value
     }

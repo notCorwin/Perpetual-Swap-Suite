@@ -1,17 +1,6 @@
 import type { PreparedChartResponse } from './chart-data.ts'
 import type { Preferences, PreferencesPatch } from '../electron/services/preferences.js'
 import type { RadarTimeframe } from './timeframe.ts'
-import type { OperationContext, OperationJournalEvent } from '../electron/services/operations.js'
-
-export type OperationSourceIdentity = { sessionId: string; executionId: string; scenarioId?: string }
-export type OperationBatch = { executionId: string; batchId: string; firstSequence: number; events: OperationJournalEvent[] }
-export type OperationAcknowledgment = { batchId: string; lastSequence: number }
-export type OperationBridgeHooks = {
-  beginRequest(command: string): { id: string; context: OperationContext }
-  endRequest(id: string, status: 'ok' | 'error'): void
-  receive(channel: string, context: OperationContext | undefined, deliver: () => void): void
-  flush(): Promise<void>
-}
 
 export type ChartCaptureBounds = { x: number; y: number; width: number; height: number; backgroundRGB: number[] }
 export type ChartImage = { imageDataURL: string; width: number; height: number }
@@ -75,14 +64,10 @@ export type DesktopResponse<Request extends DesktopRequest> = Request extends { 
   ? ChartImage : { [K in keyof DesktopCommands]: Request extends Record<K, unknown> ? DesktopCommands[K]['output'] : never }[keyof DesktopCommands]
 export interface RadarDesktop {
   readonly nativeWindowControls: boolean
-  readonly operationRecording: boolean
   readonly isSettingsWindow: boolean
   setSettingsCloseGuard(value: { dirty: boolean; busy: boolean }): void
   closeSettingsWindow(): Promise<void>
   subscribePresentation(receiver: (update: PresentationUpdate) => void): () => void
-  initializeOperations(hooks: OperationBridgeHooks): Promise<OperationSourceIdentity>
-  recordOperations(batch: OperationBatch): Promise<OperationAcknowledgment>
-  operationSourceFailure(value: { executionId: string; reason: string; omitted: number }): Promise<void>
   request(value: { statusLog: DesktopCommands['statusLog']['input'] }): Promise<DesktopCommands['statusLog']['output']>
   request(value: { preferences: DesktopCommands['preferences']['input'] }): Promise<DesktopCommands['preferences']['output']>
   request(value: { snapshot: DesktopCommands['snapshot']['input'] }): Promise<DesktopCommands['snapshot']['output']>

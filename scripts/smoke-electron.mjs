@@ -20,16 +20,13 @@ async function deadline(work, label, milliseconds = 60_000) {
   } finally { clearTimeout(timer) }
 }
 
-export async function smokeElectron({ app, revision, report: reportPath, operationRecording = false }) {
+export async function smokeElectron({ app, revision, report: reportPath }) {
   assert.match(revision ?? '', /^[0-9a-f]{40}$/i, 'Smoke requires the full expected Git revision.')
   const artifact = await inspectApp(app, revision)
   const prepared = await prepareBackgroundApp({ sourceApp: artifact.app, executableName: 'Perpetual Swap Suite' })
   const userData = await mkdtemp(join(tmpdir(), 'perpetual-swap-package-smoke-'))
   const nativeUserData = await mkdtemp(join(tmpdir(), 'perpetual-swap-native-smoke-'))
-  const operationDirectory = operationRecording
-    ? process.env.PERPETUAL_SWAP_OPERATION_DIR ?? (reportPath ? join(dirname(resolve(reportPath)), 'smoke-operations') : await mkdtemp(join(tmpdir(), 'perpetual-swap-smoke-operations-')))
-    : undefined
-  const report = { operationDirectory, app: artifact.app, revision, dirty: artifact.metadata.dirty, operationRecording, checks: [], startedAt: new Date().toISOString(),
+  const report = { app: artifact.app, revision, dirty: artifact.metadata.dirty, checks: [], startedAt: new Date().toISOString(),
     verification: { kind: 'background-replica', sourceApp: artifact.app, sourceExecutable: artifact.executable,
       sourceFingerprint: prepared.sourceFingerprint, testedApp: prepared.app, testedExecutable: prepared.executable,
       containerChanges: ['LSBackgroundOnly=true', 'LSUIElement=false', 'test bundle identifiers', 'ad-hoc signature'],
@@ -66,9 +63,6 @@ export async function smokeElectron({ app, revision, report: reportPath, operati
         ELECTRON_RENDERER_URL: undefined,
         PERPETUAL_SWAP_E2E: '1',
         PERPETUAL_SWAP_E2E_LIVE_REFRESH: '0',
-        PERPETUAL_SWAP_OPERATION_TRACE: operationRecording ? '1' : '0',
-        PERPETUAL_SWAP_OPERATION_DIR: operationDirectory ?? '',
-        PERPETUAL_SWAP_GPU_TRACE: '0',
         PERPETUAL_SWAP_USER_DATA: profile,
       }),
     })
@@ -82,10 +76,8 @@ export async function smokeElectron({ app, revision, report: reportPath, operati
       node: typeof window.require,
       electron: typeof window.process,
       url: location.href,
-      operationRecording: window.radarDesktop?.operationRecording,
     }))
     assert.equal(renderer.bridge, 'function', 'The packaged preload must expose the desktop bridge.')
-    assert.equal(renderer.operationRecording, operationRecording, 'The renderer must inherit the selected recording capability.')
     assert.equal(renderer.node, 'undefined', 'The renderer must not expose require.')
     assert.equal(renderer.electron, 'undefined', 'The renderer must not expose process.')
     assert.ok(renderer.url.startsWith('file://') && renderer.url.includes('/app.asar/dist/index.html'), 'The app must load the packaged renderer.')
@@ -178,7 +170,6 @@ export async function smokeElectron({ app, revision, report: reportPath, operati
     const saved = await readCandles()
     const files = await readdir(userData, { recursive: true })
     assert.ok(files.some(file => file.endsWith('market.sqlite')), 'The durable fixture must create the canonical SQLite database.')
-    if (!operationRecording) assert.ok(!files.some(file => /(?:^|\/)(?:Operations|diagnostics)(?:\/|$)|\.health\.json$|\.participant\.json$/.test(file)), 'Disabled recording must create no session, journal or participant files.')
     report.checks.push('SQLite WAL writes and reads in dedicated workers')
     await page.reload({ waitUntil: 'domcontentloaded' })
     await page.locator(`[aria-label="View ${fixture.instId} chart"]`).click()
@@ -225,11 +216,6 @@ export async function smokeElectron({ app, revision, report: reportPath, operati
     assert.deepEqual(await readCandles(), saved, 'Completed candles must survive process restart.')
     await close()
     assert.deepEqual(errors, [], 'The packaged renderer must not raise page errors.')
-    if (!operationRecording) {
-      const files = (await Promise.all([userData, nativeUserData].map(directory => readdir(directory, { recursive: true })))).flat()
-      assert.ok(!files.some(file => /(?:^|\/)(?:Operations|diagnostics)(?:\/|$)|\.health\.json$|\.participant\.json$/.test(file)), 'Restart and shutdown must not create recording files.')
-      report.checks.push('recording disabled through requests, chart work, SQLite persistence, restart and shutdown')
-    }
     report.checks.push('restart, revision, and persistent history')
     report.ok = true
     return report
@@ -252,8 +238,7 @@ export async function smokeElectron({ app, revision, report: reportPath, operati
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const { values } = parseArgs({ options: {
     app: { type: 'string' }, revision: { type: 'string' }, report: { type: 'string' },
-    trace: { type: 'boolean', default: false },
   } })
   if (!values.app || !values.revision) throw new Error('Usage: node scripts/smoke-electron.mjs --app PATH --revision SHA [--report PATH]')
-  console.log(JSON.stringify(await smokeElectron({ ...values, operationRecording: values.trace }), null, 2))
+  console.log(JSON.stringify(await smokeElectron(values), null, 2))
 }

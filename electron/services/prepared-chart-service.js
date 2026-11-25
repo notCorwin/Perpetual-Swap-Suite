@@ -1,10 +1,8 @@
 import { validChartWindowBars } from '../chart-viewport.js'
-import { createOperationWorker, createWorkerRequest } from './worker-operations.js'
+import { Worker } from 'node:worker_threads'
 import { availableParallelism } from 'node:os'
 import { statisticsMask, statisticsVersionFor } from './statistics-state.js'
 import { appendIndicatorCandle, projectIndicatorCandle } from './indicators.js'
-import { captureOperationContext, hasOperationRecording, hookOperationMethods, measureOperation, recordOperation } from './operations.js'
-import { stopOperationWorker } from './operation-worker.js'
 import { completePriceCandle } from './market-records.js'
 
 const VISIBLE = 96, TAIL = 128, CHUNK = 1024, HISTORY = 1536, HISTORY_AHEAD = 256, HISTORY_PAGE = 300
@@ -672,14 +670,7 @@ export class PreparedChartPipeline {
 
   projectBars(state, rows, projection, end) {
     state.projectedBars ??= new Map()
-    const misses = rows.reduce((count, row) => {
-      const cached = state.projectedBars.get(row.timestamp)
-      return count + Number(!(cached?.row === row && cached.indicator === state.indicators.get(row.timestamp)
-        && cached.oiFresh === sourceFresh(row, 1) && cached.takerFresh === sourceFresh(row, 2)))
-    }, 0)
-    const entries = () => rows.map(row => this.projectedEntry(state, row))
-    const values = misses ? measureOperation({ category: 'cpu', name: 'chart.project', resource: state.instId,
-      attributes: { candles: misses, intervalMS: state.intervalMS, projection } }, entries) : entries()
+    const values = rows.map(row => this.projectedEntry(state, row))
     const key = values.map(value => value.token).join(',')
     const previous = projection === 'history' ? state.historyBarsCache : state.barCaches.get(end)
     if (previous?.key === key) return previous.bars
@@ -857,7 +848,7 @@ export class PreparedChartPipeline {
       }
       return frame
     }
-    try { return pending ? pending.run(project) : project() } catch (error) {
+    try { return project() } catch (error) {
       pending?.reject(error)
       throw error
     }
@@ -894,9 +885,6 @@ export class PreparedChartPipeline {
       pending = { promise, resolve, reject }
       this.livePublications.set(key, pending)
     }
-    // The last admitted source owns the facts used by the eventual frame.
-    // A shared immediate otherwise inherits the first series' async context.
-    pending.run = captureOperationContext()
     this.scheduleLivePublications()
     return pending.promise
   }
@@ -1193,23 +1181,15 @@ export class PreparedChartPipeline {
     for (const entry of this.pendingFocusReads.values()) {
       if (focus !== undefined && entry.focus !== focus) continue
       this.pendingFocusReads.delete(entry.focus.slot ?? 'primary')
-      this.recordFocusCancellation(entry, reason, 'chart.history.admission')
       this.cancelFocusReadWaiters(entry)
       entry.resolveDone()
     }
   }
 
-  recordFocusCancellation(entry, reason, name) {
-    if (!hasOperationRecording()) return
-    recordOperation({ category: 'cpu', name, resource: entry.state.instId, status: 'cancelled',
-      startedAt: Date.now(), durationMS: 0, attributes: { reason } })
-  }
-
-  cancelFocusReadWaiters(entry, reason, focus) {
+  cancelFocusReadWaiters(entry, _reason, focus) {
     for (const [owner, waiter] of entry.waiters) {
       if (focus !== undefined && owner !== focus) continue
       entry.waiters.delete(owner)
-      if (reason) this.recordFocusCancellation(entry, reason, 'chart.history.consumer')
       waiter.resolve(false)
     }
   }
@@ -1226,13 +1206,11 @@ export class PreparedChartPipeline {
 
   // Focuses may change many times while one source or indicator replay is
   // held. One observer per underlying task owns removable focus waiters.
-  cancelFocusWaits(reason, focus) {
+  cancelFocusWaits(_reason, focus) {
     for (const group of this.focusWaits.values()) {
       for (const [owner, waiter] of group.waiters) {
         if (focus !== undefined && owner !== focus) continue
         group.waiters.delete(owner)
-        if (hasOperationRecording()) recordOperation({ category: 'cpu', name: 'chart.focus.consumer', resource: group.instId,
-          status: 'cancelled', startedAt: Date.now(), durationMS: 0, attributes: { reason } })
         waiter.resolve(false)
       }
     }
@@ -2104,7 +2082,6 @@ export class PreparedChartPipeline {
   }
 
   observe(rows, previous) {
-    return measureOperation({ category: 'cpu', name: 'indicators.observe', attributes: { candles: rows.length, execution: 'inline' } }, () => {
     for (const row of rows) assertCandleGrid(row.timestamp, intervalFor(row.timeframe))
     for (const [key, batch] of Map.groupBy(rows, row => seriesKey(row.instrument, row.timeframe))) {
       const state = this.series.get(key), live = this.liveStates.get(key)
@@ -2161,7 +2138,6 @@ export class PreparedChartPipeline {
         this.queueCandidate(this.universe.get(key))
       }
     }
-    })
   }
 
 
@@ -2259,15 +2235,14 @@ export class PreparedChartPipeline {
     if (this.closed) return Promise.reject(new Error('Prepared chart data service is closed.'))
     const id = ++this.nextCalculation
     return new Promise((resolve, reject) => {
-      const operation = createWorkerRequest('prepared-chart', 'calculate', resolve, reject, { priority, inputRows: candles.length })
-      this.calculations.set(id, { id, candles, intervalMS, checkpoint, priority, ...operation })
+      this.calculations.set(id, { id, candles, intervalMS, checkpoint, priority, resolve, reject })
       this.calculationQueue.push(id); this.drainCalculations()
     })
   }
   drainCalculations() {
     if (this.closed) return
     while (this.workers.length < this.workerLimit && this.workers.length < this.calculationQueue.length + this.workers.filter(slot => slot.busy !== null).length) {
-      const slot = { worker: createOperationWorker(new URL('./prepared-chart-worker.js', import.meta.url), {}, 'prepared-chart'), busy: null }
+      const slot = { worker: new Worker(new URL('./prepared-chart-worker.js', import.meta.url)), busy: null }
       slot.worker.unref()
       slot.worker.on('message', ({ id, bars, state, error }) => {
         const pending = this.calculations.get(id)
@@ -2306,7 +2281,7 @@ export class PreparedChartPipeline {
       const index = this.calculationQueue.findIndex(id => this.calculations.get(id)?.priority === 'foreground')
       const [id] = this.calculationQueue.splice(index < 0 ? 0 : index, 1), pending = this.calculations.get(id)
       slot.busy = id; slot.worker.ref()
-      try { pending.dispatch(slot.worker, { id, candles: pending.candles, intervalMS: pending.intervalMS, checkpoint: pending.checkpoint }) }
+      try { slot.worker.postMessage({ id, candles: pending.candles, intervalMS: pending.intervalMS, checkpoint: pending.checkpoint }) }
       catch (error) {
         this.calculations.delete(id); slot.busy = null; slot.worker.unref(); pending.reject(error)
         queueMicrotask(() => this.drainCalculations())
@@ -2335,17 +2310,10 @@ export class PreparedChartPipeline {
     const workers = this.workers
     this.workers = []
     this.disposeTask = (async () => {
-      await Promise.allSettled(workers.map(slot => stopOperationWorker(slot.worker, 'prepared-chart')))
+      await Promise.allSettled(workers.map(slot => slot.worker.terminate()))
       await Promise.allSettled([...this.tasks.values(), ...[...this.focusReads].map(entry => entry.done), ...this.liveSeeds.values(), ...this.candidateTasks.values()])
       this.listeners.clear()
     })()
     return this.disposeTask
   }
 }
-
-hookOperationMethods(PreparedChartPipeline.prototype, {
-  frame: state => ({ category: 'cpu', name: 'chart.frame', resource: state.instId,
-    attributes: { inputRows: state.rows.size, intervalMS: state.intervalMS, generation: state.generation } }),
-  reconcileCanonical: (state, rows) => ({ category: 'cpu', name: 'chart.reconcile', resource: state.instId,
-    attributes: { inputRows: rows.length, intervalMS: state.intervalMS } }),
-})

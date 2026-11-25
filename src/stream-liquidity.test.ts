@@ -2,7 +2,6 @@ import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
 import { evaluateLiquidity, type LiquidityInput } from '../electron/services/liquidity.js'
 import { StreamLiquidityEvaluator } from '../electron/services/stream-liquidity.js'
-import { stopOperationWorker } from '../electron/services/operation-worker.js'
 import { DEFAULT_PREFERENCES } from '../electron/services/preferences.js'
 
 const fixture = (index = 0): LiquidityInput => {
@@ -102,7 +101,7 @@ test('a replacement worker receives the required book again after its old lifeti
   const input = fixture()
   await evaluator.evaluate(input)
   const previous = (evaluator as any).worker
-  await stopOperationWorker(previous, 'stream-liquidity')
+  await previous.terminate()
   assert.deepEqual(await evaluator.evaluate(input), evaluateLiquidity(input))
   assert.notEqual((evaluator as any).worker, previous)
 })

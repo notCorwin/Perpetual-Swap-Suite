@@ -1,7 +1,4 @@
-import { hookOperationMethods } from './operations.js'
 import { diagnosticReason } from './realtime-diagnostics.js'
-import { recordedWebSocketFactory } from './network-operations.js'
-import { marketTrafficPayloadIdentity, marketTrafficWireFingerprint, monotonicMicroseconds } from './market-traffic-callback-probe.js'
 
 // OKX business WebSocket: https://www.okx.com/docs-v5/en/#order-book-trading-market-data-ws-candlesticks-channel
 // Port 8443 retires on 2026-10-31: https://www.okx.com/docs-v5/log_en/
@@ -31,7 +28,7 @@ export class RealtimeMarket {
     }
     this.options = options
     this.url = options.url ?? OKX_BUSINESS_WEBSOCKET_URL
-    this.factory = recordedWebSocketFactory(options.webSocketFactory ?? (url => new globalThis.WebSocket(url)), 'okx.business')
+    this.factory = options.webSocketFactory ?? (url => new globalThis.WebSocket(url))
     this.now = options.now ?? Date.now
     this.setTimer = options.setTimeout ?? globalThis.setTimeout
     this.clearTimer = options.clearTimeout ?? globalThis.clearTimeout
@@ -392,9 +389,6 @@ export class RealtimeMarket {
       this.overload(connection, 'Candle message decoding fell behind.')
       return
     }
-    const trafficProbeEnabled = typeof this.options.onMarketTrafficIngress === 'function'
-    const nativeHandlerEnteredAtMonotonicUS = trafficProbeEnabled ? monotonicMicroseconds() : null
-    const ingress = ++connection.ingress
     const receivedAt = this.now()
     this.armHeartbeat(connection)
     // Blob decoding is also part of the shutdown barrier. Native Node/Electron
@@ -407,13 +401,13 @@ export class RealtimeMarket {
         else if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) text = new TextDecoder().decode(data)
         else throw new TypeError('Unsupported WebSocket message data.')
       }
-      if (this.active(connection)) this.consume(connection, text, receivedAt, ingress, nativeHandlerEnteredAtMonotonicUS)
+      if (this.active(connection)) this.consume(connection, text, receivedAt)
     }).catch(error => this.report('WebSocket message decoding failed.', error, this.active(connection) ? true : 'log')).then(() => { connection.pendingMessages-- })
     connection.messageTail = task
     this.track(task)
   }
 
-  consume(connection, text, receivedAt, nativeMessageSequence, nativeHandlerEnteredAtMonotonicUS = null) {
+  consume(connection, text, receivedAt) {
     if (text === 'pong') {
       connection.waitingForPong = false
       this.clearConnectionTimer(connection, 'pong')
@@ -443,30 +437,15 @@ export class RealtimeMarket {
       return
     }
     if (!Array.isArray(message.data)) return
-    for (const raw of message.data) this.enqueue(connection, subscription, raw, receivedAt, nativeMessageSequence, nativeHandlerEnteredAtMonotonicUS)
+    for (const raw of message.data) this.enqueue(connection, subscription, raw, receivedAt)
   }
 
-  enqueue(connection, subscription, raw, receivedAt, nativeMessageSequence, nativeHandlerEnteredAtMonotonicUS) {
+  enqueue(connection, subscription, raw, receivedAt) {
     if (!this.active(connection)) return
     this.telemetry.receivedEvents++
     this.telemetry.lastReceivedAt = receivedAt
     const key = keyFor(subscription)
     const sourceEpoch = this.options.sourceEpoch?.(subscription.instId)
-    let trafficContext = null
-    const trafficObserver = this.options.onMarketTrafficIngress
-    if (Number.isSafeInteger(nativeHandlerEnteredAtMonotonicUS) && typeof trafficObserver === 'function') {
-      const probeStartedAtMonotonicUS = monotonicMicroseconds()
-      const channel = channels.get(subscription.timeframe)
-      const trafficEvent = {
-        ...(marketTrafficPayloadIdentity(channel, subscription.instId, raw)
-          ?? { channel, instId: subscription.instId, identity: null, payloadFingerprint: null }),
-        wireFingerprint: marketTrafficWireFingerprint(raw),
-        nativeMessageSequence, nativeHandlerEnteredAtMonotonicUS,
-      }
-      trafficContext = { marketTrafficEvents: [trafficEvent] }
-      const probeCostMonotonicUS = monotonicMicroseconds() - probeStartedAtMonotonicUS
-      trafficObserver([trafficEvent], probeCostMonotonicUS)
-    }
     let series = this.series.get(key)
     if (!series) {
       series = { tail: Promise.resolve(), commitTask: null, commitDemand: 0, pending: 0, forming: null, latestTimestamp: -Infinity,
@@ -483,7 +462,7 @@ export class RealtimeMarket {
       // A confirmed event accepted before cancellation still needs durable
       // ingestion. Retired transports must not publish queued forming events.
       if (raw?.[8] !== '1' && (!this.active(connection) || this.subscriptions.get(key) !== subscription)) return
-      await this.process(connection, series, subscription, raw, receivedAt, trafficContext, sourceEpoch)
+      await this.process(connection, series, subscription, raw, receivedAt, sourceEpoch)
     }).catch(error => this.report('Candle callback failed.', error, this.active(connection) ? true : 'log')).then(() => {
       series.pending--
       this.telemetry.pendingEvents--
@@ -493,7 +472,7 @@ export class RealtimeMarket {
     this.track(task)
   }
 
-  async process(connection, series, subscription, raw, receivedAt, trafficContext = null, sourceEpoch) {
+  async process(connection, series, subscription, raw, receivedAt, sourceEpoch) {
     if (!Array.isArray(raw) || raw.length < 9 || !['0', '1'].includes(raw[8]) || raw.slice(0, 8).some(value => typeof value !== 'string' || !value.trim() || !Number.isFinite(Number(value))) || volumes(raw).some(value => value < 0)) {
       this.telemetry.rejectedEvents++
       this.report('Invalid OKX candle payload.')
@@ -521,8 +500,7 @@ export class RealtimeMarket {
     this.telemetry.maxDispatchLatencyMs = Math.max(this.telemetry.maxDispatchLatencyMs, this.telemetry.lastDispatchLatencyMs)
     series.latestTimestamp = Math.max(series.latestTimestamp, timestamp)
     const context = { signal: candle.confirmed ? this.durableController.signal : connection.controller.signal, receivedAt,
-      sourceEpoch,
-      ...(trafficContext ?? {}) }
+      sourceEpoch }
     if (candle.confirmed) {
       // Exchange confirmation and local durability are independent progress.
       // Preserve correction order without putting live delivery behind fsync.
@@ -663,7 +641,3 @@ export class RealtimeMarket {
     return this.closePromise
   }
 }
-
-hookOperationMethods(RealtimeMarket.prototype, {
-  consume: { category: 'cpu', name: 'market.websocket.decode', attributes: { stream: 'okx.business' } },
-})

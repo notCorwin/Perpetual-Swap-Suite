@@ -1,23 +1,17 @@
-import { closeOperationRecording } from './operation-runtime.js'
-import { onOperationMessage } from './worker-operations.js'
-import { databaseOperation, openRecordedDatabase } from './recorded-database.js'
-import { hasOperationRecording } from './operations.js'
 import { parentPort, workerData } from 'node:worker_threads'
 import { DatabaseSync } from 'node:sqlite'
-import { performance } from 'node:perf_hooks'
 import { CANDLE_INTERVALS, validateCandle, validateQuery } from './market-records.js'
 import { statisticsMask, validTakerVolumes } from './statistics-state.js'
 import { statisticsAbsenceExpiryAt } from './statistics-coverage.js'
 import { aggregatePriceCandles } from './candle-aggregation.js'
 
-const database = openRecordedDatabase(DatabaseSync, workerData.path, { readOnly: workerData.reader === true }, workerData.reader ? 'market-reader' : 'market-writer')
+const database = new DatabaseSync(workerData.path, { readOnly: workerData.reader === true })
 database.exec('PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA cache_size=-8192;')
 if (workerData.reader) database.exec('PRAGMA query_only=ON;')
 else {
   const version = database.prepare('PRAGMA user_version').get().user_version
   if (![0, 4].includes(version) || version === 0 && database.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1").get()) {
     database.close()
-    await closeOperationRecording()
     throw new Error('Unsupported market database schema version.')
   }
   database.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=2000;')
@@ -548,14 +542,10 @@ const commands = {
   close: () => { if (!workerData.reader) database.exec('PRAGMA wal_checkpoint(TRUNCATE)'); database.close(); return { result: undefined } },
 }
 
-onOperationMessage(parentPort, workerData.reader ? 'market-reader' : 'market-writer', ({ id, command, args }) => {
-  const recording = hasOperationRecording(), started = recording ? performance.now() : undefined
+parentPort.on('message', ({ id, command, args }) => {
   try {
     if (!commands[command]) throw new Error(`Unknown market store operation: ${command}`)
-    const response = recording
-      ? databaseOperation(`market.${command}`, () => commands[command](...args), { role: workerData.reader ? 'reader' : 'writer' })
-      : commands[command](...args)
-    return { id, ...response, ...(recording ? { durationMS: performance.now() - started } : {}) }
-  } catch (error) { return { id, error: { message: error.message, name: error.name, code: error.code } } }
-}, { closeWhen: message => message.command === 'close' })
+    parentPort.postMessage({ id, ...commands[command](...args) })
+  } catch (error) { parentPort.postMessage({ id, error: { message: error.message, name: error.name, code: error.code } }) }
+})
 parentPort.postMessage({ ready: true })

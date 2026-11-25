@@ -2,12 +2,10 @@ import './desktop-bridge.ts'
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
-import { initializeOperationTelemetry } from './operation-telemetry'
 import SettingsLoadError from './SettingsLoadError'
 import { RootErrorBoundary, WorkspaceLoadError } from './WorkspaceErrorBoundary'
 
 await Promise.all([
-  initializeOperationTelemetry().catch(error => console.error('Operation telemetry initialization failed:', error)),
   document.fonts.load('400 12px "Ubuntu Mono"').catch(() => []),
   document.fonts.load('700 12px "Ubuntu Mono"').catch(() => []),
 ])

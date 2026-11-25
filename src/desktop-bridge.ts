@@ -1,19 +1,14 @@
 import { decodeChartWire } from '../electron/chart-wire.js'
-import type { DesktopRequest, OperationBridgeHooks, OperationSourceIdentity, OperationBatch, OperationAcknowledgment, PresentationUpdate, RadarDesktop } from './desktop-contract.ts'
-import type { OperationContext } from '../electron/services/operations.js'
+import type { DesktopRequest, PresentationUpdate, RadarDesktop } from './desktop-contract.ts'
 
 type DesktopTransport = {
   readonly nativeWindowControls: boolean
-  readonly operationRecording: boolean
   readonly isSettingsWindow: boolean
   setSettingsCloseGuard(value: { dirty: boolean; busy: boolean }): void
   closeSettingsWindow(): Promise<void>
-  request(value: unknown, context?: OperationContext): Promise<unknown>
-  subscribeNotifications(receiver: (channel: string, detail: unknown, context?: OperationContext) => void): void
+  request(value: unknown): Promise<unknown>
+  subscribeNotifications(receiver: (channel: string, detail: unknown) => void): void
   subscribePresentation(receiver: (update: Omit<PresentationUpdate, 'snapshot'> & { snapshot?: unknown }) => void): void
-  initializeOperations(flush: () => Promise<void>): Promise<OperationSourceIdentity>
-  recordOperations(batch: OperationBatch): Promise<OperationAcknowledgment>
-  operationSourceFailure(value: { executionId: string; reason: string; omitted: number }): Promise<void>
 }
 
 declare global { interface Window { radarDesktopBootstrap: { connect(accept: (bridge: DesktopTransport) => void): void } } }
@@ -22,24 +17,11 @@ let transport: DesktopTransport | undefined
 window.radarDesktopBootstrap.connect(bridge => { transport = bridge })
 if (!transport) throw new Error('The desktop transport is unavailable.')
 const bridge = transport
-let operations: OperationBridgeHooks | undefined
 const chartRequest = (value: unknown) => value !== null && typeof value === 'object'
   && ['chartLocal', 'chartHistory', 'chartUniverse'].some(key => Object.hasOwn(value, key))
 
 const decodeResponse = (value: DesktopRequest, result: unknown) => chartRequest(value) ? decodeChartWire(result) : result
 const plainRequest = async (value: DesktopRequest) => decodeResponse(value, await bridge.request(value))
-const recordedRequest = async (value: DesktopRequest) => {
-  const operation = operations?.beginRequest(Object.keys(value ?? {})[0] ?? 'invalid')
-  try {
-    const result = await bridge.request(value, operation?.context)
-    const response = decodeResponse(value, result)
-    if (operation) operations?.endRequest(operation.id, 'ok')
-    return response
-  } catch (error) {
-    if (operation) operations?.endRequest(operation.id, 'error')
-    throw error
-  }
-}
 
 const deliverNotification = (channel: string, detail: unknown) => {
   window.dispatchEvent(new CustomEvent(channel.replace(':', '-'), {
@@ -56,16 +38,10 @@ bridge.subscribePresentation(update => {
     finally { const { snapshot: _snapshot, ...state } = presentation; presentation = state }
   }
 })
-bridge.subscribeNotifications(bridge.operationRecording
-  ? (channel, detail, context) => {
-    if (operations) operations.receive(channel, context, () => deliverNotification(channel, detail))
-    else deliverNotification(channel, detail)
-  }
-  : deliverNotification)
+bridge.subscribeNotifications(deliverNotification)
 
 const desktop: RadarDesktop = {
   nativeWindowControls: bridge.nativeWindowControls,
-  operationRecording: bridge.operationRecording,
   isSettingsWindow: bridge.isSettingsWindow,
   setSettingsCloseGuard: value => bridge.setSettingsCloseGuard(value),
   closeSettingsWindow: () => bridge.closeSettingsWindow(),
@@ -75,14 +51,6 @@ const desktop: RadarDesktop = {
     finally { const { snapshot: _snapshot, ...state } = presentation; presentation = state }
     return () => { presentationListeners.delete(receiver) }
   },
-  request: (bridge.operationRecording ? recordedRequest : plainRequest) as RadarDesktop['request'],
-  initializeOperations(hooks) {
-    if (!bridge.operationRecording) throw new Error('Operation recording is disabled for this renderer.')
-    if (operations) throw new Error('Renderer recording is already initialized.')
-    operations = hooks
-    return bridge.initializeOperations(hooks.flush)
-  },
-  recordOperations: batch => bridge.recordOperations(batch),
-  operationSourceFailure: value => bridge.operationSourceFailure(value),
+  request: plainRequest as RadarDesktop['request'],
 }
 Object.defineProperty(window, 'radarDesktop', { value: Object.freeze(desktop), enumerable: true })

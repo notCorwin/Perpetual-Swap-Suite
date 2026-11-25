@@ -49,9 +49,12 @@ test('Settings menu opens one independent background window and changes update t
   await menuAction()
   settings = await opened
   await settings.locator('[data-layout="settings-workspace"]').waitFor()
-  const lookback = settings.locator('#rankingLookback')
-  await lookback.waitFor({ state: 'visible' })
-  await settings.waitForFunction(() => !document.querySelector('#rankingLookback')?.disabled)
+  const bollSwitch = settings.getByRole('switch', { name: 'Bollinger price labels' })
+  await bollSwitch.waitFor({ state: 'visible' })
+  await settings.waitForFunction(() => {
+    const el = document.querySelector('[role="switch"]')
+    return Boolean(el && el.getAttribute('aria-disabled') !== 'true' && !el.hasAttribute('data-disabled'))
+  })
   assert.equal(await settings.locator('#settings-section-title').evaluate(element => element === document.activeElement), false,
     'Opening settings must not move focus to the section heading.')
   for (const name of ['Liquidity filters', 'Market data', 'Workspace']) {
@@ -71,13 +74,11 @@ test('Settings menu opens one independent background window and changes update t
   await menuAction()
   assert.equal(await nativeWindowCount(), 2, 'Repeated menu commands should reuse the same settings window.')
   assert.equal(await main.locator('[data-market-list]').count(), 1, 'The main workspace remains mounted while settings are open.')
-  const previous = Number(await lookback.inputValue())
-  const next = previous === 15 ? 20 : 15
-  await lookback.fill(String(next))
+  const beforeChecked = (await bollSwitch.getAttribute('aria-checked')) === 'true'
+  await bollSwitch.click()
   await settings.getByRole('button', { name: 'Save settings' }).click()
   await settings.getByText('Settings saved.').waitFor()
-  await main.getByRole('columnheader', { name: `${next}m change By magnitude` }).waitFor()
-  assert.equal((await main.evaluate(() => window.radarDesktop.request({ preferences: { action: 'read' } }))).rankingLookback, next)
+  assert.equal((await main.evaluate(() => window.radarDesktop.request({ preferences: { action: 'read' } }))).showBollingerPriceLabels, !beforeChecked)
 })
 
 test('settings refresh preferences and job status after the application resumes', async () => {
@@ -114,16 +115,15 @@ test('settings refresh preferences and job status after the application resumes'
     await electron.evaluate(() => globalThis.__presentationTest.setActive(false))
     await electron.evaluate(() => { globalThis.__settingsStatusFixture.phase = 1 })
     const previous = await main.evaluate(() => window.radarDesktop.request({ preferences: { action: 'read' } }))
-    const next = previous.rankingLookback === 15 ? 20 : 15
-    await main.evaluate(value => window.radarDesktop.request({ preferences: { action: 'update', values: { rankingLookback: value } } }), next)
+    const next = !previous.showBollingerPriceLabels
+    await main.evaluate(value => window.radarDesktop.request({ preferences: { action: 'update', values: { showBollingerPriceLabels: value } } }), next)
     await electron.evaluate(() => globalThis.__presentationTest.setActive(true))
     await settings.getByText('Audit running · 4 / 9').waitFor()
     await settings.getByText('Downloading history · 50.0%').waitFor({ timeout: 4_000 }).catch(async error => { throw new Error(`${error.message}\nFixture: ${JSON.stringify(await electron.evaluate(() => globalThis.__settingsStatusFixture.reads))}\nBody: ${await settings.locator('body').innerText()}`) })
     const after = await electron.evaluate(() => ({ ...globalThis.__settingsStatusFixture.reads }))
     assert.ok(after.audit > before.audit && after.download > before.download, 'Both job statuses must be reread on activation.')
     await settings.getByRole('link', { name: 'Workspace', exact: true }).click()
-    await settings.waitForFunction(value => document.querySelector('#rankingLookback')?.value === String(value), next)
-    await main.getByRole('columnheader', { name: `${next}m change By magnitude` }).waitFor()
+    await settings.waitForFunction(value => document.querySelector('[role="switch"]')?.getAttribute('aria-checked') === String(value), next)
   } finally {
     await electron.evaluate(({ ipcMain }) => {
       ipcMain.removeHandler('radar:request')
@@ -135,10 +135,10 @@ test('settings refresh preferences and job status after the application resumes'
 })
 
 test('native close and quit protect unsaved and busy settings', async () => {
-  const lookback = settings.locator('#rankingLookback')
-  const next = Number(await lookback.inputValue()) === 15 ? 20 : 15
+  const bollSwitch = settings.getByRole('switch', { name: 'Bollinger price labels' })
+  const beforeChecked = (await bollSwitch.getAttribute('aria-checked')) === 'true'
   await electron.evaluate(({ dialog }) => { globalThis.__settingsDialogs = 0; dialog.showMessageBoxSync = () => { globalThis.__settingsDialogs++; return 0 } })
-  await lookback.fill(String(next))
+  await bollSwitch.click()
   // Close immediately after typing, without waiting for a status render.
   await observeGuard()
   await closeSettings()
@@ -171,8 +171,8 @@ test('native close and quit protect unsaved and busy settings', async () => {
   await menuAction()
   settings = await reopened
   await settings.locator('[data-layout="settings-workspace"]').waitFor()
-  await settings.waitForFunction(() => !document.querySelector('#rankingLookback')?.disabled)
-  assert.notEqual(Number(await settings.locator('#rankingLookback').inputValue()), next, 'Discarded changes must not be persisted on reopening.')
+  await settings.waitForFunction(() => document.querySelector('[role="switch"]')?.getAttribute('aria-disabled') !== 'true')
+  assert.equal((await settings.getByRole('switch', { name: 'Bollinger price labels' }).getAttribute('aria-checked')) === 'true', beforeChecked, 'Discarded changes must not be persisted on reopening.')
 })
 
 

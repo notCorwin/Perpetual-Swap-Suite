@@ -1,9 +1,6 @@
-import { hookOperationMethods } from './operations.js'
 import { diagnosticReason } from './realtime-diagnostics.js'
 // Native OKX public streams cover the entire eligible universe independently of
 // chart selection. https://www.okx.com/docs-v5/en/#order-book-trading-market-data
-import { recordedWebSocketFactory } from './network-operations.js'
-import { marketTrafficPayloadIdentity, marketTrafficWireFingerprint, monotonicMicroseconds } from './market-traffic-callback-probe.js'
 
 export const OKX_PUBLIC_WEBSOCKET_URL = 'wss://ws.okx.com/ws/v5/public'
 export const PUBLIC_MARKET_CONTRACTS_PER_CONNECTION = 25
@@ -53,7 +50,7 @@ class PublicMarketConnection {
     }
     this.options = options
     this.url = options.url ?? OKX_PUBLIC_WEBSOCKET_URL
-    this.factory = recordedWebSocketFactory(options.webSocketFactory ?? (url => new globalThis.WebSocket(url)), 'okx.public')
+    this.factory = options.webSocketFactory ?? (url => new globalThis.WebSocket(url))
     this.now = options.now ?? Date.now
     this.setTimer = options.setTimeout ?? globalThis.setTimeout
     this.clearTimer = options.clearTimeout ?? globalThis.clearTimeout
@@ -452,8 +449,6 @@ class PublicMarketConnection {
       this.overload(connection, 'Public market message decoding fell behind.')
       return
     }
-    const trafficProbeEnabled = typeof this.options.onMarketTrafficIngress === 'function'
-    const nativeHandlerEnteredAtMonotonicUS = trafficProbeEnabled ? monotonicMicroseconds() : null
     const receivedAt = this.now()
     const ingress = ++connection.ingress
     this.armHeartbeat(connection)
@@ -465,13 +460,13 @@ class PublicMarketConnection {
         else if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) text = new TextDecoder().decode(data)
         else throw new TypeError('Unsupported WebSocket message data.')
       }
-      if (this.active(connection)) this.consume(connection, text, receivedAt, ingress, nativeHandlerEnteredAtMonotonicUS)
+      if (this.active(connection)) this.consume(connection, text, receivedAt, ingress)
     }).catch(error => this.report('WebSocket message decoding failed.', error, this.active(connection) ? true : 'log')).then(() => { connection.pendingMessages-- })
     connection.messageTail = task
     this.track(task)
   }
 
-  consume(connection, text, receivedAt, ingress, nativeHandlerEnteredAtMonotonicUS = null) {
+  consume(connection, text, receivedAt, ingress) {
     if (text === 'pong') {
       connection.waitingForPong = false
       this.clearConnectionTimer(connection, 'pong')
@@ -551,26 +546,13 @@ class PublicMarketConnection {
         return
       }
     }
-    if (Array.isArray(message.data)) this.enqueue(connection, subscription, session, message, receivedAt, ingress, nativeHandlerEnteredAtMonotonicUS)
+    if (Array.isArray(message.data)) this.enqueue(connection, subscription, session, message, receivedAt)
   }
 
-  enqueue(connection, subscription, session, message, receivedAt, nativeMessageSequence, nativeHandlerEnteredAtMonotonicUS) {
+  enqueue(connection, subscription, session, message, receivedAt) {
     this.telemetry.receivedEvents += message.data.length
     this.telemetry.lastReceivedAt = receivedAt
     const key = keyFor(subscription)
-    let trafficEvents = null
-    const trafficObserver = this.options.onMarketTrafficIngress
-    if (Number.isSafeInteger(nativeHandlerEnteredAtMonotonicUS) && typeof trafficObserver === 'function') {
-      const probeStartedAtMonotonicUS = monotonicMicroseconds()
-      trafficEvents = message.data.map(payload => ({
-        ...(marketTrafficPayloadIdentity(subscription.channel, subscription.instId, payload, message.action ?? null)
-          ?? { channel: subscription.channel, instId: subscription.instId, identity: null, payloadFingerprint: null }),
-        wireFingerprint: marketTrafficWireFingerprint(payload, message.action ?? null),
-        nativeMessageSequence, nativeHandlerEnteredAtMonotonicUS,
-      }))
-      const probeCostMonotonicUS = monotonicMicroseconds() - probeStartedAtMonotonicUS
-      trafficObserver(trafficEvents, probeCostMonotonicUS)
-    }
     let backlog = this.backlogs.get(key)
     if (!backlog) { backlog = { pending: 0, coalesced: null }; this.backlogs.set(key, backlog) }
     const snapshot = subscription.channel === 'tickers' || subscription.channel === 'open-interest'
@@ -584,9 +566,7 @@ class PublicMarketConnection {
       }
       if (timestamp < queued.timestamp) { this.telemetry.ignoredEvents += message.data.length; return }
       this.telemetry.ignoredEvents += queued.message.data.length
-      queued.message = message; queued.receivedAt = receivedAt; queued.nativeMessageSequence = nativeMessageSequence
-      queued.nativeHandlerEnteredAtMonotonicUS = nativeHandlerEnteredAtMonotonicUS
-      queued.trafficEvents = trafficEvents
+      queued.message = message; queued.receivedAt = receivedAt
       queued.acknowledged = acknowledged
       queued.timestamp = timestamp
       return
@@ -604,27 +584,25 @@ class PublicMarketConnection {
       this.overload(connection, `Public market ${subscription.channel} callback fell behind.`)
       return
     }
-    const delivery = { connection, session, message, receivedAt, nativeMessageSequence, nativeHandlerEnteredAtMonotonicUS, trafficEvents, acknowledged, timestamp }
+    const delivery = { connection, session, message, receivedAt, acknowledged, timestamp }
     if (backlog.pending >= MAX_PENDING_CALLBACKS) backlog.coalesced = delivery
     backlog.pending++
     this.telemetry.pendingEvents++
     const current = () => this.active(connection) && this.subscriptions.get(key) === subscription && connection.sessions.get(key) === session
-    const contextFor = trafficEvent => ({ signal: session.controller.signal, receivedAt, acknowledged,
-      ...(trafficEvent ? { marketTrafficEvents: [trafficEvent] } : {}) })
     const task = (this.tails.get(key) ?? Promise.resolve()).then(async () => {
       if (backlog.coalesced === delivery) backlog.coalesced = null
-      ;({ message, receivedAt, nativeMessageSequence, nativeHandlerEnteredAtMonotonicUS, trafficEvents, acknowledged } = delivery)
+      ;({ message, receivedAt, acknowledged } = delivery)
       if (!await connection.readyTask || !current()) return
       const { instId, channel } = subscription
+      const context = { signal: session.controller.signal, receivedAt, acknowledged }
       if (channel === 'instruments') {
-        await this.options.onInstruments(message.data, contextFor(undefined))
+        await this.options.onInstruments(message.data, context)
       } else if (channel === 'trades') {
-        await this.options.onTrades(instId, message.data, { signal: session.controller.signal, receivedAt, acknowledged,
-          ...(trafficEvents ? { marketTrafficEvents: trafficEvents } : {}) })
+        await this.options.onTrades(instId, message.data, context)
         this.telemetry.tradeEvents += message.data.length
       } else for (let index = 0; index < message.data.length; index++) {
         if (!current()) return
-        const raw = message.data[index], context = contextFor(trafficEvents?.[index])
+        const raw = message.data[index]
         if (channel === 'books') {
           const book = this.updateBook(connection, instId, message.action, raw)
           if (!book) continue
@@ -981,9 +959,3 @@ export class RealtimePublicMarket {
     return this.closePromise
   }
 }
-
-hookOperationMethods(PublicMarketConnection.prototype, {
-  consume: { category: 'cpu', name: 'market.websocket.decode', cpuTime: false, attributes: { stream: 'okx.public', durationSource: 'performance.now' } },
-  updateBook: (_connection, instId, _action, raw) => ({ category: 'cpu', name: 'market.book.reconstruct', resource: instId,
-    attributes: { bidLevels: raw?.bids?.length ?? 0, askLevels: raw?.asks?.length ?? 0 } }),
-})

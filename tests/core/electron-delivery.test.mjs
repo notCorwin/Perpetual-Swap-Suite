@@ -53,25 +53,6 @@ test('renderer build clears old build files before running and temporary files a
   await assert.rejects(readdir(build), { code: 'ENOENT' })
 })
 
-test('renderer build does not publish a reuse manifest when source changes during compilation', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'perpetual-swap-renderer-snapshot-'))
-  const previous = process.env.PERPETUAL_SWAP_BUILD_RESULT_MANIFEST
-  t.after(async () => {
-    if (previous === undefined) delete process.env.PERPETUAL_SWAP_BUILD_RESULT_MANIFEST
-    else process.env.PERPETUAL_SWAP_BUILD_RESULT_MANIFEST = previous
-    await trashPath(root)
-  })
-  const manifest = join(root, 'result.json')
-  process.env.PERPETUAL_SWAP_BUILD_RESULT_MANIFEST = manifest
-  await writeFile(join(root, 'source.js'), 'before')
-  let calls = 0
-  await assert.rejects(buildRenderer({ root, execute: async () => {
-    calls++
-    if (calls === 1) await writeFile(join(root, 'source.js'), 'after')
-  } }), /Build inputs changed/)
-  await assert.rejects(readFile(manifest), { code: 'ENOENT' })
-})
-
 test('a rejected candidate never changes the installed app', async t => {
   const options = await setup(t)
   options.verify = async () => { throw new Error('Candidate preload failed') }

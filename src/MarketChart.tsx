@@ -15,7 +15,6 @@ import { timeframeLabel, timeframeMilliseconds, type RadarTimeframe } from '@/ti
 import { chartController as defaultChartController, type ChartController } from '@/chart-controller'
 import { createChartIndicatorPresentation, createChartPlotCache } from '@/chart-render'
 import type { Bar, ChartSourceStatus, PreparedChartState, ReadyChartWindow } from '@/chart-data'
-import { measureOperation } from '../electron/services/operations.js'
 import { getPresentation, usePresentation, usePresentedStore } from '@/presentation-store'
 import { isPriceFresh, watchPriceFreshness, watchPriceCountdown } from '@/price-clock'
 import { sharedChartEnd, sharedChartGesture, sharedChartLiveEnd, sharedChartViewport, type SharedChartTime } from '@/chart-time-sync'
@@ -149,10 +148,10 @@ const chartOverscan = (surface: ReadyChartWindow | null, chartController: ChartC
   return { before, after }
 }
 
-const PlotPaths = memo(function PlotPaths({ bars, geometry, areaClipId, priceVisible }: { priceVisible: boolean; bars: readonly Bar[]; geometry: ChartGeometry; areaClipId: string }) {
+const PlotPaths = memo(function PlotPaths({ geometry, areaClipId, priceVisible }: { priceVisible: boolean; bars: readonly Bar[]; geometry: ChartGeometry; areaClipId: string }) {
   const { upWicks, downWicks, upBodies, downBodies, bollLines } = geometry
   const lineStroke = (key: keyof Bar, d: string, color: string, dash?: string) => <path data-chart-indicator={key} d={d} fill="none" stroke={color} strokeLinecap="round" strokeLinejoin="round" strokeDasharray={dash} />
-  return measureOperation({ category: 'cpu', name: 'chart.svg.paths.construct', attributes: { candles: bars.length } }, () => <>
+  return <>
     <g clipPath={`url(#${areaClipId}-price)`} visibility={priceVisible ? "visible" : "hidden"}>
     {lineStroke("bollUpper", bollLines.bollUpper, "var(--chart-boll-upper)", "4 2")}
     {lineStroke("bollMiddle", bollLines.bollMiddle, "var(--chart-boll-middle)", "1.5 2.5")}
@@ -162,12 +161,11 @@ const PlotPaths = memo(function PlotPaths({ bars, geometry, areaClipId, priceVis
     <path data-chart-candle-direction="up" data-chart-candle-fill="hollow" d={upBodies} fill="var(--background)" stroke="var(--positive)" />
     <path data-chart-candle-direction="down" data-chart-candle-fill="solid" d={downBodies} fill="var(--negative)" />
     </g>
-  </>)
+  </>
 })
 
 const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = false, showBollingerPriceLabels = false, inspected, inspectedBar, contentOffset = 0 }: { bars: readonly Bar[]; geometry: ChartGeometry; liveBar: Bar; liveOverlay?: boolean; showBollingerPriceLabels?: boolean; inspected: number | null; inspectedBar?: Bar; contentOffset?: number }) {
   const areaClipId = useId().replaceAll(":", "")
-  return measureOperation({ category: 'cpu', name: 'chart.svg.construct', attributes: { candles: bars.length, inspected: inspected !== null } }, () => {
   const presentation = chartPricePresentation(geometry, contentOffset)
   const n = bars.length
   const inspecting = inspected !== null || inspectedBar !== undefined
@@ -283,7 +281,6 @@ const Plot = memo(function Plot({ bars, geometry, liveBar, liveOverlay = false, 
     </g>}
     <line x1={right} x2={right} y1={panels.price[0]} y2={panels.price[1]} stroke="var(--border)" opacity="0.8" />
   </>
-  })
 })
 
 type PlotSize = { width: number; height: number }

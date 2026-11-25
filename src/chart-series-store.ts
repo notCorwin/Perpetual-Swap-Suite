@@ -1,5 +1,4 @@
 import { validChartWindowBars } from '../electron/chart-viewport.js'
-import { hookOperationMethods, measureOperation } from '../electron/services/operations.js'
 import { completeChartPriceRange } from './chart-data.ts'
 import type { Bar, ChartSourceStatus, PreparedChartBar, PreparedChartLiveUpdate, PreparedChartMeta, PreparedChartResponse, PreparedChartState, ReadyChartWindow } from './chart-data.ts'
 import { RADAR_TIMEFRAMES, timeframeMilliseconds, type RadarTimeframe } from './timeframe.ts'
@@ -692,8 +691,7 @@ export class PreparedChartStore {
       && cached.meta.generation === entry.meta.generation && cached.meta.intervalMS === entry.meta.intervalMS
       && cached.meta.latestEnd === entry.meta.latestEnd && cached.meta.oldestHour === entry.meta.oldestHour
       && cached.meta.historyExhausted === entry.meta.historyExhausted && cached.meta.sourceStatuses === entry.meta.sourceStatuses
-    const window = reusable ? cached.window : historicalRefresh ? refreshHistoricalWindow(entry.meta, cached.window) : measureOperation({ category: 'cpu', name: 'chart.window.project', resource: entry.meta.instId,
-      attributes: { inputRows: windowBars } }, () => {
+    const window = reusable ? cached.window : historicalRefresh ? refreshHistoricalWindow(entry.meta, cached.window) : (() => {
       const bars: PreparedChartBar[] = []
       for (let index = windowBars - 1; index >= 0; index -= 1) {
         const value = entry.bars.get(endHour - index * entry.meta.intervalMS)
@@ -701,7 +699,7 @@ export class PreparedChartStore {
       }
       if (entry.bars.get(endHour)?.generation !== entry.meta.generation && !liveBar || !bars.length && !liveBar) return null
       return readyWindow(entry.meta, bars, endHour, liveBar, cached?.window, windowBars)
-    })
+    })()
     if (!window) return null
     entry.windows.delete(endHour)
     entry.windows.set(endHour, reusable ? cached : { window, meta: entry.meta, version: entry.version, liveBar })
@@ -741,9 +739,3 @@ export class PreparedChartStore {
     return entry.boundaries
   }
 }
-
-hookOperationMethods(PreparedChartStore.prototype, {
-  ingest: (response: PreparedChartResponse) => ({ category: 'cpu', name: 'chart.series.ingest', resource: response.instId,
-    attributes: { inputRows: response.bars?.length ?? 0 } }),
-  ingestLive: (response: PreparedChartLiveUpdate) => ({ category: 'cpu', name: 'chart.series.live', resource: response.instId }),
-})
