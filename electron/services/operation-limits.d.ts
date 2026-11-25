@@ -1,1 +1,0 @@
-export const MAX_OPERATION_BATCH_SIZE: 1024
